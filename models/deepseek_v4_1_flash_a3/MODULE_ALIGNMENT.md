@@ -2,6 +2,7 @@
 
 | Responsibility | Product modules |
 | --- | --- |
+| Public token-to-logit Prefill, whole-network compilation and IR reuse | `prefill_fwd.py`, `prefill_program.py` |
 | Complete layer and full 40-layer composition | `prefill_layer.py`, `prefill_layer_state.py`, `prefill_layer_plan.json` |
 | Actual network runtime, original L39 output | `prefill_network_runtime.py`, `prefill_network_input.py`, `prefill_output.py` |
 | Persistent cache allocation, aliases, owner/version handoffs | `prefill_network_state.py`, `prefill_network_cache.py`, `prefill_cache_layout.py`, `prefill_cache_publish.py` |

@@ -47,6 +47,7 @@ The original source names in this manifest are intentional provenance.
 
 | Responsibility | Implementation |
 | --- | --- |
+| Public whole-network forward and reusable compilation | `prefill_fwd.prefill_fwd`, `prefill_fwd.compile_prefill`, `prefill_program.py` |
 | Complete layer | `prefill_layer.make_prefill_layer_entries`, `run_prefill_layer_inmemory` |
 | Original 40-layer composition | `prefill_layer.run_prefill_network_inmemory` |
 | Actual checkpoint, persistent state, HCCL and L39 head | `prefill_network_runtime.run_network_runtime` |
@@ -57,7 +58,8 @@ The original source names in this manifest are intentional provenance.
 | EP MoE and actual communication | `prefill_moe_ep.py`, `moe_dispatch.py`, `moe_transport.py` |
 | Shared primitives | `quant.py`, `ecotech_linear*.py`, `qkv*.py`, `hc.py`, `gemm.py` |
 
-The public entry is `prefill_fwd.run_prefill`. It explicitly accepts inputs,
+The public entry is `prefill_fwd.prefill_fwd`; `run_prefill` remains an alias
+for existing callers. It explicitly accepts inputs,
 checkpoint weights, canonical cache state, numerical configuration, physical
 device IDs and a new output directory. It has no dependency on historical
 `formal_layer_receipts`, task releases, `TASK_DEVICE` or `DS41_JOB_ROOT`.
@@ -72,19 +74,48 @@ runtime checks. Input/cache identity hashes describe the supplied operands;
 they are not credentials from a private task.
 
 ```python
-from models.deepseek_v4_1_flash_a3.prefill_fwd import run_prefill
+from models.deepseek_v4_1_flash_a3.prefill_fwd import compile_prefill, prefill_fwd
 
-result = run_prefill(
-    inputs, weights=checkpoint, cache=cache_state, config=network_contract,
-    devices=list(range(16)), output="build_output/ds41-prefill-new-run",
+program = compile_prefill(
+    inputs, cache=cache_state, config=network_contract,
+    output="build_output/ds41-prefill-compiled",
 )
+result = prefill_fwd(
+    inputs, weights=checkpoint, cache=cache_state, config=network_contract,
+    devices=list(range(16)), compiled=program, output="build_output/ds41-prefill-new-run",
+)
+logits = result["logits"][0]["fresh"]  # Actual valid rows for logical rank 0.
 ```
+
+The forward executes vocabulary embedding and initial HC, all original layers
+0 through 39 with their original roles, final HC collapse, RMSNorm and the
+vocabulary head. Each layer consumes the previous layer's actual activations.
+Omitting `compiled` performs compilation inside the forward. A supplied program
+is reusable in the same process; changed entry sets, IR, shapes or argument
+names are rejected before execution. The pool uses structural equality as well
+as the IR hash, so a hash collision cannot reuse a different computation.
+
+`compile_prefill` derives shapes from canonical metadata using storage-free
+meta tensors. It compiles every stage without reading checkpoint payloads,
+allocating full cache backing buffers, initializing CANN or running NPU work.
+`compilation.json` records unique entries, all layer/stage bindings and actual
+compiler time. Only structurally identical entries with the same argument names
+share a compiled artifact across layers; different attention roles remain
+distinct. This is a pool of existing compiled entries, **not a single L2 graph**.
+
+The current A3 arithmetic crosses Python-managed HCCL collectives, routed-expert
+checkpoint reads and shared host Engram lookup boundaries. A single device L2
+forward requires device-side communication, resident expert weights and a
+reviewed Engram operand interface. Wrapping the current Python runtime in a
+function does not provide those capabilities. No Decode graph is exposed by
+this Prefill entry.
 
 For the CLI, copy `models/deepseek_v4_1_flash_a3/prefill.example.json`, supply
 actual files, and run from the repository root:
 
 ```bash
 python -m models.deepseek_v4_1_flash_a3.prefill_fwd --config prefill.json --check-config
+python -m models.deepseek_v4_1_flash_a3.prefill_fwd --config prefill.json --compile-only --output build_output/ds41-compiled
 python -m models.deepseek_v4_1_flash_a3.prefill_fwd --config prefill.json -p a2a3
 ```
 
@@ -98,7 +129,9 @@ The standalone `prefill_moe_ep` driver also requires `--devices`, for example
 It writes that ordered mapping to `runtime_config.json` for its HCCL workers.
 
 `inputs` and `cache_state` are Torch `weights_only=True` dictionaries. The first
-contains `input_contract`, `product_input_paths` and `product_input_files`.
+contains `input_contract`, including actual per-request token IDs and ownership
+metadata. To use an explicitly prepared backbone boundary instead of running
+embedding, additionally supply `product_input_paths` and `product_input_files`.
 The second contains `cache_ABI`, `cache_ABI_sources` and `engram_contracts`
 with integer Engram slots 1 and 14. Their canonical rank/page metadata and
 physical aliases are interpreted by `NetworkCacheProvider`; metadata must
@@ -106,8 +139,17 @@ match the actual allocated tensors. The JSON `contract` supplies `topology`,
 `model_config`, `required_modes`, `capacity`, `scheduler_capacity`,
 `fresh_shared_initialization`, `input_contract_sha256` and `state_regions`
 (path and SHA256). These remain explicit state/operand contracts. This entry
-accepts an already prepared canonical backbone/cache boundary; it does not
-create that boundary from only a checkpoint and a text prompt.
+still requires prepared canonical request/cache metadata. It does not create
+cache metadata, tokenize arbitrary text or implement a generation scheduler
+from only a checkpoint and a prompt.
+
+Weights retain the existing streaming policy: one host layer and the real
+owned active experts are loaded as needed. Full weight residency is not added.
+`execution.json` reports per-chunk elapsed time, layer/expert weight preparation
+and checkpoint reads. The weight and read counters overlap; do not add them as
+independent phases. Compiler timing is recorded separately. A ten-minute total
+for loading and compilation requires measurement on the intended hardware and
+checkpoint storage; HOST checks cannot establish that bound.
 
 The current runtime supports the original 40-layer plan with DP4/TP4/EP16,
 PP1/PCP1/DCP1 and capacity 16. Device IDs are runtime devices, not a claim of

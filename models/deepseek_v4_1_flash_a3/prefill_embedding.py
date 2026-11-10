@@ -116,6 +116,14 @@ def make_vocab_reduce(capacity, hidden, tp):
     return reduce_embedding
 
 
+def make_input_entries(capacity, config, tp):
+    """Build vocabulary-parallel lookup and initial local HC streams."""
+    hidden, vocabulary = config["hidden_size"], config["vocab_size"]
+    return dict(lookup=make_vocab_embedding(capacity, hidden, vocabulary, tp),
+                reduce=make_vocab_reduce(capacity, hidden, tp),
+                initial_hc=make_initial_hc(capacity, hidden, config["hc_mult"]))
+
+
 def golden_vocab_embedding(tensors):
     """Compute owned rows independently and preserve the inactive output suffix."""
     output, weight = tensors["output"], tensors["weight"]

@@ -24,8 +24,9 @@ from .runtime_utils import Executable
 class NetworkEngramHistory:
     """Own one V1 first-SWA slot history per rank/request batch across chunks."""
 
-    def __init__(self, bindings, initial_caches=None):
+    def __init__(self, bindings, initial_caches=None, *, geometry_only=False):
         self.bindings = bindings
+        self.geometry_only = geometry_only
         self.caches = [{} for _ in bindings]
         self.prepared = set()
         rows = set()
@@ -35,9 +36,10 @@ class NetworkEngramHistory:
                         or not binding["bound"] or not binding["kv_binding_id"] or binding["kv_blocks"] <= 0):
                     raise ValueError("Network V1 history requires the bound physical1 SWA identity and 128-row pages")
                 count = binding["kv_blocks"] * binding["block_size"]
-                cache = (torch.zeros(count, dtype=torch.int32) if initial_caches is None
+                device = "meta" if geometry_only else "cpu"
+                cache = (torch.zeros(count, dtype=torch.int32, device=device) if initial_caches is None
                          else initial_caches[rank][case])
-                if cache.dtype != torch.int32 or cache.device.type != "cpu" or tuple(cache.shape) != (count,):
+                if cache.dtype != torch.int32 or cache.device.type != device or tuple(cache.shape) != (count,):
                     raise ValueError("Network history must retain the exact first-SWA INT32 slot extent")
                 self.caches[rank][case] = cache
                 rows.add(count)
@@ -136,6 +138,8 @@ class PreparedNetworkEngram:
 def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_layer, runtime, *,
                            storage=None, storage_stack=None, storage_namespace=None):
     """Hash the global chunk once and prepare both table lookups with existing PyPTO entries."""
+    if getattr(history, "geometry_only", False):
+        raise ValueError("Compile-only Engram geometry cannot be used for execution")
     if (storage is None) != (storage_stack is None):
         raise ValueError("Caller-owned table storage requires the same finite owner ExitStack")
     constants = contract["hash_constants"]
@@ -210,14 +214,17 @@ def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_la
         functions = make_prefill_engram_entries(capacity, constants, config, own_contract["engram_shards"],
                                                 history.cache_rows, max_blocks, tp)
         entries = {}
-        for name, function in functions.items():
-            if name.startswith("engram_lookup_") or name not in shared_entries:
-                entry = Executable(function, directory / "compiled" / name)
-                if not name.startswith("engram_lookup_"):
-                    shared_entries[name] = entry
-            else:
-                entry = shared_entries[name]
-            entries[name] = entry
+        if "compile_entries" in runtime:
+            entries = runtime["compile_entries"](f"engram{layer_id}", functions)
+        else:
+            for name, function in functions.items():
+                if name.startswith("engram_lookup_") or name not in shared_entries:
+                    entry = Executable(function, directory / "compiled" / name)
+                    if not name.startswith("engram_lookup_"):
+                        shared_entries[name] = entry
+                else:
+                    entry = shared_entries[name]
+                entries[name] = entry
         rotation, rotation_receipt = load_rotation(contract["checkpoint"], 5120)
 
         def execute(name, rank, case, arguments, outputs, roles, *, entries=entries, directory=directory):

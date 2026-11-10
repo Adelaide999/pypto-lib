@@ -344,6 +344,7 @@
       "make_vocab_embedding": "e565df9607201a5762631004c032d02ef239095261895cdb6e1a268032dee14b",
       "make_initial_hc": "a3e4ab70ffb507d6c11c49846b1b223b77dd65e5c327c53b18bfdec8db76c6a6",
       "make_vocab_reduce": "fc16001692e5ab9f3be90e43c8374b32b89029437209c0d430814c36e86d0c88",
+      "make_input_entries": "4dd83e5cd1e0d97ff5060066c11db9aeb190ff0be58dfa782f2acd806233145f",
       "golden_vocab_embedding": "bab24611ae44b5f6d8b405d3a1081e5585b3f33f0f5fb588275d05aef127d44d",
       "golden_initial_hc": "09d2893b05309ca9fc5c3ef0d21e807c5d66692d35a1f9e2f5b7f7f5e23755fc",
       "golden_vocab_reduce": "cb787b51b3acad9437f16251dddd642395f5e1c7a43a0485a1a433fc179e5511",
@@ -392,9 +393,11 @@
       "admit_readonly": "db1e95792753d0c6b746510a33f9f134ae7d070f63ff588a846acc98bb49a0a2"
     },
     "prefill_fwd.py": {
-      "run_prefill": "d9a6848979b5d653f70a5b50d53a9b7b0614010b6b5c4c81d99fd9838d69f55b",
+      "compile_prefill": "b912fd1f9bf104c0a4ad59d3c6ed955444eb4bac0b6de192f464f9a338e558f1",
+      "_merge_inputs": "c04d6cb14c60cba52583e00688af86f5326d692f8ae0a4634efba4815f0a2d4a",
+      "prefill_fwd": "a4f6082c432d15f26540f7d7c41d3e284af9086ed4405b3ebebbddf7ed23380c",
       "load_configuration": "b40970cd8b7da8235adb7c0671ef591fcbf92fdffd05a0b1f9d3f3b63ec4c1ee",
-      "main": "4205b3d485b57fd25d6d97c6b30b8577175c1d8ff1dd3371359fdef072597ad4"
+      "main": "ca9c92018b2bab9d042c45ff95920be770af1fb93370b556a0a34028def134b2"
     },
     "prefill_grouped_output.py": {
       "make_prefill_grouped_output": "e4b091318916503fcc5619e090ce40648e0838f8a27c20ee99e43b7afde6ae99"
@@ -492,29 +495,32 @@
       "product_engram_observation": "3fe2769d9e48e1fd493a5e11b27317e6678b1f08eb350ff8c966dc7db58d4657"
     },
     "prefill_network_engram.py": {
-      "NetworkEngramHistory": "e0fa1c658483f61bc55f34c697c8a13a1f40e9b4498036251e3ce09b98b0d91a",
+      "NetworkEngramHistory": "7a6875c028c26cc74b6541cf982dc8e3f9171c7b232eb584807f8ef689f1eb6a",
       "_pad": "091914f42013efa70273eb55810b65f8a79a5b211a64dc4ab47c60e663943a9a",
       "_check_constants": "53cf719453cfec24eeb54eae4ecd748a437e29570970bfad8d58651cb29693e8",
       "PreparedNetworkEngram": "b0dafb9c608e3b8ab9ab506752087af80590bddeb6b1efec8400613de8fe8a13",
-      "prepare_network_engram": "df4f24d7f546c2c04eed8a1e5afb85882b5e583dfe478502429158e76589ffc2"
+      "prepare_network_engram": "885b3dae7d39dc4cd7abeda93cddce319c3aa35161a374e908ea314f7f0f5429"
     },
     "prefill_network_guard.py": {
       "interval_digest": "ef3fe91ba06f84f09c3c4631163ecd2aabc567d2449ce8d4d4c2e1ce46955781",
       "NetworkStatePreservation": "590e554eab4c87bde4feaa2c89a1e1ff46a1a973deda7f8575040538ff0024ae"
     },
     "prefill_network_input.py": {
-      "run_input_stage": "dbe54f2b91605e5145d9f83d8df356e8232c399d6b747b341e7b23484d0b128e"
+      "run_input_boundary": "7b2ae49afd127ad368d43573624e3b8cb370a81c098ed3a7a0ad05ea4bd0aa9a",
+      "run_input_stage": "2d85efb764038c5f8f27413bad1a2b9818143d73711fe04108e3f32e1929a7e6"
     },
     "prefill_network_runtime.py": {
-      "NetworkWeights": "98461dce52ba87669066f64bdaf341f940d5d934c9e4b2b4cdc5bcf1512ea097",
+      "NetworkWeights": "6f2beb327719ea68f8ed651eeb502139934636fbd52c0c41f58504bf27d8bd87",
       "network_parameter_abi": "111f274aec7122897a4e9519c7d37a4de5ca23487af0c3a2a4182a8e5592c1cc",
       "network_argument_protection": "ea3bdae8aa46f40029aaac6e988f2edf17bb8249ba0b03e541c53ca4b57ac2a2",
-      "NetworkExecutor": "b2071b66abfeefa007087f2ac7f5b319e343af393cb293f813fd8c020ce1ed40",
+      "NetworkExecutor": "8944c78a1a23d776f09cbe791ae558860d14f95629daba52dc582d01fc86b82a",
       "load_product_backbone_input": "6cc4e6b044822ddb7989b3e0f6f062856e4e0061c586d0305c3411a7e78c2dba",
-      "run_output_boundary": "03ef870275bf05169e0dab52a7a624ed0977f243d35b0012daf78de17819c965",
+      "embed_network_input": "7a07e569c1a8758264144a9e270c778c2996755d0ddd86e9161d7b94a84af805",
+      "run_output_boundary": "35df2d10db08cd343bb27d52d2785ef88b7fe730a7027d979bfbe99a0a708a02",
       "_network_owner_snapshot": "fa95779090b7a6f9d9dc6b2805cfdcbb69a04ff09b8e345c8a1aacb5a42b82b3",
-      "run_network_runtime": "20f4533dc79c8d45e667d14fc73d63c83d5be65803ef2600769c76d70a241458",
-      "_run_network_chunk": "3a1bb4793dc8e4acd25c1306b867d70caa0150f47039688326f09823245869d4"
+      "prepare_network_provider": "d7efcb57f453a4afed15c7531996817c4e69cd6e6fe2576cf4920ed4a339c629",
+      "run_network_runtime": "428a51ac01a8e75907bbe6bae8c6c5aaa0700ab860bf9d25094e539b2138078a",
+      "_run_network_chunk": "dcb58357935d06cd3ec4e3e2cf167c794711ea32be4a57f59adeaea4d38c3ee9"
     },
     "prefill_network_shared_observer.py": {
       "require": "313409857c78ee3b13cb621d7c3a2a2e2f6a9b853025c83483ed51f4c1cbdacb",
@@ -530,7 +536,7 @@
       "_descriptor_planes": "ca731ce6bf378d015d9cb3bc7fcd6c88aa59b722f251fd8a6b29fb4a3d3a0b8a",
       "_check_layout": "b5784dec4ca2e60c547cfd1cdcc68fa0ae905d6fe8195ceef6ae6e7057f70866",
       "core_geometry_issues": "e9c07097557b77ce5182b561900c20bc0ccc0d01ecbe9d826a201f599a754c52",
-      "NetworkCacheProvider": "e6bc2165788ee2e6050a30473f376af2bc35cd9d985f85e258342618941477cd"
+      "NetworkCacheProvider": "afae00c6fa071f575c482dd463fc84e375f73ffdf9e38d180b950144c9439ac4"
     },
     "prefill_norm.py": {
       "make_prefill_norm": "4ce7f40585d56ca716e715fae44d76c32c804c3263e656e1cee1d4d0a63378ed",
@@ -543,6 +549,10 @@
     "prefill_output.py": {
       "make_output_entries": "ec2f14144630c467f98e68576a654956d2159f9d915853396d565a732383c08b",
       "make_output_vocab_unpack": "30c765651d0644662720f11f57751cee4dbe645abc1195cf2aeba8d7c94438cf"
+    },
+    "prefill_program.py": {
+      "make_network_layer_entries": "4ca7b80bb36e93061c002b3a5282aa8ec4d292db242d0c58eb0fda49ae67c2eb",
+      "PrefillProgram": "5add3aa6091b0ce3b9d6be5e671d04c9e9f5d5c8eaecd5da18d43a8fa3d3833f"
     },
     "prefill_qkv_swa.py": {
       "make_prefill_swa": "af04e048c825cc9dcdf4256574cb274c8a3f7a5e20ef53c9a422a88bfeab4a97"
@@ -699,7 +709,7 @@
       "main": "724f6663194a78490add237220a29ceadf09fd9e40d06b63382259a65e01b6a6"
     },
     "weights.py": {
-      "CheckpointOperands": "bcc095bf0742890c8c292d5d241767169aa13749ef89c0cbf1c980fcc0e2ed7e",
+      "CheckpointOperands": "d01026f59da3c251ce06ec82bacbe633d41809e202783cc821be9624ef98c244",
       "load_tensor_bundle": "5481d581abf30e125102d4ff47529bf7a05941ba91ee85fd8e0cacf6952a606b",
       "load_layer0_qkv": "f3b56147b96707a026bf070932671c662812375b1cb2778895d7ebbeb0877cb6",
       "load_layer0_shared_expert": "eb622ccc1e519c11767c656b6d8257277e364c22624f089cc34ed16a48ba3b38",

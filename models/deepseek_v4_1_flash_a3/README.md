@@ -10,6 +10,13 @@ for entry points, dependencies, topology, and the limits of the evidence.
 The original source directory was named `deepseek_v4_1_flash_a2`; that historic
 path in `source_manifest.json` records provenance rather than the target hardware.
 
+`prefill_fwd.prefill_fwd` executes embedding, the complete 40-layer backbone
+and the final head from explicit request/cache metadata and checkpoint weights.
+`prefill_fwd.compile_prefill` prepares all stage artifacts for reuse in the
+same process without allocating the full cache buffers or running NPU work.
+The existing host communication and weight streaming boundaries remain;
+this interface does not claim a single device L2 graph or a Decode forward.
+
 Run the device-free package checks from the repository root:
 
 ```bash

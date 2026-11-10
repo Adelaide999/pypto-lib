@@ -13,12 +13,14 @@ from datetime import datetime, timezone
 import gc
 import json
 from pathlib import Path
+from time import perf_counter
 
 import torch
 from pypto.backend import BackendType
 from pypto.runtime import ExecutionMode, RunConfig
 
-from .prefill_layer import make_prefill_layer_entries, run_prefill_network_inmemory
+from .prefill_layer import run_prefill_network_inmemory
+from .prefill_embedding import make_input_entries
 from .prefill_layer_state import resolve_layer_role
 from .prefill_network_cache import attach_network_cache_geometry
 from .prefill_network_engram import prepare_network_engram
@@ -27,10 +29,12 @@ from .prefill_network_discrete_observer import (
 )
 from .prefill_network_guard import NetworkStatePreservation
 from .prefill_network_state import NetworkCacheProvider
+from .prefill_network_input import run_input_boundary
 from .prefill_output import make_output_entries
+from .prefill_program import PrefillProgram, make_network_layer_entries
 from .prefill_swa import prepare_product_operands
 from .runtime_config import ExpertParallelConfig
-from .runtime_utils import Executable, communicate, file_sha, loaded_source_files, tensor_sha, write_json
+from .runtime_utils import communicate, file_sha, loaded_source_files, tensor_sha, write_json
 from .weights import CheckpointOperands
 
 
@@ -43,10 +47,12 @@ class NetworkWeights:
         self.model_config = model_config
         self.current_layer, self.current = None, None
         self.layer_receipts = {}
+        self.load_seconds, self.load_calls = 0.0, 0
 
     def for_layer(self, layer_id):
         role = resolve_layer_role(layer_id)
         if self.current_layer != layer_id:
+            begin = perf_counter()
             self.release_current()
             prefix = f"layers.{layer_id}."
             selected = [name for name in self.reader.index if name.startswith(prefix)
@@ -63,6 +69,8 @@ class NetworkWeights:
                 policy="One current layer on host; real expert payloads loaded for owned active experts",
                 HBM_residency="Not established by host byte counts; measure actual execution",
             )
+            self.load_seconds += perf_counter() - begin
+            self.load_calls += 1
         return self.current
 
     def raw_for_layer(self, layer_id):
@@ -75,7 +83,11 @@ class NetworkWeights:
             raise ValueError("Routed expert request does not belong to this real EP rank")
         prefix = f"layers.{self.current_layer}.ffn."
         prefix += "shared_experts" if expert is None else f"experts.{expert}"
-        return self.reader.expert(prefix)
+        begin = perf_counter()
+        result = self.reader.expert(prefix)
+        self.load_seconds += perf_counter() - begin
+        self.load_calls += 1
+        return result
 
     def release_current(self):
         self.current = None
@@ -226,11 +238,13 @@ def network_argument_protection(arguments, outputs, abi):
 class NetworkExecutor:
     """Compile exact existing per-layer entries and record invocations without retaining all tensor captures."""
 
-    def __init__(self, output, config, topology, provider, ownership, memory, runtime_path, reports, namespace="chunk0"):
+    def __init__(self, output, config, topology, provider, ownership, memory, runtime_path, reports,
+                 program, namespace="chunk0"):
         self.output, self.config, self.topology = Path(output), config, topology
         self.provider, self.ownership, self.memory = provider, ownership, memory
         self.runtime_path, self.reports = runtime_path, reports
         self.namespace = namespace
+        self.program = program
         self.current_layer, self.current_entries = None, None
         self.compiled = {}
         self.entry_abis = {}
@@ -260,22 +274,15 @@ class NetworkExecutor:
                     raise RuntimeError("Actual network HCCL group precheck failed: " + group)
 
     def for_layer(self, layer_id):
-        geometry = self.provider.runtime_geometry()
+        definitions, geometry, expert_capacity = make_network_layer_entries(
+            self.provider, self.config, self.topology, layer_id,
+        )
         batch = self.provider.batch_for_layer(layer_id)
-        total_tokens = max(sum(record["SP_valid_rows"] for record in records) for records in batch["cases"].values())
-        expert_capacity = max(16, (total_tokens + 15) // 16 * 16)
         if self.current_layer != layer_id:
             self.current_entries = None
-            definitions = make_prefill_layer_entries(
-                geometry["capacity"], self.config, expert_capacity, layer_id,
-                geometry["cache_blocks"], geometry["requests"], geometry["table_pages"],
-                ep=self.topology["ep"], cache_layout=self.provider.layouts[0][next(iter(batch["cases"]))],
-                role=resolve_layer_role(layer_id), network_cache=True, tp=self.topology["tp"],
-            )
             directory = self.output / f"{self.namespace}-layer{layer_id}"
             directory.mkdir(exist_ok=False)
-            self.current_entries = {name: Executable(function, directory / "compiled" / name)
-                                    for name, function in definitions.items()}
+            self.current_entries = self.program.bind(f"layer{layer_id}", definitions)
             self.entry_abis = {name: network_parameter_abi(entry.compiled)
                                for name, entry in self.current_entries.items()}
             for name, entry in self.current_entries.items():
@@ -348,13 +355,52 @@ def load_product_backbone_input(paths, *, input_contract, provider, capacity, ex
     return hidden, premix
 
 
+def embed_network_input(input_contract, weights, executor, config, output):
+    """Run the shared vocabulary lookup and initial HC directly into the backbone."""
+    directory = Path(output)
+    directory.mkdir(exist_ok=False)
+    entries = executor.program.bind("embedding", make_input_entries(executor.provider.capacity, config,
+                                                                   executor.topology["tp"]))
+
+    def execute(name, rank, arguments, outputs):
+        readonly = [(index, tensor_sha(value)) for index, value in enumerate(arguments)
+                    if isinstance(value, torch.Tensor) and all(value is not out for out in outputs.values())]
+        capture = directory / f"rank-{rank}-{name}.pt"
+        entries[name].execute(arguments, outputs, rank, "network_input/" + name,
+                              capture, executor.reports[rank], executor.memory)
+        if any(tensor_sha(arguments[index]) != digest for index, digest in readonly):
+            raise RuntimeError("Embedding changed a readonly token or weight operand")
+
+    def exchange(stage, packets):
+        return executor.exchange(executor.namespace + "-" + stage, packets, "all_gather", "tp", packets=True)
+
+    begin = perf_counter()
+    boundaries = run_input_boundary(input_contract, config=config, capacity=executor.provider.capacity,
+                                    reader=weights.reader, execute=execute, exchange=exchange)
+    write_json(directory / "execution.json", dict(status="executed_not_independently_compared",
+               seconds=perf_counter() - begin, ranks=len(boundaries), layers_executed=[]))
+    hidden, premix = [], []
+    for rank, original in enumerate(boundaries):
+        record = executor.provider.batch_for_layer(0)["cases"]["fresh"][rank]
+        if any(original[name] != record[name] for name in ("SP_physical_rows", "SP_valid_rows")):
+            raise ValueError("Embedding and cache metadata disagree on rank-local token ownership")
+        local_hidden = torch.zeros((executor.provider.capacity, config["hc_mult"], config["hidden_size"]),
+                                   dtype=torch.bfloat16)
+        local_pre = torch.zeros((executor.provider.capacity, config["hc_mult"]), dtype=torch.float32)
+        physical = original["SP_physical_rows"]
+        local_hidden[:physical].copy_(original["hidden"])
+        local_pre[:physical].copy_(original["pre_mix"])
+        hidden.append(dict(fresh=local_hidden))
+        premix.append(dict(fresh=local_pre))
+    return hidden, premix
+
+
 def run_output_boundary(result, *, batch, topology, config, weights, executor, output):
     """Consume actual layer39 local delayed HC state and restore complete SP/TP vocabulary output."""
     capacity, world, tp = executor.provider.capacity, topology["ep"], topology["tp"]
     directory = Path(output)
     directory.mkdir(exist_ok=False)
-    entries = {name: Executable(function, directory / "compiled" / name)
-               for name, function in make_output_entries(capacity, config, tp).items()}
+    entries = executor.program.bind("output", make_output_entries(capacity, config, tp))
     norm = weights.reader.load("norm.weight")
     head = weights.reader.load("head.weight")
     if norm.dtype != torch.bfloat16 or head.dtype != torch.bfloat16 or tuple(head.shape) != (config["vocab_size"], 5120):
@@ -395,7 +441,7 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
             execute("projection", rank, case, [normalized, weight, local_logits, active], dict(local_logits=local_logits))
             logits_packets[rank][case] = local_logits
     gathered_logits = executor.exchange(executor.namespace + "-output-vocabulary-gather", logits_packets, "all_gather", "tp")
-    files = {}
+    files, actual_logits = {}, [{} for _ in range(world)]
     for case, records in batch["cases"].items():
         for rank, record in enumerate(records):
             logits = torch.full((capacity, config["vocab_size"]), -29, dtype=torch.bfloat16)
@@ -403,11 +449,12 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
             path = directory / f"rank-{rank}-{case}-network-logits.pt"
             torch.save(dict(logits=logits, active=len(record["positions"])), path)
             files[str(path)] = file_sha(path)
+            actual_logits[rank][case] = logits[:len(record["positions"])].clone()
     write_json(directory / "execution.json", dict(
         outcome="executed_actual_layer39_output_boundary_not_compared", files=files,
         kernels=output_report["kernels"], native_reference="not_run", full40_accuracy="not_run",
     ))
-    return files
+    return dict(files=files, logits=actual_logits)
 
 
 def _network_owner_snapshot(provider, storage):
@@ -429,17 +476,11 @@ def _network_owner_snapshot(provider, storage):
     return result
 
 
-def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, continuation=None):
-    """Execute fresh and optional history chunks with explicit devices, weights and live cache state."""
+def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=False):
+    """Allocate canonical cache owners and validate the complete original network ABI."""
     topology = contract["topology"]
     if topology != dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1):
         raise ValueError("The current network runtime requires DP4/TP4/EP16/PP1/PCP1/DCP1")
-    from .runtime_config import configure_devices
-
-    assigned = configure_devices(devices, world=topology["ep"])
-    output = Path(output).resolve()
-    if checkpoint is not None:
-        contract = dict(contract, checkpoint=str(Path(checkpoint).resolve()))
     if not all(contract["required_modes"].values()) or contract["capacity"] != 16 or contract["scheduler_capacity"] != 8192:
         raise ValueError("Retain the original model modes and bounded actual scheduler ABI")
     if contract.get("fresh_shared_initialization") != {"topk_indices": -1}:
@@ -451,30 +492,51 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
         if item["topology"] != topology or len(item["engram_shards"]) != 4:
             raise ValueError("A TP2 or diagnostic Engram contract cannot be reused as TP4")
 
-    from .moe_transport import CANNMemory
-
-    output.mkdir(parents=True, exist_ok=False)
     model_config = contract["model_config"]
     provider = NetworkCacheProvider(
         {"fresh": inputs["cache_ABI"]}, {"fresh": inputs["input_contract"]}, topology=topology,
         model_config=model_config, capacity=16, scheduler_capacity=8192,
-        allocation_id=output.name, sources_by_case={"fresh": inputs["cache_ABI_sources"]},
+        allocation_id=allocation_id, sources_by_case={"fresh": inputs["cache_ABI_sources"]},
+        geometry_only=geometry_only,
     )
     attach_network_cache_geometry(provider)
     provider.require_network_geometry()
     for cases in provider.shared:
         cases["fresh"]["topk_indices"].fill_(-1)
+    provider.begin_chunk(epoch=0, token_map_id=contract["input_contract_sha256"])
+    return provider
+
+
+def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, continuation=None, compiled=None):
+    """Execute fresh and optional history chunks with explicit devices, weights and live cache state."""
+    topology = contract["topology"]
+    if topology != dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1):
+        raise ValueError("The current network runtime requires DP4/TP4/EP16/PP1/PCP1/DCP1")
+    from .runtime_config import configure_devices
+
+    assigned = configure_devices(devices, world=topology["ep"])
+    output = Path(output).resolve()
+    if checkpoint is not None:
+        contract = dict(contract, checkpoint=str(Path(checkpoint).resolve()))
+    from .moe_transport import CANNMemory
+
+    output.mkdir(parents=True, exist_ok=False)
+    provider = prepare_network_provider(inputs, contract, output.name, geometry_only=True)
+    program = compiled if compiled is not None else PrefillProgram(output / "compiled")
+    if compiled is not None and not compiled.ready:
+        raise ValueError("The supplied Prefill program is incomplete")
+    program.compile(provider, contract["model_config"], topology, inputs["engram_contracts"])
+    provider = prepare_network_provider(inputs, contract, output.name)
     with ExitStack() as stack:
-        weights = NetworkWeights(contract["checkpoint"], topology, model_config)
+        weights = NetworkWeights(contract["checkpoint"], topology, contract["model_config"])
         stack.callback(weights.release_current)
         memory = CANNMemory()
         ownership = [weights.layout.ownership(rank) for rank in range(16)]
         table_storage = {} if continuation is not None else None
         table_stack = stack if continuation is not None else None
-        provider.begin_chunk(epoch=0, token_map_id=contract["input_contract_sha256"])
         first = _run_network_chunk(inputs, contract=contract, output=output, provider=provider,
             weights=weights, memory=memory, ownership=ownership, assigned=assigned,
-            engram_contracts=engram_contracts, epoch=0, table_storage=table_storage, table_stack=table_stack)
+            engram_contracts=inputs["engram_contracts"], program=program, epoch=0, table_storage=table_storage, table_stack=table_stack)
         if continuation is None:
             return first
         # The original full chunk, including final output/captures, must have returned before advancing.
@@ -504,29 +566,29 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
         after = _network_owner_snapshot(provider, table_storage)
         if before != after:
             raise RuntimeError("Chunk admission changed persistent raw/shared/history/table owners or bytes")
+        program.compile(provider, next_contract["model_config"], topology, inputs["engram_contracts"])
         second_output = output / "continuation-chunk1"
         second_output.mkdir(exist_ok=False)
         write_json(second_output / "own-state-continuity.json", dict(before=before, after=after,
             exact=True, previous_complete_output=True, scope="Own previous-final to current-initial; no cross-framework float byte gate"))
         second = _run_network_chunk(following, contract=next_contract, output=second_output,
             provider=provider, weights=weights, memory=memory, ownership=ownership, assigned=assigned,
-            engram_contracts=engram_contracts, epoch=1, table_storage=table_storage, table_stack=table_stack)
+            engram_contracts=inputs["engram_contracts"], program=program, epoch=1, table_storage=table_storage, table_stack=table_stack)
         return dict(second, completed_prefill_chunks=[first, second], complete_network_acceptance="not_run")
 
 
 def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, ownership,
-                       assigned, engram_contracts, epoch, table_storage, table_stack):
-    """Execute the existing complete chunk body without replacing persistent owners."""
+                       assigned, engram_contracts, program, epoch, table_storage, table_stack):
+    """Execute embedding, the complete backbone and the final head with persistent owners."""
+    begin = perf_counter()
+    initial_load_seconds, initial_load_calls = weights.load_seconds, weights.load_calls
+    initial_read_seconds, initial_read_calls = weights.reader.read_seconds, weights.reader.read_calls
     topology, model_config = contract["topology"], contract["model_config"]
     text = dict(model_config["text_config"], image_sentinel_base_id=model_config["image_token_id"])
     namespace = f"chunk{epoch}"
     state_guard = NetworkStatePreservation(
         provider, contract["state_regions"]["path"], contract["state_regions"]["sha256"],
         contract["input_contract_sha256"],
-    )
-    hidden, premix = load_product_backbone_input(
-        inputs["product_input_paths"], input_contract=inputs["input_contract"], provider=provider,
-        capacity=16, expected_files=inputs["product_input_files"],
     )
     runtime_path = output / "runtime_config.json"
     runtime = dict(
@@ -548,8 +610,16 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
                         metadata=inputs["cache_ABI"][rank]["metadata"], groups=inputs["cache_ABI"][rank]["groups"]),
                    output / f"rank-{rank}-initial-state.pt")
     reports = [dict(rank=rank, kernels=[], communication=[]) for rank in range(16)]
-    executor = NetworkExecutor(output, text, topology, provider, ownership, memory, runtime_path, reports, namespace)
+    executor = NetworkExecutor(output, text, topology, provider, ownership, memory, runtime_path, reports,
+                               program, namespace)
     executor.precheck()
+    if "product_input_paths" in inputs:
+        hidden, premix = load_product_backbone_input(
+            inputs["product_input_paths"], input_contract=inputs["input_contract"], provider=provider,
+            capacity=16, expected_files=inputs["product_input_files"],
+        )
+    else:
+        hidden, premix = embed_network_input(inputs["input_contract"], weights, executor, text, output / "embedding")
     hash_batch = provider.hash_batch()
     common_engram = engram_contracts[1]
     captured_constants = provider.hash_constants(layer_ids=[1, 14], pad_id=text["engram_pad_token_id"])
@@ -570,7 +640,7 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
     eng_runtime = dict(topology=topology, assigned_devices=assigned, capacity=16,
                        stage_namespace=namespace + "-engram", output=output / "engram", reports=reports,
                        memory=memory, exchange=executor.exchange, capture_nodes=False, capture_state=True,
-                       observe_discrete=observe_engram)
+                       observe_discrete=observe_engram, compile_entries=program.bind)
     prepared_engram = prepare_network_engram(
         common_engram, hash_batch, provider.history, engram_contracts, weights.raw_for_layer, eng_runtime,
         storage=table_storage, storage_stack=table_stack, storage_namespace=provider.allocation_id,
@@ -630,7 +700,7 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
             hidden, premix, batch_for_layer=provider.batch_for_layer, cache_for_layer=provider.cache_for_layer,
             weights_for_layer=weights.for_layer, runtime_for_layer=runtime_for_layer, observe_layer=observe_layer,
         )
-        logits = run_output_boundary(
+        output_result = run_output_boundary(
             result, batch=provider.batch_for_layer(39), topology=topology, config=text,
             weights=weights, executor=executor, output=output / "actual-layer39-output",
         )
@@ -639,16 +709,22 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
                             hash_history=provider.history.caches[rank]), output / f"rank-{rank}-final-state.pt")
         loaded_source_files(runtime)
         runtime.update(status="executed_full40_not_compared", completed_layers=list(range(40)),
-                       actual_Layer39_boundary=True, final_output_files=logits, formal_accuracy="not_run")
+                       actual_Layer39_boundary=True, final_output_files=output_result["files"], formal_accuracy="not_run")
         write_json(runtime_path, runtime)
         write_json(output / "execution.json", dict(
             at=datetime.now(timezone.utc).isoformat(), outcome="executed_actual_full40_Prefill_pending_independent_comparison",
-            reports=reports, compiled=executor.compiled, consumed_checkpoint=weights.reader.consumed,
+            reports=reports, compiled=executor.compiled, compilation=program.summary(),
+            timings=dict(chunk_seconds=perf_counter() - begin,
+                         weight_load_seconds=weights.load_seconds - initial_load_seconds,
+                         weight_load_calls=weights.load_calls - initial_load_calls,
+                         checkpoint_read_seconds=weights.reader.read_seconds - initial_read_seconds,
+                         checkpoint_read_calls=weights.reader.read_calls - initial_read_calls),
+            consumed_checkpoint=weights.reader.consumed,
             layer_host_weight_accounting=weights.layer_receipts, memory_samples=memory.samples,
             memory_intervals=memory.intervals, capacity_verified_by_execution=False,
             formal_accuracy="not_run", complete_network_acceptance="not_run",
         ))
-        return runtime
+        return dict(runtime, logits=output_result["logits"], compilation=program.summary())
     except BaseException as error:
         write_json(output / "failure.json", dict(
             at=datetime.now(timezone.utc).isoformat(), error_type=type(error).__name__, error=str(error),

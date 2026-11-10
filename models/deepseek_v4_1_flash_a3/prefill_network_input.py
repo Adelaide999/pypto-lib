@@ -21,9 +21,58 @@ from pathlib import Path
 
 import torch
 
-from .prefill_embedding import make_initial_hc, make_vocab_embedding, make_vocab_reduce
+from .prefill_embedding import make_input_entries
 from .runtime_utils import Executable, communicate, file_sha, loaded_source_files, tensor_sha, write_json
 from .weights import CheckpointOperands
+
+
+def run_input_boundary(settings, *, config, capacity, reader, execute, exchange):
+    """Embed the actual request tokens and return rank-local HC inputs in memory."""
+    topology = settings["topology"]
+    dp, tp, world = topology["dp"], topology["tp"], topology["ep"]
+    hidden, vocabulary, hc_mult = config["hidden_size"], config["vocab_size"], config["hc_mult"]
+    if world != dp * tp or len(settings["DP_engines"]) != dp:
+        raise ValueError("Input request engines must match the complete network topology")
+    if any(not 0 <= engine["active"] <= capacity for engine in settings["DP_engines"]):
+        raise ValueError("Actual request tokens exceed the compiled Prefill capacity")
+    weight = reader.load("embed.weight")
+    if tuple(weight.shape) != (vocabulary, hidden) or weight.dtype != torch.bfloat16:
+        raise ValueError("Actual checkpoint embedding shape or dtype differs")
+    packets, rows_by_rank = [], []
+    for rank in range(world):
+        engine = settings["DP_engines"][rank // tp]
+        tokens = [token for request in engine["requests"] for token in request["token_ids"]]
+        masks = [value for request in engine["requests"] for value in request["live_token_mask"]]
+        if len(tokens) != engine["active"] or len(masks) != len(tokens):
+            raise ValueError("Request/token ownership differs from the actual prepared boundary")
+        if any(token < 0 or token >= vocabulary for token in tokens):
+            raise ValueError("Prepared token ID is outside the original vocabulary")
+        ids, live = torch.zeros(capacity, dtype=torch.int64), torch.zeros(capacity, dtype=torch.int32)
+        ids[:len(tokens)] = torch.tensor(tokens, dtype=torch.int64)
+        live[:len(tokens)] = torch.tensor(masks, dtype=torch.int32)
+        output = torch.zeros((capacity, hidden), dtype=torch.bfloat16)
+        start, count = rank % tp * (vocabulary // tp), vocabulary // tp
+        local_weight = weight.narrow(0, start, count).contiguous()
+        execute("lookup", rank, [ids, live, local_weight, output, start, len(tokens)], dict(lookup=output))
+        packets.append({"network-input": {"value": output}})
+        rows_by_rank.append(len(tokens))
+    gathered = exchange("input-vocabulary-TP-gather", packets)
+    result = []
+    for rank in range(world):
+        active = rows_by_rank[rank]
+        physical = max(1, (active + tp - 1) // tp)
+        embedding = torch.zeros((capacity, hidden), dtype=torch.bfloat16)
+        execute("reduce", rank, [gathered[rank]["network-input"]["value"], embedding, active], dict(embedding=embedding))
+        streams = torch.zeros((capacity, hc_mult, hidden), dtype=torch.bfloat16)
+        premix = torch.zeros((capacity, hc_mult), dtype=torch.float32)
+        execute("initial_hc", rank, [embedding, streams, premix, rank % tp, physical, active],
+                dict(hidden=streams, pre_mix=premix))
+        valid = max(0, min(physical, active - rank % tp * physical))
+        result.append(dict(hidden=streams[:(active + tp - 1) // tp].clone(),
+            pre_mix=premix[:(active + tp - 1) // tp].clone(),
+            SP_physical_rows=(active + tp - 1) // tp, SP_kernel_rows=physical, SP_valid_rows=valid, DP_rank=rank // tp, TP_rank=rank % tp,
+            global_token_start=rank % tp * physical))
+    return result
 
 
 def run_input_stage(args):
@@ -38,16 +87,14 @@ def run_input_stage(args):
         if file_sha(checkpoint / name) != expected:
             raise ValueError("Prepared checkpoint, tokenizer or quantization contract changed: " + name)
     config = json.loads((checkpoint / "config.json").read_text())["text_config"]
-    capacity, hidden, vocabulary, hc_mult = 16, config["hidden_size"], config["vocab_size"], config["hc_mult"]
+    capacity = 16
     if len(settings["DP_engines"]) != dp or any(not 0 <= row["active"] <= capacity for row in settings["DP_engines"]):
         raise ValueError("Prepared bounded real-token input geometry differs")
     from .runtime_config import configure_devices
 
     assigned = [] if args.compile_only else configure_devices(args.devices, world=world)
     args.output.mkdir(parents=True, exist_ok=False)
-    definitions = dict(lookup=make_vocab_embedding(capacity, hidden, vocabulary, tp),
-                       reduce=make_vocab_reduce(capacity, hidden, tp),
-                       initial_hc=make_initial_hc(capacity, hidden, hc_mult))
+    definitions = make_input_entries(capacity, config, tp)
     entries = {name: Executable(function, args.output / "compiled" / name)
                for name, function in definitions.items()}
     runtime = dict(source_root=str(Path(__file__).resolve().parents[2]), source_files={},
@@ -81,9 +128,6 @@ def run_input_stage(args):
                 raise RuntimeError("Input-stage rank/group startup mismatch: " + group)
             reports[rank]["communication"].append(receipts[rank])
     reader = CheckpointOperands(checkpoint)
-    weight = reader.load("embed.weight")
-    if tuple(weight.shape) != (vocabulary, hidden) or weight.dtype != torch.bfloat16:
-        raise ValueError("Actual checkpoint embedding shape or dtype differs")
     captures = args.output / "captures"
     captures.mkdir()
 
@@ -96,41 +140,16 @@ def run_input_stage(args):
             raise RuntimeError("A readonly input-component tensor changed: " + name)
         reports[rank].setdefault("readonly_checks", []).append(dict(operator=name, passed=True, tensors=len(readonly)))
 
-    packets, rows_by_rank = [], []
-    for rank in range(world):
-        engine = settings["DP_engines"][rank // tp]
-        tokens = [token for request in engine["requests"] for token in request["token_ids"]]
-        masks = [value for request in engine["requests"] for value in request["live_token_mask"]]
-        if len(tokens) != engine["active"] or len(masks) != len(tokens):
-            raise ValueError("Request/token ownership differs from the actual prepared boundary")
-        if any(token < 0 or token >= vocabulary for token in tokens):
-            raise ValueError("Prepared token ID is outside the original vocabulary")
-        ids, live = torch.zeros(capacity, dtype=torch.int64), torch.zeros(capacity, dtype=torch.int32)
-        ids[:len(tokens)] = torch.tensor(tokens, dtype=torch.int64)
-        live[:len(tokens)] = torch.tensor(masks, dtype=torch.int32)
-        output = torch.zeros((capacity, hidden), dtype=torch.bfloat16)
-        start, count = rank % tp * (vocabulary // tp), vocabulary // tp
-        local_weight = weight.narrow(0, start, count).contiguous()
-        execute("lookup", rank, [ids, live, local_weight, output, start, len(tokens)], dict(lookup=output))
-        packets.append({"network-input": {"value": output}})
-        rows_by_rank.append(len(tokens))
-    gathered, receipts = communicate("input-vocabulary-TP-gather", packets, args.output, runtime_path,
-                                     collective="all_gather", group="tp")
-    for rank in range(world):
-        active = rows_by_rank[rank]
-        physical = max(1, (active + tp - 1) // tp)
-        embedding = torch.zeros((capacity, hidden), dtype=torch.bfloat16)
-        execute("reduce", rank, [gathered[rank]["network-input"]["value"], embedding, active], dict(embedding=embedding))
-        streams = torch.zeros((capacity, hc_mult, hidden), dtype=torch.bfloat16)
-        premix = torch.zeros((capacity, hc_mult), dtype=torch.float32)
-        execute("initial_hc", rank, [embedding, streams, premix, rank % tp, physical, active],
-                dict(hidden=streams, pre_mix=premix))
-        reports[rank]["communication"].append(receipts[rank])
-        valid = max(0, min(physical, active - rank % tp * physical))
-        torch.save(dict(hidden=streams[:(active + tp - 1) // tp].clone(),
-            pre_mix=premix[:(active + tp - 1) // tp].clone(),
-            SP_physical_rows=(active + tp - 1) // tp, SP_kernel_rows=physical, SP_valid_rows=valid, DP_rank=rank // tp, TP_rank=rank % tp,
-            global_token_start=rank % tp * physical), args.output / f"rank-{rank}-backbone-input.pt")
+    def exchange(stage, packets):
+        values, receipts = communicate(stage, packets, args.output, runtime_path, collective="all_gather", group="tp")
+        for rank, receipt in enumerate(receipts):
+            reports[rank]["communication"].append(receipt)
+        return values
+
+    outputs = run_input_boundary(settings, config=config, capacity=capacity, reader=reader,
+                                 execute=execute, exchange=exchange)
+    for rank, result in enumerate(outputs):
+        torch.save(result, args.output / f"rank-{rank}-backbone-input.pt")
         write_json(args.output / f"rank-{rank}-report.json", reports[rank])
     loaded_source_files(runtime)
     write_json(runtime_path, runtime)
