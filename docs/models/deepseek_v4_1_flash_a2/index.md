@@ -518,3 +518,70 @@ checkpoint read and operand preparation time separate. A ten-minute total
 load-and-compile bound has not been established. The public forward defaults
 to diagnostics disabled; explicit diagnostics retain state and readonly
 checks. Disabling diagnostics never establishes numerical acceptance.
+
+### Continuous Prefill chunks
+
+For a single request containing 1..2048 tokens, pass a token-ID list or raw
+completion text to the same public entry:
+
+```python
+result = run_prefill(
+    token_ids, weights=checkpoint, cache=cache_state, config=network_contract,
+    devices=devices, output="build_output/ds41-prefill-2048",
+)
+```
+
+The default is `chunk_size=16` and `dp_rank=0`. Set these fields in the Python
+`config` to select chunks of 1..16 tokens or DP engine 0..3. All other DP
+engines are empty, and all 16 ranks remain represented. A 2048-token request
+produces 128 chunks at the default size, retaining earlier cache/history state.
+This is sequential chunked Prefill; it does not make the executable query
+capacity 2048 or implement Decode, sampling or an autoregressive text loop.
+The final result points to the last chunk's output-head artifacts.
+
+For the CLI, replace `inputs` with either `prompt` or `token_ids`, omit
+`continuations`, and optionally set `chunk_size` and `dp_rank`:
+
+```json
+{
+  "checkpoint": "weights/deepseek-v4.1-flash-w8a8",
+  "prompt": "Please continue this passage.",
+  "chunk_size": 16,
+  "dp_rank": 0,
+  "cache_state": "inputs/cache-state.pt",
+  "contract": "inputs/network-contract.json",
+  "devices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+  "output": "build_output/ds41-prefill-2048"
+}
+```
+
+Text uses the checkpoint's `tokenizer.json` through `tokenizers`; it does not
+apply a chat template. Supply token IDs for an already formatted conversation.
+The limit applies after tokenization, and oversized prompts fail rather than
+being truncated. The model configuration must match the selected checkpoint.
+
+Automatic preparation still needs the 16 original `cache_ABI` templates
+(`layout`, `groups`, `hash_constants`) and both TP4 Engram contracts in
+`cache_state`. The templates describe physical storage and model constants;
+their previous token coordinates and cache contents are not imported. Preparation
+reserves fresh pages for the entire prompt once, preserving storage keys,
+typed-plane offsets, strides and aliases. It creates each chunk's positions,
+query starts, sequence/cache lengths, SWA/C1/C2 slots, C2 RoPE source positions,
+input lineage and exact state-write complements. The numerical configuration,
+required modes and deterministic initial TopK state remain explicit in
+`network_contract`; per-input hashes and state regions are regenerated.
+
+Prepared files are written under `output/prepared/chunk-N`; execution files
+are under `output/network`. Later chunks are prepared only after the preceding
+chunk completes all 40 layers. Embedding uses the existing PyPTO input stage.
+This does not change the network weight-loading or resident-weight policy.
+
+The Indexer searches up to 2048 cached keys. Ratio2 layers therefore see up to
+1024 completed keys for a 2048-token prompt, while ratio1 layers see 2048.
+TopK remains 512, and attention retains its 128-window plus 512-compressed
+slots. Causal masking happens before TopK selection, followed by chronological
+index preparation. Layer20 publishes all visible eight-key candidate blocks
+(at most 256 here), and layer24 retains its full-coverage guard. Longer histories
+requiring candidate pruning, request eviction and multi-request automatic
+scheduling are outside this bounded path.
+

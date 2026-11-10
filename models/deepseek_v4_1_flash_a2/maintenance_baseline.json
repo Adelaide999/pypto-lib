@@ -24,8 +24,11 @@
       "register": "8a3d6876e864ecfbe7726c136dc0e7bdd9af18d4338f9e3d9a4496889780ed24"
     },
     "candidate_pool.py": {
-      "make_candidate_block_pool": "d21d2fab6d461cfdd1c7b59a1c27be06b8f518fa2c5f56a30b6a2e73381d38d4",
-      "make_candidate_pool_publish": "9f9f5b68fa6f6d805caf14c27ca0918f0868cc2d2fbc51f08365c7a466e49410"
+      "make_candidate_block_pool": "eec2e8601bef43e4cc58fbad2ca58bea5fa0405d35a5e73fdb6acaada120be96",
+      "make_candidate_pool_publish": "9f9f5b68fa6f6d805caf14c27ca0918f0868cc2d2fbc51f08365c7a466e49410",
+      "golden_candidate_block_pool": "dc7d0deb266922ce38fee9bcc20e458f09c841b2a74a05aef4c8e46bdb9c8b17",
+      "golden_candidate_pool_publish": "37bc9c87b1a57cf3df1e3fff26101b12bf714bc2cdb9b8724bd95ab3c18d358d",
+      "validate": "42a9ed5860ed04369d8c82fdb9f856928f5b1c676d1f0d7e5ffbb1c7e6bc3231"
     },
     "compressor.py": {
       "pool_projected": "e5176b916ba3bf807f3ada8328cd2ea7c3824fa6bea9d48a647e07d455658d46"
@@ -171,11 +174,11 @@
     },
     "indexer_select.py": {
       "indexer_select_reference": "106a9a12b6c838ff033cd35f2bf6a472ae347eca2fc6eaec675b4f244d8a1894",
-      "make_indexer_select": "35a36af71ee892135a625a56fdd4002fbdd9d3a5ff656b4a93372830a7794988",
-      "golden_indexer_select": "d03557dc2f1879e85165816d122ec21a529bbfeab5e6c36c9f4d28d88b6db3de",
+      "make_indexer_select": "71a318bb0956d70441f63410bf22482f26405f56b5b6deba5890b523a344ae7a",
+      "golden_indexer_select": "05ba6039f4c124b45f6f29b0c0eaaccab9ee2d07df5df0f1916e44bd691ecc0e",
       "indexer_active_compare": "90591391ebf37349005fd80c139caf8569707af7c55bca0cb7a9517db9cb622c",
-      "indexer_select_golden_cases": "e95941cdd0eb84d3f948d9eef3d057ec5d2118212a8feb94b1c5470135dbdeda",
-      "validate": "1225ac80e08de625b10971593d5dc179e34c29d77a628d11f5848e5d9c13afb0"
+      "indexer_select_golden_cases": "687cd710ce0d36a16cdecb34076f2e970500f0da9f99b4a3818481172e47c6bf",
+      "validate": "7195c884f6afe621af4e0bd68ead0bb7ddc7a7749244bed634cc559f33d4cb1a"
     },
     "layer14_15.py": {
       "Layer14A2A3Contract": "77de19b8e08758e34b30918fafab2449c23a8e6c0f70e02653f8f7b9bd7e1d53",
@@ -350,7 +353,7 @@
     "prefill_compressed_runtime.py": {
       "physical_cache_views": "eba44ccb9b9d0bd9773a22d65bc81c1c91e20e10662026364886c8d74c72c8da",
       "compressed_geometry": "dc6a1996e99e3b10a6c74bafa1669db091d8d19b2647dac96ffcfd5b240fa5d0",
-      "run_compressed_attention": "357ff8f461574fa42e1015ae54d1eb6bd565402b3142c9a491b603f599b40b28"
+      "run_compressed_attention": "32aa1c4d06a59c01d30e3f605222d1c1ecaad64aacd071b0ebbd9daba8fe5617"
     },
     "prefill_consumer.py": {
       "_inline": "1fd5ef83775621e3f5bdb94150f1ae3cdaf23e16488a136d17c8af730a771112",
@@ -401,7 +404,7 @@
     },
     "prefill_full2.py": {
       "make_entries": "a46fc3fbe6176f49dd7931d1b68993d15d5f6d7c4ca97b39dbdb9174cfc11dba",
-      "make_physical_compressed_entries": "5141811df6b4bf05142c26ef5d7b9df4ea4d66c5eb1ee26b47a5ce9b8226b50e"
+      "make_physical_compressed_entries": "0ba1a5bf17e70857a2a8fc73780fdd9f0bf77a8406fbdeb0d2885d608a080391"
     },
     "prefill_full2_observed.py": {
       "make_wk_input_observed_inline": "ef359cb359098a6bdbebfcf9d1e81189efe6f9c0e7940c95f44a7d88f762bfc5",
@@ -424,10 +427,10 @@
     "prefill_fwd.py": {
       "compile_prefill": "b912fd1f9bf104c0a4ad59d3c6ed955444eb4bac0b6de192f464f9a338e558f1",
       "_merge_inputs": "c04d6cb14c60cba52583e00688af86f5326d692f8ae0a4634efba4815f0a2d4a",
-      "prefill_fwd": "9a29106e3686574eba5462bc8da48bf12af7eac7859d511f218018fa4e27c64f",
-      "load_configuration": "eef304d35e6888df08a88fbda65f170b46605e01beae66e0fc7b991c470db578",
+      "prefill_fwd": "e78633e55c2970039ae7e3bcb003011b917b2a9a9aefa3930a4eb666839ad211",
+      "load_configuration": "454feb047d66b3ace61e8bda348b5ad575c5e4d0eacd240f04494d551b76f16f",
       "load_continuations": "1c10f0de7868f77eecd4c05db27a2478a82b631938058559dc7f17684110be85",
-      "main": "342df8787f612414621bf46f6e285239fef7a85828290d53c6cc6c5f29b06bee"
+      "main": "4932d1ab79818af251919178ec8189030879df6ae8cf97de97bcb7e325fa56c5"
     },
     "prefill_grouped_output.py": {
       "make_prefill_grouped_output": "e4b091318916503fcc5619e090ce40648e0838f8a27c20ee99e43b7afde6ae99"
@@ -442,15 +445,17 @@
       "make_empty_selection": "747f45885114570fedb0327df8c0a1916bd9e3005c943320d7e4dfa58635d888",
       "make_sparse_controls": "dfc44d574db1a9d29bb68b2e384c85f500a0e7dc8dc49b11a3b98be45a3d127b",
       "make_index_weights": "00c3978c67f38ef4939428e1d5bab6d387d6a207e45653d27a08891f546243e7",
-      "make_index_key_gather": "fbd140329da5878c8fbbd25e2f2d65e4afe4f812e54020a43a3b17ee7dead71f",
+      "make_index_key_gather": "c3e34bde25d81ac033454187f160ae1bd0afcca5daf22f5cb5608c0e7987288c",
       "make_sparse_index_pack": "32ba91b95d41cc8c8b6d436ea48f05007a06c9fb441308e9dd18f9fee5e962b1",
       "make_shared_index_publish": "c7fc995226f98bf014ddc6ace74363d80207e0549a4297a696691fe81618a403",
-      "make_physical_index_query_entries": "bcc0a649118a7ed0f1efae79e7c55b805575ea672ceca0b51e0a810d5a9bbc09"
+      "make_physical_index_query_entries": "5af0200daae1b8584c43c1d3873d16c05a591d53d4269fe31e6e047610444404",
+      "golden_index_key_gather": "1215d748cf9be0a1d75b5479e7150dda33f853f32bf0ec31d34c5f3563a654f6",
+      "validate_key_gather": "8d62c20aff0f5dfc238225e08886659b8d74283cff721be258fd78c1982c75c3"
     },
     "prefill_indexer_runtime.py": {
       "validate_refresh_candidates": "534f1574cdd63054771210a53e487ee330cc7377db0d08b219ef14bd8ee53ee7",
-      "validate_live_refresh_candidates": "c8052dac709ec21b49c5f6f24d5692a00547fc1fa507adc51eb681707de70ad3",
-      "run_index_query_selection": "0df30bed171cecb5573153d49a7bbbfa90b5c868b04f722754919ade9888369c"
+      "validate_live_refresh_candidates": "d431b24b44313cc7ead7f680c7c17c3f167f7aa00ed7fd0b88ff389f1abb006c",
+      "run_index_query_selection": "fa438045002ad5f617ebfdda9061748885d7932ee13a9dbb27c8945b03ab9548"
     },
     "prefill_l2.py": {
       "region_bindings": "a8f347062f8218c8351c82096918e14a1c47eae19867dd67913d8c5271eb4955",
@@ -546,6 +551,7 @@
       "prepare_network_engram": "4be1bf92f4fe278556250dccfdad846da43ed327111097a01f6cbc4a100b51e8"
     },
     "prefill_network_guard.py": {
+      "build_state_regions": "d529961d7e978b19eb3aaa956ed9ce66f5bb741d5f032deae8818e8891924831",
       "interval_digest": "ef3fe91ba06f84f09c3c4631163ecd2aabc567d2449ce8d4d4c2e1ce46955781",
       "NetworkStatePreservation": "590e554eab4c87bde4feaa2c89a1e1ff46a1a973deda7f8575040538ff0024ae"
     },
@@ -593,6 +599,13 @@
     "prefill_output.py": {
       "make_output_entries": "ec2f14144630c467f98e68576a654956d2159f9d915853396d565a732383c08b",
       "make_output_vocab_unpack": "30c765651d0644662720f11f57751cee4dbe645abc1195cf2aeba8d7c94438cf"
+    },
+    "prefill_prepare.py": {
+      "tokenize_prompt": "24e1bf114b33b6ad7db571d71e8dc0feb02fdf45bd0105e620ba1633d87fea42",
+      "reserve_cache_layouts": "388ec3009ddafd6fb00bec9c93dc87386d0be1f9382f8a3071f0e5b837c6f833",
+      "build_chunk_metadata": "431309f0cf68ca960b61b9b5b41bec986b3699a4ee3314a5de018080509a6d32",
+      "prepare_token_chunks": "82280830c11dcd067aae5ad934f1ed98b033f6178b2c6748d7684e617fd5bc85",
+      "validate_host": "b3b54fda7e6c840da8d5fed373c3b5f9ca69b1e4948925ba25413feaf001127f"
     },
     "prefill_program.py": {
       "make_network_layer_entries": "7e8656442a4d9396eb71675be6c8e0fa873493fc86913c60e971f454cdf79e2f",
@@ -762,8 +775,9 @@
       "check_controls": "fed6f90f57455cdaf60b3dce219e8308040e7e1c78a8e082bccb604f9c283ae4",
       "check_runtime_configuration": "e28af7d05e4410bd3b37cc8442bdb8d474cb5fe0eb1a3acd8c63bfb4869fedfc",
       "check_chunk_continuation": "42db183cb5d22a6ff5658323a8702f99b7432dd6851bf9a55d8192be04371fc3",
-      "check_chunk_configuration": "574cdbfd9dc0d32d10cf65f8c22638f2f6b83b389854afd583fc7d0c6db0b6be",
-      "main": "d381db803cdad9f82c6188b6f16d0d641b830eff3edf4274dfe76406ef8df4bb"
+      "check_chunk_configuration": "0c2eb58b919bb31401d244d5429cea31d745d7316b2f0c389ac38bff4fb15fd0",
+      "check_automatic_entry": "6f9dbc0c19c981d7d9f34a310ce9340344d9593946121bae491fcfc54f5a9673",
+      "main": "4a8362c471fe52dc35c22244246092fca37bcf15789923dba13a98f5f4980929"
     },
     "weights.py": {
       "CheckpointOperands": "d01026f59da3c251ce06ec82bacbe633d41809e202783cc821be9624ef98c244",
