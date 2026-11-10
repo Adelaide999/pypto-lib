@@ -396,8 +396,9 @@
       "compile_prefill": "b912fd1f9bf104c0a4ad59d3c6ed955444eb4bac0b6de192f464f9a338e558f1",
       "_merge_inputs": "c04d6cb14c60cba52583e00688af86f5326d692f8ae0a4634efba4815f0a2d4a",
       "prefill_fwd": "a4f6082c432d15f26540f7d7c41d3e284af9086ed4405b3ebebbddf7ed23380c",
-      "load_configuration": "b40970cd8b7da8235adb7c0671ef591fcbf92fdffd05a0b1f9d3f3b63ec4c1ee",
-      "main": "ca9c92018b2bab9d042c45ff95920be770af1fb93370b556a0a34028def134b2"
+      "load_configuration": "eef304d35e6888df08a88fbda65f170b46605e01beae66e0fc7b991c470db578",
+      "load_continuations": "1c10f0de7868f77eecd4c05db27a2478a82b631938058559dc7f17684110be85",
+      "main": "342df8787f612414621bf46f6e285239fef7a85828290d53c6cc6c5f29b06bee"
     },
     "prefill_grouped_output.py": {
       "make_prefill_grouped_output": "e4b091318916503fcc5619e090ce40648e0838f8a27c20ee99e43b7afde6ae99"
@@ -527,7 +528,7 @@
       "run_output_boundary": "35df2d10db08cd343bb27d52d2785ef88b7fe730a7027d979bfbe99a0a708a02",
       "_network_owner_snapshot": "fa95779090b7a6f9d9dc6b2805cfdcbb69a04ff09b8e345c8a1aacb5a42b82b3",
       "prepare_network_provider": "d7efcb57f453a4afed15c7531996817c4e69cd6e6fe2576cf4920ed4a339c629",
-      "run_network_runtime": "428a51ac01a8e75907bbe6bae8c6c5aaa0700ab860bf9d25094e539b2138078a",
+      "run_network_runtime": "6d41916cdffc7d03dcd152937d70bed900cc0243f3884109a91ac2c135e8011a",
       "_run_network_chunk": "dcb58357935d06cd3ec4e3e2cf167c794711ea32be4a57f59adeaea4d38c3ee9"
     },
     "prefill_network_shared_observer.py": {
@@ -714,7 +715,9 @@
       "_reject": "4d916aced8be15cb2bb3dfa77f37bc21d20928aad709f014d8c27c8c670a5fd8",
       "check_controls": "fed6f90f57455cdaf60b3dce219e8308040e7e1c78a8e082bccb604f9c283ae4",
       "check_runtime_configuration": "e28af7d05e4410bd3b37cc8442bdb8d474cb5fe0eb1a3acd8c63bfb4869fedfc",
-      "main": "724f6663194a78490add237220a29ceadf09fd9e40d06b63382259a65e01b6a6"
+      "check_chunk_continuation": "42db183cb5d22a6ff5658323a8702f99b7432dd6851bf9a55d8192be04371fc3",
+      "check_chunk_configuration": "574cdbfd9dc0d32d10cf65f8c22638f2f6b83b389854afd583fc7d0c6db0b6be",
+      "main": "d381db803cdad9f82c6188b6f16d0d641b830eff3edf4274dfe76406ef8df4bb"
     },
     "weights.py": {
       "CheckpointOperands": "d01026f59da3c251ce06ec82bacbe633d41809e202783cc821be9624ef98c244",
