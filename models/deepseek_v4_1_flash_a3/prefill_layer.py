@@ -114,6 +114,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     next-layer inputs from files. Buffers are local SP shards, not gathered output.
     """
     from .moe_dispatch import MAP_PAD, validate_received_routes, validate_returned_routes
+    from .prefill_l2 import execute_region
     from .prefill_compressed_runtime import run_compressed_attention
     from .prefill_consumer_runtime import run_consumer_attention
     from .prefill_layer_state import LayerObservations, invalidate_live_versions, publish_live_versions
@@ -244,17 +245,16 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                     dict(cosine=cosine, sine=sine), "rope")
             q_cos, q_sin = pad(cosine[start:start + query_rows]), pad(sine[start:start + query_rows])
             wqa, latent, qb, query = zeros(capacity, 1280), zeros(capacity, 1280), zeros(capacity, 32768), zeros(capacity, 32768)
-            execute("wq_a", rank, case, [q_input, operands["wq_a"], operands["wq_a_scale"], wqa, query_rows],
-                    {"wqa": wqa}, "qkv")
-            execute("q_norm", rank, case, [wqa, operands["q_norm"], latent, query_rows], {"latent": latent}, "qkv")
-            execute("wq_b", rank, case, [latent, operands["wq_b"], operands["wq_b_scale"], qb, query_rows],
-                    {"qb": qb}, "qkv")
-            execute("q_rope", rank, case, [qb, q_cos, q_sin, query, query_rows], {"query": query}, "rope")
             kv_raw, kv_norm, kv_rope = zeros(capacity, 512), zeros(capacity, 512), zeros(capacity, 512)
-            execute("wkv", rank, case, [full_norm, operands["wkv"], operands["wkv_scale"], kv_raw, total],
-                    {"kv_raw": kv_raw}, "qkv")
-            execute("kv_norm", rank, case, [kv_raw, operands["kv_norm"], kv_norm, total], {"kv_norm": kv_norm}, "qkv")
-            execute("kv_rope", rank, case, [kv_norm, cosine, sine, kv_rope, total], {"kv": kv_rope}, "rope")
+            execute_region(runtime, "qkv_l2", rank, case, [
+                ("wq_a", [q_input, operands["wq_a"], operands["wq_a_scale"], wqa, query_rows], {"wqa": wqa}, "qkv"),
+                ("q_norm", [wqa, operands["q_norm"], latent, query_rows], {"latent": latent}, "qkv"),
+                ("wq_b", [latent, operands["wq_b"], operands["wq_b_scale"], qb, query_rows], {"qb": qb}, "qkv"),
+                ("q_rope", [qb, q_cos, q_sin, query, query_rows], {"query": query}, "rope"),
+                ("wkv", [full_norm, operands["wkv"], operands["wkv_scale"], kv_raw, total], {"kv_raw": kv_raw}, "qkv"),
+                ("kv_norm", [kv_raw, operands["kv_norm"], kv_norm, total], {"kv_norm": kv_norm}, "qkv"),
+                ("kv_rope", [kv_norm, cosine, sine, kv_rope, total], {"kv": kv_rope}, "rope"),
+            ])
             state["kv_rope"] = kv_rope
             if role["mode"] == "full":
                 context, cache = run_compressed_attention(
@@ -285,10 +285,11 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 context, inverse = zeros(capacity, 32768), zeros(capacity, 32768)
                 execute("swa_read", rank, case, [query, indices, operands["sink"], cache, context, query_rows],
                         {"context": context}, "swa")
-            execute("inverse_rope", rank, case, [context, q_cos, q_sin, inverse, query_rows],
-                    {"inverse": inverse}, "rope")
             packet = zeros(tp * capacity, head_width)
-            execute("head_pack", rank, case, [inverse, packet, query_rows], {"packet": packet}, "output_projection")
+            execute_region(runtime, "attention_pack_l2", rank, case, [
+                ("inverse_rope", [context, q_cos, q_sin, inverse, query_rows], {"inverse": inverse}, "rope"),
+                ("head_pack", [inverse, packet, query_rows], {"packet": packet}, "output_projection"),
+            ])
             nodes.update(q_norm=latent[:query_rows].clone(), query_latent=latent[:query_rows].clone(),
                          query_rope=query[:query_rows].reshape(query_rows, 64, 512).clone(),
                          attention_context=context[:query_rows].reshape(query_rows, 64, 512).clone())
@@ -303,14 +304,15 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             state, tp_rank = states[rank][case], rank % tp
             total, physical, nodes = state["total"], state["physical"], state["nodes"]
             heads, woa, wob = zeros(capacity, head_width), zeros(capacity, output_width), zeros(capacity, 5120)
-            execute("head_unpack", rank, case, [exchanged[rank][case], heads, state["per_rank"], total],
-                    {"heads": heads}, "output_projection")
             weight_a = operands["wo_a_grouped_prefill"][tp_rank * local_groups:(tp_rank + 1) * local_groups].contiguous()
             weight_b = operands["wo_b"][tp_rank * output_width:(tp_rank + 1) * output_width].contiguous()
-            execute("grouped_wo_a", rank, case, [heads, weight_a, woa, total], {"wo_a": woa}, "output_projection")
-            execute("wo_b", rank, case, [woa, weight_b, wob, total], {"wo_b": wob}, "output_projection")
             packed = zeros(tp * capacity, 5120)
-            execute("reduce_pack", rank, case, [wob, packed, physical, total], {"packed": packed}, "output_projection")
+            execute_region(runtime, "output_projection_l2", rank, case, [
+                ("head_unpack", [exchanged[rank][case], heads, state["per_rank"], total], {"heads": heads}, "output_projection"),
+                ("grouped_wo_a", [heads, weight_a, woa, total], {"wo_a": woa}, "output_projection"),
+                ("wo_b", [woa, weight_b, wob, total], {"wo_b": wob}, "output_projection"),
+                ("reduce_pack", [wob, packed, physical, total], {"packed": packed}, "output_projection"),
+            ])
             nodes.update(attention_heads_after_exchange=heads[:total].reshape(total, 64 // tp, 512).clone(),
                          wo_a=woa[:total].clone(), wo_b=wob[:total].clone(), attention_output=wob[:total].clone())
             reduction[rank][case] = packed
@@ -323,16 +325,11 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             state = states[rank][case]
             physical, nodes = state["physical"], state["nodes"]
             changed = zeros(capacity, 4, 5120)
-            execute("hc_post", rank, case, [scattered[rank][case], state["hidden"], state["post"], state["comb"],
-                    changed, physical], {"changed": changed}, "hc_post")
             pre, post = zeros(capacity, 4, dtype=torch.float32), zeros(capacity, 4, dtype=torch.float32)
             comb, collapsed = zeros(capacity, 4, 4, dtype=torch.float32), zeros(capacity, 5120)
             hc_args = [changed, raw[f"{prefix}.hc_ffn_fn"], raw[f"{prefix}.hc_ffn_scale"], raw[f"{prefix}.hc_ffn_base"],
                        state["pre"], pre, post, comb, collapsed, physical]
-            execute("hc_pre", rank, case, hc_args, dict(pre=pre, post=post, comb=comb, collapsed=collapsed), "hc_pre")
             normed, router_input = zeros(capacity, 5120), zeros(capacity, 5120, dtype=torch.float32)
-            execute("norm_cast", rank, case, [collapsed, raw[f"{prefix}.ffn_norm.weight"], normed, router_input, physical],
-                    dict(normed=normed, router_input=router_input), "ffn_norm")
             logits, weights = zeros(capacity, 384, dtype=torch.float32), zeros(capacity, 6, dtype=torch.float32)
             ids = torch.zeros((capacity, 6), dtype=torch.int32)
             gate = raw[f"{prefix}.ffn.gate.weight"].float()
@@ -340,15 +337,22 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             router_args = [router_input, gate, raw[f"{prefix}.ffn.gate.bias"],
                            raw[f"{prefix}.ffn.gate.bias_vl"], token_ids,
                            logits, ids, weights, routing_rows]
-            execute("router", rank, case, router_args, dict(logits=logits, route_ids=ids, route_weights=weights), "router")
             shared = zeros(capacity, 5120)
             with memory.interval(rank, "load", "shared_expert"):
                 shared_operands = expert_weights(rank, None)
-            execute("shared", rank, case, [normed, *shared_operands, shared, physical], {"shared": shared}, "shared")
             packet = {"routes": torch.full((packet_rows, 4), -1, dtype=torch.int64),
                       "hidden": zeros(packet_rows, 5120), "counts": torch.zeros((world, MAP_PAD), dtype=torch.int32)}
             args_pack = [normed, ids, packet["routes"], packet["hidden"], packet["counts"], state["valid"], rank]
-            execute("dispatch_pack", rank, case, args_pack, packet, "dispatch_pack")
+            execute_region(runtime, "ffn_dispatch_l2", rank, case, [
+                ("hc_post", [scattered[rank][case], state["hidden"], state["post"], state["comb"], changed, physical],
+                 {"changed": changed}, "hc_post"),
+                ("hc_pre", hc_args, dict(pre=pre, post=post, comb=comb, collapsed=collapsed), "hc_pre"),
+                ("norm_cast", [collapsed, raw[f"{prefix}.ffn_norm.weight"], normed, router_input, physical],
+                 dict(normed=normed, router_input=router_input), "ffn_norm"),
+                ("router", router_args, dict(logits=logits, route_ids=ids, route_weights=weights), "router"),
+                ("shared", [normed, *shared_operands, shared, physical], {"shared": shared}, "shared"),
+                ("dispatch_pack", args_pack, packet, "dispatch_pack"),
+            ])
             nodes.update({"hc_post0": changed[:physical].clone(), "hc_pre1.collapsed": collapsed[:physical].clone(),
                           "hc_pre1.post": post[:physical].clone(), "hc_pre1.comb": comb[:physical].clone(),
                           "hc_pre1.next_pre": pre[:physical].clone(), "ffn_norm_bf16": normed[:physical].clone(),
@@ -406,13 +410,14 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             returned_routes = torch.full((routes, 4), -1, dtype=torch.int64)
             combine_args = [packet["routes"], packet["hidden"], packet["counts"], state["weights"], state["shared"],
                             routed, combined, returned_routes, state["physical"]]
-            execute("combine", rank, case, combine_args, dict(routed=routed, combined=combined, returned_routes=returned_routes),
-                    "combine")
             valid, physical = state["valid"], state["physical"]
-            execute("mask_moe", rank, case, [combined, valid, physical], {"combined": combined}, "combine")
             output = torch.full((capacity, 4, 5120), runtime["output_sentinel"], dtype=torch.bfloat16)
-            execute("hc_post", rank, case + "-ffn", [combined, state["changed"], state["ffn_post"], state["ffn_comb"],
-                    output, state["physical"]], {"hidden": output}, "hc_post")
+            execute_region(runtime, "moe_finish_l2", rank, case, [
+                ("combine", combine_args, dict(routed=routed, combined=combined, returned_routes=returned_routes), "combine"),
+                ("mask_moe", [combined, valid, physical], {"combined": combined}, "combine"),
+                ("hc_post", [combined, state["changed"], state["ffn_post"], state["ffn_comb"], output, physical],
+                 {"hidden": output}, "hc_post", case + "-ffn"),
+            ])
             output_flat = output.reshape(capacity, 20480)
             execute("mask_output", rank, case, [output_flat, valid, physical], {"hidden": output}, "hc_post")
             routed_node = routed[:state["routing_rows"]].clone()

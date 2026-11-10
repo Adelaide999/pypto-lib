@@ -17,6 +17,7 @@ from .prefill_embedding import make_input_entries
 from .prefill_engram import make_prefill_engram_entries
 from .prefill_layer import make_prefill_layer_entries
 from .prefill_layer_state import resolve_layer_role
+from .prefill_l2 import REGIONS, make_network_l2_entries
 from .prefill_output import make_output_entries
 from .runtime_utils import Executable, write_json
 
@@ -33,7 +34,7 @@ def make_network_layer_entries(provider, config, topology, layer_id):
         ep=topology["ep"], tp=topology["tp"], cache_layout=provider.layouts[0][next(iter(batch["cases"]))],
         role=resolve_layer_role(layer_id), network_cache=True,
     )
-    return entries, geometry, expert_capacity
+    return make_network_l2_entries(entries, geometry["capacity"]), geometry, expert_capacity
 
 
 class PrefillProgram:
@@ -114,7 +115,8 @@ class PrefillProgram:
     def summary(self):
         """Report actual compiler work separately from device execution and accuracy."""
         return dict(complete=self.ready, layers=[layer for layer in range(40) if f"layer{layer}" in self.stages],
-                    execution_model="host_orchestrated_multi_entry", single_l2=False,
+                    execution_model="host_hccl_with_l2_compute_regions", single_l2=False,
+                    l2_regions={name: [child for child, _ in steps] for name, steps in REGIONS.items()},
                     stages={stage: list(entries) for stage, entries in self.stages.items()},
                     unique_entries=len(self.records), stage_bindings=sum(map(len, self.stages.values())),
                     compile_seconds=self.compile_seconds, prepare_seconds=getattr(self, "prepare_seconds", None),

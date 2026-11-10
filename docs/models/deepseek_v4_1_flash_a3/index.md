@@ -48,6 +48,7 @@ The original source names in this manifest are intentional provenance.
 | Responsibility | Implementation |
 | --- | --- |
 | Public whole-network forward and reusable compilation | `prefill_fwd.prefill_fwd`, `prefill_fwd.compile_prefill`, `prefill_program.py` |
+| Shared-computation L2 regions and exact argument bindings | `prefill_l2.py` |
 | Complete layer | `prefill_layer.make_prefill_layer_entries`, `run_prefill_layer_inmemory` |
 | Original 40-layer composition | `prefill_layer.run_prefill_network_inmemory` |
 | Actual checkpoint, persistent state, HCCL and L39 head | `prefill_network_runtime.run_network_runtime` |
@@ -101,14 +102,42 @@ allocating full cache backing buffers, initializing CANN or running NPU work.
 `compilation.json` records unique entries, all layer/stage bindings and actual
 compiler time. Only structurally identical entries with the same argument names
 share a compiled artifact across layers; different attention roles remain
-distinct. This is a pool of existing compiled entries, **not a single L2 graph**.
+distinct. The full-network runtime now composes five continuous compute regions
+per layer into L2 entries, directly inlining the existing child functions:
 
-The current A3 arithmetic crosses Python-managed HCCL collectives, routed-expert
-checkpoint reads and shared host Engram lookup boundaries. A single device L2
-forward requires device-side communication, resident expert weights and a
-reviewed Engram operand interface. Wrapping the current Python runtime in a
-function does not provide those capabilities. No Decode graph is exposed by
-this Prefill entry.
+| L2 region | Existing child calls |
+| --- | --- |
+| QKV | Q projection, normalization and RoPE; KV projection, normalization and RoPE |
+| Attention packing | Inverse RoPE and head packet packing |
+| Output projection | Head unpack, grouped output projection, output projection and reduce packing |
+| FFN dispatch | Attention HC post, FFN HC pre, normalization, router, shared expert and EP packing |
+| MoE finish | Combine, valid-row masking and FFN HC post |
+
+These regions replace 22 separate compute invocations with five invocations
+within each layer and rank. This counts Python/runtime invocations, not
+measured latency or the number of generated device tasks. Child arithmetic,
+quantization, rounding, BF16 communication buffers, cache writes and comparison
+tolerances are unchanged. Intermediate observation buffers remain explicit;
+returned aliases are threaded between calls. The existing leading dynamic
+token dimension is bound to the forward's explicit capacity. Inconsistent
+types, child order or operand identity are rejected. Independent-layer
+validation still executes the same child sequence with its original captures.
+
+This is **not a single L2 graph for all forty layers**; `compilation.json`
+continues to report `single_l2: false`. Python owns the HCCL boundaries and
+active routed-expert checkpoint reads. The existing HCCL BF16 reduction is
+retained, rather than replacing its reduction order during a composition
+change. The standalone child path remains a consumer for independent-layer
+validation; removing the host network scheduler requires a separately
+validated device communication and resident-expert interface.
+
+The structure was compared with `models/deepseek_v4_1_flash/prefill_fwd.py`
+and `models/qwen3_14b/prefill_fwd.py`: host preparation and resident operands
+surround device L2 composition. The former uses A5 quantization and topology,
+which are not substitutes for A3 Eco-Tech W8A8. Its host-prepared Engram lookup
+also shows that table lookup does not itself prevent a single L2 backbone;
+Engram projection and gating must consume the actual hidden at layers 1 and 14.
+No Decode graph is exposed by this Prefill entry.
 
 For the CLI, copy `models/deepseek_v4_1_flash_a3/prefill.example.json`, supply
 actual files, and run from the repository root:

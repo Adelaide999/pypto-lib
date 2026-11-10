@@ -321,7 +321,7 @@ class NetworkExecutor:
             topology=self.topology, ownership=self.ownership, enable_expert_parallel=True,
             capacity=geometry["capacity"], expert_capacity=expert_capacity, cache_blocks=geometry["cache_blocks"],
             requests=geometry["requests"], table_pages=geometry["table_pages"], memory=self.memory,
-            execute=execute, exchange=self.exchange, epoch=batch["epoch"], token_map_id=batch["token_map_id"],
+            execute=execute, execute_l2=execute, exchange=self.exchange, epoch=batch["epoch"], token_map_id=batch["token_map_id"],
             output_sentinel=-37.0, stage_namespace=f"{self.namespace}-layer{layer_id}", capture_nodes=False, capture_state=False,
         )
 
