@@ -264,7 +264,7 @@
       "_bind": "86bf73a5ea50fb97d2cbd2051cf4ccc17f4265f6d675ce152f52215de330e8e1",
       "CANNMemory": "487c2831391a5f1e0cf70b016cd0ba103fadd617ef401c234319fe91611534a2",
       "HCCLBytes": "b1a1796c9e4c158a820258b061e5360f0f7742badd23b783aa89b66689c16f47",
-      "main": "c199c9840be26c77fa2793626bb1082a3d22222c6d0cb22cb3b0810867efce0c"
+      "main": "94a09d182eeb9667323ec8e063b404fc4a33ce05836ba7233aa34b87f085a2ce"
     },
     "norm_rope.py": {
       "rms_norm_reference": "ec651dd5cc1e6c5ec8ec99a5ba0e17323ade0b5bc917868bd07bd0d57e243b4b",
@@ -471,8 +471,8 @@
       "make_ecotech_mhc_prefix": "54d085560a6d52950e7872d8f338a993fa2f5c8ca7fad65a08ff18de7d9fd6c8"
     },
     "prefill_moe_ep.py": {
-      "_prepare": "c19389cf28b8c69e3d3a9b0b46c33391eb1a36658f815d5d12d55ea163b32437",
-      "main": "1e67a91b538472b0c4a49a4fab56bfb82c8d92c0967bf95f09d91812c7a9b17c"
+      "_prepare": "66fcfa1c7905c81112980bfa58dbb70ddba1419147c888419f8544f7a29da7d1",
+      "main": "0f8cd632edebf9b16fd8213de554307b389d73847cddc2003046503f8a7d45a4"
     },
     "prefill_network_cache.py": {
       "network_cache_geometry": "56f6476ac03d86e4253eda27b235acdb31d8e158d89ae7cc16fd010b227a9f67",
@@ -496,7 +496,7 @@
       "_pad": "091914f42013efa70273eb55810b65f8a79a5b211a64dc4ab47c60e663943a9a",
       "_check_constants": "53cf719453cfec24eeb54eae4ecd748a437e29570970bfad8d58651cb29693e8",
       "PreparedNetworkEngram": "b0dafb9c608e3b8ab9ab506752087af80590bddeb6b1efec8400613de8fe8a13",
-      "prepare_network_engram": "c081a3a127b2a8a0bf661f818da13170aedd360abcc396b8c7f70b029b9afab8"
+      "prepare_network_engram": "df4f24d7f546c2c04eed8a1e5afb85882b5e583dfe478502429158e76589ffc2"
     },
     "prefill_network_guard.py": {
       "interval_digest": "ef3fe91ba06f84f09c3c4631163ecd2aabc567d2449ce8d4d4c2e1ce46955781",
@@ -695,7 +695,7 @@
       "check_layer_plan": "79d4e4820f46ff6ba4c4798e80487a6a0e6dfc7c8e6ae2a16868718abb7094ce",
       "_reject": "4d916aced8be15cb2bb3dfa77f37bc21d20928aad709f014d8c27c8c670a5fd8",
       "check_controls": "fed6f90f57455cdaf60b3dce219e8308040e7e1c78a8e082bccb604f9c283ae4",
-      "check_runtime_configuration": "d06531076f9eae1df5ab5b3522a9f0a7679945a7f4e13e701023a7cf1726a8b4",
+      "check_runtime_configuration": "e28af7d05e4410bd3b37cc8442bdb8d474cb5fe0eb1a3acd8c63bfb4869fedfc",
       "main": "724f6663194a78490add237220a29ceadf09fd9e40d06b63382259a65e01b6a6"
     },
     "weights.py": {

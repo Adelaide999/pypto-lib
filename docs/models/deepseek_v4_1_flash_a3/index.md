@@ -61,6 +61,10 @@ The public entry is `prefill_fwd.run_prefill`. It explicitly accepts inputs,
 checkpoint weights, canonical cache state, numerical configuration, physical
 device IDs and a new output directory. It has no dependency on historical
 `formal_layer_receipts`, task releases, `TASK_DEVICE` or `DS41_JOB_ROOT`.
+The runtime forwards those IDs in `assigned_devices` to both HCCL workers and
+Engram preparation. Each uses the same explicit mapping in logical rank order;
+duplicate IDs, rank-count mismatches and conflicting existing
+`ASCEND_RT_VISIBLE_DEVICES` mappings are rejected before device initialization.
 Historical release and continuation admission can be checked separately with
 `audit_task.audit_task_release` and `audit_task.audit_task_continuation`.
 Shape, dtype, topology, legal cache aliases and exact state preservation remain
@@ -88,6 +92,10 @@ Paths in the JSON are relative to that JSON file. `--checkpoint`, `--devices`
 and `--output` override the corresponding fields. `--check-config` checks the
 configuration and mapping only; it does not load weights, prove input/cache
 compatibility, compile or execute. Output directories must be new.
+
+The standalone `prefill_moe_ep` driver also requires `--devices`, for example
+`--devices 3,1` for a matching EP2 contract.
+It writes that ordered mapping to `runtime_config.json` for its HCCL workers.
 
 `inputs` and `cache_state` are Torch `weights_only=True` dictionaries. The first
 contains `input_contract`, `product_input_paths` and `product_input_files`.

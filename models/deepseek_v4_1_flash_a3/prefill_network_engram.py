@@ -9,7 +9,6 @@
 """Prepare shared network Engram hashes and both lookup slots before the backbone."""
 
 from contextlib import ExitStack
-import os
 from pathlib import Path
 
 import torch
@@ -18,6 +17,7 @@ from .engram_storage import SharedEngramArray
 from .prefill_engram import make_prefill_engram_entries
 from .prefill_engram_runtime import MappedLookup, engram_owner, load_rotation
 from .prefill_layer_state import resolve_layer_role
+from .runtime_config import configure_devices
 from .runtime_utils import Executable
 
 
@@ -149,11 +149,7 @@ def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_la
     if (contract["topology"] != topology or contract["capacity"] != capacity
             or not 0 < capacity <= 512 or capacity % 16):
         raise ValueError("Freeze the matching bounded network Engram execution ABI")
-    assigned = os.environ["TASK_DEVICE"].split(",")
-    if (assigned != runtime["assigned_devices"] or len(assigned) != world or len(set(assigned)) != world
-            or any(not device.isdecimal() for device in assigned)
-            or os.environ.get("ASCEND_RT_VISIBLE_DEVICES") != ",".join(assigned)):
-        raise ValueError("Engram must share the actual queue-mapped network device allocation")
+    configure_devices(runtime["assigned_devices"], world=world)
     if len(history.caches) != world or batch.get("engram_metadata_owner_layer") != 1:
         raise ValueError("Use the single model-level history and first-Engram SWA metadata")
     identity = (batch["epoch"], batch["token_map_id"])

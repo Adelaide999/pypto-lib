@@ -147,9 +147,12 @@ def check_controls():
 
 
 def check_runtime_configuration():
-    """Check TP import independence and reject ambiguous physical-device mappings."""
+    """Check explicit TP and device binding without inherited process configuration."""
     import importlib
+    import os
     import sys
+    from unittest.mock import patch
+
     from . import runtime_config
 
     original = sys.argv
@@ -166,7 +169,18 @@ def check_runtime_configuration():
     require(runtime.validate_devices(["2", "0"], world=2) == ["2", "0"], "Device order was changed")
     for devices in ([0, 0], [0, "00"], [0, -1], [True, 1], [0], "0,1"):
         _reject(lambda value=devices: runtime.validate_devices(value, world=2), "Invalid device mapping accepted")
-    return dict(tp="explicit_per_builder", import_argv="ignored", device_mapping="explicit_and_unique")
+        with patch.dict(os.environ, {}, clear=True):
+            _reject(lambda value=devices: runtime.configure_devices(value, world=2), "Invalid device binding accepted")
+            require("ASCEND_RT_VISIBLE_DEVICES" not in os.environ, "Invalid mapping changed device visibility")
+    with patch.dict(os.environ, {}, clear=True):
+        assigned = runtime.configure_devices([3, 1], world=2)
+        require(assigned == ["3", "1"] and os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "3,1",
+                "Explicit device binding depends on an inherited task environment")
+        require(runtime.configure_devices(assigned, world=2) == assigned, "Matching runtime mapping was rejected")
+        _reject(lambda: runtime.configure_devices([1, 3], world=2), "Conflicting device order was accepted")
+        require(os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "3,1", "Conflicting mapping changed device visibility")
+    return dict(tp="explicit_per_builder", import_argv="ignored", device_mapping="explicit_and_unique",
+                inherited_environment="not_required", conflicting_mapping="rejected_without_mutation")
 
 
 def main():
