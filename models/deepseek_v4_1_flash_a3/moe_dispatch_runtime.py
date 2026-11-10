@@ -8,6 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Stage actual PyPTO operands through the native A2 MoE dispatch runtime."""
 
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
+
 import argparse
 import json
 import os

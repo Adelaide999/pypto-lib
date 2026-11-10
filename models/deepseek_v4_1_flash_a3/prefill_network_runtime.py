@@ -12,7 +12,6 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 import gc
 import json
-import os
 from pathlib import Path
 
 import torch
@@ -30,12 +29,9 @@ from .prefill_network_guard import NetworkStatePreservation
 from .prefill_network_state import NetworkCacheProvider
 from .prefill_output import make_output_entries
 from .prefill_swa import prepare_product_operands
-from .runtime_config import ExpertParallelConfig, TP_SIZE
+from .runtime_config import ExpertParallelConfig
 from .runtime_utils import Executable, communicate, file_sha, loaded_source_files, tensor_sha, write_json
 from .weights import CheckpointOperands
-
-
-FORMAL_LAYERS = (0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25)
 
 
 class NetworkWeights:
@@ -274,7 +270,7 @@ class NetworkExecutor:
                 geometry["capacity"], self.config, expert_capacity, layer_id,
                 geometry["cache_blocks"], geometry["requests"], geometry["table_pages"],
                 ep=self.topology["ep"], cache_layout=self.provider.layouts[0][next(iter(batch["cases"]))],
-                role=resolve_layer_role(layer_id), network_cache=True,
+                role=resolve_layer_role(layer_id), network_cache=True, tp=self.topology["tp"],
             )
             directory = self.output / f"{self.namespace}-layer{layer_id}"
             directory.mkdir(exist_ok=False)
@@ -433,30 +429,17 @@ def _network_owner_snapshot(provider, storage):
     return result
 
 
-def run_network_runtime(inputs, *, contract, output, release, continuation=None):
-    """Execute admitted fresh and optional history Prefill chunks with one finite owner lifetime."""
-    if release.get("scope") != "actual_full40_network_prefill" or not release.get("eleven_formal_layers_verified"):
-        raise ValueError("Main must independently release full40 after all eleven formal single-layer gates")
-    if continuation is not None and not release.get("complete_engram_retained_capacity_verified"):
-        raise ValueError("Measure retained complete Engram slots and full host/workspace capacity before history execution")
-    expected = {str(layer) for layer in FORMAL_LAYERS}
-    if set(release.get("formal_layer_receipts", {})) != expected:
-        raise ValueError("The complete independently audited eleven-layer delivery receipt mapping is missing")
-    for receipt in release["formal_layer_receipts"].values():
-        if file_sha(receipt["path"]) != receipt["sha256"]:
-            raise ValueError("A Main-admitted actual formal layer delivery receipt changed")
-    if not release.get("actual_capacity_and_sharding_verified") or not release.get("independent_full40_reference_ready"):
-        raise ValueError("Actual capacity/sharding and independent same-input full40 reference must be ready before execution")
+def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, continuation=None):
+    """Execute fresh and optional history chunks with explicit devices, weights and live cache state."""
     topology = contract["topology"]
-    if topology != dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1) or TP_SIZE != topology["tp"]:
-        raise ValueError("Freeze initial DP4TP4EP16PP1PCP1DCP1 and --tp4 before process import")
-    assigned = os.environ.get("TASK_DEVICE", "").split(",")
-    if (len(assigned) != 16 or len(set(assigned)) != 16 or any(not value.isdecimal() for value in assigned)
-            or os.environ.get("ASCEND_RT_VISIBLE_DEVICES") != ",".join(assigned)):
-        raise ValueError("Require the complete current public16-device lease and exact logical rank mapping")
+    if topology != dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1):
+        raise ValueError("The current network runtime requires DP4/TP4/EP16/PP1/PCP1/DCP1")
+    from .runtime_config import configure_devices
+
+    assigned = configure_devices(devices, world=topology["ep"])
     output = Path(output).resolve()
-    if not output.is_relative_to(Path(os.environ["DS41_JOB_ROOT"]).resolve()):
-        raise ValueError("Actual network outputs must remain inside this unique whole-group lease")
+    if checkpoint is not None:
+        contract = dict(contract, checkpoint=str(Path(checkpoint).resolve()))
     if not all(contract["required_modes"].values()) or contract["capacity"] != 16 or contract["scheduler_capacity"] != 8192:
         raise ValueError("Retain the original model modes and bounded actual scheduler ABI")
     if contract.get("fresh_shared_initialization") != {"topk_indices": -1}:
@@ -495,21 +478,6 @@ def run_network_runtime(inputs, *, contract, output, release, continuation=None)
         if continuation is None:
             return first
         # The original full chunk, including final output/captures, must have returned before advancing.
-        admission = continuation.get("chunk0_completion_admission")
-        if not isinstance(admission, dict) or admission.get("reviewed_and_frozen") is not True:
-            raise ValueError("A real completed chunk0 comparison and current Main admission are required before history")
-        for name in ("comparison", "current_admission", "owner_state"):
-            record = admission[name]
-            if file_sha(record["path"]) != record["sha256"]:
-                raise ValueError("Completed chunk0 admission evidence changed: " + name)
-        comparison = json.loads(Path(admission["comparison"]["path"]).read_text())
-        owner_state = json.loads(Path(admission["owner_state"]["path"]).read_text())
-        if (comparison.get("outcome") != "valid" or comparison.get("input_contract_sha256") != contract["input_contract_sha256"]
-                or comparison.get("actual_product_execution_sha256") != file_sha(output / "execution.json")
-                or owner_state.get("actual_product_execution_sha256") != file_sha(output / "execution.json")
-                or owner_state.get("retained_allocation_id") != provider.allocation_id
-                or owner_state.get("own_state_preserved") is not True):
-            raise ValueError("History requires this actual chunk0 output and retained owner state, not another run")
         following, next_contract = continuation["inputs"], continuation["contract"]
         fixed = ("topology", "checkpoint", "model_config", "required_modes", "capacity", "scheduler_capacity")
         if any(next_contract[name] != contract[name] for name in fixed):

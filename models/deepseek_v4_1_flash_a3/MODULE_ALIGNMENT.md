@@ -18,8 +18,21 @@ general names. `grouped_output.py` becomes `prefill_grouped_output.py` because
 its only exported kernel is `prefill_grouped_output`. Internal `a2` name hints
 and shared A2/A3 ABI names retain their source identity.
 
-Legacy `decode_*` modules and native-boundary/reference helpers are retained
-as part of the tracked source closure. They do not establish new A3 Decode
-validation or replace the PyPTO full-network arithmetic with native forward.
-No custom product C++ translation unit is required by this source closure;
-the actual transport binds the installed CANN/HCCL libraries through ctypes.
+The maintained public entry is `prefill_fwd.py`. Historical task release
+checks live in `audit_task.py`; original and maintained source identities are
+checked separately by `audit_source.py`. The source manifest is immutable;
+`source_refactor_map.json` tracks consolidation into these owners:
+
+| Former owner | Maintained computation owner |
+| --- | --- |
+| `ops.py`: INT8 packing, quantization, dot, scaling | `linear_primitives.py` |
+| `ops.py`: RMSNorm, adjacent-pair RoPE | `rmsnorm.py`, `norm_rope.py` |
+| `staged.py`: BF16/FP32/direct Linear | `gemm.py` |
+| `staged.py`: grouped projection, SwiGLU | `output_proj.py`, `activation.py` |
+| `staged.py`: norm/RoPE, index quantization, SWA | `norm_rope.py`, `index_cache.py`, `swa_attention.py` |
+| Six `decode_*` reference facades | `layer14_15.py`, `layers19_25.py`, `swa_attention.py` directly |
+| Fixed L1/L3 command wrappers | `prefill_layer.py --layer-id` |
+
+Cache ownership, Engram lifetime, communication and numerical variants with
+distinct rounding contracts remain separate. See the public migration notes
+for optional native-helper consumers and validation limits.

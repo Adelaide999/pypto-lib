@@ -57,20 +57,67 @@ The original source names in this manifest are intentional provenance.
 | EP MoE and actual communication | `prefill_moe_ep.py`, `moe_dispatch.py`, `moe_transport.py` |
 | Shared primitives | `quant.py`, `ecotech_linear*.py`, `qkv*.py`, `hc.py`, `gemm.py` |
 
-The network entry consumes explicitly supplied contracts, source receipts,
-captured physical cache ABI, checkpoint operands, and an actual whole-group
-device allocation. It executes the product layers in memory and observes real
-output/state boundaries; it does not invoke a native model forward as a
-fallback. Contract/weight paths must be supplied by the caller. Private task
-fixtures, leases, reports, and checkpoints are deliberately not packaged.
+The public entry is `prefill_fwd.run_prefill`. It explicitly accepts inputs,
+checkpoint weights, canonical cache state, numerical configuration, physical
+device IDs and a new output directory. It has no dependency on historical
+`formal_layer_receipts`, task releases, `TASK_DEVICE` or `DS41_JOB_ROOT`.
+Historical release and continuation admission can be checked separately with
+`audit_task.audit_task_release` and `audit_task.audit_task_continuation`.
+Shape, dtype, topology, legal cache aliases and exact state preservation remain
+runtime checks. Input/cache identity hashes describe the supplied operands;
+they are not credentials from a private task.
 
-The layer plan retains all original physical layers 0 through 39. Capacity
-16 is the frozen local executable row extent of the network entry; it is not
-a claim that arbitrary batch=16 or every TP/DP arrangement has passed.
+```python
+from models.deepseek_v4_1_flash_a3.prefill_fwd import run_prefill
 
-Prefill-specific files have a `prefill_` prefix. Shared primitives retain
-general names. Legacy Decode exports and native boundary/reference utilities
-remain traceable to the source snapshot and have no new validation claim.
+result = run_prefill(
+    inputs, weights=checkpoint, cache=cache_state, config=network_contract,
+    devices=list(range(16)), output="build_output/ds41-prefill-new-run",
+)
+```
+
+For the CLI, copy `models/deepseek_v4_1_flash_a3/prefill.example.json`, supply
+actual files, and run from the repository root:
+
+```bash
+python -m models.deepseek_v4_1_flash_a3.prefill_fwd --config prefill.json --check-config
+python -m models.deepseek_v4_1_flash_a3.prefill_fwd --config prefill.json -p a2a3
+```
+
+Paths in the JSON are relative to that JSON file. `--checkpoint`, `--devices`
+and `--output` override the corresponding fields. `--check-config` checks the
+configuration and mapping only; it does not load weights, prove input/cache
+compatibility, compile or execute. Output directories must be new.
+
+`inputs` and `cache_state` are Torch `weights_only=True` dictionaries. The first
+contains `input_contract`, `product_input_paths` and `product_input_files`.
+The second contains `cache_ABI`, `cache_ABI_sources` and `engram_contracts`
+with integer Engram slots 1 and 14. Their canonical rank/page metadata and
+physical aliases are interpreted by `NetworkCacheProvider`; metadata must
+match the actual allocated tensors. The JSON `contract` supplies `topology`,
+`model_config`, `required_modes`, `capacity`, `scheduler_capacity`,
+`fresh_shared_initialization`, `input_contract_sha256` and `state_regions`
+(path and SHA256). These remain explicit state/operand contracts. This entry
+accepts an already prepared canonical backbone/cache boundary; it does not
+create that boundary from only a checkpoint and a text prompt.
+
+The current runtime supports the original 40-layer plan with DP4/TP4/EP16,
+PP1/PCP1/DCP1 and capacity 16. Device IDs are runtime devices, not a claim of
+16 separate physical cards. Multi-chunk continuation additionally retains
+exact own-state identities, metadata lineage and unchanged numerical settings.
+Dataset accuracy remains a separate check after execution.
+
+TP is passed to builders explicitly, for example
+`make_prefill_layer_entries(..., ep=16, tp=4)` or
+`make_prefill_grouped_output(tp=2)`. Importing a module does not inspect
+`sys.argv` or specialize the process globally. TP1/TP2 factories do not
+establish TP1/TP2 full-network acceptance.
+
+Prefill-specific files have a `prefill_` prefix; shared primitives retain general
+names. Fixed-layer CLI wrappers for L1/L3 and misleading `decode_*` facades
+were removed. Use `prefill_layer --layer-id ...`; L0/L2 retain their actual
+computation/reference definitions without duplicate CLI wrappers. Explicit
+`*_reference` APIs resolve directly to their owning operator modules.
 
 ## Dependencies and execution
 
@@ -86,20 +133,45 @@ custom native operators when explicitly invoked. They are not required by the
 device-free checks and do not substitute for the A3 PyPTO network arithmetic.
 `runtime.example.json` describes only this retained native-helper configuration.
 
-Run the bounded checks from the repository root:
+Run bounded host controls and operator checks from the repository root:
 
 ```bash
 python -B -m models.deepseek_v4_1_flash_a3.validate
-python -B -m models.deepseek_v4_1_flash_a3.prefill_layer --help
+python -m models.deepseek_v4_1_flash_a3.hc -p a2a3 --cpu-only
+python -m models.deepseek_v4_1_flash_a3.swa -p a2a3 --cpu-only
+python -m models.deepseek_v4_1_flash_a3.indexer_select -p a2a3 --cpu-only
+python -m models.deepseek_v4_1_flash_a3.prefill_embedding -p a2a3 -d 0
 ```
 
-The first command uses only the Python standard library. It checks import
-closure, preserved compute definitions, all 40 layer roles, EP ownership,
-request/page scheduling, and negative controls without compilation or device
-initialization. The second requires the runtime Python dependencies but does
-not dispatch work. Operator files retain their own Torch goldens and validation
-entries; invoke them only in a separately allocated execution environment.
+`validate` uses only the standard library. It checks the maintained import DAG,
+public exports, all 40 roles, scheduler/EP ownership, TP import independence and
+device mappings. It deliberately does not require historical AST equality.
+`audit_source` performs the separate opt-in source identity audit.
 
-No original task files, source branches, validation jobs, or device reservations
-were changed to create this package. See the [migration notes](prefill_migration.md)
-for the exact packaging transformations and verification limits.
+Executable operator entries accept `-p/--platform a2a3`, `-d/--device`,
+`--sim` and `--compile-only`. HC, SWA and QLI additionally support `--cpu-only`;
+that mode checks Torch reference fixtures without running kernels and cannot
+be combined with `--compile-only`. Default device runs use `golden.run` with
+the same compute factories as model composition. HC/SWA compare floating
+outputs at `rtol=0.05, atol=0.05`, and untouched state exactly. SWA also checks
+the entire updated cache exactly. QLI checks active discrete indices exactly;
+its inactive pure-`Out` rows are undefined and are not compared. The QLI golden
+models both FP16 rounding boundaries and the fixed 512-candidate score order;
+`indexer_select_reference` remains the separate ideal logical visibility oracle.
+
+CI owns this directory on `a2a3` and resolves relative imports for downstream
+selection. Drivers needing external weights, cache state or whole-group device
+allocation use `# ci: manual`, keeping their dependencies visible while excluding
+them from automatic bounded execution.
+
+HOST validation passed 19 CI-selection tests, all 114 module imports and 84
+public exports, 20 CPU golden cases, and TP4/TP1/TP2/TP4 factory construction.
+All 20 HC/SWA/QLI cases and eight grouped-output/sparse TP specializations
+compiled with PTOAS 0.70. Simulator dispatch was checked
+to resolve to `a2a3sim`, but simulation could not execute because the validation
+host lacks `g++-15`. Device accuracy, full simulator CI and full-network execution
+of the refactored package remain unverified; earlier A3 acceptance does not
+certify this refactor. An AST comparison preserved all 200 original JIT definitions;
+this structural check does not replace numerical regression.
+No original task source, Goal or device job was changed for these checks.
+See [migration notes](prefill_migration.md) for provenance and helper ownership.

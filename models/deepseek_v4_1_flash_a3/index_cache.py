@@ -103,3 +103,19 @@ def make_index_cache_quantize(capacity: int, heads: int, head_dim: int = 128):
 
 
 __all__ = ["dequantize_index_cache", "make_index_cache_quantize", "quantize_index_cache"]
+
+
+def make_index_quantize(capacity: int, heads: int, head_dim: int = 128):
+    quantize = make_index_cache_quantize(capacity, heads, head_dim)
+
+    @pl.jit
+    def kernel(
+        value: pl.Tensor[[capacity, heads, head_dim], pl.BF16],
+        payload: pl.InOut[pl.Tensor[[capacity, heads, head_dim], pl.INT8]],
+        scales: pl.InOut[pl.Tensor[[capacity, heads], pl.FP16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        quantize(value, payload, scales, active)
+        return payload, scales
+
+    return kernel

@@ -9,22 +9,13 @@
 """Runtime sizing controls for A2/A3 operator entry points."""
 
 from dataclasses import dataclass
-import sys
 
 
-def _parse_parallel_size(name: str, default: int) -> int:
-    """Read one integer parallel-size option without changing model config."""
-
-    flag = f"--{name}"
-    for index, argument in enumerate(sys.argv):
-        if argument == flag and index + 1 < len(sys.argv):
-            return int(sys.argv[index + 1])
-        if argument.startswith(f"{flag}="):
-            return int(argument.split("=", 1)[1])
-    return default
-
-
-TP_SIZE = _parse_parallel_size("tp", 1)
+def validate_tp(tp):
+    """Validate a caller-supplied tensor-parallel specialization."""
+    if type(tp) is not int or tp not in (1, 2, 4):
+        raise ValueError("Tensor parallelism must be 1, 2 or 4")
+    return tp
 
 
 @dataclass(frozen=True)
@@ -69,4 +60,29 @@ class ExpertParallelConfig:
         return int(controls["active_by_dp"][rank])
 
 
-__all__ = ["ExpertParallelConfig", "TP_SIZE"]
+def validate_devices(devices, *, world):
+    """Validate physical-to-logical device mapping without changing process state."""
+    if not isinstance(devices, (list, tuple)) or any(type(value) not in (int, str) for value in devices):
+        raise ValueError("Devices must be an explicit list of nonnegative physical IDs")
+    assigned = [str(value) for value in devices]
+    if len(assigned) != world or len(set(assigned)) != world or any(not value.isdecimal() for value in assigned):
+        raise ValueError("Devices must contain one distinct nonnegative physical ID per rank")
+    assigned = [str(int(value)) for value in assigned]
+    if len(set(assigned)) != world:
+        raise ValueError("Physical device aliases cannot identify different logical ranks")
+    return assigned
+
+
+def configure_devices(devices, *, world):
+    """Bind explicit physical devices to logical ranks before runtime initialization."""
+    import os
+
+    assigned = validate_devices(devices, world=world)
+    visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    if visible is not None and visible != ",".join(assigned):
+        raise ValueError("Explicit devices differ from the existing visible-device mapping")
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(assigned)
+    return assigned
+
+
+__all__ = ["ExpertParallelConfig", "configure_devices", "validate_devices", "validate_tp"]

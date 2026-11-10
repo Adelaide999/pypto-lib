@@ -6,12 +6,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""A2 blocked INT8 projections, FP32 scaling, RMSNorm and adjacent-pair RoPE."""
+"""Blocked INT8 quantization, GEMM and FP32 dequantization primitives."""
 
 import pypto.language as pl
 
-
-# tiling
 M_TILE = 16
 VEC_M_TILE = 8
 K_TILE = 256
@@ -169,70 +167,3 @@ def make_dequantize(capacity, output_width, combine_scales=False, channel_dtype=
         return output
 
     return dequantize
-
-
-def make_norm(capacity, width, eps):
-    """Specialize weighted FP32 RMSNorm with a BF16 output."""
-
-    @pl.jit.inline
-    def norm(
-        x: pl.Tensor[[capacity, width], pl.BF16],
-        weight: pl.Tensor[[width], pl.BF16],
-        output: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        for block in pl.spmd((active + VEC_M_TILE - 1) // VEC_M_TILE, name_hint="a2_rms_norm"):
-            t0 = block * VEC_M_TILE
-            rows = pl.min(VEC_M_TILE, active - t0)
-            source = pl.slice(x, [VEC_M_TILE, width], [t0, 0], valid_shape=[rows, width])
-            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), VEC_M_TILE, width)
-            value = pl.cast(source, pl.FP32)
-            square = pl.mul(value, value)
-            mean = pl.mul(pl.row_sum(square), 1.0 / width)
-            inverse = pl.rsqrt(pl.add(mean, eps), high_precision=True)
-            normalized = pl.row_expand_mul(value, inverse)
-            gamma = pl.reshape(pl.cast(weight[:], pl.FP32), [1, width])
-            weighted = pl.col_expand_mul(normalized, gamma)
-            narrowed = pl.cast(weighted, pl.BF16, mode="rint")
-            output[t0:t0 + VEC_M_TILE, :] = pl.set_validshape(narrowed, rows, width)
-        return output
-
-    return norm
-
-
-def make_rope(capacity, heads, head_dim, rope_dim):
-    """Rotate the final channels of each head in adjacent pairs."""
-    output_width = heads * head_dim
-    nope_dim = head_dim - rope_dim
-    pair_width = rope_dim // 2
-
-    @pl.jit.inline
-    def rope(
-        x: pl.Tensor[[capacity, output_width], pl.BF16],
-        cosine: pl.Tensor[[capacity, pair_width], pl.FP32],
-        sine: pl.Tensor[[capacity, pair_width], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        for block in pl.spmd(active * heads, name_hint="a2_adjacent_rope"):
-            t = block // heads
-            base = (block % heads) * head_dim
-            output[t:t + 1, base:base + nope_dim] = x[t:t + 1, base:base + nope_dim]
-            tail = pl.cast(x[t:t + 1, base + nope_dim:base + head_dim], pl.FP32)
-            even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-            c = cosine[t:t + 1, :]
-            s = sine[t:t + 1, :]
-            even_c = pl.mul(even, c)
-            odd_s = pl.mul(odd, s)
-            odd_c = pl.mul(odd, c)
-            even_s = pl.mul(even, s)
-            real = pl.sub(even_c, odd_s)
-            imag = pl.add(odd_c, even_s)
-            rotated = pl.full([1, rope_dim], dtype=pl.FP32, value=0.0)
-            rotated = pl.tensor.scatter(real, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-            rotated = pl.tensor.scatter(imag, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-            output[t:t + 1, base + nope_dim:base + head_dim] = pl.cast(rotated, pl.BF16, mode="rint")
-        return output
-
-    return rope

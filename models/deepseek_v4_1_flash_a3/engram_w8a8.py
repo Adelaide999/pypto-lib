@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 
-from .ops import N_TILE, make_dequantize, make_dot, make_pack_weight, make_quantize
+from .linear_primitives import N_TILE, make_dequantize, make_dot, make_pack_weight, make_quantize
 
 
 # model config

@@ -150,3 +150,76 @@ def make_rope_tables(capacity, rope_dim, theta, scaling=None):
 
 
 __all__ = ["make_rmsnorm", "make_rope", "make_rope_tables", "rms_norm_reference", "rope_reference"]
+
+
+def make_adjacent_rope(capacity, heads, head_dim, rope_dim):
+    """Rotate the final channels of each head in adjacent pairs."""
+    output_width = heads * head_dim
+    nope_dim = head_dim - rope_dim
+    pair_width = rope_dim // 2
+
+    @pl.jit.inline
+    def rope(
+        x: pl.Tensor[[capacity, output_width], pl.BF16],
+        cosine: pl.Tensor[[capacity, pair_width], pl.FP32],
+        sine: pl.Tensor[[capacity, pair_width], pl.FP32],
+        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for block in pl.spmd(active * heads, name_hint="a2_adjacent_rope"):
+            t = block // heads
+            base = (block % heads) * head_dim
+            output[t:t + 1, base:base + nope_dim] = x[t:t + 1, base:base + nope_dim]
+            tail = pl.cast(x[t:t + 1, base + nope_dim:base + head_dim], pl.FP32)
+            even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+            odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+            c = cosine[t:t + 1, :]
+            s = sine[t:t + 1, :]
+            even_c = pl.mul(even, c)
+            odd_s = pl.mul(odd, s)
+            odd_c = pl.mul(odd, c)
+            even_s = pl.mul(even, s)
+            real = pl.sub(even_c, odd_s)
+            imag = pl.add(odd_c, even_s)
+            rotated = pl.full([1, rope_dim], dtype=pl.FP32, value=0.0)
+            rotated = pl.tensor.scatter(real, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
+            rotated = pl.tensor.scatter(imag, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
+            output[t:t + 1, base + nope_dim:base + head_dim] = pl.cast(rotated, pl.BF16, mode="rint")
+        return output
+
+    return rope
+
+
+def make_rmsnorm_entry(capacity: int, width: int, eps: float):
+    norm = make_rmsnorm(capacity, width, eps)
+
+    @pl.jit
+    def kernel(
+        value: pl.Tensor[[capacity, width], pl.BF16],
+        weight: pl.Tensor[[width], pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        norm(value, weight, output, active)
+        return output
+
+    return kernel
+
+
+def make_rope_kernel(capacity: int, heads: int, head_dim: int, rope_dim: int):
+    rotate = make_rope(capacity, heads, head_dim, rope_dim)
+    pairs = rope_dim // 2
+    width = heads * head_dim
+
+    @pl.jit
+    def kernel(
+        value: pl.Tensor[[capacity, width], pl.BF16],
+        cosine: pl.Tensor[[capacity, pairs], pl.FP32],
+        sine: pl.Tensor[[capacity, pairs], pl.FP32],
+        output: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        rotate(value, cosine, sine, output, active)
+        return output
+
+    return kernel

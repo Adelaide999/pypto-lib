@@ -6,9 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: manual
 """Compose physical Prefill layers with CP/SP attention, Engram, EP MoE and delayed HC."""
 
-import os
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
+
 from pathlib import Path
 import sys
 
@@ -37,7 +44,7 @@ def validate_prefill_ownership(layout, ownership):
 
 def make_prefill_layer_entries(
     capacity, config, expert_capacity, layer_id=0, cache_blocks=3, requests=1, table_pages=2, *,
-    ep, cache_layout=None, role=None, network_cache=False,
+    ep, tp=1, cache_layout=None, role=None, network_cache=False,
 ):
     """Construct shared physical-layer attention, HC and MoE computations."""
     from .hc import make_hc_post_inline, make_hc_pre_inline
@@ -50,13 +57,13 @@ def make_prefill_layer_entries(
     from .prefill_norm import make_prefill_norm_cast
     from .prefill_layer_state import resolve_layer_role
     from .prefill_swa import make_builders
-    from .runtime_config import TP_SIZE
+    from .runtime_config import validate_tp
 
     role = resolve_layer_role(layer_id, role)
-    tp = TP_SIZE
+    tp = validate_tp(tp)
     if tp not in (1, 2, 4) or capacity % 16 or not 2 <= ep <= 16 or ep % tp or 384 % ep:
-        raise ValueError("Freeze --tp 1/2/4 before importing and compiling the aligned Prefill layer")
-    entries = make_builders(capacity, cache_blocks=cache_blocks)
+        raise ValueError("Require TP1/2/4 and an aligned complete Prefill layer")
+    entries = make_builders(capacity, cache_blocks=cache_blocks, tp=tp)
     del entries["swa"]
     entries.update(
         hc_pre=pl.jit(make_hc_pre_inline(capacity, config)._func),
@@ -111,7 +118,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     from .prefill_consumer_runtime import run_consumer_attention
     from .prefill_layer_state import LayerObservations, invalidate_live_versions, publish_live_versions
     from .prefill_layer_state import resolve_layer_role, validate_live_state
-    from .runtime_config import ExpertParallelConfig, TP_SIZE
+    from .runtime_config import ExpertParallelConfig
     from .swa_scheduler import from_controls
 
     layer_id = role["physical_layer"]
@@ -119,8 +126,8 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     topology = runtime["topology"]
     layout = ExpertParallelConfig(topology["dp"], topology["tp"], topology["ep"], 384)
     tp, world = layout.tp, layout.ep
-    if tp != TP_SIZE or tp not in (1, 2, 4) or not 2 <= world <= 16:
-        raise ValueError("Freeze matching TP1/2/4 with real multi-rank EP before building the layer")
+    if tp not in (1, 2, 4) or not 2 <= world <= 16:
+        raise ValueError("Require matching TP1/2/4 with real multi-rank EP before building the layer")
     if any(topology[name] != 1 for name in ("pp", "pcp", "dcp")):
         raise ValueError("Require PP1/PCP1/DCP1")
     if not runtime["enable_expert_parallel"] or not all(runtime["required_modes"].values()):
@@ -459,7 +466,7 @@ def run_prefill_layer(args, layer_id=0):
     from .moe_transport import CANNMemory
     from .prefill_layer_state import fixture_live_state, resolve_layer_role
     from .prefill_swa import prepare_product_operands
-    from .runtime_config import ExpertParallelConfig, TP_SIZE
+    from .runtime_config import ExpertParallelConfig
     from .runtime_utils import Executable, communicate, file_sha, loaded_source_files, write_json
     from .weights import CheckpointOperands
 
@@ -495,8 +502,8 @@ def run_prefill_layer(args, layer_id=0):
     tp, world = layout.tp, layout.ep
     if any(topology[name] != 1 for name in ("pp", "pcp", "dcp")):
         raise ValueError("Require PP1/PCP1/DCP1")
-    if args.tp != TP_SIZE or TP_SIZE != tp or not 2 <= world <= 16:
-        raise ValueError("Freeze matching TP1/2/4 and a real local multi-rank EP topology before import")
+    if args.tp != tp or not 2 <= world <= 16:
+        raise ValueError("Require matching TP1/2/4 and a real local multi-rank EP topology")
     if any(len(records) != world for records in contract["cases"].values()):
         raise ValueError("Every case must cover the actual complete world")
     if not contract["enable_expert_parallel"] or not all(contract["required_modes"].values()):
@@ -505,10 +512,11 @@ def run_prefill_layer(args, layer_id=0):
     if contract["global_experts"] != 384 or contract["top_k"] != 6 or contract["cache_pages"] != cache_pages:
         raise ValueError("Original expert, top-k and cache geometry is required")
     ownership = validate_prefill_ownership(layout, contract["ownership"])
-    assigned = os.environ["TASK_DEVICE"].split(",")
+    from .runtime_config import configure_devices
+
+    assigned = configure_devices(args.devices, world=world)
     if len(assigned) != world or len(set(assigned)) != world or any(not device.isdecimal() for device in assigned):
         raise ValueError("Require the complete distinct queue-assigned device set for this topology")
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(assigned)
     torch.set_num_threads(4)
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -568,6 +576,7 @@ def run_prefill_layer(args, layer_id=0):
     functions = make_prefill_layer_entries(
         capacity, config, expert_capacity, layer_id, cache_pages, requests, table_pages, ep=world,
         cache_layout=next(iter(contract["cases"].values()))[0].get("cache_layout"),
+        tp=tp,
     )
     entries = {name: Executable(function, build / name) for name, function in functions.items()}
 
@@ -712,6 +721,7 @@ def compile_prefill_layer(args, layer_id=0):
         capacity, config, expert_capacity, layer_id, cache_pages, requests, table_pages,
         ep=contract["topology"]["ep"],
         cache_layout=originals[0].get("cache_layout"),
+        tp=args.tp,
     )
     if layer_id in (1, 14):
         from .prefill_engram_runtime import engram_owner
@@ -746,8 +756,10 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=("a2a3",), default="a2a3")
     parser.add_argument("--layer-id", type=int, choices=(0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25), required=True)
     parser.add_argument("--tp", type=int, choices=(1, 2, 4), required=True)
+    parser.add_argument("--devices", type=lambda value: value.split(","), required=True)
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compile-only", action="store_true")

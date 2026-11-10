@@ -8,9 +8,15 @@
 # -----------------------------------------------------------------------------------------------------------
 """Compose vocabulary lookup, TP exchange, PyPTO summation and initial SP/HC streams."""
 
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
+
 import argparse
 import json
-import os
 from pathlib import Path
 
 import torch
@@ -35,17 +41,9 @@ def run_input_stage(args):
     capacity, hidden, vocabulary, hc_mult = 16, config["hidden_size"], config["vocab_size"], config["hc_mult"]
     if len(settings["DP_engines"]) != dp or any(not 0 <= row["active"] <= capacity for row in settings["DP_engines"]):
         raise ValueError("Prepared bounded real-token input geometry differs")
-    assigned = os.environ.get("TASK_DEVICE", "").split(",")
-    if not args.compile_only:
-        if len(assigned) != world or len(set(assigned)) != world or any(not value.isdecimal() for value in assigned):
-            raise ValueError("Require the complete actual public16-device allocation")
-        if len(assigned) != world or os.environ.get("ASCEND_RT_VISIBLE_DEVICES") != ",".join(assigned):
-            raise ValueError("Leased and visible device mapping differs")
-        job = Path(os.environ["DS41_JOB_ROOT"]).resolve()
-        if not args.output.resolve().is_relative_to(job):
-            raise ValueError("Output must remain in this isolated whole-group job")
-    elif os.environ.get("TASK_DEVICE"):
-        raise ValueError("CPU compilation must not reserve a device")
+    from .runtime_config import configure_devices
+
+    assigned = [] if args.compile_only else configure_devices(args.devices, world=world)
     args.output.mkdir(parents=True, exist_ok=False)
     definitions = dict(lookup=make_vocab_embedding(capacity, hidden, vocabulary, tp),
                        reduce=make_vocab_reduce(capacity, hidden, tp),
@@ -144,6 +142,7 @@ def run_input_stage(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--devices", type=lambda value: value.split(","), required=True)
     parser.add_argument("--input-contract", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compile-only", action="store_true")

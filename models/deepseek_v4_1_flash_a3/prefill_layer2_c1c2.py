@@ -17,7 +17,9 @@ attention remain separate dependencies.
 import pypto.language as pl
 
 from .prefill_cache_publish import make_compressed_cache_publish
-from .ops import VEC_M_TILE, make_norm, make_rope
+from .linear_primitives import VEC_M_TILE
+from .rmsnorm import make_blocked_rmsnorm as make_norm
+from .norm_rope import make_adjacent_rope as make_rope
 from .compressor_core import compressor_ratio2, RING_ROWS_DYN
 from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN
 from .qkv_w8a8 import make_qkv_w8a8_inline

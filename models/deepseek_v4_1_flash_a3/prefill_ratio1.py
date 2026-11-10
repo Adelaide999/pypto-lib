@@ -17,7 +17,8 @@ import pypto.language as pl
 
 from .prefill_cache_publish import make_compressed_cache_publish
 from .prefill_layer2_c1c2 import make_indexer_cache_publish_128
-from .ops import make_norm, make_rope
+from .rmsnorm import make_blocked_rmsnorm as make_norm
+from .norm_rope import make_adjacent_rope as make_rope
 from .qkv_proj_rope import make_bf16_projection_staged
 
 

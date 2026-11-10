@@ -4,7 +4,8 @@
 
 The product source is the tracked model subtree of commit
 `ebf19ad0ae7d668b4f7f2b04b526c9dcff2785a9`, exported read-only from the A3
-product Git repository. All 118 Python modules are included. The original
+product Git repository. The initial delivery included all 118 Python modules. The maintenance mapping
+records subsequent consolidation and removal of redundant facades. The original
 subtree name `models/deepseek_v4_1_flash_a2` is historical; it must not be
 confused with a separately published A2 adaptation.
 
@@ -28,21 +29,56 @@ Full-network acceptance is not inferred from those independent-layer results.
    A3 scope and a sanitized source manifest. Keep weights, fixtures, reports,
    secrets, generated compiler files, and machine paths outside the package.
 
-The retained `decode_*` and native helper modules preserve source provenance;
-they are not newly validated Decode paths or a full-network native fallback.
-Actual transport is implemented in `moe_transport.py` using ctypes bindings to
-installed CANN/HCCL libraries. No product-specific C++ source is missing.
+## Maintained file ownership
 
-## Verification
+`ops.py` and `staged.py` were split by computation responsibility. Function
+bodies, arithmetic ordering, dtypes, quantization and rounding semantics remain
+unchanged. The distinct implementations are intentional: `linear_primitives`
+owns blocked INT8 quantization/packing/dequantization, while `gemm` owns direct
+and BF16/FP32 linear entries. `rmsnorm.make_blocked_rmsnorm` and
+`norm_rope.make_adjacent_rope` keep the former blocked semantics separately
+from the existing norm/RoPE contracts. `output_proj`, `activation`, `index_cache`
+and `swa_attention` own the remaining staged computations. Pure direct-linear
+forwarding now resolves directly to `gemm.make_int8_linear_direct`.
 
-`models.deepseek_v4_1_flash_a3.validate` checks all relocated source definitions
-against their normalized source AST identities, resolves all local imports,
-rejects dependency cycles, verifies the complete physical-layer plan against
-the model configuration, and exercises bounded scheduler and expert controls.
-It never compiles kernels, loads checkpoint weights, or initializes an NPU.
-These HOST checks validate the relocation and cannot establish device numerics,
-communication, full-network accuracy, HBM residency, or performance.
+`prefill_grouped_output` and the paged sparse core capture explicit TP values
+in builders instead of module-level command-line state. L1/L3 fixed-ID wrappers
+and all six misleading Decode facades were removed. L0/L2 files retain their
+actual computations and references, with the generic complete-layer CLI as the
+single execution interface. No Decode execution claim has been added.
 
-Original A3 independent-layer acceptance remains evidence for its exact source,
-inputs, and topology. A fresh device run of this relocated package remains
-necessary before making an equivalent acceptance claim for this branch.
+| Native helper | Retained purpose and caller |
+| --- | --- |
+| `hc_pre_runtime` | Explicit native HC-pre boundary used by `prefill_mhc_ffn_staged.EcotechMhcFfnStaged.execute`; not selected by the default complete-network builder |
+| `prefill_hc_full2_runtime` | Optional explicit HC capture boundary; no maintained main-path importer |
+| `qli_runtime`, `prefill_qli_full2_runtime`, `qli_boundary` | Explicit native QLI capture/contract tools; no default complete-network importer |
+| `norm_runtime`, `projection_runtime` | Explicit native norm/projection capture tools; no maintained main-path importer |
+| `bf16_linear_native.register` | Opt-in BF16 custom-op reference instrumentation; no maintained model caller or automatic registration |
+
+These helpers require their own explicit native configuration and dependencies.
+They are not exported as a Decode forward or silently selected as a numerical
+fallback. Their historical provenance remains in `source_manifest.json`.
+Actual product transport remains `moe_transport.py` with ctypes CANN/HCCL
+bindings; no custom product C++ translation unit is missing.
+
+## Provenance and correctness checks
+
+- `source_manifest.json` is the immutable original export identity. Its file set
+  and hashes describe that export, including modules subsequently consolidated.
+- `source_refactor_map.json` maps original definitions/facades to maintained
+  owners and documents API/configuration changes.
+- `maintenance_baseline.json` records the explicitly reviewed post-refactor
+  definitions. `python -m models.deepseek_v4_1_flash_a3.audit_source` checks this
+  optional identity baseline. Use `--original-root /path/to/exported-checkout`
+  to verify the original snapshot against the original source manifest.
+- `python -m models.deepseek_v4_1_flash_a3.validate` checks ongoing model/import,
+  scheduler, ownership and runtime-configuration contracts without historical
+  AST locks. Operator `golden.run` entries check numerical behavior.
+- `audit_task.audit_task_release` and `audit_task.audit_task_continuation` retain
+  original release and continuation receipt checks as opt-in historical audits;
+  the public network entry does not require them.
+
+The maintenance checks do not establish device numerics, communication,
+full-network accuracy, HBM residency or performance. Original A3 independent-layer
+acceptance remains evidence for its exact source, inputs and topology. New device
+precision regressions are required before making that claim for maintained code.

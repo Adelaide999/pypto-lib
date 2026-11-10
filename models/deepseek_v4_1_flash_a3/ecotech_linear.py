@@ -13,7 +13,7 @@ import math
 import torch
 import pypto.language as pl
 
-from .ops import make_dequantize, make_dot, make_pack_weight, make_quantize
+from .linear_primitives import make_dequantize, make_dot, make_pack_weight, make_quantize
 
 
 def prepare_ecotech_dynamic_weight(weight_nk, source_scale, source_offset):

@@ -10,7 +10,9 @@
 import pypto.language as pl
 from .prefill_layer2_c1c2 import HEAD_DIM, INDEX_WIDTH, make_fp32_projection
 from .prefill_cache_publish import make_compressed_cache_publish
-from .ops import VEC_M_TILE, N_TILE, make_norm, make_rope, make_dequantize, make_dot, make_pack_weight, make_quantize
+from .linear_primitives import VEC_M_TILE, N_TILE, make_dequantize, make_dot, make_pack_weight, make_quantize
+from .rmsnorm import make_blocked_rmsnorm as make_norm
+from .norm_rope import make_adjacent_rope as make_rope
 from .compressor_core import RING_ROWS_DYN
 from .prefill_c2_pool import compressor_ratio2_prefill
 from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN

@@ -10,7 +10,8 @@
 
 import pypto.language as pl
 
-from .ops import M_TILE, K_TILE, N_TILE, make_rope, make_quantize, make_pack_weight, make_dot, make_dequantize
+from .linear_primitives import M_TILE, K_TILE, N_TILE, make_quantize, make_pack_weight, make_dot, make_dequantize
+from .norm_rope import make_adjacent_rope as make_rope
 
 
 def make_o_proj_inline(capacity, config):

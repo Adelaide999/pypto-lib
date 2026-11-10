@@ -6,10 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Validate relocated source identities and bounded HOST controls without device imports."""
+"""Validate import contracts, model roles and bounded HOST controls without device imports."""
+
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
 
 import ast
-import hashlib
 import json
 from pathlib import Path
 
@@ -27,35 +33,10 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-class _ComputeIdentity(ast.NodeTransformer):
-    """Exclude documentation and retain all source computation and ABI expressions."""
-
-    def generic_visit(self, node):
-        node = super().generic_visit(node)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
-            if node.body and isinstance(node.body[0], ast.Expr):
-                value = node.body[0].value
-                if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                    node.body = node.body[1:]
-        if hasattr(node, "type_params") and not node.type_params:
-            del node.type_params
-        return node
-
-
-def _definitions(tree):
-    result = {}
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            value = ast.dump(_ComputeIdentity().visit(node), include_attributes=False)
-            result[node.name] = hashlib.sha256(value.encode()).hexdigest()
-    return result
-
-
 def check_sources():
-    """Resolve the complete local import DAG and check every original definition."""
-    manifest = json.loads((ROOT / "source_manifest.json").read_text(encoding="utf-8"))
+    """Resolve the maintained local import DAG independently of migration identities."""
     modules = {path.stem: path for path in ROOT.glob("*.py")}
-    graph, definitions = {}, 0
+    graph = {}
     for name, path in modules.items():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=path.name)
         graph[name] = set()
@@ -83,16 +64,18 @@ def check_sources():
 
     for name in graph:
         visit(name)
-    for record in manifest["files"]:
-        path = ROOT / record["target"]
-        actual = _definitions(ast.parse(path.read_text(encoding="utf-8")))
-        require(actual == record["definition_sha256"], "Changed numerical definition: " + path.name)
-        definitions += len(actual)
-    require(set(modules) == {Path(row["target"]).stem for row in manifest["files"]} | {"validate"},
-            "Manifest and packaged source closure differ")
-    require(not (ROOT / "grouped_output.py").exists() and (ROOT / "prefill_grouped_output.py").exists(),
-            "The dedicated grouped Prefill kernel needs its filename prefix")
-    return dict(modules=len(modules), preserved_source_modules=len(manifest["files"]), preserved_definitions=definitions)
+    exports = ast.parse((ROOT / "__init__.py").read_text(encoding="utf-8"))
+    mapping = next(node.value for node in exports.body if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "_EXPORTS" for target in node.targets))
+    for public, (module, symbol) in ast.literal_eval(mapping).items():
+        require(module in modules, "Missing public module: " + public)
+        tree = ast.parse(modules[module].read_text(encoding="utf-8"))
+        defined = {node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef))}
+        defined.update(target.id for node in tree.body if isinstance(node, (ast.Assign, ast.AnnAssign))
+                       for target in ast.walk(node) if isinstance(target, ast.Name) and isinstance(target.ctx, ast.Store))
+        require(symbol in defined, "Missing public symbol: " + public)
+    return dict(modules=len(modules), import_graph="acyclic", public_exports=len(ast.literal_eval(mapping)))
+
 
 
 def check_layer_plan():
@@ -162,9 +145,34 @@ def check_controls():
     return dict(expert_topologies=len(topologies), experts=384, scheduling_requests=16, scheduling_active_rows=128)
 
 
+
+def check_runtime_configuration():
+    """Check TP import independence and reject ambiguous physical-device mappings."""
+    import importlib
+    import sys
+    from . import runtime_config
+
+    original = sys.argv
+    try:
+        sys.argv = ["unrelated-tool", "--tp", "not-an-integer"]
+        runtime = importlib.reload(runtime_config)
+        require(not hasattr(runtime, "TP_SIZE"), "TP must not be frozen at import time")
+        require([runtime.validate_tp(tp) for tp in (4, 1, 2, 4)] == [4, 1, 2, 4],
+                "Explicit TP specializations depend on import order")
+    finally:
+        sys.argv = original
+    for tp in (True, 0, 3, 8, "4"):
+        _reject(lambda value=tp: runtime.validate_tp(value), "Invalid TP accepted")
+    require(runtime.validate_devices(["2", "0"], world=2) == ["2", "0"], "Device order was changed")
+    for devices in ([0, 0], [0, "00"], [0, -1], [True, 1], [0], "0,1"):
+        _reject(lambda value=devices: runtime.validate_devices(value, world=2), "Invalid device mapping accepted")
+    return dict(tp="explicit_per_builder", import_argv="ignored", device_mapping="explicit_and_unique")
+
+
 def main():
     """Publish a bounded HOST result without claiming numerical device acceptance."""
     result = dict(source=check_sources(), layer_plan=check_layer_plan(), controls=check_controls(),
+                  runtime_configuration=check_runtime_configuration(),
                   device_initialization="not_run", compilation="not_run", NPU_numerics="not_run")
     print(json.dumps(result, sort_keys=True))
 
