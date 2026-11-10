@@ -27,7 +27,11 @@ def make_network_layer_entries(provider, config, topology, layer_id):
     geometry = provider.runtime_geometry()
     batch = provider.batch_for_layer(layer_id)
     total = max(sum(record["SP_valid_rows"] for record in records) for records in batch["cases"].values())
-    expert_capacity = max(16, (total + 15) // 16 * 16)
+    # One expert can receive every valid token once; SP shards partition each DP chunk.
+    bound = geometry["capacity"] * topology["dp"]
+    if total > bound:
+        raise ValueError("Actual routed token rows exceed the compiled per-DP chunk capacity")
+    expert_capacity = max(16, (bound + 15) // 16 * 16)
     entries = make_prefill_layer_entries(
         geometry["capacity"], config, expert_capacity, layer_id,
         geometry["cache_blocks"], geometry["requests"], geometry["table_pages"],

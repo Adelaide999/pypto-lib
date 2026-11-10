@@ -560,7 +560,7 @@
       "make_output_vocab_unpack": "30c765651d0644662720f11f57751cee4dbe645abc1195cf2aeba8d7c94438cf"
     },
     "prefill_program.py": {
-      "make_network_layer_entries": "db158477e9a183d3c2ed2a20688a28c22abca8d3d895570c91a73a196bc7f6fb",
+      "make_network_layer_entries": "7e8656442a4d9396eb71675be6c8e0fa873493fc86913c60e971f454cdf79e2f",
       "PrefillProgram": "df4c8d21a00e96077ccf9b4c7c6a97d87f2538b420e719430a432dfa394ae251"
     },
     "prefill_qkv_swa.py": {

@@ -201,8 +201,8 @@ result = run_prefill(
 
 Each continuation has `inputs`, `contract`, and `metadata_sources`. `inputs`
 uses the same token contract and optional prepared backbone boundary as the
-first chunk. Its input
-contract must have the next integer `epoch` (1, 2, 3, ...) and a
+first chunk. Its input contract must have the next integer `epoch`
+(1, 2, 3, ...) and a
 `predecessor_input_sha256` matching the immediately preceding completed chunk.
 The numerical configuration, model and topology stay fixed. The optional
 checkpoint override applies to the entire stream.
@@ -216,6 +216,12 @@ The same weight provider, raw KV backing, shared index state, Engram history
 and retained Engram tables span the entire stream. An execution failure stops
 iteration; later chunks are not loaded. This does not change the weight-loading
 policy or establish that all weights reside in HBM.
+
+The compiled routed-expert capacity uses the full per-DP token bound, not
+the current chunk's valid-row count. Partial and empty chunks therefore
+retain the same expert slab shape and compiled ABI. Actual valid counts
+still control each expert computation. Cache, request and table geometry
+must remain compatible with the compiled program.
 
 The iterable can load or prepare its next item lazily after the preceding
 chunk returns. First-chunk outputs retain their original location; subsequent
