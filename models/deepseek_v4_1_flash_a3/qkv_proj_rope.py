@@ -8,6 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """A2 single-layer dependencies extracted from the shared model operators."""
 
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
+
 from math import gcd
 
 import pypto.language as pl
@@ -201,7 +208,7 @@ def bf16_projection_golden_cases():
                    golden_fn=golden_bf16_projection, compare_fn={"output": golden_prefix_compare(active)})
 
 
-def validate_bf16_projection(*, device=0, compile_only=False):
+def validate_bf16_projection(*, device=0, compile_only=False, platform="a2a3", sim=False):
     """Run bounded owning projection cases through the Golden Harness."""
     from golden import run
 
@@ -209,7 +216,7 @@ def validate_bf16_projection(*, device=0, compile_only=False):
         name = case.pop("name")
         result = run(
             **case,
-            config={"platform": "a2a3", "device_id": device},
+            config={"backend_type": platform, "execution_mode": sim, "device_id": device},
             compile_only=compile_only,
         )
         if not result.passed:
@@ -220,7 +227,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=("a2a3",), default="a2a3")
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
-    validate_bf16_projection(device=args.device, compile_only=args.compile_only)
+    validate_bf16_projection(device=args.device, compile_only=args.compile_only, platform=args.platform, sim=args.sim)

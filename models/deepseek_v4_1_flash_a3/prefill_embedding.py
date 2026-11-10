@@ -8,6 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Look up vocabulary shards and initialize sequence-parallel HC streams."""
 
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
+
 import pypto.language as pl
 
 
@@ -220,7 +227,7 @@ def embedding_golden_cases(checkpoint=None):
                    fn=make_initial_hc(capacity, hidden, hc_mult), specs=specs, golden_fn=golden_initial_hc)
 
 
-def validate(*, device=0, compile_only=False, checkpoint=None):
+def validate(*, device=0, compile_only=False, checkpoint=None, platform="a2a3", sim=False):
     """Run exact embedding and HC initialization boundaries through Golden Harness."""
     from golden import run
 
@@ -229,7 +236,7 @@ def validate(*, device=0, compile_only=False, checkpoint=None):
         name = case.pop("name")
         result = run(
             **case,
-            config={"platform": "a2a3", "device_id": device},
+            config={"backend_type": platform, "execution_mode": sim, "device_id": device},
             compile_only=compile_only,
             rtol=0.0,
             atol=0.0,
@@ -246,11 +253,13 @@ if __name__ == "__main__":
     from pathlib import Path
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=("a2a3",), default="a2a3")
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
-    records = validate(device=args.device, compile_only=args.compile_only, checkpoint=args.checkpoint)
+    records = validate(device=args.device, compile_only=args.compile_only, checkpoint=args.checkpoint, platform=args.platform, sim=args.sim)
     if args.report is not None:
         args.report.write_text(json.dumps(dict(compile_only=args.compile_only, cases=records), indent=2) + "\n")

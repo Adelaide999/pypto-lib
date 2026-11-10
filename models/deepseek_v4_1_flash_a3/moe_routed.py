@@ -7,6 +7,13 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 MoE routed expert with BF16 W2 output and FP32 weighted routes."""
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
+
 import os
 
 import pypto.language as pl
@@ -467,15 +474,19 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--sim", action="store_true")
+    parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
 
     result = run(
         fn=expert_routed_test,
+        compile_only=args.compile_only,
         specs=build_tensor_specs(),
         golden_fn=golden_expert_routed,
         config=dict(
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.platform.removesuffix("sim"),
+            execution_mode=args.sim or args.platform.endswith("sim"),
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

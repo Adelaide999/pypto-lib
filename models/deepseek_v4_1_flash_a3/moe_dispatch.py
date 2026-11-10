@@ -8,6 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Pack EP route payloads, unpack owned expert slabs, and stage returned results."""
 
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
+
 import pypto.language as pl
 
 
@@ -250,7 +257,7 @@ def golden_ep_return_pack(tensors):
             tensors["sent_hidden"][packet] = tensors["expert_y"][source]
 
 
-def validate_ep_dispatch(*, device=0):
+def validate_ep_dispatch(*, device=0, compile_only=False, platform="a2a3", sim=False):
     """Validate packing, received expert layout, empty buckets, and return gathering."""
     import torch
     from golden import ScalarSpec, TensorSpec, run
@@ -274,10 +281,11 @@ def validate_ep_dispatch(*, device=0):
                 ScalarSpec("source_rank", torch.int32, 0),
             ]
             result = run(
+                         compile_only=compile_only,
                 fn=make_ep_dispatch_pack(capacity, hidden, experts, topk, world),
                 specs=pack_specs,
                 golden_fn=golden_ep_dispatch_pack,
-                config={"platform": "a2a3", "device_id": device},
+                config={"backend_type": platform, "execution_mode": sim, "device_id": device},
                 rtol=0.0,
                 atol=0.0,
             )
@@ -303,10 +311,11 @@ def validate_ep_dispatch(*, device=0):
                 ScalarSpec("owner_rank", torch.int32, 0),
             ]
             result = run(
+                         compile_only=compile_only,
                 fn=make_ep_dispatch_unpack(capacity, hidden, experts, topk, world),
                 specs=unpack_specs,
                 golden_fn=golden_ep_dispatch_unpack,
-                config={"platform": "a2a3", "device_id": device},
+                config={"backend_type": platform, "execution_mode": sim, "device_id": device},
                 rtol=0.0,
                 atol=0.0,
             )
@@ -324,10 +333,11 @@ def validate_ep_dispatch(*, device=0):
                 TensorSpec("sent_hidden", [packet_rows, hidden], torch.bfloat16, init_value=0.0),
             ]
             result = run(
+                         compile_only=compile_only,
                 fn=make_ep_return_pack(capacity, hidden, experts, topk, world),
                 specs=return_specs,
                 golden_fn=golden_ep_return_pack,
-                config={"platform": "a2a3", "device_id": device},
+                config={"backend_type": platform, "execution_mode": sim, "device_id": device},
                 rtol=0.0,
                 atol=0.0,
             )
@@ -409,5 +419,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=("a2a3",), default="a2a3")
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    validate_ep_dispatch(device=parser.parse_args().device)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
+    validate_ep_dispatch(device=args.device, compile_only=args.compile_only, platform=args.platform, sim=args.sim)
