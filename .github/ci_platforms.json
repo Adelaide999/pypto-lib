@@ -1,5 +1,6 @@
 {
   "examples/": ["a2a3", "a5"],
+  "models/deepseek_v4_1_flash_a2/": ["a2a3"],
   "models/deepseek_v4_1_flash/": ["a5"],
   "models/deepseek_v4_flash_dspark/": ["a2a3"],
   "models/deepseek_v4_flash_lowlat/": ["a2a3"],

@@ -11,7 +11,7 @@ source artifact. Physical L14, L15, L19, L20, L21, L24 and L25 have also passed 
 independent complete-layer acceptance and required impact regressions at
 DP2/TP2/EP4. These seven deliveries preserve all 384 experts, 96 per rank,
 Top6, and the matching CP/SP, quantization, cache and shared-expert modes.
-Together with L0–L3 they complete the eleven independent-layer targets.
+Together with L0鈥揕3 they complete the eleven independent-layer targets.
 Each delivery remains bound to its own actual source, inputs, initial state,
 independent reference and topology. The retained L14 EP16 failures keep their
 original status. EP4 success does not establish EP16 whole-network acceptance.
@@ -585,3 +585,24 @@ index preparation. Layer20 publishes all visible eight-key candidate blocks
 requiring candidate pruning, request eviction and multi-request automatic
 scheduling are outside this bounded path.
 
+
+### Shared-expert precision and compiler reuse
+
+The fused shared expert retains FP32 channel scaling through gate/up and down
+rather than inserting the routed expert's FP16 channel boundary. The routed
+expert keeps its previous default, and standalone BF16 activation is unchanged.
+The selected repair comes from candidate
+`34dd9543a59808bb07e55e3efa11c29dfa036361`; its original localized A3 report
+matched 10240/10240 elements bit for bit. The alternative candidate is not
+stacked with it. This localized result does not establish repaired full-layer
+or complete-network accuracy on this publication branch.
+
+The network compiler validates model constants, topology, cache layout and
+Engram geometry before reusing a program across chunks. Unchanged chunks
+reuse stage bindings directly without reconstructing and specializing all
+forty layers. Changed compile-time geometry is rejected before execution.
+`compile_seconds` measures PyPTO IR/PTO/C++ generation; device binary building
+and first-call initialization belong to the runtime and are not included in
+that number. Checkpoint loading and complete first-token latency must be
+measured separately on the allocated device group. Neither CPU code generation
+nor the IR deduplication count establishes a ten-minute end-to-end bound.

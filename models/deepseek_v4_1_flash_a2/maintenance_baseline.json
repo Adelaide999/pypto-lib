@@ -138,9 +138,7 @@
       "make_bf16_linear": "efd8ca661a83892fe3d0b31268652dcd99ec023d8467c3c5fff1dc589c9b1026",
       "make_fp32_linear": "24ff8cf3e0a8bdcf4a6117ca158ae6b0966e8117098cb2701b664a3db8a0a4ac"
     },
-    "grouped_output.py": {
-      "prefill_grouped_output": "72f9407c46b3f1bd059bdf25140ca6591c934a206bd0f88505c5291bcfcb753c"
-    },
+    "grouped_output.py": {},
     "hc.py": {
       "make_hc_collapse_inline": "72fd2e2d49a0a52b637f349f132e5fbce5235513718e4fdc4b1bc2ac0bdf425c",
       "make_hc_pre_inline": "6763ee3a9e37c8a112216028606f99eab31147cfc83ef8a804b930e5659960e2",
@@ -276,11 +274,11 @@
       "validate_moe_router": "e311b51ba601ab17d311cab49032abb2467b58e3fb2235085e32627a180d5249"
     },
     "moe_shared.py": {
-      "_make_shared_activation": "f403632b7ce45fb09764315800b95fa2fdc19483f6ebc064bf0ca453acd99998",
-      "make_shared_moe_w8a8_inline": "f2832f182d2d110b625cfdba116bd0d5bec9fa3ddeeaac9d5c5a1d3c794fc186",
-      "make_shared_moe_w8a8": "e5ab03c5cce8b39a2a1bf171c8a07dd64662dd6bfde7ddb22b76fc37580aa9fb",
-      "golden_shared_moe_w8a8": "3857c6cd9a915013a3ed7e21d38cac76f734b88b95596ec01eb31011e851f1ee",
-      "validate_shared_moe": "cf8d349aefb151bdb0d808eb333f70b1fd52b9e5353940ff90b952d64ca747c8"
+      "_make_shared_activation": "915917d1ff451eb1132a33054eb1bd2cce8daa20b541a467ae2851737f2a3d14",
+      "make_shared_moe_w8a8_inline": "4122d5cb731904b867c21579b9905ac67caab197fd84782ab6b6ce8722c539a7",
+      "make_shared_moe_w8a8": "4f129f510bcbb92464610ef18f4cd17d2cc84d23730afc5e4494c77dbbac3554",
+      "golden_shared_moe_w8a8": "6947fbe8941efc4cdec156f7fb39ca9a600a5da79f18958e41ed6be040543687",
+      "validate_shared_moe": "4f61ff9b014a3747d0e82109cf5339a648f2c598a318f3fb1465d9b1adb91f42"
     },
     "moe_transport.py": {
       "_check": "eb2ecace4e5dedcfc00b62cd7a05482dc52145b23d51bc81577d6ee7fa7ee638",
@@ -467,7 +465,7 @@
     },
     "prefill_layer.py": {
       "validate_prefill_ownership": "4d245cc59c6bdfb0144b6c48434e44f6d6d7e544b02aa72a22a64fee24f81630",
-      "make_prefill_layer_entries": "9eddcea97cabe87dfc647002dba160d30e8ec6197bf6bf51da3c2404ac7a9e1e",
+      "make_prefill_layer_entries": "e91d5e9b6af5f31b3af43aeefe85e30980c50a49b1727fee3e06be5fbc64bdb0",
       "run_prefill_layer_inmemory": "9fdc511f6de9181945cdcc7baffb085f9c354251a26dac78c6bb9581decce990",
       "run_prefill_network_inmemory": "894927b84785e32d5ab03d4c29bf8c023feedde1163a4ff62fcd38526a149c14",
       "run_prefill_layer": "60a90c3863f3aaea7143d6a381e52a39fd98ef7560fa9c6845bf68436211bc65",
@@ -524,7 +522,7 @@
     },
     "prefill_moe_ep.py": {
       "_prepare": "66fcfa1c7905c81112980bfa58dbb70ddba1419147c888419f8544f7a29da7d1",
-      "main": "0f8cd632edebf9b16fd8213de554307b389d73847cddc2003046503f8a7d45a4"
+      "main": "25e5cdedaa5bd87e5a658c0766101eb63df4d1a15b284d0f895dd51f89a1d941"
     },
     "prefill_network_cache.py": {
       "network_cache_geometry": "56f6476ac03d86e4253eda27b235acdb31d8e158d89ae7cc16fd010b227a9f67",
@@ -548,7 +546,7 @@
       "_pad": "091914f42013efa70273eb55810b65f8a79a5b211a64dc4ab47c60e663943a9a",
       "_check_constants": "53cf719453cfec24eeb54eae4ecd748a437e29570970bfad8d58651cb29693e8",
       "PreparedNetworkEngram": "b0dafb9c608e3b8ab9ab506752087af80590bddeb6b1efec8400613de8fe8a13",
-      "prepare_network_engram": "4be1bf92f4fe278556250dccfdad846da43ed327111097a01f6cbc4a100b51e8"
+      "prepare_network_engram": "7e012df92955123c99f663ed7fc2ed7b95e624eefc8c52543f3ba18d71397f58"
     },
     "prefill_network_guard.py": {
       "build_state_regions": "d529961d7e978b19eb3aaa956ed9ce66f5bb741d5f032deae8818e8891924831",
@@ -563,14 +561,14 @@
       "NetworkWeights": "6f2beb327719ea68f8ed651eeb502139934636fbd52c0c41f58504bf27d8bd87",
       "network_parameter_abi": "111f274aec7122897a4e9519c7d37a4de5ca23487af0c3a2a4182a8e5592c1cc",
       "network_argument_protection": "ea3bdae8aa46f40029aaac6e988f2edf17bb8249ba0b03e541c53ca4b57ac2a2",
-      "NetworkExecutor": "dbd4b27b1898926cca10c9d17174b163e9c63fb39593889970f776d12a8ab0ee",
+      "NetworkExecutor": "37f48c0b23e16b14d138e655e97bcc7b38f00da74dfb2e021a0b4aa95a6d5abc",
       "load_product_backbone_input": "6cc4e6b044822ddb7989b3e0f6f062856e4e0061c586d0305c3411a7e78c2dba",
-      "embed_network_input": "7a07e569c1a8758264144a9e270c778c2996755d0ddd86e9161d7b94a84af805",
-      "run_output_boundary": "535573d941744e1412e03dc3806a9f332e5b4fdf6b449ad04f97659759d49d24",
+      "embed_network_input": "43e0647ecdb3abb721af39a820ce2986175f10fbed2c5d7b912a61f1195b6fba",
+      "run_output_boundary": "2bdc8fdfe3858e280004f275857d394e65cdb9f766f4fb1fc638a5d494563a20",
       "_network_owner_snapshot": "fa95779090b7a6f9d9dc6b2805cfdcbb69a04ff09b8e345c8a1aacb5a42b82b3",
       "prepare_network_provider": "d7efcb57f453a4afed15c7531996817c4e69cd6e6fe2576cf4920ed4a339c629",
       "run_network_runtime": "1e2d4b7da777bc8b909f81444577266e82d3290a3fb33615e774d5d5a8fa7c0d",
-      "_run_network_chunk": "bb06c42119b30c8c1005c266740c32e7d990f8de55e7e5ed09d01f2a5132eddd"
+      "_run_network_chunk": "0fb5307027b642fd6067ab90d598475b57078b6a24b47d4b3b3100ccbccd720f"
     },
     "prefill_network_shared_observer.py": {
       "require": "313409857c78ee3b13cb621d7c3a2a2e2f6a9b853025c83483ed51f4c1cbdacb",
@@ -608,8 +606,10 @@
       "validate_host": "b3b54fda7e6c840da8d5fed373c3b5f9ca69b1e4948925ba25413feaf001127f"
     },
     "prefill_program.py": {
-      "make_network_layer_entries": "7e8656442a4d9396eb71675be6c8e0fa873493fc86913c60e971f454cdf79e2f",
-      "PrefillProgram": "df4c8d21a00e96077ccf9b4c7c6a97d87f2538b420e719430a432dfa394ae251"
+      "network_layer_geometry": "e8121f445f13ba4fd4c1f2c154827ce1b2b59c0768502cac35354822008f19ee",
+      "make_network_layer_entries": "d3bbb555c1ba2201e70c718f5959c27adab668b249d97aab77a24399fce9b536",
+      "_compile_signature": "cda34ebbf775518fee727cce64bfd93f85422c99237f672d05b70dbdb6ba842f",
+      "PrefillProgram": "b45ebfc8dafa6f3553707da1f3ec54f96e9c95934c0fc22884d2b0ce31bf99ed"
     },
     "prefill_qkv_swa.py": {
       "make_prefill_swa": "af04e048c825cc9dcdf4256574cb274c8a3f7a5e20ef53c9a422a88bfeab4a97"
@@ -629,7 +629,7 @@
     },
     "prefill_swa.py": {
       "prepare_product_operands": "6d1e55f087f0da87f35761c23d39e33c027eda65376b8856bfa064470e5bffd0",
-      "make_builders": "685a6191db9e4c26fde09f71ea122063ba75243ef12a2aabc404422a48b19a0d"
+      "make_builders": "4554bd50dfbbaab52f618b2e2a7e91099c9781cd9df668ce8de3a08591fece40"
     },
     "projection_runtime.py": {
       "fp32_compressor_projection_host": "0046c8b1e97848becc12f69f031753c0ad23326f43560adf9aa9557ed325a1aa",

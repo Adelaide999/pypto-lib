@@ -77,7 +77,7 @@ def make_prefill_layer_entries(
         final_unpack=make_sp_gather_unpack(capacity, 20480, tp),
         pre_unpack=make_sp_gather_unpack(capacity, 4, tp, pl.FP32, 4),
         router=make_moe_router(capacity, config, pl.FP32),
-        shared=make_shared_moe_w8a8(capacity, config, fused_activation=True),
+        shared=make_shared_moe_w8a8(capacity, config, fused_activation=True, fused_channel_dtype=pl.FP32),
         routed=make_shared_moe_w8a8(expert_capacity, config, fused_activation=True),
         dispatch_pack=make_ep_dispatch_pack(capacity, 5120, 384, 6, ep),
         dispatch_unpack=make_ep_dispatch_unpack(capacity, 5120, 384, 6, ep, expert_capacity),

@@ -211,12 +211,12 @@ def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_la
         prefix, slot = engram_owner(own_contract, layer_id, resolve_layer_role(layer_id))
         directory = output / f"layer-{layer_id}"
         (directory / "captures").mkdir(parents=True)
-        functions = make_prefill_engram_entries(capacity, constants, config, own_contract["engram_shards"],
-                                                history.cache_rows, max_blocks, tp)
         entries = {}
-        if "compile_entries" in runtime:
-            entries = runtime["compile_entries"](f"engram{layer_id}", functions)
+        if "entries_for_stage" in runtime:
+            entries = runtime["entries_for_stage"](f"engram{layer_id}")
         else:
+            functions = make_prefill_engram_entries(capacity, constants, config, own_contract["engram_shards"],
+                                                    history.cache_rows, max_blocks, tp)
             for name, function in functions.items():
                 if name.startswith("engram_lookup_") or name not in shared_entries:
                     entry = Executable(function, directory / "compiled" / name, diagnostics=runtime.get("diagnostics", True))
@@ -228,6 +228,13 @@ def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_la
         rotation, rotation_receipt = load_rotation(contract["checkpoint"], 5120)
 
         def execute(name, rank, case, arguments, outputs, roles, *, entries=entries, directory=directory):
+            if not runtime.get("diagnostics", True):
+                from pypto.backend import BackendType
+                from pypto.runtime import ExecutionMode, RunConfig
+
+                run = RunConfig(arch=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD, device_id=rank)
+                entries[name].compiled(*arguments, config=run)
+                return
             capture = directory / "captures" / f"rank-{rank}-{case}-{name}-{len(reports[rank]['kernels'])}.pt"
             entries[name].execute(arguments, outputs, rank, roles, capture, reports[rank], memory)
 

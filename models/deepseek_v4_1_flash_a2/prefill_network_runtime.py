@@ -21,7 +21,6 @@ from pypto.backend import BackendType
 from pypto.runtime import ExecutionMode, RunConfig
 
 from .prefill_layer import run_prefill_network_inmemory
-from .prefill_embedding import make_input_entries
 from .prefill_layer_state import resolve_layer_role
 from .prefill_network_cache import attach_network_cache_geometry
 from .prefill_network_engram import prepare_network_engram
@@ -31,8 +30,7 @@ from .prefill_network_discrete_observer import (
 from .prefill_network_guard import NetworkStatePreservation
 from .prefill_network_state import NetworkCacheProvider
 from .prefill_network_input import run_input_boundary
-from .prefill_output import make_output_entries
-from .prefill_program import PrefillProgram, make_network_layer_entries
+from .prefill_program import PrefillProgram, network_layer_geometry
 from .prefill_swa import prepare_product_operands
 from .runtime_config import ExpertParallelConfig
 from .runtime_utils import communicate, file_sha, loaded_source_files, tensor_sha, write_json
@@ -276,15 +274,13 @@ class NetworkExecutor:
                     raise RuntimeError("Actual network HCCL group precheck failed: " + group)
 
     def for_layer(self, layer_id):
-        definitions, geometry, expert_capacity = make_network_layer_entries(
-            self.provider, self.config, self.topology, layer_id,
-        )
+        geometry, expert_capacity = network_layer_geometry(self.provider, self.topology, layer_id)
         batch = self.provider.batch_for_layer(layer_id)
         if self.current_layer != layer_id:
             self.current_entries = None
             directory = self.output / f"{self.namespace}-layer{layer_id}"
             directory.mkdir(exist_ok=False)
-            self.current_entries = self.program.bind(f"layer{layer_id}", definitions)
+            self.current_entries = self.program.entries_for_stage(f"layer{layer_id}")
             self.entry_abis = {name: network_parameter_abi(entry.compiled)
                                for name, entry in self.current_entries.items()}
             for name, entry in self.current_entries.items():
@@ -365,10 +361,13 @@ def embed_network_input(input_contract, weights, executor, config, output):
     """Run the shared vocabulary lookup and initial HC directly into the backbone."""
     directory = Path(output)
     directory.mkdir(exist_ok=False)
-    entries = executor.program.bind("embedding", make_input_entries(executor.provider.capacity, config,
-                                                                   executor.topology["tp"]))
+    entries = executor.program.entries_for_stage("embedding")
 
     def execute(name, rank, arguments, outputs):
+        if not executor.diagnostics:
+            run = RunConfig(arch=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD, device_id=rank)
+            entries[name].compiled(*arguments, config=run)
+            return
         readonly = [(index, tensor_sha(value)) for index, value in enumerate(arguments)
                     if isinstance(value, torch.Tensor) and all(value is not out for out in outputs.values())]
         capture = directory / f"rank-{rank}-{name}.pt"
@@ -406,7 +405,7 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
     capacity, world, tp = executor.provider.capacity, topology["ep"], topology["tp"]
     directory = Path(output)
     directory.mkdir(exist_ok=False)
-    entries = executor.program.bind("output", make_output_entries(capacity, config, tp))
+    entries = executor.program.entries_for_stage("output")
     norm = weights.reader.load("norm.weight")
     head = weights.reader.load("head.weight")
     if norm.dtype != torch.bfloat16 or head.dtype != torch.bfloat16 or tuple(head.shape) != (config["vocab_size"], 5120):
@@ -695,7 +694,7 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
                        stage_namespace=namespace + "-engram", output=output / "engram", reports=reports,
                        memory=memory, exchange=executor.exchange, capture_nodes=False, capture_state=diagnostics,
                        diagnostics=diagnostics, observe_discrete=observe_engram if diagnostics else None,
-                       compile_entries=program.bind)
+                       entries_for_stage=program.entries_for_stage)
     prepared_engram = prepare_network_engram(
         common_engram, hash_batch, provider.history, engram_contracts, weights.raw_for_layer, eng_runtime,
         storage=table_storage, storage_stack=table_stack, storage_namespace=provider.allocation_id,

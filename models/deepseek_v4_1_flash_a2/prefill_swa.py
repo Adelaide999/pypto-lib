@@ -82,7 +82,7 @@ def prepare_product_operands(raw, layer_id=0, *, role=None):
 
 def make_builders(capacity=16, config=None, cache_blocks=2, *, tp=1):
     """Build twelve Prefill stages with explicit predecessor and cache buffers."""
-    from . import grouped_output as grouped
+    from . import prefill_grouped_output as grouped
     from . import qkv_proj_rope as shared
 
     config = dict(GEOMETRY) if config is None else config

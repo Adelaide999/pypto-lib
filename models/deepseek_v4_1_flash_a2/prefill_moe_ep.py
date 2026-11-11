@@ -22,6 +22,7 @@ import shlex
 import sys
 
 import torch
+import pypto.language as pl
 
 from .moe_combine import make_moe_combine
 from .moe_dispatch import MAP_PAD, make_ep_dispatch_pack, make_ep_dispatch_unpack, make_ep_return_pack
@@ -84,7 +85,8 @@ def main():
     routers = {controlled: _Executable(make_moe_router(capacity, dict(config, controlled_routing=controlled)),
                                       build / ("router-controlled" if controlled else "router-natural"))
                for controlled in (False, True)}
-    shared = _Executable(make_shared_moe_w8a8(capacity, config, fused_activation=True), build / "shared")
+    shared_compute = make_shared_moe_w8a8(capacity, config, fused_activation=True, fused_channel_dtype=pl.FP32)
+    shared = _Executable(shared_compute, build / "shared")
     expert_capacity = ((capacity * layout.ep + 15) // 16) * 16
     routed = _Executable(make_shared_moe_w8a8(expert_capacity, config, fused_activation=True), build / "routed")
     dimensions = [capacity, hidden, layout.experts, topk, layout.ep]

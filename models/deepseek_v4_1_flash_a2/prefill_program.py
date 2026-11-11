@@ -8,6 +8,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """Compile and reuse the existing A3 Prefill entries across all original layers."""
 
+from hashlib import sha256
+import json
+
 from pathlib import Path
 from time import perf_counter
 
@@ -19,11 +22,11 @@ from .prefill_layer import make_prefill_layer_entries
 from .prefill_layer_state import resolve_layer_role
 from .prefill_l2 import REGIONS, make_network_l2_entries
 from .prefill_output import make_output_entries
-from .runtime_utils import Executable, write_json
+from .runtime_utils import Executable, tensor_sha, write_json
 
 
-def make_network_layer_entries(provider, config, topology, layer_id):
-    """Build the exact layer specialization from its live cache and request geometry."""
+def network_layer_geometry(provider, topology, layer_id):
+    """Check the live routed row bound without rebuilding any operator IR."""
     geometry = provider.runtime_geometry()
     batch = provider.batch_for_layer(layer_id)
     total = max(sum(record["SP_valid_rows"] for record in records) for records in batch["cases"].values())
@@ -32,6 +35,13 @@ def make_network_layer_entries(provider, config, topology, layer_id):
     if total > bound:
         raise ValueError("Actual routed token rows exceed the compiled per-DP chunk capacity")
     expert_capacity = max(16, (bound + 15) // 16 * 16)
+    return geometry, expert_capacity
+
+
+def make_network_layer_entries(provider, config, topology, layer_id):
+    """Build the exact layer specialization from its validated request/cache geometry."""
+    geometry, expert_capacity = network_layer_geometry(provider, topology, layer_id)
+    batch = provider.batch_for_layer(layer_id)
     entries = make_prefill_layer_entries(
         geometry["capacity"], config, expert_capacity, layer_id,
         geometry["cache_blocks"], geometry["requests"], geometry["table_pages"],
@@ -39,6 +49,23 @@ def make_network_layer_entries(provider, config, topology, layer_id):
         role=resolve_layer_role(layer_id), network_cache=True,
     )
     return make_network_l2_entries(entries, geometry["capacity"]), geometry, expert_capacity
+
+
+def _compile_signature(provider, model_config, topology, engram_contracts):
+    """Freeze all compile-time geometry and constants, excluding token values and live cache bytes."""
+    def encode(value):
+        if hasattr(value, "dtype") and hasattr(value, "shape"):
+            return dict(shape=list(value.shape), dtype=str(value.dtype), sha256=tensor_sha(value))
+        raise TypeError("Unsupported compile-time configuration value: " + type(value).__name__)
+
+    batch = provider.hash_batch()
+    max_blocks = max(1, max(record["metadata"]["block_table"].shape[1]
+                           for records in batch["cases"].values() for record in records))
+    signature = dict(geometry=provider.runtime_geometry(), layouts=provider.layouts,
+        model=model_config, topology=topology, history_rows=provider.history.cache_rows, max_blocks=max_blocks,
+        engram={layer: {name: contract[name] for name in ("model_config", "hash_constants", "engram_shards")}
+                for layer, contract in engram_contracts.items()})
+    return sha256(json.dumps(signature, sort_keys=True, default=encode).encode()).hexdigest()
 
 
 class PrefillProgram:
@@ -87,8 +114,19 @@ class PrefillProgram:
         self.stages[stage] = entries
         return entries
 
+    def entries_for_stage(self, stage):
+        """Use a stage only after the complete program's compile-time signature has been admitted."""
+        if not self.ready or stage not in self.stages:
+            raise ValueError("The compiled network does not cover stage: " + stage)
+        return self.stages[stage]
+
     def compile(self, provider, model_config, topology, engram_contracts):
         """Compile embedding, forty complete layers, both Engram slots and the final head."""
+        signature = _compile_signature(provider, model_config, topology, engram_contracts)
+        if self.ready:
+            if signature != self._signature:
+                raise ValueError("The compiled network geometry or constants changed")
+            return self
         begin = perf_counter()
         text = dict(model_config["text_config"], image_sentinel_base_id=model_config["image_token_id"])
         geometry = provider.runtime_geometry()
@@ -110,6 +148,7 @@ class PrefillProgram:
                 )
                 self.bind(f"engram{layer}", definitions)
             self.bind("output", make_output_entries(geometry["capacity"], text, topology["tp"]))
+            self._signature = signature
             self.ready = True
         finally:
             self.prepare_seconds = perf_counter() - begin
@@ -123,5 +162,6 @@ class PrefillProgram:
                     l2_regions={name: [child for child, _ in steps] for name, steps in REGIONS.items()},
                     stages={stage: list(entries) for stage, entries in self.stages.items()},
                     unique_entries=len(self.records), stage_bindings=sum(map(len, self.stages.values())),
-                    compile_seconds=self.compile_seconds, prepare_seconds=getattr(self, "prepare_seconds", None),
+                    compile_seconds=self.compile_seconds, compile_phase="pypto_ir_pto_cpp_generation",
+                    device_binary_build_and_weight_loading="not_measured_here", prepare_seconds=getattr(self, "prepare_seconds", None),
                     entries=self.records, device_execution="not_run", numerical_acceptance="not_run")
