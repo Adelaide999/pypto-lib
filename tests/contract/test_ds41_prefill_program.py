@@ -17,8 +17,8 @@ pypto = pytest.importorskip("pypto")
 if getattr(pypto, "__pypto_stub__", False):
     pytest.skip("Real PyPTO IR is required", allow_module_level=True)
 
-from models.deepseek_v4_1_flash_a2 import prefill_program as pool
-from models.deepseek_v4_1_flash_a2.prefill_embedding import make_vocab_embedding
+from models.deepseek_v4_1_flash_a3 import prefill_program as pool
+from models.deepseek_v4_1_flash_a3.prefill_embedding import make_vocab_embedding
 
 
 def test_chunk_reuse_does_not_rebuild_ir_and_rejects_changed_constants(tmp_path, monkeypatch):
