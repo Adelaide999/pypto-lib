@@ -32,6 +32,7 @@ def pool_prefill(
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     num_state_blocks: pl.Scalar[pl.INT32],
     pair_ready: pl.Scalar[pl.TASK_ID],
+    pooled_output: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
 ):
     ring_rows = pl.tensor.dim(state_cache, 1)
     state_rows = num_state_blocks * ring_rows
@@ -82,6 +83,9 @@ def pool_prefill(
             current_weighted = pl.mul(current_kv, current_probability)
             pooled = pl.add(previous_weighted, current_weighted)
             pooled_bf16 = pl.cast(pooled, pl.BF16, mode="rint")
+            parity_value = pl.row_sum(parity)
+            pooled_masked = pl.row_expand_mul(pl.cast(pooled_bf16, pl.FP32), parity_value)
+            pooled_output[t:t + T_TILE, :] = pl.set_validshape(pl.cast(pooled_masked, pl.BF16), rows, HEAD_DIM)
             value = pl.cast(pooled_bf16, pl.FP32)
             square = pl.mul(value, value)
             square = pl.mul(pl.row_sum(square), 1.0 / HEAD_DIM)
@@ -111,12 +115,41 @@ def compressor_ratio2_prefill(
     state_ready: pl.Scalar[pl.TASK_ID],
 ):
     blocks = pl.cast(pl.tensor.dim(state_cache, 0), pl.INT32)
+    pooled_output = pl.create_tensor([pl.tensor.dim(kv_proj, 0), HEAD_DIM], dtype=pl.BF16)
     pool_tid = pool_prefill(
         kv_proj, score_proj, state_cache, position_ids, norm_weight, latent,
-        num_tokens, query_start_loc, token_to_req_indices, state_block_table, blocks, state_ready,
+        num_tokens, query_start_loc, token_to_req_indices, state_block_table, blocks, state_ready, pooled_output,
     )
     state_tid = compressor_state_write(
         kv_proj, score_proj, query_start_loc, position_ids, token_to_req_indices,
         state_block_table, state_cache, num_tokens, pool_tid,
     )
     return pool_tid, state_tid
+
+
+def make_c2_pool_observed(capacity, cache_blocks, requests):
+    """Pool complete request pairs and publish the actual FP32 ring with BF16 observations."""
+
+    @pl.jit
+    def c2_pool_observed(
+        kv: pl.Tensor[[capacity, HEAD_DIM], pl.FP32],
+        gate: pl.Tensor[[capacity, HEAD_DIM], pl.FP32],
+        starts: pl.Tensor[[requests + 1], pl.INT32],
+        positions: pl.Tensor[[capacity], pl.INT32],
+        request_ids: pl.Tensor[[capacity], pl.INT32],
+        blocks: pl.Tensor[[requests, 1], pl.INT32],
+        gamma: pl.Tensor[[HEAD_DIM], pl.BF16],
+        state: pl.InOut[pl.Tensor[[cache_blocks, 32, STATE_WIDTH], pl.FP32]],
+        pooled: pl.InOut[pl.Tensor[[capacity, HEAD_DIM], pl.BF16]],
+        normalized: pl.InOut[pl.Tensor[[capacity, HEAD_DIM], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        ready = pl.system.task_dummy(deps=[])
+        pooled_tid = pool_prefill(
+            kv, gate, state, positions, gamma, normalized,
+            active, starts, request_ids, blocks, cache_blocks, ready, pooled,
+        )
+        compressor_state_write(kv, gate, starts, positions, request_ids, blocks, state, active, pooled_tid)
+        return state, pooled, normalized
+
+    return c2_pool_observed

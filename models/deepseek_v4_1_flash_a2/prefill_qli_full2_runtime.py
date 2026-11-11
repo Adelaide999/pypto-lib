@@ -23,7 +23,7 @@ import torch
 
 from .runtime_utils import validate_device, file_sha as _sha
 from .qli_boundary import QLIContract, run_qli_native_boundary
-from .full2_readback_runtime import admit_readonly, save_readonly_device_inputs
+from .prefill_full2_readback_runtime import admit_readonly, save_readonly_device_inputs
 
 
 def _tensor_sha(value):

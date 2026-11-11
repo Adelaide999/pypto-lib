@@ -8,18 +8,18 @@
 # -----------------------------------------------------------------------------------------------------------
 """Full2 Prefill projection, pooling, indexing and device observation ports."""
 import pypto.language as pl
-from .layer2_c1c2 import HEAD_DIM, INDEX_WIDTH, make_fp32_projection
-from .c1c2 import make_compressed_cache_publish
+from .prefill_layer2_c1c2 import HEAD_DIM, INDEX_WIDTH, make_fp32_projection
+from .prefill_cache_publish import make_compressed_cache_publish
 from .ops import VEC_M_TILE, N_TILE, make_norm, make_rope, make_dequantize, make_dot, make_pack_weight, make_quantize
 from .compressor_core import RING_ROWS_DYN
-from .c2_prefill_pool import compressor_ratio2_prefill
+from .prefill_c2_pool import compressor_ratio2_prefill
 from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN
 from .qkv_proj_rope import make_bf16_projection_staged
-from .indexer import INDEX_HEADS, WEIGHT_ROWS_TILE, QUANT_ROWS_TILE
+from .prefill_indexer import INDEX_HEADS, WEIGHT_ROWS_TILE, QUANT_ROWS_TILE
 
 
 def make_wk_input_observed_inline(capacity):
-    project = make_bf16_projection_staged(HEAD_DIM, INDEX_WIDTH)
+    project = pl.jit.inline(make_bf16_projection_staged(HEAD_DIM, INDEX_WIDTH)._func)
 
     @pl.jit.inline
     def observe(
@@ -168,7 +168,7 @@ def make_indexer_projection_observed(capacity, config):
     dot = make_dot(capacity, latent, index_width)
     dequantize = make_dequantize(capacity, index_width)
     rotate = make_rope(capacity, INDEX_HEADS, INDEX_WIDTH, rope_width)
-    project_weights = make_bf16_projection_staged(hidden, INDEX_HEADS)
+    project_weights = pl.jit.inline(make_bf16_projection_staged(hidden, INDEX_HEADS)._func)
 
     @pl.jit
     def indexer_projection(

@@ -16,7 +16,7 @@ attention remain separate dependencies.
 
 import pypto.language as pl
 
-from .c1c2 import make_compressed_cache_publish
+from .prefill_cache_publish import make_compressed_cache_publish
 from .ops import VEC_M_TILE, make_norm, make_rope
 from .compressor_core import compressor_ratio2, RING_ROWS_DYN
 from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN
@@ -60,7 +60,7 @@ def make_fp32_projection(width, output_width):
 
 
 def make_indexer_cache_publish_128(capacity, blocks):
-    """Publish width-128 rows without the generic 256-wide quantizer assumption."""
+    """Publish width-128 rows with the historical reciprocal rounding boundary."""
     rows = blocks * 128
     QUANT_M_TILE = 16
 
@@ -127,7 +127,7 @@ def make_c2_index_publish_projected_inline(capacity, config, cache_blocks=2):
     """Pool projected FP32 rows, then normalize, rotate and publish caches."""
     pairs = config["qk_rope_head_dim"] // 2
     eps = config["rms_norm_eps"]
-    project_index = make_bf16_projection_staged(HEAD_DIM, INDEX_WIDTH)
+    project_index = pl.jit.inline(make_bf16_projection_staged(HEAD_DIM, INDEX_WIDTH)._func)
     norm_index = make_norm(capacity, INDEX_WIDTH, eps)
     rope_index = make_rope(capacity, 1, INDEX_WIDTH, config["qk_rope_head_dim"])
     rope_compressed = make_rope(capacity, 1, HEAD_DIM, config["qk_rope_head_dim"])
@@ -305,3 +305,23 @@ def make_layer2_c1c2(capacity, config):
         )
 
     return layer2_c1c2
+
+
+def make_c2_projection(capacity, hidden):
+    """Expose both full-width FP32 compressor projections from BF16 checkpoint operands."""
+    project = make_fp32_projection(hidden, HEAD_DIM)
+
+    @pl.jit
+    def c2_projection(
+        x: pl.Tensor[[capacity, hidden], pl.BF16],
+        wkv: pl.Tensor[[hidden, HEAD_DIM], pl.BF16],
+        wgate: pl.Tensor[[hidden, HEAD_DIM], pl.BF16],
+        kv: pl.InOut[pl.Tensor[[capacity, HEAD_DIM], pl.FP32]],
+        gate: pl.InOut[pl.Tensor[[capacity, HEAD_DIM], pl.FP32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        project(x, wkv, kv, active)
+        project(x, wgate, gate, active)
+        return kv, gate
+
+    return c2_projection

@@ -1,3 +1,11 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """Load and validate the prepared A2/A3 W8A8 tensor bundles."""
 
 from __future__ import annotations
@@ -7,6 +15,50 @@ from typing import Mapping
 from contextlib import contextmanager
 
 import torch
+
+from .runtime_utils import tensor_sha
+
+
+class CheckpointOperands:
+    """Read original sharded safetensors and record each consumed operand."""
+
+    def __init__(self, root):
+        import json
+
+        self.root = Path(root).resolve()
+        index = self.root / "quant_model_weights.safetensors.index.json"
+        self.index = json.loads(index.read_text())["weight_map"]
+        self.consumed = {}
+
+    def load(self, name):
+        """Load complete logical checkpoint bytes before any layout or dtype conversion."""
+        from safetensors import safe_open
+
+        path = self.root / self.index[name]
+        with safe_open(path, framework="pt", device="cpu") as source:
+            value = source.get_tensor(name)
+        self.consumed[name] = {
+            "file": path.name, "shape": list(value.shape), "dtype": str(value.dtype),
+            "selected_rows": None, "sha256": tensor_sha(value),
+        }
+        return value
+
+    def expert(self, prefix):
+        """Return canonical gate/up and down operands with the true channel scales."""
+        operands = {}
+        for stem in ("w1", "w2", "w3"):
+            for suffix in ("weight", "weight_scale", "weight_offset"):
+                operands[stem + "." + suffix] = self.load(prefix + "." + stem + "." + suffix)
+            if any(value != 0 for value in operands[stem + ".weight_offset"].reshape(-1).tolist()):
+                raise ValueError("W8A8 expert operands must have symmetric zero offsets")
+        w1, w3 = operands["w1.weight"], operands["w3.weight"]
+        gate_up = torch.cat((w1, w3), dim=0).transpose(0, 1).contiguous()
+        gate_scale = torch.cat((operands["w1.weight_scale"], operands["w3.weight_scale"])).flatten().float()
+        down = operands["w2.weight"].transpose(0, 1).contiguous()
+        down_scale = operands["w2.weight_scale"].flatten().float()
+        if gate_up.dtype != torch.int8 or down.dtype != torch.int8:
+            raise TypeError("Expert checkpoint weights must remain INT8")
+        return gate_up, gate_scale, down, down_scale
 
 
 def load_tensor_bundle(path: str | Path, required: Mapping[str, tuple[torch.dtype, tuple[int, ...]]] | None = None):
@@ -190,6 +242,7 @@ def open_layer0_moe(path: str | Path):
 
 
 __all__ = [
+    "CheckpointOperands",
     "load_layer0_output",
     "load_layer0_qkv",
     "load_layer0_router",

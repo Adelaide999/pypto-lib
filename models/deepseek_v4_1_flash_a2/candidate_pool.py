@@ -2,15 +2,15 @@
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """A2/A3 C1A candidate-block publication.
 
 The standalone A2 QLI leaf exposes a fixed 512-row score bucket.  This leaf
-reduces those scores in groups of eight rows and publishes the same sorted
-logical block IDs and counts that vLLM-Ascend passes to C1A reindex.
+reduces those scores in groups of eight rows and publishes the same score-ordered
+logical block IDs and compact counts that vLLM-Ascend passes to C1A reindex.
 """
 
 from __future__ import annotations
@@ -65,37 +65,35 @@ def make_candidate_block_pool(
                     POOL_CAPACITY,
                 )
                 lanes = pl.tile.arange(0, [1, POOL_CAPACITY], dtype=pl.INT32)
-                for lane in pl.range(POOL_CAPACITY):
-                    if lane >= visible_blocks:
-                        pl.tile.write(maxima, [0, lane], -1.0e30)
-                if visible_blocks > 0:
-                    # The newest causal block must remain a candidate even if
-                    # its score is below every historical block.
-                    pl.tile.write(maxima, [0, visible_blocks - 1], 1.0e30)
-                pairs = pl.tile.sort32(maxima, pl.reinterpret_view(lanes, pl.UINT32))
+                # Build masks and IDs with vector operations. Scalar tile writes
+                # can race the following sort on A3.
+                last_block = pl.cast(visible_blocks - 1, pl.INT32)
+                invalid = pl.minimum(pl.maximum(pl.sub(lanes, last_block), 0), 1)
+                one = pl.tile.full([1, POOL_CAPACITY], dtype=pl.INT32, value=1)
+                valid = pl.sub(one, invalid)
+                maxima = pl.add(pl.mul(maxima, pl.cast(valid, pl.FP32)),
+                                pl.mul(pl.cast(invalid, pl.FP32), -1.0e30))
+                delta = pl.sub(lanes, last_block)
+                distance = pl.maximum(delta, pl.mul(delta, -1))
+                pinned = pl.sub(one, pl.minimum(distance, 1))
+                maxima = pl.add(pl.mul(maxima, pl.cast(pl.sub(one, pinned), pl.FP32)),
+                                pl.mul(pl.cast(pinned, pl.FP32), 1.0e30))
+                logical_ids = pl.sub(lanes, pl.mul(pl.add(lanes, 1), invalid))
+                # Four 32-element runs are required by the A3 merge primitive.
+                sort_scores = pl.tile.full([1, 128], dtype=pl.FP32, value=-1.0e30)
+                sort_scores = pl.tile.assemble(sort_scores, maxima, [0, 0])
+                sort_ids = pl.tile.full([1, 128], dtype=pl.INT32, value=-1)
+                sort_ids = pl.tile.assemble(sort_ids, logical_ids, [0, 0])
+                sort_tmp = pl.tile.create([1, 256], dtype=pl.FP32)
+                unsigned_ids = pl.reinterpret_view(sort_ids, pl.UINT32)
+                pairs = pl.tile.sort32(sort_scores, unsigned_ids, tmp=sort_tmp)
                 pairs = pl.tile.mrgsort(pairs, block_len=64)
+                leading_pairs = pl.tile.slice(pairs, [1, 2 * POOL_CAPACITY], [0, 0])
                 sorted_ids = pl.tile.gather_mask(
-                    pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
+                    leading_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
                 )
-
-                # Sort the selected prefix by logical ID before publication.
-                # The vLLM pool uses this order so a consumer can expand blocks
-                # without carrying score order through the cache gather.
-                ordered_scores = pl.tile.full([1, POOL_CAPACITY], dtype=pl.FP32, value=-1.0e30)
-                ordered_ids = pl.tile.full([1, POOL_CAPACITY], dtype=pl.INT32, value=-1)
-                selected_count = pl.min(visible_blocks, POOL_CAPACITY)
-                for lane in pl.range(selected_count):
-                    block_id = pl.tile.read(sorted_ids, [0, lane])
-                    pl.tile.write(ordered_scores, [0, lane], -pl.cast(block_id, pl.FP32))
-                    pl.tile.write(ordered_ids, [0, lane], block_id)
-                ordered = pl.tile.sort32(
-                    ordered_scores, pl.reinterpret_view(ordered_ids, pl.UINT32)
-                )
-                ordered = pl.tile.mrgsort(ordered, block_len=64)
-                ordered_ids = pl.tile.gather_mask(
-                    ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
-                )
-                pl.store(ordered_ids, [token, 0], pool_block_ids)
+                # Native A3 preserves score order, with the newest block first.
+                pl.store(sorted_ids, [token, 0], pool_block_ids)
             else:
                 empty = pl.tile.full([1, POOL_CAPACITY], dtype=pl.INT32, value=-1)
                 pl.store(empty, [token, 0], pool_block_ids)
@@ -126,3 +124,33 @@ __all__ = [
     "SCORE_WIDTH",
     "make_candidate_block_pool",
 ]
+
+
+def make_candidate_pool_publish(capacity: int, shared_rows: int = 8192):
+    """Publish compact candidate blocks into active persistent-state rows."""
+
+    @pl.jit
+    def candidate_pool_publish(
+        blocks: pl.Tensor[[capacity, POOL_CAPACITY], pl.INT32],
+        counts: pl.Tensor[[capacity], pl.INT32],
+        shared_blocks: pl.InOut[pl.Tensor[[shared_rows, 1, CANDIDATE_TOPK_BLOCKS], pl.INT32]],
+        shared_counts: pl.InOut[pl.Tensor[[shared_rows, 1], pl.INT32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        flat = pl.reshape(shared_blocks, [shared_rows, CANDIDATE_TOPK_BLOCKS])
+        for section in pl.spmd(capacity * (CANDIDATE_TOPK_BLOCKS // POOL_CAPACITY),
+                               name_hint="prefill_candidate_blocks_publish"):
+            token = section // (CANDIDATE_TOPK_BLOCKS // POOL_CAPACITY)
+            column = section % (CANDIDATE_TOPK_BLOCKS // POOL_CAPACITY) * POOL_CAPACITY
+            if token < active:
+                if column == 0:
+                    ids = pl.load(blocks, [token, 0], [1, POOL_CAPACITY])
+                    pl.store(ids, [token, 0], flat)
+                else:
+                    empty = pl.tile.full([1, POOL_CAPACITY], dtype=pl.INT32, value=-1)
+                    pl.store(empty, [token, column], flat)
+        # The pinned A3 native QLI returns candidates but leaves this persistent
+        # length buffer unchanged on its nonempty source path.
+        return shared_blocks, shared_counts
+
+    return candidate_pool_publish

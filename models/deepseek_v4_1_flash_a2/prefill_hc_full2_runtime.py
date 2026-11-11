@@ -19,7 +19,7 @@ import subprocess
 import torch
 
 from .runtime_utils import validate_device, file_sha as _sha
-from .full2_readback_runtime import admit_readonly, save_readonly_device_inputs, tensor_sha as _tensor_sha
+from .prefill_full2_readback_runtime import admit_readonly, save_readonly_device_inputs, tensor_sha as _tensor_sha
 
 
 OUTPUT_NAMES = ("collapsed", "post", "comb", "next_pre")

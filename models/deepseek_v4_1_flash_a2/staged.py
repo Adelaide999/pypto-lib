@@ -1,11 +1,17 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """Memory-bounded staged kernels for a real-width A2/A3 L0 assembly.
 
 Each entry point owns one stable decoder boundary.  Keeping the boundaries
 separate lets the runtime reuse device buffers between projections and avoids
 materializing packed V4.1 matrices in the per-core Mat buffer.
 """
-
-from __future__ import annotations
 
 from collections.abc import Mapping
 

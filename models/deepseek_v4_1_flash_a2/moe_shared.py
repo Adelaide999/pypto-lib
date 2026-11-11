@@ -14,7 +14,7 @@ from .ops import N_TILE, VEC_M_TILE, make_dequantize, make_dot, make_pack_weight
 
 
 def _make_shared_activation(capacity, intermediate, limit, fused_activation):
-    """Select native fused FP32 or the preserved standalone BF16 rounding."""
+    """Select fused FP32 or standalone BF16 activation rounding."""
     width = intermediate * 2
     tile = 256
     dequantize = make_dequantize(capacity, width)
@@ -71,8 +71,12 @@ def _make_shared_activation(capacity, intermediate, limit, fused_activation):
             gate_channels = pl.reshape(channels[column:column + tile], [1, tile])
             up_channels = pl.reshape(channels[up_column:up_column + tile], [1, tile])
             row_scale = pl.row_min(scales[token:token + VEC_M_TILE, :])
-            gate = pl.row_expand_mul(pl.col_expand_mul(pl.cast(gate_i32, pl.FP32), gate_channels), row_scale)
-            up = pl.row_expand_mul(pl.col_expand_mul(pl.cast(up_i32, pl.FP32), up_channels), row_scale)
+            gate_channel = pl.col_expand_mul(pl.cast(gate_i32, pl.FP32), gate_channels)
+            up_channel = pl.col_expand_mul(pl.cast(up_i32, pl.FP32), up_channels)
+            gate_half = pl.cast(gate_channel, pl.FP16, mode="rint")
+            up_half = pl.cast(up_channel, pl.FP16, mode="rint")
+            gate = pl.row_expand_mul(pl.cast(gate_half, pl.FP32), row_scale)
+            up = pl.row_expand_mul(pl.cast(up_half, pl.FP32), row_scale)
             gate = pl.set_validshape(pl.fillpad(gate, pad_value=pl.PadValue.zero), VEC_M_TILE, tile)
             up = pl.set_validshape(pl.fillpad(up, pad_value=pl.PadValue.zero), VEC_M_TILE, tile)
             gate = pl.minimum(gate, limit)
@@ -103,7 +107,8 @@ def make_shared_moe_w8a8_inline(capacity, config, *, fused_activation=False):
     pack_down = make_pack_weight(intermediate, hidden)
     dot_gate_up = make_dot(capacity, hidden, gate_up_width)
     dot_down = make_dot(capacity, intermediate, hidden)
-    dequant_down = make_dequantize(capacity, hidden)
+    channel_dtype = pl.FP16 if fused_activation else pl.FP32
+    dequant_down = make_dequantize(capacity, hidden, channel_dtype=channel_dtype)
 
     @pl.jit.inline
     def shared_moe_w8a8_inline(
@@ -160,3 +165,86 @@ def make_shared_moe_w8a8(capacity, config, *, fused_activation=False):
         return x, output
 
     return shared_moe_w8a8
+
+
+def golden_shared_moe_w8a8(tensors, *, fused_activation=False):
+    """Evaluate channel scaling, activation rounding and requantization for validation."""
+    import torch
+
+    active = int(tensors["active"])
+    if not active:
+        return
+
+    def quantize(value):
+        value = value.float()
+        maximum = value.abs().amax(-1, keepdim=True).clamp_min(1e-30)
+        scale = maximum * (1.0 / 127.0)
+        quantized = (value * (127.0 / maximum)).round().clamp(-127, 127).to(torch.int32)
+        return quantized, scale
+
+    def dot(payload, weight, channels, scale):
+        accumulator = payload @ weight.to(torch.int32)
+        channel = accumulator.float() * channels.float()
+        if fused_activation:
+            channel = channel.to(torch.float16).float()
+        return channel * scale
+
+    payload, scale = quantize(tensors["x"][:active])
+    gate_up = dot(payload, tensors["gate_up_weight"], tensors["gate_up_scale"], scale)
+    if not fused_activation:
+        gate_up = gate_up.to(torch.bfloat16).float()
+    gate, up = gate_up.chunk(2, dim=-1)
+    gate, up = gate.clamp(max=10.0), up.clamp(-10.0, 10.0)
+    if fused_activation:
+        activation = (gate / (1.0 + torch.exp(-gate))) * up
+    else:
+        sigmoid = torch.sigmoid(gate).to(torch.bfloat16)
+        silu = (gate * sigmoid.float()).to(torch.bfloat16)
+        activation = (silu.float() * up).to(torch.bfloat16)
+    payload, scale = quantize(activation)
+    down = dot(payload, tensors["down_weight"], tensors["down_scale"], scale)
+    tensors["output"][:active] = down.to(torch.bfloat16)
+
+
+def validate_shared_moe(*, device=0):
+    """Validate both numerical expert boundaries with the product kernel definitions."""
+    from functools import partial
+
+    import torch
+    from golden import ScalarSpec, TensorSpec, run
+
+    torch.manual_seed(41)
+    capacity, hidden, intermediate = 16, 256, 256
+    config = {"hidden_size": hidden, "moe_intermediate_size": intermediate, "swiglu_limit": 10.0}
+    for fused in (False, True):
+        for active in (0, 1, 7, 16):
+            x = torch.randn(capacity, hidden, dtype=torch.bfloat16)
+            gate_up = torch.randint(-32, 33, (hidden, 2 * intermediate), dtype=torch.int8)
+            down = torch.randint(-32, 33, (intermediate, hidden), dtype=torch.int8)
+            specs = [
+                TensorSpec("x", list(x.shape), x.dtype, init_value=x),
+                TensorSpec("gate_up_weight", list(gate_up.shape), gate_up.dtype, init_value=gate_up),
+                TensorSpec("gate_up_scale", [2 * intermediate], torch.float32, init_value=0.002),
+                TensorSpec("down_weight", list(down.shape), down.dtype, init_value=down),
+                TensorSpec("down_scale", [hidden], torch.float32, init_value=0.002),
+                TensorSpec("output", [capacity, hidden], torch.bfloat16, init_value=-12.5),
+                ScalarSpec("active", torch.int32, active),
+            ]
+            result = run(
+                fn=make_shared_moe_w8a8(capacity, config, fused_activation=fused),
+                specs=specs,
+                golden_fn=partial(golden_shared_moe_w8a8, fused_activation=fused),
+                config={"backend_type": "a2a3", "device_id": device},
+                rtol=0.05,
+                atol=0.05,
+            )
+            if not result.passed:
+                raise RuntimeError(f"Expert validation failed: fused={fused}, active={active}: {result.error}")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-d", "--device", type=int, default=0)
+    validate_shared_moe(device=parser.parse_args().device)

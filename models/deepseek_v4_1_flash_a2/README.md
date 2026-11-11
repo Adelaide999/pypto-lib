@@ -20,3 +20,10 @@ leaves. Decoder paths follow the A5 file names: `decode_c2a_full.py` owns L14,
 `layer14_15.py` and `layers19_25.py` remain aggregate compatibility providers.
 Shared SWA compute is owned by `swa_attention.py`; `decode_swa.py` remains a
 compatibility export for existing callers.
+
+
+The package also contains the complete 40-layer Prefill composition in
+`prefill_network_runtime.py`. See the model documentation's complete-network
+section for its input requirements, A3 execution evidence and the unresolved
+first-token precision result. This does not establish continuous Decode or
+complete-answer generation.

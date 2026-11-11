@@ -11,52 +11,70 @@
 import pypto.language as pl
 import torch
 from .config import FLASH as M
+from .ops import make_cast_tile
 
 
+# model config
 D = M.hidden_size
-
-
 EPS = M.rms_norm_eps
 
-
+# tiling
 NORM_T_TILE = 8
-
-
 NORM_D_TILE = 512
 
 
-@pl.jit.inline
-def rms_norm_tiled(
-    x: pl.Tensor,
-    norm_w: pl.Tensor[[D], pl.BF16],
-    x_normed: pl.Tensor,
-    block: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Normalize one eight-row block using 512-column accumulation."""
-    t0 = block * NORM_T_TILE
-    valid_rows = pl.min(NORM_T_TILE, num_tokens - t0)
-    sq_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
-    for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
-        k0 = kb * NORM_D_TILE
-        source = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE])
-        source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), NORM_T_TILE, NORM_D_TILE)
-        value = pl.cast(source, target_type=pl.FP32)
-        sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(value, value)), [1, NORM_T_TILE]))
-    inv_rms = pl.reshape(
-        pl.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), EPS), high_precision=True), [NORM_T_TILE, 1]
-    )
-    for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
-        k0 = kb * NORM_D_TILE
-        source = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE])
-        source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), NORM_T_TILE, NORM_D_TILE)
-        value = pl.cast(source, target_type=pl.FP32)
-        gamma = pl.reshape(pl.cast(norm_w[k0 : k0 + NORM_D_TILE], target_type=pl.FP32), [1, NORM_D_TILE])
-        normalized = pl.col_expand_mul(pl.row_expand_mul(value, inv_rms), gamma)
-        x_normed[t0 : t0 + NORM_T_TILE, k0 : k0 + NORM_D_TILE] = pl.set_validshape(
-            pl.cast(normalized, target_type=pl.BF16, mode="rint"), valid_rows, NORM_D_TILE
-        )
-    return x_normed
+def make_rms_norm_tiled(output_dtype=pl.BF16):
+    """Specialize the tiled normalization output dtype before compilation."""
+    convert = make_cast_tile(NORM_T_TILE, NORM_D_TILE, pl.FP32, output_dtype)
+
+    @pl.jit.inline
+    def norm_tiled(
+        x: pl.Tensor,
+        norm_w: pl.Tensor[[D], pl.BF16],
+        x_normed: pl.Tensor,
+        block: pl.Scalar[pl.INT32],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        """Normalize one eight-row block using 512-column accumulation."""
+        t0 = block * NORM_T_TILE
+        valid_rows = pl.min(NORM_T_TILE, num_tokens - t0)
+        sq_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
+        for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
+            k0 = kb * NORM_D_TILE
+            source = pl.full([NORM_T_TILE, NORM_D_TILE], dtype=pl.BF16, value=0.0)
+            for row in pl.range(valid_rows):
+                source_row = t0 + row
+                source[row:row + 1, :] = x[source_row:source_row + 1, k0:k0 + NORM_D_TILE]
+            value = pl.cast(source, target_type=pl.FP32)
+            square = pl.mul(value, value)
+            partial = pl.reshape(pl.row_sum(square), [1, NORM_T_TILE])
+            sq_sum = pl.add(sq_sum, partial)
+        mean = pl.mul(sq_sum, 1.0 / D)
+        inverse = pl.rsqrt(pl.add(mean, EPS), high_precision=True)
+        inv_rms = pl.reshape(inverse, [NORM_T_TILE, 1])
+        for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
+            k0 = kb * NORM_D_TILE
+            source = pl.full([NORM_T_TILE, NORM_D_TILE], dtype=pl.BF16, value=0.0)
+            for row in pl.range(valid_rows):
+                source_row = t0 + row
+                source[row:row + 1, :] = x[source_row:source_row + 1, k0:k0 + NORM_D_TILE]
+            value = pl.cast(source, target_type=pl.FP32)
+            weight = pl.cast(norm_w[k0:k0 + NORM_D_TILE], target_type=pl.FP32)
+            gamma = pl.reshape(weight, [1, NORM_D_TILE])
+            scaled = pl.row_expand_mul(value, inv_rms)
+            normalized = pl.col_expand_mul(scaled, gamma)
+            normalized_storage = pl.create_tensor([NORM_T_TILE, NORM_D_TILE], dtype=pl.FP32)
+            normalized_storage[:, :] = normalized
+            rounded_storage = pl.create_tensor([NORM_T_TILE, NORM_D_TILE], dtype=output_dtype)
+            rounded_storage[:, :] = convert(normalized_storage)
+            result = pl.set_validshape(rounded_storage, valid_rows, NORM_D_TILE)
+            x_normed[t0:t0 + NORM_T_TILE, k0:k0 + NORM_D_TILE] = result
+        return x_normed
+
+    return norm_tiled
+
+
+rms_norm_tiled = make_rms_norm_tiled()
 
 
 @pl.jit.inline

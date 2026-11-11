@@ -9,6 +9,7 @@
 """A2 single-layer dependencies extracted from the shared model operators."""
 
 import pypto.language as pl
+
 from .ops import make_quantize
 
 
@@ -83,3 +84,38 @@ def make_indexer_cache_publish(capacity, blocks, width):
         return cache, scales
 
     return publish
+
+
+def make_index_cache_publish_observed(capacity, blocks, page_rows=64):
+    """Quantize padded index rows and publish codes and FP16 scales with one writer."""
+    width = 128
+    quantize = make_quantize(capacity, width, rows_tile=16)
+
+    @pl.jit
+    def index_cache_publish(
+        value: pl.Tensor[[capacity, width], pl.BF16],
+        slots: pl.Tensor[[capacity, 2], pl.INT32],
+        cache: pl.InOut[pl.Tensor[[blocks, page_rows, 1, width], pl.INT8]],
+        scales: pl.InOut[pl.Tensor[[blocks, page_rows, 1, 1], pl.FP16]],
+        payload: pl.InOut[pl.Tensor[[capacity, width], pl.INT8]],
+        row_scales: pl.InOut[pl.Tensor[[capacity, 8], pl.FP32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        quantize(value, payload, row_scales, active)
+        flat_cache = pl.reshape(cache, [blocks * page_rows, width])
+        flat_scales = pl.reshape(scales, [blocks * page_rows, 1])
+        scale_values = pl.reshape(row_scales, [1, capacity * 8])
+        with pl.spmd(1, name_hint="index_fused_publication"):
+            _writer = pl.tile.get_block_idx()
+            narrowed_scales = pl.cast(scale_values[:, :], pl.FP16, mode="rint")
+            for token in pl.range(active):
+                block = pl.read(slots, [token, 0])
+                offset = pl.read(slots, [token, 1])
+                if block >= 0 and offset >= 0:
+                    row = pl.cast(block * page_rows + offset, pl.INDEX)
+                    flat_cache[row:row + 1, :] = payload[token:token + 1, :]
+                    publication_scale = pl.read(narrowed_scales, [0, token * 8])
+                    pl.write(flat_scales, [row, 0], publication_scale)
+        return cache, scales, payload, row_scales
+
+    return index_cache_publish

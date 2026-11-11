@@ -1,6 +1,14 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """BF16 RMSNorm and adjacent-pair RoPE for A2/A3."""
 
-from __future__ import annotations
+import math
 
 import torch
 import pypto.language as pl
@@ -97,4 +105,48 @@ def make_rope(capacity: int, heads: int, head_dim: int, rope_dim: int):
     return rope
 
 
-__all__ = ["make_rmsnorm", "make_rope", "rms_norm_reference", "rope_reference"]
+def make_rope_tables(capacity, rope_dim, theta, scaling=None):
+    """Build plain or YaRN RoPE tables from actual token positions."""
+    pairs = rope_dim // 2
+    exponent_scale = 2.0 * math.log(theta) / rope_dim
+    factor, low, high = 1.0, 0, 1
+    if scaling is not None:
+        factor = float(scaling["factor"])
+        original = scaling["original_max_position_embeddings"]
+        fast = scaling.get("beta_fast", 32)
+        slow = scaling.get("beta_slow", 1)
+        low = max(0, math.floor(rope_dim * math.log(original / (fast * 2 * math.pi)) / (2 * math.log(theta))))
+        high = min(rope_dim - 1, math.ceil(rope_dim * math.log(original / (slow * 2 * math.pi)) / (2 * math.log(theta))))
+    use_yarn = scaling is not None
+    ramp_start = float(low)
+    inverse_ramp_width = 1.0 / max(high - low, 0.001)
+    interpolation_delta = 1.0 / factor - 1.0
+
+    @pl.jit
+    def rope_tables(
+        positions: pl.Tensor[[capacity], pl.INT64],
+        cosine: pl.InOut[pl.Tensor[[capacity, pairs], pl.FP32]],
+        sine: pl.InOut[pl.Tensor[[capacity, pairs], pl.FP32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for token in pl.spmd(active, name_hint="prefill_rope_tables"):
+            dimension_ids = pl.arange(0, [1, pairs], dtype=pl.INT32)
+            dimensions = pl.cast(dimension_ids, pl.FP32)
+            powers = pl.exp(pl.mul(dimensions, exponent_scale))
+            ones = pl.full([1, pairs], dtype=pl.FP32, value=1.0)
+            frequencies = pl.div(ones, powers, high_precision=True)
+            if use_yarn:
+                ramp_unbounded = pl.mul(pl.sub(dimensions, ramp_start), inverse_ramp_width)
+                ramp = pl.minimum(pl.maximum(ramp_unbounded, 0.0), 1.0)
+                multiplier = pl.add(pl.mul(ramp, interpolation_delta), 1.0)
+                frequencies = pl.mul(frequencies, multiplier)
+            position = pl.cast(pl.read(positions, [token]), pl.FP32)
+            angles = pl.mul(frequencies, position)
+            cosine[token:token + 1, :] = pl.cos(angles)
+            sine[token:token + 1, :] = pl.sin(angles)
+        return cosine, sine
+
+    return rope_tables
+
+
+__all__ = ["make_rmsnorm", "make_rope", "make_rope_tables", "rms_norm_reference", "rope_reference"]

@@ -35,12 +35,12 @@ def build(query_lengths, prefix_lengths, block_table, *, cache_blocks, capacity)
     require(cache_blocks * PAGE_ROWS <= INT32_MAX, 'Physical window indices must fit the original INT32 ABI')
     integer(capacity, minimum=1)
     require(type(query_lengths) is list and type(prefix_lengths) is list
-            and type(block_table) is list and query_lengths
+            and type(block_table) is list
             and len(query_lengths) == len(prefix_lengths) == len(block_table),
             'Explicit own request lengths/prefixes/page rows are required')
     requests = len(query_lengths)
     require(all(type(row) is list and row for row in block_table)
-            and len({len(row) for row in block_table}) == 1,
+            and (not requests or len({len(row) for row in block_table}) == 1),
             'A rectangular nonempty own block table is required')
     starts, seq_lens, positions, flat_slots, slots, indices, logical = [0], [], [], [], [], [], []
     allocated = set()
@@ -79,7 +79,7 @@ def build(query_lengths, prefix_lengths, block_table, *, cache_blocks, capacity)
                 block_table=[list(row) for row in block_table], positions=positions,
                 flat_slot_mapping=flat_slots, slot_mapping=slots,
                 physical_window_indices=indices, logical_window_indices=logical,
-                max_query_len=max(query_lengths), max_seq_len=max(seq_lens),
+                max_query_len=max(query_lengths, default=0), max_seq_len=max(seq_lens, default=0),
                 cache_shape=[cache_blocks, PAGE_ROWS, 1, HEAD_DIM], cache_dtype='BF16',
                 heads=HEADS, head_dim=HEAD_DIM, sliding_window=WINDOW,
                 cmp_ratio=0, causal=True, ori_mask_mode=4, cmp_mask_mode=0,
@@ -89,7 +89,7 @@ def build(query_lengths, prefix_lengths, block_table, *, cache_blocks, capacity)
 
 
 def from_controls(starts, seq_lens, block_table, *, cache_blocks, capacity):
-    require(type(starts) is list and len(starts) >= 2 and starts[0] == 0
+    require(type(starts) is list and len(starts) >= 1 and starts[0] == 0
             and type(starts[0]) is int and type(seq_lens) is list
             and len(seq_lens) == len(starts) - 1, 'Own cumulative query starts must partition requests')
     for value in starts:

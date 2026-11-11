@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 
-from .rmsnorm import NORM_T_TILE, rms_norm_tiled
+from .rmsnorm import NORM_D_TILE, NORM_T_TILE, rms_norm_tiled
 
 
 def make_prefill_norm(capacity, hidden):
@@ -26,3 +26,26 @@ def make_prefill_norm(capacity, hidden):
         return normed
 
     return prefill_norm
+
+
+def make_prefill_norm_cast(capacity, hidden):
+    """Normalize to BF16 and widen the rounded values for FP32 routing."""
+
+    @pl.jit
+    def prefill_norm_cast(
+        collapsed: pl.Tensor[[capacity, hidden], pl.BF16],
+        weight: pl.Tensor[[hidden], pl.BF16],
+        normed: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
+        router_input: pl.InOut[pl.Tensor[[capacity, hidden], pl.FP32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for block in pl.spmd((active + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="prefill_norm_bf16"):
+            rms_norm_tiled(collapsed, weight, normed, block, active)
+        for block in pl.spmd(active * (hidden // NORM_D_TILE), name_hint="prefill_norm_fp32"):
+            token = block // (hidden // NORM_D_TILE)
+            column = block % (hidden // NORM_D_TILE) * NORM_D_TILE
+            value = normed[token:token + 1, column:column + NORM_D_TILE]
+            router_input[token:token + 1, column:column + NORM_D_TILE] = pl.cast(value, pl.FP32)
+        return normed, router_input
+
+    return prefill_norm_cast

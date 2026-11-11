@@ -1,3 +1,11 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """DeepSeek V4.1 Flash A2 prefill and A2/A3 decoder operators."""
 
 from importlib import import_module
@@ -24,8 +32,14 @@ _EXPORTS = {
     "qkv_shape": ("qkv", "qkv_shape"),
     "make_routed_expert_w8a8": ("moe", "make_routed_expert_w8a8"),
     "make_shared_expert_w8a8": ("moe", "make_shared_expert_w8a8"),
-    "layer0_reference": ("layer0", "layer0_reference"),
-    "route_reference": ("layer0", "route_reference"),
+    "make_prefill_layer_entries": ("prefill_layer", "make_prefill_layer_entries"),
+    "run_prefill_layer": ("prefill_layer", "run_prefill_layer"),
+    "make_physical_compressed_entries": ("prefill_full2", "make_physical_compressed_entries"),
+    "make_prefill_engram_entries": ("prefill_engram", "make_prefill_engram_entries"),
+    "layer0_reference": ("prefill_layer0", "layer0_reference"),
+    "make_prefill_layer0_entries": ("prefill_layer0", "make_prefill_layer0_entries"),
+    "run_prefill_layer0": ("prefill_layer0", "run_prefill_layer0"),
+    "route_reference": ("prefill_layer0", "route_reference"),
     "engram_reference": ("engram", "engram_reference"),
     "make_gate": ("engram", "make_gate"),
     "make_lookup": ("engram", "make_lookup"),

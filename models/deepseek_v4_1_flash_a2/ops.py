@@ -19,11 +19,12 @@ N_TILE = 64
 
 
 def make_cast_tile(rows, width, input_dtype, output_dtype):
-    """Choose identity or a rounding cast before the DSL parses either body."""
+    """Select a typed identity or cross-dtype rounding conversion."""
     if input_dtype == output_dtype:
         @pl.jit.inline
         def identity(value: pl.Tensor[[rows, width], input_dtype]):
             return value
+
         return identity
 
     @pl.jit.inline
@@ -33,9 +34,10 @@ def make_cast_tile(rows, width, input_dtype, output_dtype):
     return cast_tile
 
 
-def make_quantize(capacity, width, input_dtype=pl.BF16):
+def make_quantize(capacity, width, input_dtype=pl.BF16, *, rows_tile=VEC_M_TILE):
     """Specialize symmetric per-token INT8 quantization."""
-    widen = make_cast_tile(VEC_M_TILE, K_TILE, input_dtype, pl.FP32)
+    width_tile = min(K_TILE, width)
+    widen = make_cast_tile(rows_tile, width_tile, input_dtype, pl.FP32)
 
     @pl.jit.inline
     def quantize(
@@ -44,32 +46,35 @@ def make_quantize(capacity, width, input_dtype=pl.BF16):
         scales: pl.Tensor[[capacity, 8], pl.FP32],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd((active + VEC_M_TILE - 1) // VEC_M_TILE, name_hint="a2_token_quantize"):
-            t0 = block * VEC_M_TILE
-            rows = pl.min(VEC_M_TILE, active - t0)
-            maximum_row = pl.full([1, VEC_M_TILE], dtype=pl.FP32, value=1e-30)
-            for k0 in pl.range(0, width, K_TILE):
-                source = pl.slice(x, [VEC_M_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE])
-                source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), VEC_M_TILE, K_TILE)
-                value = widen(source)
-                chunk_maximum = pl.reshape(pl.row_max(pl.abs(value)), [1, VEC_M_TILE])
+        for block in pl.spmd((active + rows_tile - 1) // rows_tile, name_hint="a2_token_quantize"):
+            t0 = block * rows_tile
+            rows = pl.min(rows_tile, active - t0)
+            maximum_row = pl.full([1, rows_tile], dtype=pl.FP32, value=0.0)
+            for k0 in pl.range(0, width, width_tile):
+                source = pl.slice(x, [rows_tile, width_tile], [t0, k0], valid_shape=[rows, width_tile])
+                widened = widen(source)
+                value = pl.set_validshape(pl.fillpad(widened, pad_value=pl.PadValue.zero), rows_tile, width_tile)
+                chunk_maximum = pl.reshape(pl.row_max(pl.abs(value)), [1, rows_tile])
                 maximum_row = pl.maximum(maximum_row, chunk_maximum)
-            maximum = pl.reshape(maximum_row, [VEC_M_TILE, 1])
+            maximum = pl.reshape(maximum_row, [rows_tile, 1])
             scale = pl.mul(maximum, 1.0 / 127.0)
-            numerator = pl.full([1, VEC_M_TILE], dtype=pl.FP32, value=127.0)
-            inverse_row = pl.div(numerator, maximum_row)
-            inverse = pl.reshape(inverse_row, [VEC_M_TILE, 1])
-            scale_rows = pl.full([VEC_M_TILE, 8], dtype=pl.FP32, value=1.0)
-            scales[t0:t0 + VEC_M_TILE, :] = pl.row_expand_mul(scale_rows, scale)
-            for k0 in pl.range(0, width, K_TILE):
-                source = pl.slice(x, [VEC_M_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE])
-                source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), VEC_M_TILE, K_TILE)
-                value = widen(source)
+            numerator = pl.full([1, rows_tile], dtype=pl.FP32, value=127.0)
+            safe_maximum_row = pl.maximum(maximum_row, 1e-30)
+            inverse_row = pl.div(numerator, safe_maximum_row)
+            inverse = pl.reshape(inverse_row, [rows_tile, 1])
+            scale_rows = pl.full([rows_tile, 8], dtype=pl.FP32, value=1.0)
+            expanded_scale = pl.row_expand_mul(scale_rows, scale)
+            scales[t0:t0 + rows_tile, :] = pl.set_validshape(expanded_scale, rows, 8)
+            for k0 in pl.range(0, width, width_tile):
+                source = pl.slice(x, [rows_tile, width_tile], [t0, k0], valid_shape=[rows, width_tile])
+                widened = widen(source)
+                value = pl.set_validshape(pl.fillpad(widened, pad_value=pl.PadValue.zero), rows_tile, width_tile)
                 normalized = pl.row_expand_mul(value, inverse)
                 bounded = pl.minimum(pl.maximum(normalized, -127.0), 127.0)
                 rounded = pl.cast(bounded, pl.INT32, mode="rint")
                 exact_half = pl.cast(rounded, pl.FP16, mode="rint")
-                payload[t0:t0 + VEC_M_TILE, k0:k0 + K_TILE] = pl.cast(exact_half, pl.INT8, mode="trunc")
+                codes = pl.cast(exact_half, pl.INT8, mode="trunc")
+                payload[t0:t0 + rows_tile, k0:k0 + width_tile] = pl.set_validshape(codes, rows, width_tile)
         return payload, scales
 
     return quantize
@@ -125,13 +130,11 @@ def make_dot(capacity, width, output_width):
     return dot
 
 
-def make_dequantize(capacity, output_width, combine_scales=False):
-    """Apply the selected native FP32 scale boundary to INT32 products.
+def make_dequantize(capacity, output_width, combine_scales=False, channel_dtype=pl.FP32):
+    """Apply channel-first or combined scales with the selected channel rounding."""
+    narrow_channel = make_cast_tile(VEC_M_TILE, N_TILE, pl.FP32, channel_dtype)
+    widen_channel = make_cast_tile(VEC_M_TILE, N_TILE, channel_dtype, pl.FP32)
 
-    The native per-token optimized kernel combines channel/token scales before
-    multiplying the accumulator. Other native kernels scale channel-first.
-    Callers select their source boundary explicitly; QKV keeps its existing ABI.
-    """
     @pl.jit.inline
     def dequantize(
         accumulator: pl.Tensor[[capacity, output_width], pl.INT32],
@@ -155,8 +158,12 @@ def make_dequantize(capacity, output_width, combine_scales=False):
                 combined = pl.row_expand_mul(channel_rows, scale)
                 scaled = pl.mul(value, combined)
             else:
-                scaled_channels = pl.col_expand_mul(value, channels)
-                scaled = pl.row_expand_mul(scaled_channels, scale)
+                scaled_channels = pl.create_tensor([VEC_M_TILE, N_TILE], dtype=pl.FP32)
+                scaled_channels[:, :] = pl.col_expand_mul(value, channels)
+                rounded_channels = pl.create_tensor([VEC_M_TILE, N_TILE], dtype=channel_dtype)
+                rounded_channels[:, :] = narrow_channel(scaled_channels)
+                channel_fp32 = widen_channel(rounded_channels)
+                scaled = pl.row_expand_mul(channel_fp32, scale)
             narrowed = pl.cast(scaled, pl.BF16, mode="rint")
             output[t0:t0 + VEC_M_TILE, n0:n0 + N_TILE] = pl.set_validshape(narrowed, rows, N_TILE)
         return output
@@ -171,7 +178,7 @@ def make_norm(capacity, width, eps):
     def norm(
         x: pl.Tensor[[capacity, width], pl.BF16],
         weight: pl.Tensor[[width], pl.BF16],
-        output: pl.Tensor[[capacity, width], pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
         for block in pl.spmd((active + VEC_M_TILE - 1) // VEC_M_TILE, name_hint="a2_rms_norm"):
@@ -204,7 +211,7 @@ def make_rope(capacity, heads, head_dim, rope_dim):
         x: pl.Tensor[[capacity, output_width], pl.BF16],
         cosine: pl.Tensor[[capacity, pair_width], pl.FP32],
         sine: pl.Tensor[[capacity, pair_width], pl.FP32],
-        output: pl.Tensor[[capacity, output_width], pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
         for block in pl.spmd(active * heads, name_hint="a2_adjacent_rope"):

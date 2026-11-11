@@ -16,7 +16,7 @@ HEAD_TILE = 16
 WINDOW_TILE = 128
 
 
-def make_swa_inline(capacity, cache_blocks, config):
+def make_swa_leaves(capacity, cache_blocks, config):
     """Build a BF16 PA_BBND SWA leaf for the full configured query width."""
     heads = config["num_attention_heads"]
     head_dim = config["head_dim"]
@@ -31,7 +31,7 @@ def make_swa_inline(capacity, cache_blocks, config):
     def publish(
         kv: pl.Tensor[[capacity, head_dim], pl.BF16],
         slots: pl.Tensor[[capacity, 2], pl.INT64],
-        cache: pl.Tensor[[cache_blocks, 128, 1, head_dim], pl.BF16],
+        cache: pl.InOut[pl.Tensor[[cache_blocks, 128, 1, head_dim], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
         flat = pl.reshape(cache, [cache_rows, head_dim])
@@ -83,6 +83,26 @@ def make_swa_inline(capacity, cache_blocks, config):
             maximum = pl.reshape(sink[head:head + HEAD_TILE], [1, HEAD_TILE])
             denominator = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=1.0)
             numerator = pl.full([HEAD_TILE, head_dim], dtype=pl.FP32, value=0.0)
+            sparse_maximum = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=-1e30)
+            if window == 640:
+                for sparse_part in pl.range(4):
+                    sparse_column = 128 + sparse_part * WINDOW_TILE
+                    sparse_row = token * window + sparse_column
+                    sparse_query = qflat[query_row:query_row + HEAD_TILE, :]
+                    sparse_kv = selected[sparse_row:sparse_row + WINDOW_TILE, :]
+                    sparse_dot = pl.matmul(sparse_query, sparse_kv, b_trans=True)
+                    sparse_scores = pl.mul(sparse_dot, score_scale)
+                    sparse_ids = indices[token:token + 1, sparse_column:sparse_column + WINDOW_TILE]
+                    sparse_ids_fp32 = pl.cast(sparse_ids, pl.FP32)
+                    sparse_shifted = pl.add(sparse_ids_fp32, 1.0)
+                    sparse_positive = pl.maximum(sparse_shifted, 0.0)
+                    sparse_valid = pl.minimum(sparse_positive, 1.0)
+                    sparse_invalid = pl.sub(sparse_valid, 1.0)
+                    sparse_bias = pl.mul(sparse_invalid, 1e30)
+                    sparse_scores = pl.col_expand_add(sparse_scores, sparse_bias)
+                    sparse_row_max = pl.row_max(sparse_scores)
+                    sparse_local_max = pl.reshape(sparse_row_max, [1, HEAD_TILE])
+                    sparse_maximum = pl.maximum(sparse_maximum, sparse_local_max)
             for part in pl.range(window // WINDOW_TILE):
                 cache_row = token * window + part * WINDOW_TILE
                 q = qflat[query_row:query_row + HEAD_TILE, :]
@@ -99,6 +119,9 @@ def make_swa_inline(capacity, cache_blocks, config):
                 scores = pl.col_expand_add(scores, bias)
                 row_max = pl.row_max(scores)
                 local_max = pl.reshape(row_max, [1, HEAD_TILE])
+                if window == 640:
+                    if part > 0:
+                        local_max = pl.maximum(local_max, sparse_maximum)
                 next_max = pl.maximum(maximum, local_max)
                 max_difference = pl.sub(maximum, next_max)
                 correction = pl.exp(max_difference)
@@ -110,18 +133,52 @@ def make_swa_inline(capacity, cache_blocks, config):
                 probability_sum = pl.reshape(row_sum, [1, HEAD_TILE])
                 old_denominator = pl.mul(denominator, correction)
                 denominator = pl.add(old_denominator, probability_sum)
-                weights = pl.cast(probabilities, pl.BF16, mode="rint")
+                weights = pl.cast(probabilities, pl.BF16, mode="round")
                 weighted = pl.matmul(weights, kv)
                 correction_column = pl.reshape(correction, [HEAD_TILE, 1])
                 corrected = pl.row_expand_mul(numerator, correction_column)
                 numerator = pl.add(corrected, weighted)
                 maximum = next_max
-            one = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=1.0)
-            normalized = pl.div(one, denominator, high_precision=True)
-            normalized_column = pl.reshape(normalized, [HEAD_TILE, 1])
-            result = pl.row_expand_mul(numerator, normalized_column)
+            denominator_column = pl.reshape(denominator, [HEAD_TILE, 1])
+            result = pl.row_expand_div(numerator, denominator_column)
             oflat[query_row:query_row + HEAD_TILE, :] = pl.cast(result, pl.BF16, mode="rint")
         return output
+
+    return publish, gather, attend
+
+
+def make_swa_read(capacity, cache_blocks, config):
+    """Read a published cache with an independent CP query row count."""
+    heads = config["num_attention_heads"]
+    head_dim = config["head_dim"]
+    width = heads * head_dim
+    window = config["sliding_window"]
+    _publish, gather, attend = make_swa_leaves(capacity, cache_blocks, config)
+
+    @pl.jit
+    def swa_read(
+        query: pl.Tensor[[capacity, width], pl.BF16],
+        indices: pl.Tensor[[capacity, window], pl.INT32],
+        sink: pl.Tensor[[heads], pl.FP32],
+        cache: pl.Tensor[[cache_blocks, 128, 1, head_dim], pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        selected = pl.create_tensor([capacity * window, head_dim], dtype=pl.BF16)
+        gather(cache, indices, selected, active)
+        attend(query, selected, indices, sink, output, active)
+        return output
+
+    return swa_read
+
+
+def make_swa_inline(capacity, cache_blocks, config):
+    """Publish and read a BF16 paged SWA cache."""
+    heads = config["num_attention_heads"]
+    head_dim = config["head_dim"]
+    width = heads * head_dim
+    window = config["sliding_window"]
+    publish, gather, attend = make_swa_leaves(capacity, cache_blocks, config)
 
     @pl.jit.inline
     def swa_inline(

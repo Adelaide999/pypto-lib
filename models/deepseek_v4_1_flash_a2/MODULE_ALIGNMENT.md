@@ -49,7 +49,7 @@ Status values mean:
 | `rope_tables.py` | `norm_rope.py`, `staged.py` | split | RoPE tables and the tiled RoPE leaf share the BF16 boundary. |
 | `sparse_attention.py` | `sparse_attention.py`, `swa.py`, `swa_attention.py`, `swa_cache.py` | split | Cache publication, gather, attention, and reference are explicit. |
 | `compressor.py` | `compressor.py`, `compressor_core.py` | split | Ratio-one and ratio-two state paths have separate ownership. |
-| `hc.py` | `hc.py`, `hc_pre_runtime.py`, `hc_pre_full2_runtime.py` | split | PyPTO HC leaves are separate from native HC-pre boundaries. |
+| `hc.py` | `hc.py`, `hc_pre_runtime.py`, `prefill_hc_full2_runtime.py` | split | PyPTO HC leaves are separate from native HC-pre boundaries. |
 | `engram.py` | `engram.py`, `engram_ecotech.py`, `engram_hash.py`, `engram_offload.py`, `engram_w8a8.py` | split | Lookup, hash, residency, and projection are independently testable. |
 | `expert_routed.py`, `expert_shared.py`, `gate.py` | `moe.py`, `moe_router.py`, `moe_shared.py`, `moe_routed.py` | split | A2 W8A8 expert and gate paths are split by routing and dispatch boundary. |
 
@@ -62,11 +62,11 @@ Status values mean:
 | `decode_c1a_full.py` | `decode_c1a_full.py`, `layers19_25.py`, `candidate_pool.py` | aligned | L20 C1A source, compressor, QLI, and candidate blocks. |
 | `decode_c1a_reuse.py` | `decode_c1a_reuse.py`, `layers19_25.py` | aligned | L21 and L25 C1A cache reuse contracts. |
 | `decode_c1a_reindex.py` | `decode_c1a_reindex.py`, `layers19_25.py`, `indexer_select.py`, `indexer_prepare.py` | aligned | L24 index refresh followed by sparse attention. |
-| `decode_indexer.py` | `indexer.py`, `indexer_query.py`, `indexer_select.py`, `indexer_prepare.py`, `index_cache.py`, `candidate_pool.py`, `qli_*` | split | QLI and candidate selection are separated at A2 native boundaries. |
+| `decode_prefill_indexer.py` | `prefill_indexer.py`, `indexer_query.py`, `indexer_select.py`, `indexer_prepare.py`, `index_cache.py`, `candidate_pool.py`, `qli_*` | split | QLI and candidate selection are separated at A2 native boundaries. |
 | `decode_swa.py` | `swa_attention.py`, `swa_native.py`, `swa_scheduler.py` | split | Decoder name remains a compatibility export; implementation is shared. |
 | `decode_moe.py` | `moe.py`, `moe_router.py`, `moe_dispatch.py`, `moe_combine.py`, `moe_*_runtime.py` | split | W8A8 expert leaves, metadata, and dispatch are separate. |
 | `decode_layer.py` | `decode_c2a_*.py`, `decode_c1a_*.py`, `layer14_15.py`, `layers19_25.py` | partial | Layer contracts and stage factories; complete A5 forward is deferred. |
-| `decode_fwd.py` | `layer0.py`, `prefill.py`, `decode_c2a_*.py`, `decode_c1a_*.py` | partial | Independent layer composition only; no serving or whole-network runner. |
+| `decode_fwd.py` | `prefill_layer0.py`, `prefill_qkv_swa.py`, `decode_c2a_*.py`, `decode_c1a_*.py` | partial | Independent layer composition only; no serving or whole-network runner. |
 
 The migrated L19-L25 schedule is fixed in the canonical decode files:
 
@@ -82,17 +82,17 @@ L25: C1A reuse <- L20 cache and L24 index selection
 
 | A5 module | A2 owner | Status | Responsibility |
 | --- | --- | --- | --- |
-| `prefill_c2a_full.py` | `layer2_prefill.py`, `layer2_c1c2.py`, `c2_prefill_pool.py`, `ecotech_full2_*` | split | Ratio-two projection, pooling, state publication, and readback. |
-| `prefill_c2a_reuse.py` | `ecotech_prefill_consumer.py`, `sparse_consumer_prefill.py` | partial | Consumer stages are available; a distributed full forward is deferred. |
-| `prefill_c1a_full.py` | `ratio1_prefill.py`, `ecotech_full2_prefill.py`, `ecotech_full2_observed.py` | split | Ratio-one publication and observed index stages. |
-| `prefill_c1a_reindex.py` | `indexer_query.py`, `indexer_select.py`, `indexer_prepare.py`, `ecotech_prefill_consumer.py` | partial | Reindex leaves are available as independent stages. |
-| `prefill_c1a_reuse.py` | `ecotech_prefill_consumer.py`, `sparse_consumer_prefill.py` | partial | Reuse consumer stages are available. |
-| `prefill_swa.py` | `ecotech_swa_prefill.py`, `swa.py`, `swa_cache.py` | aligned | BF16 SWA publication and attention. |
-| `prefill_indexer.py` | `indexer*.py`, `index_cache.py`, `c1c2.py` | split | Index preparation and cache publication are independent. |
+| `prefill_c2a_full.py` | `prefill_layer2.py`, `prefill_layer2_c1c2.py`, `prefill_c2_pool.py`, `ecotech_full2_*` | split | Ratio-two projection, pooling, state publication, and readback. |
+| `prefill_c2a_reuse.py` | `prefill_consumer.py`, `prefill_sparse_consumer.py` | partial | Consumer stages are available; the current A3 target requires a distributed independent-layer replay. |
+| `prefill_c1a_full.py` | `prefill_ratio1.py`, `prefill_full2.py`, `prefill_full2_observed.py` | split | Ratio-one publication and observed index stages. |
+| `prefill_c1a_reindex.py` | `indexer_query.py`, `indexer_select.py`, `indexer_prepare.py`, `prefill_consumer.py` | partial | Reindex leaves are available as independent stages. |
+| `prefill_c1a_reuse.py` | `prefill_consumer.py`, `prefill_sparse_consumer.py` | partial | Reuse consumer stages are available. |
+| `prefill_swa.py` | `prefill_swa.py`, `swa.py`, `swa_cache.py` | aligned | BF16 SWA publication and attention. |
+| `prefill_prefill_indexer.py` | `indexer*.py`, `index_cache.py`, `prefill_cache_publish.py` | split | Index preparation and cache publication are independent. |
 | `prefill_moe.py` | `moe.py`, `moe_router.py`, `moe_dispatch.py`, `moe_combine.py` | split | A2 W8A8 shared/routed expert path. |
-| `prefill_layer.py` | `layer0.py`, `layer0_single_card.py`, `layer2_prefill.py`, `layer14_15.py` | partial | Single-layer composition and references. |
-| `prefill_fwd.py` | `prefill.py`, `attention.py`, `attention_block.py` | partial | Existing A2 prefill entries; no A5 distributed runner. |
-| `prefill_cp_allgather.py` | none | out of scope | A2 single-card target does not accept the A5 collective ABI. |
+| `prefill_layer.py` | `prefill_layer0.py`, `prefill_layer0_local.py`, `prefill_layer2.py`, `layer14_15.py` | partial | Single-layer composition and references. |
+| `prefill_fwd.py` | `prefill_qkv_swa.py`, `prefill_attention.py`, `prefill_attention_block.py` | partial | Existing A2 prefill entries; no A5 distributed runner. |
+| `prefill_cp_allgather.py` | pending | partial | The current A3 target requires the native DSA_CP/SP collective and token layout at TP1/2/4; its A3 replay is not yet validated. |
 
 ## A2 current ownership groups
 
@@ -102,8 +102,8 @@ should follow these logical groups:
 | Logical group | Current files | Owns |
 | --- | --- | --- |
 | Shared leaves | `config.py`, `operator_config.py`, `runtime_config.py`, `ops.py`, `gemm.py`, `quant.py`, `norm_rope.py`, `rmsnorm.py`, `staged.py`, `qkv.py`, `qkv_w8a8.py`, `qkv_proj_rope.py`, `o_proj.py`, `output_proj.py`, `grouped_output.py`, `sparse_attention.py`, `swa.py`, `swa_attention.py`, `swa_cache.py`, `decode_swa.py` | A2/A3 tensor ABI and reusable computation. |
-| Cache and index stages | `compressor*.py`, `c1c2.py`, `c2_prefill_pool.py`, `ratio1_prefill.py`, `index_cache.py`, `indexer*.py`, `candidate_pool.py`, `sparse_consumer_prefill.py` | C1A/C2A publication, QLI, candidate selection, and cache ownership. |
-| Layer composition | `attention*.py`, `prefill.py`, `prefill_norm.py`, `layer0*.py`, `layer2_*.py`, `decode_c2a_*.py`, `decode_c1a_*.py`, `layer14_15.py`, `layers19_25.py`, `ecotech_*.py` | Bounded layer and path composition. The two aggregate decoder files remain compatibility providers during migration. |
+| Cache and index stages | `compressor*.py`, `prefill_cache_publish.py`, `prefill_c2_pool.py`, `prefill_ratio1.py`, `index_cache.py`, `indexer*.py`, `candidate_pool.py`, `prefill_sparse_consumer.py` | C1A/C2A publication, QLI, candidate selection, and cache ownership. |
+| Layer composition | `attention*.py`, `prefill_qkv_swa.py`, `prefill_norm.py`, `layer0*.py`, `layer2_*.py`, `decode_c2a_*.py`, `decode_c1a_*.py`, `layer14_15.py`, `layers19_25.py`, `ecotech_*.py` | Bounded layer and path composition. The two aggregate decoder files remain compatibility providers during migration. |
 | HC, Engram, and MoE | `hc.py`, `engram*.py`, `moe.py`, `moe_*.py` | Model-specific side paths and W8A8 expert boundaries. |
 | Runtime boundaries | `*_native.py`, `*_runtime.py`, `*_boundary.py`, `*_scheduler.py`, `smla_staging.py`, `projection_runtime.py`, `runtime_utils.py`, `scheduler_utils.py`, `bf16_linear_native.py` | Native calls, descriptors, scheduling metadata, and identity checks. |
 | Validation and data | `raw_checkpoint.py`, `weights.py`, `source_manifest.json` | Checkpoint loading and implementation source receipts. Precision, vLLM capture, and test entry points live under `/data/disk/sunhaolun/captrue_and_vllm/models/deepseek_v4_1_flash_a2/`. |
@@ -121,7 +121,7 @@ should follow these logical groups:
 
 ## A5 modules intentionally not mirrored
 
-`dspark_attention.py`, `dspark_context_kv.py`, `dspark_drafter.py`,
+`dspark_prefill_attention.py`, `dspark_context_kv.py`, `dspark_drafter.py`,
 `dspark_markov.py`, `vision.py`, and `lm_head.py` are not part of the current
 A2/A3 decoder and single-layer prefill target. They require separate runtime,
 collective, or dtype contracts. They should not be copied into this package

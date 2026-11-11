@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 
-from .attention import make_attention_inline
+from .prefill_attention import make_attention_inline
 from .hc import make_hc_pre_inline, make_hc_post_inline
 from .rmsnorm import D, EPS, NORM_T_TILE, rms_norm_tiled
 

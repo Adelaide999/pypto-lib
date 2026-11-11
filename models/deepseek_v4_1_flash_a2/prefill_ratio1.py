@@ -15,8 +15,8 @@ latent, while separate buffers carry its current-position rotary views.
 
 import pypto.language as pl
 
-from .c1c2 import make_compressed_cache_publish
-from .layer2_c1c2 import make_indexer_cache_publish_128
+from .prefill_cache_publish import make_compressed_cache_publish
+from .prefill_layer2_c1c2 import make_indexer_cache_publish_128
 from .ops import make_norm, make_rope
 from .qkv_proj_rope import make_bf16_projection_staged
 
@@ -33,7 +33,7 @@ def make_ratio1_compress_publish(capacity, config, cache_blocks=2, request_count
     if head_dim != 512 or index_width != 128:
         raise ValueError("Use the original full512 compressor and128-wide index cache")
     norm_compressed = make_norm(capacity, head_dim, config["rms_norm_eps"])
-    project_index = make_bf16_projection_staged(head_dim, index_width)
+    project_index = pl.jit.inline(make_bf16_projection_staged(head_dim, index_width)._func)
     norm_index = make_norm(capacity, index_width, config["rms_norm_eps"])
     rope_compressed = make_rope(capacity, 1, head_dim, rope_dim)
     rope_index = make_rope(capacity, 1, index_width, rope_dim)

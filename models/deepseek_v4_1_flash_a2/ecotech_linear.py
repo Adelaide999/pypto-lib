@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Eco-Tech dynamic INT8 linear with the native BF16 parameter scale boundary."""
 
+import math
+
 import torch
 import pypto.language as pl
 
@@ -27,12 +29,12 @@ def prepare_ecotech_dynamic_weight(weight_nk, source_scale, source_offset):
     for value in (source_scale, source_offset):
         if value.shape != (output_width, 1) or value.dtype != torch.float32:
             raise ValueError("Source per-channel scale and offset require FP32 [N,1]")
-        if not bool(torch.isfinite(value).all()):
+        if any(not math.isfinite(item) for item in value.flatten().tolist()):
             raise ValueError("Source scale and offset must be finite")
-    if not bool((source_offset == 0).all()):
+    if any(item != 0 for item in source_offset.flatten().tolist()):
         raise ValueError("The symmetric native INT8 path requires zero checkpoint offsets")
     native_scale = source_scale.to(torch.bfloat16)
-    if not bool(torch.isfinite(native_scale).all()) or not bool((native_scale > 0).all()):
+    if any(not math.isfinite(item) or item <= 0 for item in native_scale.flatten().tolist()):
         raise ValueError("Effective BF16 channel scales must remain finite and positive")
     weight_kn = weight_nk.T.contiguous()
     channel_scale = native_scale.to(torch.float32).flatten()

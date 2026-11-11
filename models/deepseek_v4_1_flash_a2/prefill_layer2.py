@@ -6,17 +6,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""A2 layer2 prefill QKV/C2 producer with separate native source-position RoPE.
-
-The compressed caches use a lossless physical-row view: native [2,64,1,D]
-becomes [1,128,1,D]. Flattened slots retain page*64+offset addresses. Sparse
-selection and attention consume these actual outputs in subsequent stages.
-"""
+"""Physical L2 Prefill entry and bounded QKV/C2 producer."""
 
 import pypto.language as pl
 
-from .c1c2 import make_compressed_cache_publish
-from .layer2_c1c2 import HEAD_DIM, make_c2_index_publish_projected_inline, make_fp32_projection
+from .prefill_cache_publish import make_compressed_cache_publish
+from .prefill_layer2_c1c2 import HEAD_DIM, make_c2_index_publish_projected_inline, make_fp32_projection
 from .compressor_core import RING_ROWS_DYN
 from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN
 from .qkv_w8a8 import make_qkv_w8a8_inline
@@ -246,3 +241,27 @@ def make_layer2_prefill_producer(capacity, config, preprojected=False):
         )
 
     return producer
+
+
+
+def main():
+    """Run the complete physical L2 through the reusable Prefill composition."""
+    import argparse
+    from pathlib import Path
+
+    from .prefill_layer import compile_prefill_layer, run_prefill_layer
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tp", type=int, choices=(1, 2, 4), required=True)
+    parser.add_argument("--inputs", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
+    if args.compile_only:
+        compile_prefill_layer(args, layer_id=2)
+    else:
+        run_prefill_layer(args, layer_id=2)
+
+
+if __name__ == "__main__":
+    main()

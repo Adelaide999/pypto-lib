@@ -16,6 +16,39 @@ D_TILE = 256
 TOKEN_TILE = 8
 CHANNEL_TILE = 8
 MIX_TILE = 8
+PROJ_T_TILE = 16
+PROJ_N_TILE = 16
+PROJ_K_TILE = 64
+
+
+def make_hc_collapse_inline(capacity, config):
+    """Collapse four BF16 residual streams with FP32 premix weights."""
+    hidden = config["hidden_size"]
+    hc = config["hc_mult"]
+
+    @pl.jit.inline
+    def collapse(
+        x: pl.Tensor[[capacity, hc, hidden], pl.BF16],
+        incoming: pl.Tensor[[capacity, hc], pl.FP32],
+        collapsed: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        flat = pl.reshape(x, [capacity, hc * hidden])
+        for block in pl.spmd(active * (hidden // D_TILE), name_hint="a2_hc_collapse"):
+            token = block // (hidden // D_TILE)
+            offset = block % (hidden // D_TILE) * D_TILE
+            collapsed_tile = pl.full([1, D_TILE], dtype=pl.FP32, value=0.0)
+            for stream in pl.unroll(hc):
+                source_offset = stream * hidden + offset
+                source_bf16 = flat[token:token + 1, source_offset:source_offset + D_TILE]
+                source_fp32 = pl.cast(source_bf16, pl.FP32)
+                coefficient = pl.read(incoming, [token, stream])
+                term = pl.mul(source_fp32, coefficient)
+                collapsed_tile = pl.add(collapsed_tile, term)
+            collapsed[token:token + 1, offset:offset + D_TILE] = pl.cast(collapsed_tile, pl.BF16, mode="rint")
+        return collapsed
+
+    return collapse
 
 
 def make_hc_pre_inline(capacity, config):
@@ -27,6 +60,7 @@ def make_hc_pre_inline(capacity, config):
     iterations = config["hc_sinkhorn_iters"]
     eps = config["hc_eps"]
     norm_eps = config["rms_norm_eps"]
+    collapse = make_hc_collapse_inline(capacity, config)
 
     @pl.jit.inline
     def pre(
@@ -35,10 +69,10 @@ def make_hc_pre_inline(capacity, config):
         scale: pl.Tensor[[3], pl.FP32],
         base: pl.Tensor[[channels], pl.FP32],
         incoming: pl.Tensor[[capacity, hc], pl.FP32],
-        next_pre: pl.Tensor[[capacity, hc], pl.FP32],
-        post: pl.Tensor[[capacity, hc], pl.FP32],
-        comb: pl.Tensor[[capacity, hc, hc], pl.FP32],
-        collapsed: pl.Tensor[[capacity, hidden], pl.BF16],
+        next_pre: pl.InOut[pl.Tensor[[capacity, hc], pl.FP32]],
+        post: pl.InOut[pl.Tensor[[capacity, hc], pl.FP32]],
+        comb: pl.InOut[pl.Tensor[[capacity, hc, hc], pl.FP32]],
+        collapsed: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
         flat = pl.reshape(x, [capacity, flat_width])
@@ -60,18 +94,34 @@ def make_hc_pre_inline(capacity, config):
             inverse_tile = pl.row_expand_mul(ones, inverse_column)
             inverse[token:token + TOKEN_TILE, :] = pl.set_validshape(inverse_tile, rows, TOKEN_TILE)
 
+        accumulated = pl.create_tensor([capacity, channels], dtype=pl.FP32)
+        channel_blocks = (channels + PROJ_N_TILE - 1) // PROJ_N_TILE
+        for block in pl.spmd((active + PROJ_T_TILE - 1) // PROJ_T_TILE * channel_blocks, name_hint="a2_hc_projection_cube"):
+            token = block // channel_blocks * PROJ_T_TILE
+            channel = block % channel_blocks * PROJ_N_TILE
+            rows = pl.min(PROJ_T_TILE, active - token)
+            columns = pl.min(PROJ_N_TILE, channels - channel)
+            acc = pl.create_tensor([PROJ_T_TILE, PROJ_N_TILE], dtype=pl.FP32)
+            for inner in pl.range(0, flat_width, PROJ_K_TILE):
+                source = pl.slice(flat, [PROJ_T_TILE, PROJ_K_TILE], [token, inner], valid_shape=[rows, PROJ_K_TILE])
+                source = pl.cast(pl.fillpad(source, pad_value=pl.PadValue.zero), pl.FP32)
+                weight = pl.slice(function, [PROJ_N_TILE, PROJ_K_TILE], [channel, inner], valid_shape=[columns, PROJ_K_TILE])
+                weight = pl.fillpad(weight, pad_value=pl.PadValue.zero)
+                weight_bits = pl.reinterpret_view(weight, pl.INT32)
+                rounded_units = pl.shrs(pl.add(weight_bits, 2048), 12)
+                rounded_bits = pl.shls(rounded_units, 12)
+                weight = pl.reinterpret_view(rounded_bits, pl.FP32)
+                acc = pl.matmul_acc(acc, source, weight, b_trans=True, init_cond=(inner == 0))
+            projection_tile = pl.set_validshape(pl.mul(acc, 1.0), rows, columns)
+            accumulated[token:token + PROJ_T_TILE, channel:channel + PROJ_N_TILE] = projection_tile
+
         projected = pl.create_tensor([capacity, channels], dtype=pl.FP32)
-        for block in pl.spmd(active * (channels // CHANNEL_TILE), name_hint="a2_hc_projection"):
+        for block in pl.spmd(active * (channels // CHANNEL_TILE), name_hint="a2_hc_projection_normalize"):
             token = block // (channels // CHANNEL_TILE)
             channel = block % (channels // CHANNEL_TILE) * CHANNEL_TILE
-            dot_sum = pl.full([1, CHANNEL_TILE], dtype=pl.FP32, value=0.0)
-            for inner in pl.range(0, flat_width, D_TILE):
-                source = pl.cast(flat[token:token + 1, inner:inner + D_TILE], pl.FP32)
-                weight = function[channel:channel + CHANNEL_TILE, inner:inner + D_TILE]
-                product = pl.col_expand_mul(weight, source)
-                dot_sum = pl.add(dot_sum, pl.reshape(pl.row_sum(product), [1, CHANNEL_TILE]))
+            dot = accumulated[token:token + 1, channel:channel + CHANNEL_TILE]
             inverse_scalar = pl.read(inverse, [token, 0])
-            normalized = pl.mul(dot_sum, inverse_scalar)
+            normalized = pl.mul(dot, inverse_scalar)
             projected[token:token + 1, channel:channel + CHANNEL_TILE] = normalized
 
         comb_flat = pl.reshape(comb, [capacity, hc * hc])
@@ -132,18 +182,7 @@ def make_hc_pre_inline(capacity, config):
                 comb_value = pl.slice(probabilities, [1, MIX_TILE], [row, 0], valid_shape=[1, hc])
                 pl.store(comb_value, [token, row * hc], comb_flat)
 
-        for block in pl.spmd(active * (hidden // D_TILE), name_hint="a2_hc_collapse"):
-            token = block // (hidden // D_TILE)
-            offset = block % (hidden // D_TILE) * D_TILE
-            collapsed_tile = pl.full([1, D_TILE], dtype=pl.FP32, value=0.0)
-            for stream in pl.unroll(hc):
-                source_offset = stream * hidden + offset
-                source_bf16 = flat[token:token + 1, source_offset:source_offset + D_TILE]
-                source_fp32 = pl.cast(source_bf16, pl.FP32)
-                coefficient = pl.read(incoming, [token, stream])
-                term = pl.mul(source_fp32, coefficient)
-                collapsed_tile = pl.add(collapsed_tile, term)
-            collapsed[token:token + 1, offset:offset + D_TILE] = pl.cast(collapsed_tile, pl.BF16, mode="rint")
+        collapse(x, incoming, collapsed, active)
         return next_pre, post, comb, collapsed
 
     return pre
@@ -160,7 +199,7 @@ def make_hc_post_inline(capacity, config):
         residual: pl.Tensor[[capacity, hc, hidden], pl.BF16],
         post_mix: pl.Tensor[[capacity, hc], pl.FP32],
         comb: pl.Tensor[[capacity, hc, hc], pl.FP32],
-        output: pl.Tensor[[capacity, hc, hidden], pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, hc, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
         flat = pl.reshape(residual, [capacity, hc * hidden])

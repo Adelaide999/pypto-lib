@@ -1,3 +1,11 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """A2/A3 INT8 QLI scoring and Top-K selection.
 
 The A2/A3 DeepSeek V4.1 indexer does not have the A5 FP8/MX path.  Its
@@ -12,8 +20,6 @@ chronological sort; keeping that step separate makes the score/index boundary
 independently checkable on A2/A3 and lets the sparse-attention consumer use
 either ordering (attention is permutation invariant).
 """
-
-from __future__ import annotations
 
 import torch
 import pypto.language as pl
@@ -110,7 +116,7 @@ def make_indexer_select(
     if compress_ratio not in (1, 2):
         raise ValueError("compress_ratio must be 1 or 2")
 
-    @pl.jit.incore
+    @pl.jit.inline
     def select_one(
         query: pl.Tensor[[capacity, heads, head_dim], pl.INT8],
         query_scale: pl.Tensor[[capacity, heads], pl.FP16],
@@ -121,7 +127,7 @@ def make_indexer_select(
         running_pairs: pl.Tensor[[capacity, 2 * topk], pl.FP32],
         scores: pl.Tensor[[capacity, key_capacity], pl.FP32],
         indices: pl.Tensor[[capacity, topk], pl.INT32],
-    ) -> None:
+    ):
         token = pl.tile.get_block_idx()
         # The A2/A3 QLI cache ABI is one fixed 512-entry candidate row.  Sort
         # the complete row here; ``prepare_indexer_indices`` applies the
@@ -142,22 +148,21 @@ def make_indexer_select(
             valid = pl.min(KEY_TILE, visible - k0)
             key_tile = key[k0:k0 + KEY_TILE, :]
             scale_tile = pl.reshape(pl.cast(key_scale[k0:k0 + KEY_TILE], pl.FP32), [1, KEY_TILE])
-            total = pl.full([1, KEY_TILE], dtype=pl.FP32, value=0.0)
-            for h0 in pl.range(0, heads, HEAD_TILE):
-                q_tile = pl.reshape(query[token:token + 1, h0:h0 + HEAD_TILE, :], [HEAD_TILE, head_dim])
-                dots = pl.matmul(q_tile, key_tile, b_trans=True, out_dtype=pl.INT32)
-                dots = pl.cast(dots, pl.FP32, mode="none")
-                q_scale_tile = pl.reshape(
-                    pl.cast(query_scale[token, h0:h0 + HEAD_TILE], pl.FP32), [HEAD_TILE, 1]
-                )
-                weight_tile = pl.reshape(
-                    pl.cast(weights[token, h0:h0 + HEAD_TILE], pl.FP32), [HEAD_TILE, 1]
-                )
-                dots = pl.row_expand_mul(dots, q_scale_tile)
-                dots = pl.col_expand_mul(dots, scale_tile)
-                dots = pl.maximum(dots, 0.0)
-                dots = pl.row_expand_mul(dots, weight_tile)
-                total = pl.add(total, pl.reshape(pl.col_sum(dots), [1, KEY_TILE]))
+            q_tile = pl.reshape(query[token:token + 1, :, :], [heads, head_dim])
+            dots = pl.matmul(q_tile, key_tile, b_trans=True, out_dtype=pl.INT32)
+            dots_fp32 = pl.cast(dots, pl.FP32, mode="none")
+            dots_scaled = pl.mul(pl.maximum(dots_fp32, 0.0), 0.0009765625)
+            dots_half = pl.cast(dots_scaled, pl.FP16, mode="rint")
+            q_scale_row = pl.cast(query_scale[token:token + 1, :], pl.FP32)
+            weight_row = pl.cast(weights[token:token + 1, :], pl.FP32)
+            combined = pl.mul(q_scale_row, weight_row)
+            combined_half = pl.cast(combined, pl.FP16, mode="rint")
+            weight_ones = pl.full([HEAD_TILE, heads], dtype=pl.FP16, value=1.0)
+            weight_matrix = pl.col_expand_mul(weight_ones, combined_half)
+            reduced = pl.matmul(weight_matrix, dots_half, out_dtype=pl.FP32)
+            reduced_vector = pl.mul(reduced, 1.0)
+            reduced_row = pl.slice(reduced_vector, [1, KEY_TILE], [0, 0])
+            total = pl.mul(reduced_row, scale_tile)
             scores[token:token + 1, k0:k0 + KEY_TILE] = pl.fillpad(
                 pl.set_validshape(total, 1, valid), pad_value=pl.PadValue.min
             )
@@ -193,6 +198,7 @@ def make_indexer_select(
             picked = pl.tile.gather_mask(pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
             selected = picked
         pl.store(selected, [token, 0], indices)
+        return scores, indices
 
     @pl.jit
     def kernel(
@@ -207,7 +213,7 @@ def make_indexer_select(
         active: pl.Scalar[pl.INT32],
     ):
         running_pairs = pl.create_tensor([capacity, 2 * topk], dtype=pl.FP32)
-        with pl.spmd(active, name_hint="dsv41_a2a3_qli_select"):
+        for _worker in pl.spmd(active, name_hint="dsv41_a2a3_qli_select"):
             select_one(
                 query, query_scale, key, key_scale, weights, positions,
                 running_pairs, scores, indices,

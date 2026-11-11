@@ -39,7 +39,7 @@ def make_indexer_projection(capacity, config):
     dot = make_dot(capacity, latent, index_width)
     dequantize = make_dequantize(capacity, index_width)
     rotate = make_rope(capacity, INDEX_HEADS, INDEX_WIDTH, rope_width)
-    project_weights = make_bf16_projection_staged(hidden, INDEX_HEADS)
+    project_weights = pl.jit.inline(make_bf16_projection_staged(hidden, INDEX_HEADS)._func)
 
     @pl.jit
     def indexer_projection(
@@ -135,12 +135,15 @@ def make_empty_selection(capacity):
     return empty_selection
 
 
-def make_sparse_controls(capacity, requests, long_pages, window_pages, long_page_rows=64, *, compress_ratio=2):
-    """Filter and sort QLI logical IDs, then map both caches to physical rows."""
+def make_sparse_controls(capacity, requests, long_pages, window_pages, long_page_rows=64, *,
+                         compress_ratio=2, long_page_stride=None, selection_ready=False):
+    """Prepare producer QLI or readonly consumer IDs and map both caches to physical rows."""
     if long_page_rows not in (64, 128):
         raise ValueError("A2 compressed page rows must match the actual 64/128-row cache ABI")
     if compress_ratio not in (1, 2):
         raise ValueError("Sparse controls require the physical source compression ratio 1 or 2")
+
+    long_page_stride = long_page_rows if long_page_stride is None else long_page_stride
 
     @pl.jit
     def sparse_controls(
@@ -160,18 +163,21 @@ def make_sparse_controls(capacity, requests, long_pages, window_pages, long_page
             position = pl.cast(pl.read(positions, [token]), pl.INT32)
             visible = (position + 1) // compress_ratio
             request = pl.read(request_ids, [token])
-            sort_scores = pl.tile.full([1, INDEX_TOPK], dtype=pl.FP32, value=-1e30)
-            sort_ids = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
-            for lane in pl.range(INDEX_TOPK):
-                index = pl.read(raw_selected, [token, lane])
-                if index >= 0:
-                    if index < visible:
-                        pl.tile.write(sort_scores, [0, lane], -pl.cast(index, pl.FP32))
-                        pl.tile.write(sort_ids, [0, lane], index)
-            sorted_pairs = pl.tile.sort32(sort_scores, pl.reinterpret_view(sort_ids, pl.UINT32))
-            sorted_pairs = pl.tile.mrgsort(sorted_pairs, block_len=64)
-            sorted_pairs = pl.tile.mrgsort(sorted_pairs, block_len=256)
-            logical_ids = pl.tile.gather_mask(sorted_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+            if selection_ready:
+                logical_ids = pl.load(raw_selected, [token, 0], [1, INDEX_TOPK])
+            else:
+                sort_scores = pl.tile.full([1, INDEX_TOPK], dtype=pl.FP32, value=-1e30)
+                sort_ids = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
+                for lane in pl.range(INDEX_TOPK):
+                    index = pl.read(raw_selected, [token, lane])
+                    if index >= 0:
+                        if index < visible:
+                            pl.tile.write(sort_scores, [0, lane], -pl.cast(index, pl.FP32))
+                            pl.tile.write(sort_ids, [0, lane], index)
+                sorted_pairs = pl.tile.sort32(sort_scores, pl.reinterpret_view(sort_ids, pl.UINT32))
+                sorted_pairs = pl.tile.mrgsort(sorted_pairs, block_len=64)
+                sorted_pairs = pl.tile.mrgsort(sorted_pairs, block_len=256)
+                logical_ids = pl.tile.gather_mask(sorted_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
             pl.store(logical_ids, [token, 0], selected)
             physical_ids = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
             for lane in pl.range(INDEX_TOPK):
@@ -180,7 +186,7 @@ def make_sparse_controls(capacity, requests, long_pages, window_pages, long_page
                     page = logical // long_page_rows
                     offset = logical % long_page_rows
                     block = pl.read(long_block_table, [request, page])
-                    physical = pl.cast(block * long_page_rows + offset, pl.INT32)
+                    physical = pl.cast(block * long_page_stride + offset, pl.INT32)
                     pl.tile.write(physical_ids, [0, lane], physical)
             pl.store(physical_ids, [token, 0], compressed_indices)
 
@@ -207,3 +213,128 @@ def make_sparse_controls(capacity, requests, long_pages, window_pages, long_page
         return selected, selected_lengths, compressed_indices, window_indices
 
     return sparse_controls
+
+
+def make_index_weights(capacity):
+    """Scale BF16 projected head weights into the QLI FP16 boundary."""
+
+    @pl.jit
+    def index_weights(
+        projected: pl.Tensor[[capacity, INDEX_HEADS], pl.BF16],
+        weights: pl.InOut[pl.Tensor[[capacity, INDEX_HEADS], pl.FP16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        with pl.spmd((active + WEIGHT_ROWS_TILE - 1) // WEIGHT_ROWS_TILE, name_hint="index_weights_scale"):
+            row = pl.tile.get_block_idx() * WEIGHT_ROWS_TILE
+            rows = pl.min(WEIGHT_ROWS_TILE, active - row)
+            source = pl.slice(projected, [WEIGHT_ROWS_TILE, INDEX_HEADS], [row, 0], valid_shape=[rows, INDEX_HEADS])
+            scaled = pl.mul(pl.cast(source, pl.FP32), 1.0 / 64.0)
+            weights[row:row + WEIGHT_ROWS_TILE, :] = pl.set_validshape(pl.cast(scaled, pl.FP16), rows, INDEX_HEADS)
+        return weights
+
+    return index_weights
+
+
+def make_index_key_gather(cache_blocks, requests, table_pages, page_rows=64):
+    """Pack one request's paged INT8/FP16 index cache into the fixed QLI arena."""
+    KEY_ROWS_TILE = 32
+
+    @pl.jit
+    def index_key_gather(
+        cache: pl.Tensor[[cache_blocks, page_rows, 1, INDEX_WIDTH], pl.INT8],
+        scales: pl.Tensor[[cache_blocks, page_rows, 1, 1], pl.FP16],
+        table: pl.Tensor[[requests, table_pages], pl.INT32],
+        key: pl.InOut[pl.Tensor[[512, INDEX_WIDTH], pl.INT8]],
+        key_scale: pl.InOut[pl.Tensor[[512], pl.FP16]],
+        request: pl.Scalar[pl.INT32],
+        length: pl.Scalar[pl.INT32],
+    ):
+        flat = pl.reshape(cache, [cache_blocks * page_rows, INDEX_WIDTH])
+        scale_flat = pl.reshape(scales, [cache_blocks * page_rows, 1])
+        with pl.spmd(512 // KEY_ROWS_TILE, name_hint="index_key_pack"):
+            start = pl.tile.get_block_idx() * KEY_ROWS_TILE
+            zero_values = pl.full([KEY_ROWS_TILE, INDEX_WIDTH], dtype=pl.FP16, value=0.0)
+            values = pl.cast(zero_values, pl.INT8, mode="trunc")
+            if start < length:
+                page = start // page_rows
+                offset = start % page_rows
+                block = pl.cast(pl.read(table, [request, page]), pl.INDEX)
+                valid = pl.min(KEY_ROWS_TILE, length - start)
+                source = pl.slice(flat, [KEY_ROWS_TILE, INDEX_WIDTH], [block * page_rows + offset, 0], valid_shape=[valid, INDEX_WIDTH])
+                values = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), KEY_ROWS_TILE, INDEX_WIDTH)
+            key[start:start + KEY_ROWS_TILE, :] = values
+        with pl.spmd(1, name_hint="index_key_scale_pack"):
+            _writer = pl.tile.get_block_idx()
+            for row in pl.range(512):
+                scale = pl.cast(0.0, pl.FP16)
+                if row < length:
+                    block = pl.cast(pl.read(table, [request, row // page_rows]), pl.INDEX)
+                    scale = pl.read(scale_flat, [block * page_rows + row % page_rows, 0])
+                pl.write(key_scale, [row], scale)
+        return key, key_scale
+
+    return index_key_gather
+
+
+def make_sparse_index_pack(capacity):
+    """Pack the window and compressed physical row IDs into the attention arena."""
+
+    @pl.jit
+    def sparse_index_pack(
+        window: pl.Tensor[[capacity, WINDOW_SIZE], pl.INT32],
+        compressed: pl.Tensor[[capacity, INDEX_TOPK], pl.INT32],
+        indices: pl.InOut[pl.Tensor[[capacity, WINDOW_SIZE + INDEX_TOPK], pl.INT32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        with pl.spmd(active, name_hint="sparse_physical_index_pack"):
+            row = pl.tile.get_block_idx()
+            indices[row:row + 1, :WINDOW_SIZE] = window[row:row + 1, :]
+            indices[row:row + 1, WINDOW_SIZE:] = compressed[row:row + 1, :]
+        return indices
+
+    return sparse_index_pack
+
+
+def make_shared_index_publish(capacity, shared_rows=8192):
+    """Publish actual CP selection rows while preserving shared history and tails."""
+
+    @pl.jit
+    def shared_index_publish(
+        indices: pl.Tensor[[capacity, INDEX_TOPK], pl.INT32],
+        lengths: pl.Tensor[[capacity, 1], pl.INT32],
+        shared_indices: pl.InOut[pl.Tensor[[shared_rows, INDEX_TOPK], pl.INT32]],
+        shared_lengths: pl.InOut[pl.Tensor[[shared_rows, 1], pl.INT32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        with pl.spmd(active, name_hint="shared_index_rows"):
+            row = pl.tile.get_block_idx()
+            shared_indices[row:row + 1, :] = indices[row:row + 1, :]
+        with pl.spmd(1, name_hint="shared_index_lengths"):
+            _writer = pl.tile.get_block_idx()
+            for row in pl.range(active):
+                pl.write(shared_lengths, [row, 0], pl.read(lengths, [row, 0]))
+        return shared_indices, shared_lengths
+
+    return shared_index_publish
+
+
+def make_physical_index_query_entries(capacity, config, cache_blocks, requests, table_pages, compress_ratio=2):
+    """Build index query, quantization, paged scoring and selection publication entries."""
+    from .ecotech_linear import make_ecotech_dynamic_linear
+    from .indexer_select import make_indexer_select
+    from .ops import make_rope
+    from .qkv_proj_rope import make_bf16_projection_staged
+
+    return dict(
+        index_wqb=make_ecotech_dynamic_linear(capacity, 1280, 4096, combine_scales=True),
+        index_weights_proj=make_bf16_projection_staged(5120, 32, capacity=capacity),
+        index_query_rope=pl.jit(make_rope(capacity, 32, 128, 64)._func),
+        index_query_quant=make_indexer_query_quantize(capacity),
+        index_weights_scale=make_index_weights(capacity),
+        index_key_gather=make_index_key_gather(cache_blocks, requests, table_pages, page_rows=128 // compress_ratio),
+        index_select=make_indexer_select(capacity, 512, compress_ratio=compress_ratio),
+        sparse_controls=make_sparse_controls(capacity, requests, table_pages, table_pages,
+                                            long_page_rows=128 // compress_ratio, compress_ratio=compress_ratio,
+                                            long_page_stride=128),
+        shared_index_publish=make_shared_index_publish(capacity),
+    )

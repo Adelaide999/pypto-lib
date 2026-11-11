@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 
-from .c1c2 import make_compressed_cache_publish
+from .prefill_cache_publish import make_compressed_cache_publish
 from .o_proj import make_o_proj_inline
 from .ops import N_TILE
 from .qkv_w8a8 import make_qkv_w8a8_inline

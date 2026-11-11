@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 
-from .ecotech_norm_projections import make_ecotech_norm_projections
+from .prefill_norm_projections import make_ecotech_norm_projections
 from .hc import make_hc_pre_inline
 
 
