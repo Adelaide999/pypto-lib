@@ -14,7 +14,7 @@ from .hc import make_hc_collapse_inline
 from .prefill_cp import make_sp_gather_unpack
 from .prefill_norm import make_prefill_norm
 from .rmsnorm import D, EPS
-from .staged import make_bf16_linear
+from .gemm import make_bf16_linear
 
 
 def make_output_entries(capacity, config, tp):

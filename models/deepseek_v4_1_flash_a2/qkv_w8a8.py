@@ -10,7 +10,9 @@
 
 import pypto.language as pl
 
-from .ops import N_TILE, make_quantize, make_pack_weight, make_dot, make_dequantize, make_norm, make_rope
+from .linear_primitives import N_TILE, make_quantize, make_pack_weight, make_dot, make_dequantize
+from .rmsnorm import make_blocked_rmsnorm as make_norm
+from .norm_rope import make_adjacent_rope as make_rope
 
 
 def make_qkv_w8a8_inline(capacity, config):

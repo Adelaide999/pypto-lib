@@ -8,9 +8,15 @@
 # -----------------------------------------------------------------------------------------------------------
 """Compose PyPTO prefill MoE routing, EP dispatch, W8A8 experts, and token restoration."""
 
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a2"
+
 import argparse
 import json
-import os
 from pathlib import Path
 import shlex
 import sys
@@ -23,7 +29,7 @@ from .moe_dispatch import validate_received_routes, validate_returned_routes
 from .moe_router import make_moe_router
 from .moe_shared import make_shared_moe_w8a8
 from .moe_transport import CANNMemory
-from .runtime_config import ExpertParallelConfig
+from .runtime_config import ExpertParallelConfig, configure_devices
 from .runtime_utils import Executable as _Executable, communicate as _communicate
 from .runtime_utils import loaded_source_files as _loaded_source_files, write_json as _json
 from .runtime_utils import file_sha, tensor_sha
@@ -35,15 +41,12 @@ from .weights import CheckpointOperands
 def _prepare(args, contract):
     topology = contract["topology"]
     layout = ExpertParallelConfig(topology["dp"], topology["tp"], topology["ep"], contract["global_experts"])
-    devices = [value.strip() for value in os.environ["TASK_DEVICE"].split(",")]
-    if len(devices) != layout.ep or len(set(devices)) != layout.ep:
-        raise RuntimeError("Require one distinct queue-assigned device per EP rank")
     if any(topology[key] != 1 for key in ("pp", "pcp", "dcp")) or not contract["enable_expert_parallel"]:
         raise ValueError("Require PP1/PCP1/DCP1 with expert parallelism enabled")
     for rank in range(layout.ep):
         if layout.ownership(rank) != contract["ownership"][rank]:
             raise ValueError("Expert ownership differs from the input contract")
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(devices)
+    devices = configure_devices(args.devices.split(","), world=layout.ep)
     root = Path(__file__).resolve().parents[2]
     runtime = {"topology": topology, "enable_expert_parallel": True, "assigned_devices": devices,
                "logical_rank_mapping": list(range(layout.ep)), "source_root": str(root), "source_files": {},
@@ -62,6 +65,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--devices", required=True, help="Comma-separated physical IDs in logical rank order")
     args = parser.parse_args()
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=True)

@@ -13,7 +13,7 @@ import torch
 
 from .ecotech_linear import prepare_ecotech_dynamic_weight
 from .ecotech_linear_tail import prepare_ecotech_tail_weight
-from .ops import make_dequantize, make_dot, make_pack_weight, make_quantize
+from .linear_primitives import make_dequantize, make_dot, make_pack_weight, make_quantize
 
 
 def prepare_ecotech_shared_weights(gate, up, down):

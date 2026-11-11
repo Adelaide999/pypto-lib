@@ -10,7 +10,8 @@
 
 import pypto.language as pl
 
-from .ops import N_TILE, make_dequantize, make_dot, make_pack_weight, make_quantize, make_rope
+from .linear_primitives import N_TILE, make_dequantize, make_dot, make_pack_weight, make_quantize
+from .norm_rope import make_adjacent_rope as make_rope
 from .qkv_proj_rope import make_bf16_projection_staged
 
 
@@ -322,7 +323,7 @@ def make_physical_index_query_entries(capacity, config, cache_blocks, requests, 
     """Build index query, quantization, paged scoring and selection publication entries."""
     from .ecotech_linear import make_ecotech_dynamic_linear
     from .indexer_select import make_indexer_select
-    from .ops import make_rope
+    from .norm_rope import make_adjacent_rope as make_rope
     from .qkv_proj_rope import make_bf16_projection_staged
 
     return dict(

@@ -8,9 +8,16 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek V4.1 shared expert with A2 INT8 activation and weight matmuls."""
 
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a2"
+
 import pypto.language as pl
 
-from .ops import N_TILE, VEC_M_TILE, make_dequantize, make_dot, make_pack_weight, make_quantize
+from .linear_primitives import N_TILE, VEC_M_TILE, make_dequantize, make_dot, make_pack_weight, make_quantize
 
 
 def _make_shared_activation(capacity, intermediate, limit, fused_activation):
@@ -206,7 +213,7 @@ def golden_shared_moe_w8a8(tensors, *, fused_activation=False):
     tensors["output"][:active] = down.to(torch.bfloat16)
 
 
-def validate_shared_moe(*, device=0):
+def validate_shared_moe(*, device=0, compile_only=False, platform="a2a3", sim=False):
     """Validate both numerical expert boundaries with the product kernel definitions."""
     from functools import partial
 
@@ -231,10 +238,11 @@ def validate_shared_moe(*, device=0):
                 ScalarSpec("active", torch.int32, active),
             ]
             result = run(
+                         compile_only=compile_only,
                 fn=make_shared_moe_w8a8(capacity, config, fused_activation=fused),
                 specs=specs,
                 golden_fn=partial(golden_shared_moe_w8a8, fused_activation=fused),
-                config={"backend_type": "a2a3", "device_id": device},
+                config={"backend_type": platform, "execution_mode": sim, "device_id": device},
                 rtol=0.05,
                 atol=0.05,
             )
@@ -246,5 +254,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=("a2a3",), default="a2a3")
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    validate_shared_moe(device=parser.parse_args().device)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
+    validate_shared_moe(device=args.device, compile_only=args.compile_only, platform=args.platform, sim=args.sim)

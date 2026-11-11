@@ -21,6 +21,13 @@ independently checkable on A2/A3 and lets the sparse-attention consumer use
 either ordering (attention is permutation invariant).
 """
 
+from pathlib import Path
+import sys
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a2"
+
 import torch
 import pypto.language as pl
 
@@ -48,7 +55,7 @@ def indexer_select_reference(
     topk: int = INDEX_TOPK,
     compress_ratio: int = 2,
 ) -> dict[str, torch.Tensor]:
-    """CPU oracle for the A2/A3 QLI score and score-order Top-K contract.
+    """Ideal visibility-aware oracle without the executable kernel's FP16 boundaries.
 
     ``query`` is ``[T, H, 128]`` INT8, ``key`` is ``[K, 128]`` INT8, and the
     two scale tensors are FP16.  ``positions`` is the raw token position used
@@ -223,4 +230,136 @@ def make_indexer_select(
     return kernel
 
 
-__all__ = ["INDEX_HEADS", "INDEX_HEAD_DIM", "INDEX_TOPK", "indexer_select_reference", "make_indexer_select"]
+def golden_indexer_select(tensors):
+    """Evaluate all 512 candidates with the kernel's two FP16 narrowing boundaries."""
+    active = int(tensors["active"])
+    if not 0 <= active <= tensors["query"].shape[0]:
+        raise ValueError("Indexer active rows must fit the actual capacity")
+    if not active:
+        return
+    key = tensors["key"].to(torch.int32)
+    for token in range(active):
+        dots = tensors["query"][token].to(torch.int32) @ key.T
+        positive = dots.float().clamp_min(0.0) * 0.0009765625
+        narrowed_dots = positive.to(torch.float16).float()
+        combined = tensors["query_scale"][token].float() * tensors["weights"][token].float()
+        narrowed_weight = combined.to(torch.float16).float()
+        reduced = narrowed_weight[None] @ narrowed_dots
+        scores = reduced[0] * tensors["key_scale"].float()
+        tensors["scores"][token] = scores
+        tensors["indices"][token] = torch.argsort(scores, descending=True).to(torch.int32)
+
+
+def indexer_active_compare(active, *, exact=False):
+    """Compare the defined prefix; pure Out inactive rows have no preservation contract."""
+    from golden.validation import ratio_allclose
+
+    tolerance = 0.0 if exact else 0.05
+    comparator = ratio_allclose(rtol=tolerance, atol=tolerance, max_error_ratio=0.0)
+
+    def compare(actual, expected, **context):
+        if not active:
+            return True, "No active pure-Out rows; inactive rows are undefined"
+        return comparator(actual[:active], expected[:active], **context)
+
+    return compare
+
+
+def indexer_select_golden_cases(*, build=True):
+    """Use unique positive scores, negative-dot heads and ignored visibility positions."""
+    from golden import ScalarSpec, TensorSpec
+
+    capacity = 16
+    rows = torch.arange(KEY_CAPACITY, dtype=torch.int32)
+    key = torch.ones((KEY_CAPACITY, INDEX_HEAD_DIM), dtype=torch.int8)
+    key[:, 0] = (rows // 4).to(torch.int8)
+    key[:, 1] = (rows % 4).to(torch.int8)
+    query = torch.ones((capacity, INDEX_HEADS, INDEX_HEAD_DIM), dtype=torch.int8)
+    query[:, :, 0] = 4
+    query[:, ::3] *= -1
+    heads = torch.arange(INDEX_HEADS, dtype=torch.float32)
+    query_scale = ((heads % 7 + 8.0) / 17.0).repeat(capacity, 1).to(torch.float16)
+    weights = ((heads % 5 + 3.0) / 11.0).repeat(capacity, 1).to(torch.float16)
+    positions = torch.tensor([-1, 0, 1, 31, 127, 511, 1023, 2047] * 2, dtype=torch.int32)
+    for ratio in (1, 2):
+        for active in (0, 1, 7, capacity):
+            specs = [
+                TensorSpec("query", [capacity, INDEX_HEADS, INDEX_HEAD_DIM], torch.int8, init_value=query),
+                TensorSpec("query_scale", [capacity, INDEX_HEADS], torch.float16, init_value=query_scale),
+                TensorSpec("key", [KEY_CAPACITY, INDEX_HEAD_DIM], torch.int8, init_value=key),
+                TensorSpec("key_scale", [KEY_CAPACITY], torch.float16, init_value=0.75),
+                TensorSpec("weights", [capacity, INDEX_HEADS], torch.float16, init_value=weights),
+                TensorSpec("positions", [capacity], torch.int32, init_value=positions),
+                TensorSpec("scores", [capacity, KEY_CAPACITY], torch.float32, init_value=-53.0),
+                TensorSpec("indices", [capacity, INDEX_TOPK], torch.int32, init_value=-59),
+                ScalarSpec("active", torch.int32, active, compile_runtime=True),
+            ]
+            case = dict(name=f"indexer-fixed512-ratio{ratio}-active{active}", specs=specs,
+                        golden_fn=golden_indexer_select,
+                        compare_fn=dict(scores=indexer_active_compare(active),
+                                        indices=indexer_active_compare(active, exact=True)))
+            if build:
+                case["fn"] = make_indexer_select(capacity, KEY_CAPACITY, compress_ratio=ratio)
+            yield case
+
+
+def validate(*, device=0, sim=False, compile_only=False, cpu_only=False):
+    """Run fixed-row kernel goldens without applying the later visibility filter."""
+    from golden import run
+
+    if cpu_only and compile_only:
+        raise ValueError("CPU golden checks and kernel compilation are separate modes")
+    records = []
+    for case in indexer_select_golden_cases(build=not cpu_only):
+        name = case.pop("name")
+        if cpu_only:
+            values = {spec.name: spec.create_tensor().clone() if hasattr(spec, "create_tensor") else spec.to_python()
+                      for spec in case["specs"]}
+            before = {key: value.clone() for key, value in values.items() if isinstance(value, torch.Tensor)}
+            case["golden_fn"](values)
+            active = int(values["active"])
+            for key in before:
+                if key not in ("scores", "indices") and not torch.equal(values[key], before[key]):
+                    raise RuntimeError("Indexer golden mutated input " + key)
+            if active:
+                scores = values["scores"][:active]
+                ordered = torch.sort(scores, dim=1).values
+                if not (torch.diff(ordered, dim=1) > 0).all():
+                    raise RuntimeError("The exact-index fixture must contain no tied scores")
+                expected = torch.arange(KEY_CAPACITY - 1, -1, -1, dtype=torch.int32).repeat(active, 1)
+                if not torch.equal(values["indices"][:active], expected):
+                    raise RuntimeError("The fixed 512-row selection changed its exact score ordering")
+                if not torch.isfinite(scores).all():
+                    raise RuntimeError("Indexer golden produced nonfinite scores")
+            records.append(dict(name=name, cpu_golden="passed", device="not_run", inactive_Out_rows="undefined"))
+            continue
+        result = run(
+            **case,
+            config=dict(backend_type="a2a3", execution_mode=bool(sim), device_id=device),
+            compile_only=compile_only,
+            rtol=0.05,
+            atol=0.05,
+        )
+        if not result.passed:
+            raise RuntimeError(f"{name}: {result.error}")
+        records.append(dict(name=name, compiled=True, device="not_run" if compile_only else "passed",
+                            inactive_Out_rows="undefined"))
+    return records
+
+
+__all__ = ["INDEX_HEADS", "INDEX_HEAD_DIM", "INDEX_TOPK", "indexer_select_reference", "make_indexer_select",
+           "golden_indexer_select", "indexer_select_golden_cases", "validate"]
+
+
+if __name__ == "__main__":
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=["a2a3"], default="a2a3")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--sim", action="store_true")
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--cpu-only", action="store_true")
+    args = parser.parse_args()
+    print(json.dumps(validate(device=args.device, sim=args.sim, compile_only=args.compile_only, cpu_only=args.cpu_only)))

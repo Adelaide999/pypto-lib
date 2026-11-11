@@ -12,9 +12,9 @@ import pypto.language as pl
 
 from .prefill_cache_publish import make_compressed_cache_publish
 from .o_proj import make_o_proj_inline
-from .ops import N_TILE
+from .linear_primitives import N_TILE
 from .qkv_w8a8 import make_qkv_w8a8_inline
-from .sparse_attention import attend_bf16
+from .sparse_attention import make_sparse_attention_inline
 
 
 def make_consumer_qkv_publish(capacity, config):
@@ -61,10 +61,11 @@ def make_consumer_qkv_publish(capacity, config):
     return consumer_qkv_publish
 
 
-def make_consumer_sparse_core(active, config, *, compressed_blocks=1):
+def make_consumer_sparse_core(active, config, *, compressed_blocks=1, tp=1):
     """Expose exact readonly device staging around the existing sparse core."""
     heads = config["num_attention_heads"]
     head_dim = config["head_dim"]
+    attend_bf16 = make_sparse_attention_inline(tp)
     if compressed_blocks < 1:
         raise ValueError("Compressed cache staging requires its actual positive block count")
 

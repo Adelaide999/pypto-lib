@@ -12,7 +12,7 @@ import pypto.language as pl
 
 from .hc import make_hc_post_inline, make_hc_pre_inline
 from .rmsnorm import NORM_T_TILE, rms_norm_tiled
-from .ops import make_quantize
+from .linear_primitives import make_quantize
 
 
 def make_moe_input_quantize(capacity, hidden):

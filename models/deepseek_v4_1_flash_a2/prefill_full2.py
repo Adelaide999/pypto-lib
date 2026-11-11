@@ -69,7 +69,8 @@ def make_physical_compressed_entries(capacity, config, cache_blocks, requests, t
     """Build paged physical-layer C2, index packing and full-head compressed attention entries."""
     from .indexer_select import make_indexer_select
     from .norm_rope import make_rope_tables
-    from .ops import make_norm, make_rope
+    from .rmsnorm import make_blocked_rmsnorm as make_norm
+    from .norm_rope import make_adjacent_rope as make_rope
     from .prefill_c2_pool import make_c2_pool_observed
     from .prefill_cache_publish import make_index_cache_publish_observed
     from .prefill_indexer import make_index_key_gather, make_physical_index_query_entries

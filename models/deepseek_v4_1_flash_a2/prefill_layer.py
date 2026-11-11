@@ -6,9 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: manual
 """Compose physical Prefill layers with CP/SP attention, Engram, EP MoE and delayed HC."""
 
-import os
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a2"
+
 from pathlib import Path
 import sys
 
@@ -37,7 +44,7 @@ def validate_prefill_ownership(layout, ownership):
 
 def make_prefill_layer_entries(
     capacity, config, expert_capacity, layer_id=0, cache_blocks=3, requests=1, table_pages=2, *,
-    ep, cache_layout=None, role=None, network_cache=False,
+    ep, tp=1, cache_layout=None, role=None, network_cache=False,
 ):
     """Construct shared physical-layer attention, HC and MoE computations."""
     from .hc import make_hc_post_inline, make_hc_pre_inline
@@ -50,13 +57,13 @@ def make_prefill_layer_entries(
     from .prefill_norm import make_prefill_norm_cast
     from .prefill_layer_state import resolve_layer_role
     from .prefill_swa import make_builders
-    from .runtime_config import TP_SIZE
+    from .runtime_config import validate_tp
 
     role = resolve_layer_role(layer_id, role)
-    tp = TP_SIZE
+    tp = validate_tp(tp)
     if tp not in (1, 2, 4) or capacity % 16 or not 2 <= ep <= 16 or ep % tp or 384 % ep:
-        raise ValueError("Freeze --tp 1/2/4 before importing and compiling the aligned Prefill layer")
-    entries = make_builders(capacity, cache_blocks=cache_blocks)
+        raise ValueError("Require TP1/2/4 and an aligned complete Prefill layer")
+    entries = make_builders(capacity, cache_blocks=cache_blocks, tp=tp)
     del entries["swa"]
     entries.update(
         hc_pre=pl.jit(make_hc_pre_inline(capacity, config)._func),
@@ -107,11 +114,12 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     next-layer inputs from files. Buffers are local SP shards, not gathered output.
     """
     from .moe_dispatch import MAP_PAD, validate_received_routes, validate_returned_routes
+    from .prefill_l2 import execute_region
     from .prefill_compressed_runtime import run_compressed_attention
     from .prefill_consumer_runtime import run_consumer_attention
     from .prefill_layer_state import LayerObservations, invalidate_live_versions, publish_live_versions
     from .prefill_layer_state import resolve_layer_role, validate_live_state
-    from .runtime_config import ExpertParallelConfig, TP_SIZE
+    from .runtime_config import ExpertParallelConfig
     from .swa_scheduler import from_controls
 
     layer_id = role["physical_layer"]
@@ -119,8 +127,8 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     topology = runtime["topology"]
     layout = ExpertParallelConfig(topology["dp"], topology["tp"], topology["ep"], 384)
     tp, world = layout.tp, layout.ep
-    if tp != TP_SIZE or tp not in (1, 2, 4) or not 2 <= world <= 16:
-        raise ValueError("Freeze matching TP1/2/4 with real multi-rank EP before building the layer")
+    if tp not in (1, 2, 4) or not 2 <= world <= 16:
+        raise ValueError("Require matching TP1/2/4 with real multi-rank EP before building the layer")
     if any(topology[name] != 1 for name in ("pp", "pcp", "dcp")):
         raise ValueError("Require PP1/PCP1/DCP1")
     if not runtime["enable_expert_parallel"] or not all(runtime["required_modes"].values()):
@@ -239,17 +247,16 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                     dict(cosine=cosine, sine=sine), "rope")
             q_cos, q_sin = pad(cosine[start:start + query_rows]), pad(sine[start:start + query_rows])
             wqa, latent, qb, query = zeros(capacity, 1280), zeros(capacity, 1280), zeros(capacity, 32768), zeros(capacity, 32768)
-            execute("wq_a", rank, case, [q_input, operands["wq_a"], operands["wq_a_scale"], wqa, query_rows],
-                    {"wqa": wqa}, "qkv")
-            execute("q_norm", rank, case, [wqa, operands["q_norm"], latent, query_rows], {"latent": latent}, "qkv")
-            execute("wq_b", rank, case, [latent, operands["wq_b"], operands["wq_b_scale"], qb, query_rows],
-                    {"qb": qb}, "qkv")
-            execute("q_rope", rank, case, [qb, q_cos, q_sin, query, query_rows], {"query": query}, "rope")
             kv_raw, kv_norm, kv_rope = zeros(capacity, 512), zeros(capacity, 512), zeros(capacity, 512)
-            execute("wkv", rank, case, [full_norm, operands["wkv"], operands["wkv_scale"], kv_raw, total],
-                    {"kv_raw": kv_raw}, "qkv")
-            execute("kv_norm", rank, case, [kv_raw, operands["kv_norm"], kv_norm, total], {"kv_norm": kv_norm}, "qkv")
-            execute("kv_rope", rank, case, [kv_norm, cosine, sine, kv_rope, total], {"kv": kv_rope}, "rope")
+            execute_region(runtime, "qkv_l2", rank, case, [
+                ("wq_a", [q_input, operands["wq_a"], operands["wq_a_scale"], wqa, query_rows], {"wqa": wqa}, "qkv"),
+                ("q_norm", [wqa, operands["q_norm"], latent, query_rows], {"latent": latent}, "qkv"),
+                ("wq_b", [latent, operands["wq_b"], operands["wq_b_scale"], qb, query_rows], {"qb": qb}, "qkv"),
+                ("q_rope", [qb, q_cos, q_sin, query, query_rows], {"query": query}, "rope"),
+                ("wkv", [full_norm, operands["wkv"], operands["wkv_scale"], kv_raw, total], {"kv_raw": kv_raw}, "qkv"),
+                ("kv_norm", [kv_raw, operands["kv_norm"], kv_norm, total], {"kv_norm": kv_norm}, "qkv"),
+                ("kv_rope", [kv_norm, cosine, sine, kv_rope, total], {"kv": kv_rope}, "rope"),
+            ])
             state["kv_rope"] = kv_rope
             if role["mode"] == "full":
                 context, cache = run_compressed_attention(
@@ -280,15 +287,15 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 context, inverse = zeros(capacity, 32768), zeros(capacity, 32768)
                 execute("swa_read", rank, case, [query, indices, operands["sink"], cache, context, query_rows],
                         {"context": context}, "swa")
-            execute("inverse_rope", rank, case, [context, q_cos, q_sin, inverse, query_rows],
-                    {"inverse": inverse}, "rope")
             packet = zeros(tp * capacity, head_width)
-            execute("head_pack", rank, case, [inverse, packet, query_rows], {"packet": packet}, "output_projection")
+            execute_region(runtime, "attention_pack_l2", rank, case, [
+                ("inverse_rope", [context, q_cos, q_sin, inverse, query_rows], {"inverse": inverse}, "rope"),
+                ("head_pack", [inverse, packet, query_rows], {"packet": packet}, "output_projection"),
+            ])
             if capture_nodes:
                 nodes.update(q_norm=latent[:query_rows].clone(), query_latent=latent[:query_rows].clone(),
                              query_rope=query[:query_rows].reshape(query_rows, 64, 512).clone(),
                              attention_context=context[:query_rows].reshape(query_rows, 64, 512).clone())
-            if capture_nodes:
                 nodes.update(wkv=kv_raw[:total].clone(), kv_norm=kv_norm[:total].clone(),
                              attention_context_inverse_rope=inverse[:query_rows].reshape(query_rows, 64, 512).clone())
             state.update(cache=cache, per_rank=per_rank, positions=positions)
@@ -300,14 +307,15 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             state, tp_rank = states[rank][case], rank % tp
             total, physical, nodes = state["total"], state["physical"], state["nodes"]
             heads, woa, wob = zeros(capacity, head_width), zeros(capacity, output_width), zeros(capacity, 5120)
-            execute("head_unpack", rank, case, [exchanged[rank][case], heads, state["per_rank"], total],
-                    {"heads": heads}, "output_projection")
             weight_a = operands["wo_a_grouped_prefill"][tp_rank * local_groups:(tp_rank + 1) * local_groups].contiguous()
             weight_b = operands["wo_b"][tp_rank * output_width:(tp_rank + 1) * output_width].contiguous()
-            execute("grouped_wo_a", rank, case, [heads, weight_a, woa, total], {"wo_a": woa}, "output_projection")
-            execute("wo_b", rank, case, [woa, weight_b, wob, total], {"wo_b": wob}, "output_projection")
             packed = zeros(tp * capacity, 5120)
-            execute("reduce_pack", rank, case, [wob, packed, physical, total], {"packed": packed}, "output_projection")
+            execute_region(runtime, "output_projection_l2", rank, case, [
+                ("head_unpack", [exchanged[rank][case], heads, state["per_rank"], total], {"heads": heads}, "output_projection"),
+                ("grouped_wo_a", [heads, weight_a, woa, total], {"wo_a": woa}, "output_projection"),
+                ("wo_b", [woa, weight_b, wob, total], {"wo_b": wob}, "output_projection"),
+                ("reduce_pack", [wob, packed, physical, total], {"packed": packed}, "output_projection"),
+            ])
             if capture_nodes:
                 nodes.update(attention_heads_after_exchange=heads[:total].reshape(total, 64 // tp, 512).clone(),
                              wo_a=woa[:total].clone(), wo_b=wob[:total].clone(), attention_output=wob[:total].clone())
@@ -321,16 +329,11 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             state = states[rank][case]
             physical, nodes = state["physical"], state["nodes"]
             changed = zeros(capacity, 4, 5120)
-            execute("hc_post", rank, case, [scattered[rank][case], state["hidden"], state["post"], state["comb"],
-                    changed, physical], {"changed": changed}, "hc_post")
             pre, post = zeros(capacity, 4, dtype=torch.float32), zeros(capacity, 4, dtype=torch.float32)
             comb, collapsed = zeros(capacity, 4, 4, dtype=torch.float32), zeros(capacity, 5120)
             hc_args = [changed, raw[f"{prefix}.hc_ffn_fn"], raw[f"{prefix}.hc_ffn_scale"], raw[f"{prefix}.hc_ffn_base"],
                        state["pre"], pre, post, comb, collapsed, physical]
-            execute("hc_pre", rank, case, hc_args, dict(pre=pre, post=post, comb=comb, collapsed=collapsed), "hc_pre")
             normed, router_input = zeros(capacity, 5120), zeros(capacity, 5120, dtype=torch.float32)
-            execute("norm_cast", rank, case, [collapsed, raw[f"{prefix}.ffn_norm.weight"], normed, router_input, physical],
-                    dict(normed=normed, router_input=router_input), "ffn_norm")
             logits, weights = zeros(capacity, 384, dtype=torch.float32), zeros(capacity, 6, dtype=torch.float32)
             ids = torch.zeros((capacity, 6), dtype=torch.int32)
             gate = raw[f"{prefix}.ffn.gate.weight"].float()
@@ -338,15 +341,22 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             router_args = [router_input, gate, raw[f"{prefix}.ffn.gate.bias"],
                            raw[f"{prefix}.ffn.gate.bias_vl"], token_ids,
                            logits, ids, weights, routing_rows]
-            execute("router", rank, case, router_args, dict(logits=logits, route_ids=ids, route_weights=weights), "router")
             shared = zeros(capacity, 5120)
             with memory.interval(rank, "load", "shared_expert"):
                 shared_operands = expert_weights(rank, None)
-            execute("shared", rank, case, [normed, *shared_operands, shared, physical], {"shared": shared}, "shared")
             packet = {"routes": torch.full((packet_rows, 4), -1, dtype=torch.int64),
                       "hidden": zeros(packet_rows, 5120), "counts": torch.zeros((world, MAP_PAD), dtype=torch.int32)}
             args_pack = [normed, ids, packet["routes"], packet["hidden"], packet["counts"], state["valid"], rank]
-            execute("dispatch_pack", rank, case, args_pack, packet, "dispatch_pack")
+            execute_region(runtime, "ffn_dispatch_l2", rank, case, [
+                ("hc_post", [scattered[rank][case], state["hidden"], state["post"], state["comb"], changed, physical],
+                 {"changed": changed}, "hc_post"),
+                ("hc_pre", hc_args, dict(pre=pre, post=post, comb=comb, collapsed=collapsed), "hc_pre"),
+                ("norm_cast", [collapsed, raw[f"{prefix}.ffn_norm.weight"], normed, router_input, physical],
+                 dict(normed=normed, router_input=router_input), "ffn_norm"),
+                ("router", router_args, dict(logits=logits, route_ids=ids, route_weights=weights), "router"),
+                ("shared", [normed, *shared_operands, shared, physical], {"shared": shared}, "shared"),
+                ("dispatch_pack", args_pack, packet, "dispatch_pack"),
+            ])
             if capture_nodes:
                 nodes.update({"hc_post0": changed[:physical].clone(), "hc_pre1.collapsed": collapsed[:physical].clone(),
                               "hc_pre1.post": post[:physical].clone(), "hc_pre1.comb": comb[:physical].clone(),
@@ -406,13 +416,14 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             returned_routes = torch.full((routes, 4), -1, dtype=torch.int64)
             combine_args = [packet["routes"], packet["hidden"], packet["counts"], state["weights"], state["shared"],
                             routed, combined, returned_routes, state["physical"]]
-            execute("combine", rank, case, combine_args, dict(routed=routed, combined=combined, returned_routes=returned_routes),
-                    "combine")
             valid, physical = state["valid"], state["physical"]
-            execute("mask_moe", rank, case, [combined, valid, physical], {"combined": combined}, "combine")
             output = torch.full((capacity, 4, 5120), runtime["output_sentinel"], dtype=torch.bfloat16)
-            execute("hc_post", rank, case + "-ffn", [combined, state["changed"], state["ffn_post"], state["ffn_comb"],
-                    output, state["physical"]], {"hidden": output}, "hc_post")
+            execute_region(runtime, "moe_finish_l2", rank, case, [
+                ("combine", combine_args, dict(routed=routed, combined=combined, returned_routes=returned_routes), "combine"),
+                ("mask_moe", [combined, valid, physical], {"combined": combined}, "combine"),
+                ("hc_post", [combined, state["changed"], state["ffn_post"], state["ffn_comb"], output, physical],
+                 {"hidden": output}, "hc_post", case + "-ffn"),
+            ])
             output_flat = output.reshape(capacity, 20480)
             execute("mask_output", rank, case, [output_flat, valid, physical], {"hidden": output}, "hc_post")
             routed_node = routed[:state["routing_rows"]].clone() if capture_nodes else None
@@ -469,7 +480,7 @@ def run_prefill_layer(args, layer_id=0):
     from .moe_transport import CANNMemory
     from .prefill_layer_state import fixture_live_state, resolve_layer_role
     from .prefill_swa import prepare_product_operands
-    from .runtime_config import ExpertParallelConfig, TP_SIZE
+    from .runtime_config import ExpertParallelConfig
     from .runtime_utils import Executable, communicate, file_sha, loaded_source_files, write_json
     from .weights import CheckpointOperands
 
@@ -505,8 +516,8 @@ def run_prefill_layer(args, layer_id=0):
     tp, world = layout.tp, layout.ep
     if any(topology[name] != 1 for name in ("pp", "pcp", "dcp")):
         raise ValueError("Require PP1/PCP1/DCP1")
-    if args.tp != TP_SIZE or TP_SIZE != tp or not 2 <= world <= 16:
-        raise ValueError("Freeze matching TP1/2/4 and a real local multi-rank EP topology before import")
+    if args.tp != tp or not 2 <= world <= 16:
+        raise ValueError("Require matching TP1/2/4 and a real local multi-rank EP topology")
     if any(len(records) != world for records in contract["cases"].values()):
         raise ValueError("Every case must cover the actual complete world")
     if not contract["enable_expert_parallel"] or not all(contract["required_modes"].values()):
@@ -515,10 +526,11 @@ def run_prefill_layer(args, layer_id=0):
     if contract["global_experts"] != 384 or contract["top_k"] != 6 or contract["cache_pages"] != cache_pages:
         raise ValueError("Original expert, top-k and cache geometry is required")
     ownership = validate_prefill_ownership(layout, contract["ownership"])
-    assigned = os.environ["TASK_DEVICE"].split(",")
+    from .runtime_config import configure_devices
+
+    assigned = configure_devices(args.devices, world=world)
     if len(assigned) != world or len(set(assigned)) != world or any(not device.isdecimal() for device in assigned):
         raise ValueError("Require the complete distinct queue-assigned device set for this topology")
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(assigned)
     torch.set_num_threads(4)
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -578,6 +590,7 @@ def run_prefill_layer(args, layer_id=0):
     functions = make_prefill_layer_entries(
         capacity, config, expert_capacity, layer_id, cache_pages, requests, table_pages, ep=world,
         cache_layout=next(iter(contract["cases"].values()))[0].get("cache_layout"),
+        tp=tp,
     )
     entries = {name: Executable(function, build / name) for name, function in functions.items()}
 
@@ -722,6 +735,7 @@ def compile_prefill_layer(args, layer_id=0):
         capacity, config, expert_capacity, layer_id, cache_pages, requests, table_pages,
         ep=contract["topology"]["ep"],
         cache_layout=originals[0].get("cache_layout"),
+        tp=args.tp,
     )
     if layer_id in (1, 14):
         from .prefill_engram_runtime import engram_owner
@@ -756,8 +770,10 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=("a2a3",), default="a2a3")
     parser.add_argument("--layer-id", type=int, choices=(0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25), required=True)
     parser.add_argument("--tp", type=int, choices=(1, 2, 4), required=True)
+    parser.add_argument("--devices", type=lambda value: value.split(","), required=True)
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compile-only", action="store_true")

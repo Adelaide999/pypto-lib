@@ -11,7 +11,11 @@
 from __future__ import annotations
 
 import torch
+from collections.abc import Mapping
+
 import pypto.language as pl
+
+from .qkv import qkv_shape
 
 from .swa_cache import (
     gather_swa_cache_reference,
@@ -127,3 +131,25 @@ __all__ = [
     "swa_attention_reference",
     "write_swa_cache_reference",
 ]
+
+
+def make_swa_entry(capacity: int, config: Mapping[str, object]):
+    shape = qkv_shape(config)
+    window = int(config["sliding_window"])
+    attend = make_swa_attention(capacity, shape.num_attention_heads, shape.head_dim, window)
+
+    @pl.jit
+    def kernel(
+        query: pl.Tensor[[capacity, shape.query_width], pl.BF16],
+        window_kv: pl.Tensor[[capacity, shape.head_dim], pl.BF16],
+        slots: pl.Tensor[[capacity, 2], pl.INT64],
+        indices: pl.Tensor[[capacity, window], pl.INT32],
+        sink: pl.Tensor[[shape.num_attention_heads], pl.FP32],
+        cache: pl.InOut[pl.Tensor[[2, 128, 1, shape.head_dim], pl.BF16]],
+        output: pl.InOut[pl.Tensor[[capacity, shape.query_width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        attend(query, window_kv, slots, indices, sink, cache, output, active)
+        return cache, output
+
+    return kernel

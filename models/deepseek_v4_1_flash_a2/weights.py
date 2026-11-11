@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import perf_counter
 from typing import Mapping
 from contextlib import contextmanager
 
@@ -29,11 +30,13 @@ class CheckpointOperands:
         index = self.root / "quant_model_weights.safetensors.index.json"
         self.index = json.loads(index.read_text())["weight_map"]
         self.consumed = {}
+        self.read_seconds, self.read_calls = 0.0, 0
 
     def load(self, name):
         """Load complete logical checkpoint bytes before any layout or dtype conversion."""
         from safetensors import safe_open
 
+        begin = perf_counter()
         path = self.root / self.index[name]
         with safe_open(path, framework="pt", device="cpu") as source:
             value = source.get_tensor(name)
@@ -41,6 +44,8 @@ class CheckpointOperands:
             "file": path.name, "shape": list(value.shape), "dtype": str(value.dtype),
             "selected_rows": None, "sha256": tensor_sha(value),
         }
+        self.read_seconds += perf_counter() - begin
+        self.read_calls += 1
         return value
 
     def expert(self, prefix):

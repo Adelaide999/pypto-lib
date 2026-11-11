@@ -8,8 +8,15 @@
 # -----------------------------------------------------------------------------------------------------------
 """FP32 MoE gate, text/vision expert selection, and normalized routing weights."""
 
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a2"
+
 import pypto.language as pl
-from .ops import make_cast_tile
+from .linear_primitives import make_cast_tile
 
 
 
@@ -167,7 +174,7 @@ def golden_moe_router(tensors, config):
     tensors["route_weights"][:active] = weights
 
 
-def validate_moe_router(*, device=0):
+def validate_moe_router(*, device=0, compile_only=False, platform="a2a3", sim=False):
     """Validate natural and controlled routing using the product router definition."""
     from functools import partial
 
@@ -195,10 +202,11 @@ def validate_moe_router(*, device=0):
                 ScalarSpec("active", torch.int32, active),
             ]
             result = run(
+                         compile_only=compile_only,
                 fn=make_moe_router(capacity, settings),
                 specs=specs,
                 golden_fn=partial(golden_moe_router, config=settings),
-                config={"backend_type": "a2a3", "device_id": device},
+                config={"backend_type": platform, "execution_mode": sim, "device_id": device},
                 rtol=0.01,
                 atol=0.001,
             )
@@ -210,5 +218,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=("a2a3",), default="a2a3")
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    validate_moe_router(device=parser.parse_args().device)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
+    validate_moe_router(device=args.device, compile_only=args.compile_only, platform=args.platform, sim=args.sim)

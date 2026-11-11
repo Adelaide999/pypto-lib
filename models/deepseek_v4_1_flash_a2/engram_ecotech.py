@@ -8,6 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """INT8/F32 Engram lookup, BF16 projection and block32 original-basis gating."""
 
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a2"
+
 import pypto.language as pl
 
 from .qkv_proj_rope import make_bf16_projection_staged
@@ -300,7 +307,7 @@ def engram_int8_golden_cases():
                    compare_fn={"lookup": exact_lookup})
 
 
-def validate_engram_int8(*, device=0, compile_only=False):
+def validate_engram_int8(*, device=0, compile_only=False, platform="a2a3", sim=False):
     """Run the owning fused lookup and group32 Golden cases."""
     from golden import run
 
@@ -308,7 +315,7 @@ def validate_engram_int8(*, device=0, compile_only=False):
         name = case.pop("name")
         result = run(
             **case,
-            config={"platform": "a2a3", "device_id": device},
+            config={"backend_type": platform, "execution_mode": sim, "device_id": device},
             compile_only=compile_only,
         )
         if not result.passed:
@@ -319,7 +326,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=("a2a3",), default="a2a3")
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
-    validate_engram_int8(device=args.device, compile_only=args.compile_only)
+    validate_engram_int8(device=args.device, compile_only=args.compile_only, platform=args.platform, sim=args.sim)

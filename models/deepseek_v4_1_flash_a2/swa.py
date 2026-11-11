@@ -8,6 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """BF16 paged SWA cache publication, window gather and sink attention."""
 
+from pathlib import Path
+import sys
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a2"
+
 import pypto.language as pl
 
 
@@ -223,3 +230,200 @@ def make_swa(capacity, cache_blocks, config):
         return cache, output
 
     return swa
+
+
+def golden_swa(tensors, *, config):
+    """Publish legal slots and evaluate sink softmax with BF16 probability rounding."""
+    import torch
+
+    active = int(tensors["active"])
+    heads, dim, window = (config[name] for name in ("num_attention_heads", "head_dim", "sliding_window"))
+    if not 0 <= active <= tensors["query"].shape[0]:
+        raise ValueError("SWA active rows must fit the actual capacity")
+    if not active:
+        return
+    flat = tensors["cache"].view(-1, dim)
+    for token in range(active):
+        page, offset = (int(value) for value in tensors["slots"][token])
+        if page < 0:
+            continue
+        if page >= tensors["cache"].shape[0] or not 0 <= offset < 128:
+            raise ValueError("Positive SWA publication slots must remain in the allocated cache")
+        flat[page * 128 + offset] = tensors["kv"][token]
+    indices = tensors["indices"][:active].long()
+    if (indices >= len(flat)).any():
+        raise ValueError("SWA selected cache rows must remain in the allocated cache")
+    for token in range(active):
+        valid = indices[token] >= 0
+        selected = torch.zeros((window, dim), dtype=torch.bfloat16)
+        selected[valid] = flat[indices[token, valid]]
+        query = tensors["query"][token].reshape(heads, dim).float()
+        scores = (query @ selected.float().T) * (dim ** -0.5)
+        scores = scores + (valid.float() - 1.0)[None] * 1e30
+        maximum = tensors["sink"].float().clone()
+        denominator = torch.ones(heads, dtype=torch.float32)
+        numerator = torch.zeros((heads, dim), dtype=torch.float32)
+        sparse_maximum = torch.full((heads,), -1e30, dtype=torch.float32)
+        if window == 640:
+            for part in range(4):
+                start = 128 + part * WINDOW_TILE
+                sparse_maximum = torch.maximum(sparse_maximum, scores[:, start:start + WINDOW_TILE].amax(dim=1))
+        for part in range(window // WINDOW_TILE):
+            start = part * WINDOW_TILE
+            score = scores[:, start:start + WINDOW_TILE]
+            local_max = score.amax(dim=1)
+            if window == 640 and part > 0:
+                local_max = torch.maximum(local_max, sparse_maximum)
+            next_max = torch.maximum(maximum, local_max)
+            correction = torch.exp(maximum - next_max)
+            probability = torch.exp(score - next_max[:, None]) * valid[start:start + WINDOW_TILE].float()[None]
+            denominator = denominator * correction + probability.sum(dim=1)
+            rounded = probability.to(torch.bfloat16).float()
+            weighted = rounded @ selected[start:start + WINDOW_TILE].float()
+            numerator = numerator * correction[:, None] + weighted
+            maximum = next_max
+        tensors["output"][token] = (numerator / denominator[:, None]).reshape(-1).to(torch.bfloat16)
+
+
+def swa_output_compare(active, all_masked):
+    """Compare active values while requiring exact masked rows and inactive tails."""
+    from golden.validation import ratio_allclose
+
+    numeric = ratio_allclose(rtol=0.05, atol=0.05, max_error_ratio=0.0)
+    exact = ratio_allclose(rtol=0.0, atol=0.0, max_error_ratio=0.0)
+
+    def compare(actual, expected, **context):
+        if active:
+            passed, detail = numeric(actual[:active], expected[:active], **context)
+            if not passed:
+                return False, "active: " + detail
+        for label, region in (("untouched", slice(active, None)), ("masked", all_masked)):
+            if actual[region].numel():
+                passed, detail = exact(actual[region], expected[region], **context)
+                if not passed:
+                    return False, label + ": " + detail
+        return True, ""
+
+    return compare
+
+
+def swa_golden_cases(*, build=True):
+    """Cover 128/640 windows, page edges, skipped slots, masks and inactive rows."""
+    from functools import partial
+    import torch
+    from golden import ScalarSpec, TensorSpec
+    from golden.validation import ratio_allclose
+
+    capacity, blocks, heads, dim = 16, 6, 16, 64
+    generator = torch.Generator().manual_seed(517)
+    query = (torch.randn((capacity, heads * dim), generator=generator) * 0.2).to(torch.bfloat16)
+    kv = (torch.randn((capacity, dim), generator=generator) * 0.3).to(torch.bfloat16)
+    cache = (torch.randn((blocks, 128, 1, dim), generator=generator) * 0.3).to(torch.bfloat16)
+    sink = torch.linspace(-2.0, 2.0, heads)
+    exact = ratio_allclose(rtol=0.0, atol=0.0, max_error_ratio=0.0)
+    for window in (128, 640):
+        config = dict(num_attention_heads=heads, head_dim=dim, sliding_window=window)
+        for active in (0, 1, 7, capacity):
+            slots = torch.tensor([[token // 4, token * 37 % 128] for token in range(capacity)], dtype=torch.int64)
+            slots[0] = torch.tensor([0, 127])
+            slots[1] = torch.tensor([1, 0])
+            slots[3] = torch.tensor([-1, 999])
+            slots[active:] = torch.tensor([blocks + 1, 999])
+            indices = (torch.arange(capacity * window).reshape(capacity, window) * 7 % (blocks * 128)).int()
+            indices[:, ::5] = -1
+            indices[0] = -1
+            if active > 1:
+                indices[1, 0] = 128
+            indices[active:] = blocks * 128 + 999
+            all_masked = list(range(min(active, 1)))
+            specs = [
+                TensorSpec("query", [capacity, heads * dim], torch.bfloat16, init_value=query),
+                TensorSpec("kv", [capacity, dim], torch.bfloat16, init_value=kv),
+                TensorSpec("slots", [capacity, 2], torch.int64, init_value=slots),
+                TensorSpec("indices", [capacity, window], torch.int32, init_value=indices),
+                TensorSpec("sink", [heads], torch.float32, init_value=sink),
+                TensorSpec("cache", [blocks, 128, 1, dim], torch.bfloat16, init_value=cache),
+                TensorSpec("output", [capacity, heads * dim], torch.bfloat16, init_value=-43.0),
+                ScalarSpec("active", torch.int32, active, compile_runtime=True),
+            ]
+            case = dict(name=f"swa-window{window}-active{active}", specs=specs,
+                        golden_fn=partial(golden_swa, config=config),
+                        compare_fn=dict(cache=exact, output=swa_output_compare(active, all_masked)))
+            if build:
+                case["fn"] = make_swa(capacity, blocks, config)
+            yield case
+
+
+def validate(*, device=0, sim=False, compile_only=False, cpu_only=False):
+    """Run bounded SWA goldens; CPU mode does not compile or execute a kernel."""
+    import torch
+    from golden import run
+
+    if cpu_only and compile_only:
+        raise ValueError("CPU golden checks and kernel compilation are separate modes")
+    records = []
+    for case in swa_golden_cases(build=not cpu_only):
+        name = case.pop("name")
+        if cpu_only:
+            values = {spec.name: spec.create_tensor().clone() if hasattr(spec, "create_tensor") else spec.to_python()
+                      for spec in case["specs"]}
+            before = {key: value.clone() for key, value in values.items() if isinstance(value, torch.Tensor)}
+            case["golden_fn"](values)
+            active = int(values["active"])
+            for key in before:
+                if key not in ("cache", "output") and not torch.equal(values[key], before[key]):
+                    raise RuntimeError("SWA golden mutated input " + key)
+            expected_cache = before["cache"].clone()
+            for token in range(active):
+                page, offset = (int(value) for value in values["slots"][token])
+                if page >= 0:
+                    expected_cache[page, offset, 0] = values["kv"][token]
+            if not torch.equal(values["cache"], expected_cache):
+                raise RuntimeError("SWA cache publication changed an untouched byte")
+            if not torch.equal(values["output"][active:], before["output"][active:]):
+                raise RuntimeError("SWA golden changed an inactive output row")
+            if active and values["output"][0].count_nonzero():
+                raise RuntimeError("All-masked SWA row must retain the zero-value sink result")
+            if not torch.isfinite(values["output"]).all():
+                raise RuntimeError("SWA golden produced nonfinite output")
+            if active == 1:
+                for invalid_name in ("slot", "selection"):
+                    invalid = {key: value.clone() if isinstance(value, torch.Tensor) else value
+                               for key, value in values.items()}
+                    if invalid_name == "slot":
+                        invalid["slots"][0] = torch.tensor([values["cache"].shape[0], 0])
+                    else:
+                        invalid["indices"][0, 0] = values["cache"].shape[0] * 128
+                    try:
+                        case["golden_fn"](invalid)
+                    except ValueError:
+                        pass
+                    else:
+                        raise RuntimeError("SWA golden accepted an out-of-allocation " + invalid_name)
+            records.append(dict(name=name, cpu_golden="passed", device="not_run"))
+            continue
+        result = run(
+            **case,
+            config=dict(backend_type="a2a3", execution_mode=bool(sim), device_id=device),
+            compile_only=compile_only,
+            rtol=0.05,
+            atol=0.05,
+        )
+        if not result.passed:
+            raise RuntimeError(f"{name}: {result.error}")
+        records.append(dict(name=name, compiled=True, device="not_run" if compile_only else "passed"))
+    return records
+
+
+if __name__ == "__main__":
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=["a2a3"], default="a2a3")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--sim", action="store_true")
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--cpu-only", action="store_true")
+    args = parser.parse_args()
+    print(json.dumps(validate(device=args.device, sim=args.sim, compile_only=args.compile_only, cpu_only=args.cpu_only)))

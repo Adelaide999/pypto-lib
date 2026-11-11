@@ -8,6 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Transport contiguous PyPTO route buckets through CANN memory and HCCL bytes."""
 
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a2"
+
 import argparse
 from contextlib import contextmanager
 import ctypes
@@ -19,6 +26,7 @@ import time
 
 import torch
 
+from .runtime_config import configure_devices
 from .runtime_utils import file_sha
 
 
@@ -186,11 +194,10 @@ def main():
     parser.add_argument("--rank", type=int, required=True)
     args = parser.parse_args()
     runtime = json.loads(args.runtime_config.read_text())
-    assigned = os.environ["TASK_DEVICE"].split(",")
     world, rank = runtime["topology"]["ep"], args.rank
-    if assigned != runtime["assigned_devices"] or len(set(assigned)) != world or not 0 <= rank < world:
-        raise RuntimeError("HCCL rank mapping differs from the queue allocation")
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(assigned)
+    if not 0 <= rank < world:
+        raise ValueError("HCCL rank is outside the explicit runtime device mapping")
+    assigned = configure_devices(runtime["assigned_devices"], world=world)
     os.environ["HCCL_EXEC_TIMEOUT"] = "180"
     settings = runtime.get("transport", {"collective": "all_to_all", "group": "ep", "stage": args.directory.name})
     collective = settings["collective"]

@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 
-from .ops import make_quantize
+from .linear_primitives import make_quantize
 
 
 def make_compressed_cache_publish(capacity, blocks, width):

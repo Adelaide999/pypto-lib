@@ -13,7 +13,8 @@ import torch
 
 from .ecotech_linear import make_ecotech_dynamic_linear, prepare_ecotech_dynamic_weight
 from .hc import make_hc_pre_inline
-from .ops import make_norm, make_rope
+from .rmsnorm import make_blocked_rmsnorm as make_norm
+from .norm_rope import make_adjacent_rope as make_rope
 from .prefill_norm import make_prefill_norm
 from .swa import make_swa_inline, make_swa_leaves, make_swa_read
 
@@ -79,7 +80,7 @@ def prepare_product_operands(raw, layer_id=0, *, role=None):
     return prepared
 
 
-def make_builders(capacity=16, config=None, cache_blocks=2):
+def make_builders(capacity=16, config=None, cache_blocks=2, *, tp=1):
     """Build twelve Prefill stages with explicit predecessor and cache buffers."""
     from . import grouped_output as grouped
     from . import qkv_proj_rope as shared
@@ -89,13 +90,7 @@ def make_builders(capacity=16, config=None, cache_blocks=2):
         raise ValueError("Retain complete Eco-Tech SWA geometry")
     if capacity <= 0 or capacity % 16:
         raise ValueError("Capacity must cover complete 16-row tiles")
-    dimensions = (
-        grouped.TP_SIZE, grouped.LOCAL_H, grouped.LOCAL_O_GROUPS,
-        grouped.LOCAL_O_WIDTH, grouped.O_GROUP_IN, grouped.O_LORA,
-    )
-    tp = grouped.TP_SIZE
-    if tp not in (1, 2, 4) or dimensions != (tp, 64 // tp, 8 // tp, 8192 // tp, 4096, 1024):
-        raise ValueError("Freeze TP1/2/4 before importing output projection definitions")
+    grouped_output = grouped.make_prefill_grouped_output(tp)
     publish, _gather, _attend = make_swa_leaves(capacity, cache_blocks, config)
     pre = make_hc_pre_inline(capacity, config)
     norm = pl.jit.inline(make_prefill_norm(capacity, 5120)._func)
@@ -135,6 +130,6 @@ def make_builders(capacity=16, config=None, cache_blocks=2):
         swa_read=make_swa_read(capacity, cache_blocks, config),
         swa=standalone(make_swa_inline(capacity, cache_blocks, config)),
         inverse_rope=standalone(shared.make_rope(64, inverse=True, head_dim=512, rope_dim=64)),
-        grouped_wo_a=standalone(grouped.prefill_grouped_output),
+        grouped_wo_a=standalone(grouped_output),
         wo_b=shared.make_bf16_projection_staged(8192 // tp, 5120, capacity=capacity),
     )

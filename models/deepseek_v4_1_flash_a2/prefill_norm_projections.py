@@ -11,7 +11,7 @@
 import pypto.language as pl
 
 from .ecotech_linear import make_ecotech_dynamic_linear
-from .ops import make_norm
+from .rmsnorm import make_blocked_rmsnorm as make_norm
 from .rmsnorm import D, EPS, NORM_T_TILE, rms_norm_tiled
 
 

@@ -493,3 +493,28 @@ registered numerical source. Experimental
 shared-expert candidates with local exact results are not installed here.
 Frozen tensor fixtures, private execution reports and machine-local
 provenance pointers remain with their original validation records.
+
+## Public complete-network forward and compilation reuse
+
+`prefill_fwd.prefill_fwd` (also exported as `run_prefill`) accepts explicit
+weights, request inputs, cache state, device mapping and output configuration.
+It executes token embedding, the original forty layers and the vocabulary
+head. `prefill_fwd.compile_prefill` compiles from storage-free geometry before
+checkpoint reads or device allocation; its returned `PrefillProgram` can be
+reused for compatible subsequent forwards. See
+[`prefill.example.json`](../../../models/deepseek_v4_1_flash_a2/prefill.example.json)
+for the prepared-input configuration.
+
+The compiler pool deduplicates structurally equal IR only when parameter
+names and ABI also match. Each layer composes five L2 compute regions between
+existing host HCCL and expert-dispatch boundaries. This is not one device L2
+for the entire forty-layer network. The established compute functions retain
+their arithmetic. Legacy Decode helpers remain for existing callers and do
+not establish complete-network Decode support.
+
+`compiled/compilation.json` records unique compilations, stage bindings,
+compiler seconds and preparation wall time. Per-chunk execution records keep
+checkpoint read and operand preparation time separate. A ten-minute total
+load-and-compile bound has not been established. The public forward defaults
+to diagnostics disabled; explicit diagnostics retain state and readonly
+checks. Disabling diagnostics never establishes numerical acceptance.

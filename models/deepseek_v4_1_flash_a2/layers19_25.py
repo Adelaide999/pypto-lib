@@ -51,7 +51,7 @@ from .output_proj import (
     output_projection_bf16_reference,
 )
 from .qkv import make_qkv_w8a8, qkv_reference
-from .staged import make_bf16_linear
+from .gemm import make_bf16_linear
 
 
 HIDDEN = 5120

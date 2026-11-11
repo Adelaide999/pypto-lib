@@ -122,7 +122,7 @@ class NetworkCacheProvider:
     """Allocate real network aliases once and provide bounded original-layer metadata."""
 
     def __init__(self, abi_by_case, input_by_case, *, topology, model_config, capacity,
-                 scheduler_capacity, allocation_id, sources_by_case):
+                 scheduler_capacity, allocation_id, sources_by_case, geometry_only=False):
         _require(topology["tp"] in (1, 2, 4) and topology["ep"] == topology["dp"] * topology["tp"]
                  and 2 <= topology["ep"] <= 16, "Require the actual DP/TP/EP world")
         _require(all(topology[name] == 1 for name in ("pp", "pcp", "dcp")), "Require PP1/PCP1/DCP1")
@@ -137,6 +137,8 @@ class NetworkCacheProvider:
                  and text["candidate_topk_blocks"] == 2048 and text["candidate_block_size"] == 8
                  and text["engram_layer_ids"] == [1, 14], "Require the pinned complete model selection layout")
         self.topology, self.capacity = deepcopy(topology), capacity
+        self.geometry_only = geometry_only
+        allocation_device = "meta" if geometry_only else "cpu"
         self.scheduler_capacity, self.allocation_id = scheduler_capacity, allocation_id
         self.sources = deepcopy(sources_by_case)
         world = topology["ep"]
@@ -162,14 +164,15 @@ class NetworkCacheProvider:
                 layout = _check_layout(deepcopy(payload["layout"]))
                 _require(set(layout["views"]) == set(payload["metadata"]), "All typed views need original metadata")
                 self.layouts[rank][case] = layout
-                raw = {key: torch.zeros(descriptor["shape"][0], dtype=torch.int8)
+                raw = {key: torch.zeros(descriptor["shape"][0], dtype=torch.int8, device=allocation_device)
                        for key, descriptor in layout["raw"].items()}
                 self.arenas[rank][case] = raw
                 self.views[rank][case] = physical_cache_views(raw, layout)
-                complete = dict(topk_indices=torch.empty((scheduler_capacity, 512), dtype=torch.int32),
-                    candidates=torch.full((scheduler_capacity, 1, 2048), -1, dtype=torch.int32),
-                    candidate_lengths=torch.zeros((scheduler_capacity, 1), dtype=torch.int32),
-                    topk_lengths=torch.zeros((scheduler_capacity, 1), dtype=torch.int32))
+                complete = dict(topk_indices=torch.empty((scheduler_capacity, 512), dtype=torch.int32,
+                                                        device=allocation_device),
+                    candidates=torch.full((scheduler_capacity, 1, 2048), -1, dtype=torch.int32, device=allocation_device),
+                    candidate_lengths=torch.zeros((scheduler_capacity, 1), dtype=torch.int32, device=allocation_device),
+                    topk_lengths=torch.zeros((scheduler_capacity, 1), dtype=torch.int32, device=allocation_device))
                 self.shared[rank][case] = complete
                 shared = {name: value[:capacity] for name, value in complete.items()}
                 versions = self.versions[rank][case] = {}
@@ -186,7 +189,7 @@ class NetworkCacheProvider:
                     self.geometry[rank].setdefault(case, {})[layer] = core_geometry_issues(layout, role)
                 self._abi_by_case[case].append({name: _metadata_copy(payload[name]) for name in
                     ("metadata", "groups", "positions", "lengths", "query_start_loc", "hash_constants")})
-        self.history = NetworkEngramHistory(self.bindings)
+        self.history = NetworkEngramHistory(self.bindings, geometry_only=geometry_only)
 
     def _input_coordinates(self, contract, rank):
         _require(contract["topology"] == self.topology, "Real input and product topology differ")
@@ -377,6 +380,7 @@ class NetworkCacheProvider:
 
     def cache_for_layer(self, layer_id):
         """Reject incompatible core geometry before any layer can mutate product state."""
+        _require(not self.geometry_only, "Compile-only cache geometry cannot be used for execution")
         role = resolve_layer_role(layer_id)
         self.batch_for_layer(layer_id)
         problems = [(rank, case, issues[layer_id]) for rank, cases in enumerate(self.geometry)

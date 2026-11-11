@@ -11,15 +11,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-import argparse
-from pathlib import Path
 
 import torch
 import pypto.language as pl
 
-from .prefill_layer import compile_prefill_layer
-from .prefill_layer import make_prefill_layer_entries as make_prefill_layer0_entries
-from .prefill_layer import run_prefill_layer as run_prefill_layer0
 from .gemm import make_fp32_dequantize, make_int8_gemm, make_pack_weight
 from .moe import routed_expert_reference, shared_expert_reference
 from .norm_rope import make_rope, make_rmsnorm
@@ -299,23 +294,4 @@ def make_l0_attention(capacity: int, config: Mapping[str, object]):
     return layer0_attention
 
 
-__all__ = ["layer0_reference", "make_l0_attention", "make_prefill_layer0_entries", "route_reference",
-           "run_prefill_layer0"]
-
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Execute the independent physical L0 short Prefill product")
-    parser.add_argument("--tp", type=int, choices=(4,), required=True)
-    parser.add_argument("--inputs", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args()
-    if args.compile_only:
-        compile_prefill_layer(args)
-    else:
-        run_prefill_layer0(args)
-
-
-if __name__ == "__main__":
-    main()
+__all__ = ["layer0_reference", "make_l0_attention", "route_reference"]

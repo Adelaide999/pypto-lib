@@ -8,6 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """FP32 HC coefficients, delayed stream collapse and BF16 residual expansion."""
 
+from pathlib import Path
+import sys
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a2"
+
 import pypto.language as pl
 
 
@@ -254,3 +261,174 @@ def make_hc(capacity, config):
         return next_pre, post, comb, collapsed, merged
 
     return hc_entry
+
+
+def golden_hc(tensors, *, config):
+    """Evaluate rounded projection weights, tiled FP32 sums and ordered HC mixing."""
+    import torch
+
+    active = int(tensors["active"])
+    if not 0 <= active <= tensors["x"].shape[0]:
+        raise ValueError("HC active rows must fit the actual capacity")
+    if not active:
+        return
+    x = tensors["x"][:active].float()
+    hc, hidden = config["hc_mult"], config["hidden_size"]
+    flat = x.reshape(active, hc * hidden)
+    bits = tensors["function"].contiguous().view(torch.int32).to(torch.int64)
+    rounded_bits = (((bits + 2048) >> 12) << 12).to(torch.int32)
+    weight = rounded_bits.contiguous().view(torch.float32)
+    squares = torch.zeros(active, dtype=torch.float32)
+    for column in range(0, flat.shape[1], D_TILE):
+        chunk = flat[:, column:column + D_TILE]
+        squares = squares + (chunk * chunk).sum(dim=1)
+    inverse = torch.rsqrt(squares * (1.0 / flat.shape[1]) + config["rms_norm_eps"])
+    channels = (hc + 2) * hc
+    projected = torch.zeros((active, channels), dtype=torch.float32)
+    for column in range(0, flat.shape[1], PROJ_K_TILE):
+        product = flat[:, column:column + PROJ_K_TILE] @ weight[:, column:column + PROJ_K_TILE].T
+        projected = projected + product
+    projected = projected * inverse[:, None]
+    scale, base = tensors["scale"], tensors["base"]
+    pre_logits = projected[:, :hc] * scale[0] + base[:hc]
+    post_logits = projected[:, hc:2 * hc] * scale[1] + base[hc:2 * hc]
+    pre = torch.reciprocal(torch.exp(-pre_logits) + 1.0) + config["hc_eps"]
+    post = torch.reciprocal(torch.exp(-post_logits) + 1.0) * 2.0
+    logits = projected[:, 2 * hc:].reshape(active, hc, hc) * scale[2] + base[2 * hc:].reshape(hc, hc)
+    repeats = MIX_TILE // hc
+    expanded = logits.repeat(1, repeats, repeats)
+    shifted = expanded - expanded.amax(dim=-1, keepdim=True)
+    exponential = torch.exp(shifted)
+    probability = exponential / (exponential.sum(dim=-1, keepdim=True) * (hc / MIX_TILE))
+    probability = probability + config["hc_eps"]
+    denominator = probability.sum(dim=-2, keepdim=True) * (hc / MIX_TILE) + config["hc_eps"]
+    probability = probability / denominator
+    for _ in range(config["hc_sinkhorn_iters"] - 1):
+        denominator = probability.sum(dim=-1, keepdim=True) * (hc / MIX_TILE) + config["hc_eps"]
+        probability = probability / denominator
+        denominator = probability.sum(dim=-2, keepdim=True) * (hc / MIX_TILE) + config["hc_eps"]
+        probability = probability / denominator
+    comb = probability[:, :hc, :hc]
+    collapsed = torch.zeros((active, hidden), dtype=torch.float32)
+    for stream in range(hc):
+        collapsed = collapsed + x[:, stream] * tensors["incoming"][:active, stream, None]
+    merged = torch.empty_like(x)
+    for stream in range(hc):
+        value = tensors["sublayer"][:active].float() * post[:, stream, None]
+        for source in range(hc):
+            value = value + x[:, source] * comb[:, source, stream, None]
+        merged[:, stream] = value
+    for name, value in (("next_pre", pre), ("post", post), ("comb", comb),
+                        ("collapsed", collapsed), ("merged", merged)):
+        tensors[name][:active] = value.to(tensors[name].dtype)
+
+
+def hc_prefix_compare(active):
+    """Use the shared floating comparator and exact untouched InOut tails."""
+    from golden.validation import ratio_allclose
+
+    numeric = ratio_allclose(rtol=0.05, atol=0.05, max_error_ratio=0.0)
+    exact = ratio_allclose(rtol=0.0, atol=0.0, max_error_ratio=0.0)
+
+    def compare(actual, expected, **context):
+        for label, region, comparator in (("active", slice(None, active), numeric),
+                                          ("untouched", slice(active, None), exact)):
+            if actual[region].numel():
+                passed, detail = comparator(actual[region], expected[region], **context)
+                if not passed:
+                    return False, label + ": " + detail
+        return True, ""
+
+    return compare
+
+
+def hc_golden_cases(*, build=True):
+    """Cover empty, singleton, seven-row tail and full-capacity four-stream HC."""
+    from functools import partial
+    import torch
+    from golden import ScalarSpec, TensorSpec
+
+    capacity, hidden, streams = 16, 256, 4
+    channels = (streams + 2) * streams
+    config = dict(hidden_size=hidden, hc_mult=streams, hc_sinkhorn_iters=20, hc_eps=1e-6, rms_norm_eps=1e-20)
+    generator = torch.Generator().manual_seed(417)
+    x = torch.randn((capacity, streams, hidden), generator=generator).to(torch.bfloat16)
+    function = torch.randn((channels, streams * hidden), generator=generator) * 0.03 + 2.0 ** -20
+    incoming = torch.rand((capacity, streams), generator=generator)
+    sublayer = torch.randn((capacity, hidden), generator=generator).to(torch.bfloat16)
+    for active in (0, 1, 7, capacity):
+        specs = [
+            TensorSpec("x", [capacity, streams, hidden], torch.bfloat16, init_value=x),
+            TensorSpec("function", [channels, streams * hidden], torch.float32, init_value=function),
+            TensorSpec("scale", [3], torch.float32, init_value=torch.tensor([0.3, -0.2, 0.1])),
+            TensorSpec("base", [channels], torch.float32, init_value=torch.linspace(-0.2, 0.2, channels)),
+            TensorSpec("incoming", [capacity, streams], torch.float32, init_value=incoming),
+            TensorSpec("sublayer", [capacity, hidden], torch.bfloat16, init_value=sublayer),
+            TensorSpec("next_pre", [capacity, streams], torch.float32, init_value=-23.0),
+            TensorSpec("post", [capacity, streams], torch.float32, init_value=-29.0),
+            TensorSpec("comb", [capacity, streams, streams], torch.float32, init_value=-31.0),
+            TensorSpec("collapsed", [capacity, hidden], torch.bfloat16, init_value=-37.0),
+            TensorSpec("merged", [capacity, streams, hidden], torch.bfloat16, init_value=-41.0),
+            ScalarSpec("active", torch.int32, active, compile_runtime=True),
+        ]
+        outputs = ("next_pre", "post", "comb", "collapsed", "merged")
+        case = dict(name=f"hc-four-stream-active{active}", specs=specs, golden_fn=partial(golden_hc, config=config),
+                    compare_fn={name: hc_prefix_compare(active) for name in outputs})
+        if build:
+            case["fn"] = make_hc(capacity, config)
+        yield case
+
+
+def validate(*, device=0, sim=False, compile_only=False, cpu_only=False):
+    """Run bounded HC goldens; CPU mode checks only the reference implementation."""
+    import torch
+    from golden import run
+
+    if cpu_only and compile_only:
+        raise ValueError("CPU golden checks and kernel compilation are separate modes")
+    records = []
+    outputs = ("next_pre", "post", "comb", "collapsed", "merged")
+    for case in hc_golden_cases(build=not cpu_only):
+        name = case.pop("name")
+        if cpu_only:
+            values = {spec.name: spec.create_tensor().clone() if hasattr(spec, "create_tensor") else spec.to_python()
+                      for spec in case["specs"]}
+            before = {key: value.clone() for key, value in values.items() if isinstance(value, torch.Tensor)}
+            case["golden_fn"](values)
+            active = int(values["active"])
+            for key in before:
+                if key not in outputs and not torch.equal(values[key], before[key]):
+                    raise RuntimeError("HC golden mutated input " + key)
+            for key in outputs:
+                if not torch.isfinite(values[key]).all() or not torch.equal(values[key][active:], before[key][active:]):
+                    raise RuntimeError("HC golden changed an inactive tail or produced a nonfinite result")
+            if active:
+                sums = values["comb"][:active].sum(dim=-2)
+                torch.testing.assert_close(sums, torch.ones_like(sums), rtol=0.0, atol=1e-5)
+            records.append(dict(name=name, cpu_golden="passed", device="not_run"))
+            continue
+        result = run(
+            **case,
+            config=dict(backend_type="a2a3", execution_mode=bool(sim), device_id=device),
+            compile_only=compile_only,
+            rtol=0.05,
+            atol=0.05,
+        )
+        if not result.passed:
+            raise RuntimeError(f"{name}: {result.error}")
+        records.append(dict(name=name, compiled=True, device="not_run" if compile_only else "passed"))
+    return records
+
+
+if __name__ == "__main__":
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=["a2a3"], default="a2a3")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--sim", action="store_true")
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--cpu-only", action="store_true")
+    args = parser.parse_args()
+    print(json.dumps(validate(device=args.device, sim=args.sim, compile_only=args.compile_only, cpu_only=args.cpu_only)))

@@ -241,27 +241,3 @@ def make_layer2_prefill_producer(capacity, config, preprojected=False):
         )
 
     return producer
-
-
-
-def main():
-    """Run the complete physical L2 through the reusable Prefill composition."""
-    import argparse
-    from pathlib import Path
-
-    from .prefill_layer import compile_prefill_layer, run_prefill_layer
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tp", type=int, choices=(1, 2, 4), required=True)
-    parser.add_argument("--inputs", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args()
-    if args.compile_only:
-        compile_prefill_layer(args, layer_id=2)
-    else:
-        run_prefill_layer(args, layer_id=2)
-
-
-if __name__ == "__main__":
-    main()

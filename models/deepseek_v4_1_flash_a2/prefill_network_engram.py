@@ -9,7 +9,6 @@
 """Prepare shared network Engram hashes and both lookup slots before the backbone."""
 
 from contextlib import ExitStack
-import os
 from pathlib import Path
 
 import torch
@@ -18,14 +17,16 @@ from .engram_storage import SharedEngramArray
 from .prefill_engram import make_prefill_engram_entries
 from .prefill_engram_runtime import MappedLookup, engram_owner, load_rotation
 from .prefill_layer_state import resolve_layer_role
+from .runtime_config import configure_devices
 from .runtime_utils import Executable
 
 
 class NetworkEngramHistory:
     """Own one V1 first-SWA slot history per rank/request batch across chunks."""
 
-    def __init__(self, bindings, initial_caches=None):
+    def __init__(self, bindings, initial_caches=None, *, geometry_only=False):
         self.bindings = bindings
+        self.geometry_only = geometry_only
         self.caches = [{} for _ in bindings]
         self.prepared = set()
         rows = set()
@@ -35,9 +36,10 @@ class NetworkEngramHistory:
                         or not binding["bound"] or not binding["kv_binding_id"] or binding["kv_blocks"] <= 0):
                     raise ValueError("Network V1 history requires the bound physical1 SWA identity and 128-row pages")
                 count = binding["kv_blocks"] * binding["block_size"]
-                cache = (torch.zeros(count, dtype=torch.int32) if initial_caches is None
+                device = "meta" if geometry_only else "cpu"
+                cache = (torch.zeros(count, dtype=torch.int32, device=device) if initial_caches is None
                          else initial_caches[rank][case])
-                if cache.dtype != torch.int32 or cache.device.type != "cpu" or tuple(cache.shape) != (count,):
+                if cache.dtype != torch.int32 or cache.device.type != device or tuple(cache.shape) != (count,):
                     raise ValueError("Network history must retain the exact first-SWA INT32 slot extent")
                 self.caches[rank][case] = cache
                 rows.add(count)
@@ -136,6 +138,8 @@ class PreparedNetworkEngram:
 def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_layer, runtime, *,
                            storage=None, storage_stack=None, storage_namespace=None):
     """Hash the global chunk once and prepare both table lookups with existing PyPTO entries."""
+    if getattr(history, "geometry_only", False):
+        raise ValueError("Compile-only Engram geometry cannot be used for execution")
     if (storage is None) != (storage_stack is None):
         raise ValueError("Caller-owned table storage requires the same finite owner ExitStack")
     constants = contract["hash_constants"]
@@ -149,11 +153,7 @@ def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_la
     if (contract["topology"] != topology or contract["capacity"] != capacity
             or not 0 < capacity <= 512 or capacity % 16):
         raise ValueError("Freeze the matching bounded network Engram execution ABI")
-    assigned = os.environ["TASK_DEVICE"].split(",")
-    if (assigned != runtime["assigned_devices"] or len(assigned) != world or len(set(assigned)) != world
-            or any(not device.isdecimal() for device in assigned)
-            or os.environ.get("ASCEND_RT_VISIBLE_DEVICES") != ",".join(assigned)):
-        raise ValueError("Engram must share the actual queue-mapped network device allocation")
+    configure_devices(runtime["assigned_devices"], world=world)
     if len(history.caches) != world or batch.get("engram_metadata_owner_layer") != 1:
         raise ValueError("Use the single model-level history and first-Engram SWA metadata")
     identity = (batch["epoch"], batch["token_map_id"])
@@ -214,14 +214,17 @@ def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_la
         functions = make_prefill_engram_entries(capacity, constants, config, own_contract["engram_shards"],
                                                 history.cache_rows, max_blocks, tp)
         entries = {}
-        for name, function in functions.items():
-            if name.startswith("engram_lookup_") or name not in shared_entries:
-                entry = Executable(function, directory / "compiled" / name, diagnostics=runtime.get("diagnostics", True))
-                if not name.startswith("engram_lookup_"):
-                    shared_entries[name] = entry
-            else:
-                entry = shared_entries[name]
-            entries[name] = entry
+        if "compile_entries" in runtime:
+            entries = runtime["compile_entries"](f"engram{layer_id}", functions)
+        else:
+            for name, function in functions.items():
+                if name.startswith("engram_lookup_") or name not in shared_entries:
+                    entry = Executable(function, directory / "compiled" / name, diagnostics=runtime.get("diagnostics", True))
+                    if not name.startswith("engram_lookup_"):
+                        shared_entries[name] = entry
+                else:
+                    entry = shared_entries[name]
+                entries[name] = entry
         rotation, rotation_receipt = load_rotation(contract["checkpoint"], 5120)
 
         def execute(name, rank, case, arguments, outputs, roles, *, entries=entries, directory=directory):

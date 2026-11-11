@@ -16,7 +16,7 @@ import pypto.language as pl
 from .gemm import make_fp32_dequantize, make_int8_gemm, make_pack_weight
 from .norm_rope import rope_reference
 from .quant import int8_matmul, make_dynamic_int8_quantize, quantize_per_token_int8
-from .staged import make_bf16_linear
+from .gemm import make_bf16_linear
 
 
 def output_projection_reference(
@@ -213,3 +213,45 @@ __all__ = [
     "output_projection_bf16_reference",
     "output_projection_reference",
 ]
+
+
+def make_grouped_wo_a(capacity: int, heads: int, head_dim: int,
+                      groups: int, rank: int):
+    """Apply grouped BF16 Wo-A while retaining only one GEMM tile on core."""
+
+    width = heads * head_dim
+    if width % groups or (width // groups) % 256 or rank % 64:
+        raise ValueError("Wo-A dimensions are not A2/A3 aligned")
+    group_input = width // groups
+    group_blocks = rank // 64
+    input_blocks = group_input // 256
+
+    @pl.jit
+    def project(
+        rotated: pl.Tensor[[capacity, width], pl.BF16],
+        wo_a: pl.Tensor[[groups, group_input, rank], pl.BF16],
+        grouped: pl.InOut[pl.Tensor[[capacity, groups * rank], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for block in pl.spmd(((active + 15) // 16) * groups * group_blocks,
+                             name_hint="dsv41_a2a3_grouped_wo_a"):
+            token = (block // (groups * group_blocks)) * 16
+            group = (block % (groups * group_blocks)) // group_blocks
+            n0 = (block % group_blocks) * 64
+            rows = pl.min(16, active - token)
+            acc = pl.create_tensor([16, 64], dtype=pl.FP32)
+            for k0 in pl.pipeline(0, group_input, 256, stage=2):
+                source = pl.slice(
+                    rotated, [16, 256], [token, group * group_input + k0],
+                    valid_shape=[rows, 256],
+                )
+                source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 16, 256)
+                weight = wo_a[group:group + 1, k0:k0 + 256, n0:n0 + 64]
+                weight = pl.reshape(weight, [256, 64])
+                acc = pl.matmul_acc(acc, source, weight, init_cond=(k0 == 0))
+            grouped[token:token + 16, group * rank + n0:group * rank + n0 + 64] = pl.set_validshape(
+                pl.cast(acc, pl.BF16, mode="rint"), rows, 64
+            )
+        return grouped
+
+    return project

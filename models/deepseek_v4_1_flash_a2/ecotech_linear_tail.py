@@ -14,7 +14,7 @@ import pypto.language as pl
 from .ecotech_linear import (
     make_ecotech_dynamic_linear, prepare_ecotech_dynamic_weight,
 )
-from .ops import make_pack_weight, make_dot, make_dequantize
+from .linear_primitives import make_pack_weight, make_dot, make_dequantize
 
 
 def padded_dimensions(input_width, output_width):
