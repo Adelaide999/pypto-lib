@@ -19,19 +19,35 @@ if __package__ in (None, ""):
 import argparse
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
-def compile_prefill(inputs, *, cache, config, output):
+def compile_prefill(inputs, *, cache, config, output, weights=None):
     """Compile every original network stage from canonical request/cache geometry.
 
     This uses metadata and storage-free meta tensors to derive exact shapes.
     It does not read checkpoint payloads, allocate cache backing storage,
     initialize CANN, execute kernels or establish accuracy.
     The returned program can be supplied to ``prefill_fwd`` in this process.
+    Raw text or token IDs require ``weights`` for checkpoint metadata and use
+    the same full-prompt cache geometry as automatic execution.
     """
     from .prefill_network_runtime import prepare_network_provider
     from .prefill_program import PrefillProgram
 
+    if isinstance(inputs, (str, list, tuple)):
+        from .prefill_prepare import prepare_token_chunks
+
+        if weights is None:
+            raise ValueError("Automatic compile-only inputs require an explicit checkpoint via weights")
+        with TemporaryDirectory(prefix="ds41-prefill-compile-") as temporary:
+            chunks = prepare_token_chunks(inputs, checkpoint=weights, cache=cache, config=config,
+                output=Path(temporary) / "prepared", chunk_size=config.get("chunk_size", 16), dp_rank=config.get("dp_rank", 0))
+            try:
+                first = next(chunks)
+                return compile_prefill(first["inputs"], cache=first["cache"], config=first["contract"], output=output)
+            finally:
+                chunks.close()
     operands = _merge_inputs(inputs, cache)
     directory = Path(output).resolve()
     provider = prepare_network_provider(operands, config, directory.name, geometry_only=True)
@@ -196,7 +212,7 @@ def main():
         inputs = torch.load(settings["inputs"], map_location="cpu", weights_only=True)
     cache = torch.load(settings["cache_state"], map_location="cpu", weights_only=True)
     if args.compile_only:
-        program = compile_prefill(inputs, cache=cache, config=contract, output=settings["output"])
+        program = compile_prefill(inputs, cache=cache, config=contract, output=settings["output"], weights=settings["checkpoint"])
         print(json.dumps(program.summary()))
         return
     continuation = load_continuations(settings["continuations"]) if settings.get("continuations") else None

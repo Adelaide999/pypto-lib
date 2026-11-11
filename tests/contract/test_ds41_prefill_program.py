@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Check program reuse and compile-time admission without compiling or initializing devices."""
 
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
@@ -18,7 +19,9 @@ if getattr(pypto, "__pypto_stub__", False):
     pytest.skip("Real PyPTO IR is required", allow_module_level=True)
 
 from models.deepseek_v4_1_flash_a3 import prefill_program as pool
+from models.deepseek_v4_1_flash_a3.config import FLASH
 from models.deepseek_v4_1_flash_a3.prefill_embedding import make_vocab_embedding
+from models.deepseek_v4_1_flash_a3.prefill_output import make_output_entries
 
 
 def test_chunk_reuse_does_not_rebuild_ir_and_rejects_changed_constants(tmp_path, monkeypatch):
@@ -38,6 +41,8 @@ def test_chunk_reuse_does_not_rebuild_ir_and_rejects_changed_constants(tmp_path,
     monkeypatch.setattr(pool, "make_network_layer_entries", lambda *args: (definitions(), {}, 16))
     monkeypatch.setattr(pool, "make_prefill_engram_entries", definitions)
     monkeypatch.setattr(pool, "make_output_entries", definitions)
+    # This contract probe replaces stage computations; real L2 composition is checked by the model entry.
+    monkeypatch.setattr(pool, "make_network_l2_entries", lambda definitions, *args: definitions)
     provider = SimpleNamespace(
         layouts=[], runtime_geometry=lambda: dict(capacity=16), history=SimpleNamespace(cache_rows=128),
         hash_batch=lambda: dict(cases={"fresh": [dict(metadata=dict(block_table=torch.zeros(1, 1)))]}),
@@ -75,3 +80,10 @@ def test_ir_hash_collision_does_not_alias_different_shapes(tmp_path, monkeypatch
     same = program.bind("b", {"lookup": make_vocab_embedding(16, 512, 8, 2)})["lookup"]
     changed = program.bind("c", {"lookup": make_vocab_embedding(16, 1024, 8, 2)})["lookup"]
     assert first is same and first is not changed
+
+
+def test_output_head_specializes_without_tensor_payloads():
+    definitions = make_output_entries(16, asdict(FLASH), 4)
+    entries = pool.make_network_l2_entries(definitions, 16, "output")
+    for function in entries.values():
+        assert function.specialize().functions

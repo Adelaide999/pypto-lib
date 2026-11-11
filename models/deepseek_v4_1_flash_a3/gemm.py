@@ -8,8 +8,6 @@
 # -----------------------------------------------------------------------------------------------------------
 """A2/A3 INT8 GEMM and FP32 dequantization kernels."""
 
-from __future__ import annotations
-
 import pypto.language as pl
 
 M_TILE = 16

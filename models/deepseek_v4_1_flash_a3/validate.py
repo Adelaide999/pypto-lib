@@ -534,6 +534,67 @@ def check_automatic_entry():
     return dict(lazy_preparation="checked", reserved_cache="forwarded", execution="stubbed_not_validated")
 
 
+def check_automatic_compile():
+    """Check automatic compile admission and cleanup without a compiler or device runtime."""
+    import os
+    import sys
+
+    from tempfile import TemporaryDirectory
+    from types import ModuleType
+    from unittest.mock import patch
+
+    from . import prefill_fwd
+
+    prepare = ModuleType(__package__ + ".prefill_prepare")
+    runtime = ModuleType(__package__ + ".prefill_network_runtime")
+    program = ModuleType(__package__ + ".prefill_program")
+    seen, temporary_paths = [], []
+
+    def chunks(inputs, **kwargs):
+        require(inputs == list(range(32)), "Compile-only changed the complete prompt")
+        require(kwargs["chunk_size"] == 8 and kwargs["dp_rank"] == 2, "Compile-only lost automatic controls")
+        root = kwargs["output"]
+        root.mkdir()
+        temporary_paths.append(root)
+        try:
+            yield dict(inputs=dict(input_contract="complete-prompt-geometry"),
+                       cache=dict(engram_contracts={1: "slot0", 14: "slot1"}), contract=kwargs["config"])
+            raise AssertionError("Compile-only consumed a second chunk")
+        finally:
+            seen.append("closed")
+
+    def provider(operands, config, namespace, *, geometry_only):
+        require(geometry_only is True, "Compile-only requested actual cache storage")
+        require(operands["input_contract"] == "complete-prompt-geometry", "Automatic geometry was lost")
+        require(temporary_paths[0].exists(), "Automatic metadata was cleaned before compilation")
+        return "provider"
+
+    class Program:
+        def __init__(self, directory):
+            self.directory = directory
+
+        def compile(self, current, model, topology, contracts):
+            require(current == "provider" and contracts[14] == "slot1", "Compile arguments changed")
+            seen.append("compiled")
+            return self
+
+    prepare.prepare_token_chunks, runtime.prepare_network_provider = chunks, provider
+    program.PrefillProgram = Program
+    modules = {module.__name__: module for module in (prepare, runtime, program)}
+    with TemporaryDirectory(prefix="a3-compile-entry-") as temporary, patch.dict(sys.modules, modules), \
+            patch.dict(os.environ, {}, clear=True):
+        config = dict(topology=dict(ep=16), model_config={}, chunk_size=8, dp_rank=2)
+        _reject(lambda: prefill_fwd.compile_prefill([1], cache={}, config=config, output=temporary),
+                "Automatic compile-only accepted a missing checkpoint")
+        result = prefill_fwd.compile_prefill(list(range(32)), weights="checkpoint", cache={},
+            config=config, output=Path(temporary) / "compiled")
+        require(result.directory.name == "compiled", "Compile-only changed its output directory")
+        require(seen == ["compiled", "closed"], "Compile-only did not close its metadata stream")
+        require(not temporary_paths[0].exists(), "Compile-only leaked temporary metadata")
+        require(not os.environ, "Compile-only modified device visibility")
+    return dict(full_prompt="forwarded", metadata="temporary", device_visibility="unchanged", compiler="stubbed")
+
+
 def main():
     """Publish a bounded HOST result without claiming numerical device acceptance."""
     result = dict(source=check_sources(), layer_plan=check_layer_plan(), controls=check_controls(),
@@ -541,6 +602,7 @@ def main():
                   chunk_continuation=check_chunk_continuation(),
                   chunk_configuration=check_chunk_configuration(),
                   automatic_entry=check_automatic_entry(),
+                  automatic_compile=check_automatic_compile(),
                   device_initialization="not_run", compilation="not_run", NPU_numerics="not_run")
     print(json.dumps(result, sort_keys=True))
 

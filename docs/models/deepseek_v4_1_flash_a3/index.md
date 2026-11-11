@@ -95,6 +95,11 @@ Omitting `compiled` performs compilation inside the forward. A supplied program
 is reusable in the same process; changed entry sets, IR, shapes or argument
 names are rejected before execution. The pool uses structural equality as well
 as the IR hash, so a hash collision cannot reuse a different computation.
+During cold preparation, equivalent layer definitions also share their builder
+result and specialized IR. The key includes the model, topology, routed capacity,
+attention role and all cache plane offsets, strides, dtypes and shapes. Physical
+cache ownership is still validated for every layer; sharing generated code does
+not share live cache objects or bypass layer/source admission.
 
 `compile_prefill` derives shapes from canonical metadata using storage-free
 meta tensors. It compiles every stage without reading checkpoint payloads,
@@ -107,11 +112,13 @@ per layer into L2 entries, directly inlining the existing child functions:
 
 | L2 region | Existing child calls |
 | --- | --- |
+| Input | TP embedding summation and initial SP/HC streams, after vocabulary gather |
 | QKV | Q projection, normalization and RoPE; KV projection, normalization and RoPE |
 | Attention packing | Inverse RoPE and head packet packing |
 | Output projection | Head unpack, grouped output projection, output projection and reduce packing |
 | FFN dispatch | Attention HC post, FFN HC pre, normalization, router, shared expert and EP packing |
 | MoE finish | Combine, valid-row masking and FFN HC post |
+| Head | SP unpack, RMSNorm and vocabulary projection, before vocabulary gather |
 
 These regions replace 22 separate compute invocations with five invocations
 within each layer and rank. This counts Python/runtime invocations, not
@@ -122,6 +129,11 @@ returned aliases are threaded between calls. The existing leading dynamic
 token dimension is bound to the forward's explicit capacity. Inconsistent
 types, child order or operand identity are rejected. Independent-layer
 validation still executes the same child sequence with its original captures.
+The input boundary additionally replaces two compute invocations with one;
+the output head replaces three with one, per rank and chunk. Lookup, HC collapse
+and vocabulary unpack stay on their respective sides of host communication.
+`compilation.json` reports layer definition specializations and specialized
+functions separately from unique compiled entries and total stage bindings.
 
 This is **not a single L2 graph for all forty layers**; `compilation.json`
 continues to report `single_l2: false`. Python owns the HCCL boundaries and
@@ -152,6 +164,11 @@ Paths in the JSON are relative to that JSON file. `--checkpoint`, `--devices`
 and `--output` override the corresponding fields. `--check-config` checks the
 configuration and mapping only; it does not load weights, prove input/cache
 compatibility, compile or execute. Output directories must be new.
+Compile-only also accepts the automatic `prompt` or `token_ids` configuration.
+For the Python API, pass `weights=checkpoint` when compiling automatic inputs;
+only checkpoint metadata is read. The complete prompt reserves the same cache
+geometry as execution, while temporary first-chunk descriptors are removed after
+compilation. Prepared dictionary inputs retain the existing API.
 
 The standalone `prefill_moe_ep` driver also requires `--devices`, for example
 `--devices 3,1` for a matching EP2 contract.
@@ -168,9 +185,9 @@ match the actual allocated tensors. The JSON `contract` supplies `topology`,
 `model_config`, `required_modes`, `capacity`, `scheduler_capacity`,
 `fresh_shared_initialization`, `input_contract_sha256` and `state_regions`
 (path and SHA256). These remain explicit state/operand contracts. This entry
-still requires prepared canonical request/cache metadata. It does not create
-cache metadata, tokenize arbitrary text or implement a generation scheduler
-from only a checkpoint and a prompt.
+requires canonical cache-layout and Engram templates. The automatic entry below
+prepares request metadata and tokenizes raw text from these templates; a checkpoint
+and prompt alone do not define cache ownership or a generation scheduler.
 
 Weights retain the existing streaming policy: one host layer and the real
 owned active experts are loaded as needed. Full weight residency is not added.
@@ -331,6 +348,22 @@ and first-call initialization belong to the runtime and are not included in
 that number. Checkpoint loading and complete first-token latency must be
 measured separately on the allocated device group. Neither CPU code generation
 nor the IR deduplication count establishes a ten-minute end-to-end bound.
+
+Local CPU checks on 2026-11-11 used PyPTO `f32ecf3f`, Torch 2.10.0 CPU and
+PTOAS 0.70, without connecting to an A3 server. With capacity 16, DP4/TP4/EP16
+and two cache pages, all 926 bindings across forty layer roles produced IR
+structurally equal to the previous builder path, retaining 55 unique entries.
+Only seven layer definitions were constructed. One local comparison reduced
+IR preparation from 90.38 seconds to 24.59 seconds; compilation, checkpoint
+reads and device execution were excluded from this measurement.
+
+All seven L2 region types generated PTO and C++ successfully, including the
+new input and head regions. CPU golden scheduling checks covered TP2/TP4 and
+active row counts 0, 1, 7 and 16, including empty DP engines and live masks.
+The BF16 linear's eager shape annotations also produced IR equal to the old
+sample-tensor specialization in three configurations; its function body was
+unchanged. These are local composition and code-generation checks, not NPU
+precision, HCCL, full-network logits or elapsed-time acceptance.
 
 ## Recorded complete-network execution
 

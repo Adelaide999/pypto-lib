@@ -393,12 +393,12 @@
       "admit_readonly": "db1e95792753d0c6b746510a33f9f134ae7d070f63ff588a846acc98bb49a0a2"
     },
     "prefill_fwd.py": {
-      "compile_prefill": "b912fd1f9bf104c0a4ad59d3c6ed955444eb4bac0b6de192f464f9a338e558f1",
+      "compile_prefill": "9ca4ce73e87182aee79d811631fc76cfbecb341e93ebc57d3fefbc55981ecf20",
       "_merge_inputs": "c04d6cb14c60cba52583e00688af86f5326d692f8ae0a4634efba4815f0a2d4a",
       "prefill_fwd": "e78633e55c2970039ae7e3bcb003011b917b2a9a9aefa3930a4eb666839ad211",
       "load_configuration": "454feb047d66b3ace61e8bda348b5ad575c5e4d0eacd240f04494d551b76f16f",
       "load_continuations": "1c10f0de7868f77eecd4c05db27a2478a82b631938058559dc7f17684110be85",
-      "main": "4932d1ab79818af251919178ec8189030879df6ae8cf97de97bcb7e325fa56c5"
+      "main": "86107b5e944c2bfd64ed95a0b315e9aaece1d24706193419c12bb3a5fcb3e252"
     },
     "prefill_grouped_output.py": {
       "make_prefill_grouped_output": "e4b091318916503fcc5619e090ce40648e0838f8a27c20ee99e43b7afde6ae99"
@@ -430,8 +430,9 @@
       "_parameter_type": "7f9f541c55197c9e6f219b86ea33e0c808f753612bb4e45d37fe81ebe6eb42e4",
       "_annotation": "9f100945b3e79fd8d7d905edd1441b63336ecc27a3a12d96753571fdfff1f379",
       "compose_l2": "3f7f71a4ab4f7e31d10896197b42a129a74b0703220f6d20a76519dc6b44253d",
-      "make_network_l2_entries": "29d415723d309382b4850efac23e8738467fb46c84d9c58493abbd1c5032e05d",
-      "execute_region": "d1205861a3e09c7be51d8dbee9e9840198dd566a2a387f46f5efc585b9959031"
+      "make_network_l2_entries": "36e3f0b93c61d8945d343dea5ec4fdaf21e55148c4340ef2a00fe51e481818f5",
+      "execute_region": "398ba8a12d0b378b2d9e318951fdcb06e0fd63b1c5b677397db9c50344f25d06",
+      "region_arguments": "003f75d6c97f2f2333ae439820f81f71281952f9557ff5895510e15615ee6cd1"
     },
     "prefill_layer.py": {
       "validate_prefill_ownership": "4d245cc59c6bdfb0144b6c48434e44f6d6d7e544b02aa72a22a64fee24f81630",
@@ -518,7 +519,7 @@
       "NetworkStatePreservation": "590e554eab4c87bde4feaa2c89a1e1ff46a1a973deda7f8575040538ff0024ae"
     },
     "prefill_network_input.py": {
-      "run_input_boundary": "7b2ae49afd127ad368d43573624e3b8cb370a81c098ed3a7a0ad05ea4bd0aa9a",
+      "run_input_boundary": "11c25743430cb316764a15f7d5fd5d48aac79fb7353893db3217bfd5b64b5812",
       "run_input_stage": "2d85efb764038c5f8f27413bad1a2b9818143d73711fe04108e3f32e1929a7e6"
     },
     "prefill_network_runtime.py": {
@@ -527,8 +528,8 @@
       "network_argument_protection": "ea3bdae8aa46f40029aaac6e988f2edf17bb8249ba0b03e541c53ca4b57ac2a2",
       "NetworkExecutor": "37f48c0b23e16b14d138e655e97bcc7b38f00da74dfb2e021a0b4aa95a6d5abc",
       "load_product_backbone_input": "6cc4e6b044822ddb7989b3e0f6f062856e4e0061c586d0305c3411a7e78c2dba",
-      "embed_network_input": "43e0647ecdb3abb721af39a820ce2986175f10fbed2c5d7b912a61f1195b6fba",
-      "run_output_boundary": "2bdc8fdfe3858e280004f275857d394e65cdb9f766f4fb1fc638a5d494563a20",
+      "embed_network_input": "19f21c03583ce35498f32341de2106b46604715f6a17e60d3bf0b96003931dd6",
+      "run_output_boundary": "d8bb17ca00dc208181e7739e0d0f675287555bb2a2c7dbd5920d4a9808af533c",
       "_network_owner_snapshot": "fa95779090b7a6f9d9dc6b2805cfdcbb69a04ff09b8e345c8a1aacb5a42b82b3",
       "prepare_network_provider": "d7efcb57f453a4afed15c7531996817c4e69cd6e6fe2576cf4920ed4a339c629",
       "run_network_runtime": "1e2d4b7da777bc8b909f81444577266e82d3290a3fb33615e774d5d5a8fa7c0d",
@@ -571,9 +572,9 @@
     },
     "prefill_program.py": {
       "network_layer_geometry": "e8121f445f13ba4fd4c1f2c154827ce1b2b59c0768502cac35354822008f19ee",
-      "make_network_layer_entries": "d3bbb555c1ba2201e70c718f5959c27adab668b249d97aab77a24399fce9b536",
+      "make_network_layer_entries": "8e06e4808ee1532e3470f5b4e56404a8caf9838812137c50e244cf292d011971",
       "_compile_signature": "cda34ebbf775518fee727cce64bfd93f85422c99237f672d05b70dbdb6ba842f",
-      "PrefillProgram": "b45ebfc8dafa6f3553707da1f3ec54f96e9c95934c0fc22884d2b0ce31bf99ed"
+      "PrefillProgram": "2c473a5a8aabd8d2a66e93dc82e98ed5a72436787870e4ae6091f539e3ae9da9"
     },
     "prefill_qkv_swa.py": {
       "make_prefill_swa": "af04e048c825cc9dcdf4256574cb274c8a3f7a5e20ef53c9a422a88bfeab4a97"
@@ -730,7 +731,8 @@
       "check_chunk_continuation": "42db183cb5d22a6ff5658323a8702f99b7432dd6851bf9a55d8192be04371fc3",
       "check_chunk_configuration": "0c2eb58b919bb31401d244d5429cea31d745d7316b2f0c389ac38bff4fb15fd0",
       "check_automatic_entry": "6f9dbc0c19c981d7d9f34a310ce9340344d9593946121bae491fcfc54f5a9673",
-      "main": "4a8362c471fe52dc35c22244246092fca37bcf15789923dba13a98f5f4980929"
+      "check_automatic_compile": "d742ae58fb5a54299edaa23923db2450bd094f215b09c05bb8658099b326e561",
+      "main": "e2d1829f632a762e69d6564876a6e19e6d679e67df0e7a72cceb82d3e3543f99"
     },
     "weights.py": {
       "CheckpointOperands": "d01026f59da3c251ce06ec82bacbe633d41809e202783cc821be9624ef98c244",

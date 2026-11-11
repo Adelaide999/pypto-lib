@@ -22,6 +22,7 @@ from pypto.runtime import ExecutionMode, RunConfig
 
 from .prefill_layer import run_prefill_network_inmemory
 from .prefill_layer_state import resolve_layer_role
+from .prefill_l2 import execute_region
 from .prefill_network_cache import attach_network_cache_geometry
 from .prefill_network_engram import prepare_network_engram
 from .prefill_network_discrete_observer import (
@@ -381,7 +382,7 @@ def embed_network_input(input_contract, weights, executor, config, output):
 
     begin = perf_counter()
     boundaries = run_input_boundary(input_contract, config=config, capacity=executor.provider.capacity,
-                                    reader=weights.reader, execute=execute, exchange=exchange)
+                                    reader=weights.reader, execute=execute, exchange=exchange, execute_l2=execute)
     write_json(directory / "execution.json", dict(status="executed_not_independently_compared",
                seconds=perf_counter() - begin, ranks=len(boundaries), layers_executed=[]))
     hidden, premix = [], []
@@ -412,7 +413,7 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
         raise ValueError("Actual complete output norm/head checkpoint ABI differs")
     output_report = dict(kernels=[])
 
-    def execute(name, rank, case, arguments, outputs):
+    def execute(name, rank, case, arguments, outputs, responsibility=None):
         if not executor.diagnostics:
             config = RunConfig(arch=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD, device_id=rank)
             entries[name].compiled(*arguments, config=config)
@@ -441,13 +442,15 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
             collapsed = torch.full((capacity, 5120), -17, dtype=torch.bfloat16)
             normalized = torch.full((capacity, 5120), -19, dtype=torch.bfloat16)
             local_logits = torch.full((capacity, config["vocab_size"] // tp), -23, dtype=torch.bfloat16)
-            execute("sp_unpack", rank, case, [gathered[rank][case], collapsed, max(physical, 1), active], dict(collapsed=collapsed))
-            execute("norm", rank, case, [collapsed, norm, normalized, active], dict(normalized=normalized))
             count = config["vocab_size"] // tp
             weight = head.narrow(0, rank % tp * count, count).T.contiguous()
             if tuple(weight.shape) != (5120, count):
                 raise ValueError("Output head must use canonical KN vocabulary shard layout")
-            execute("projection", rank, case, [normalized, weight, local_logits, active], dict(local_logits=local_logits))
+            execute_region({"execute_l2": execute}, "head_l2", rank, case, (
+                ("sp_unpack", [gathered[rank][case], collapsed, max(physical, 1), active], dict(collapsed=collapsed), "output"),
+                ("norm", [collapsed, norm, normalized, active], dict(normalized=normalized), "output"),
+                ("projection", [normalized, weight, local_logits, active], dict(local_logits=local_logits), "output"),
+            ))
             logits_packets[rank][case] = local_logits
     gathered_logits = executor.exchange(executor.namespace + "-output-vocabulary-gather", logits_packets, "all_gather", "tp")
     files, actual_logits = {}, [{} for _ in range(world)]

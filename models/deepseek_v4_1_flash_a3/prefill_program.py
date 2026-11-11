@@ -21,6 +21,7 @@ from .prefill_engram import make_prefill_engram_entries
 from .prefill_layer import make_prefill_layer_entries
 from .prefill_layer_state import resolve_layer_role
 from .prefill_l2 import REGIONS, make_network_l2_entries
+from .prefill_network_cache import network_cache_geometry
 from .prefill_output import make_output_entries
 from .runtime_utils import Executable, tensor_sha, write_json
 
@@ -38,17 +39,30 @@ def network_layer_geometry(provider, topology, layer_id):
     return geometry, expert_capacity
 
 
-def make_network_layer_entries(provider, config, topology, layer_id):
+def make_network_layer_entries(provider, config, topology, layer_id, definitions_cache=None):
     """Build the exact layer specialization from its validated request/cache geometry."""
     geometry, expert_capacity = network_layer_geometry(provider, topology, layer_id)
     batch = provider.batch_for_layer(layer_id)
+    layout = provider.layouts[0][next(iter(batch["cases"]))]
+    role = resolve_layer_role(layer_id)
+    planes = {} if role["mode"] == "swa" else network_cache_geometry(layout, role, geometry["cache_blocks"])
+    # Physical ownership is checked above and by the runtime; only byte geometry enters child IR.
+    semantic_role = {name: value for name, value in role.items()
+                     if name not in ("physical_layer", "kv_source", "index_source", "candidate_source", "engram_slot")}
+    plane_types = {name: {key: value for key, value in plane.items() if key != "storage_key"}
+                   for name, plane in planes.items()}
+    key = json.dumps([geometry, expert_capacity, config, topology, semantic_role, plane_types], sort_keys=True)
+    if definitions_cache is not None and key in definitions_cache:
+        return definitions_cache[key], geometry, expert_capacity
     entries = make_prefill_layer_entries(
         geometry["capacity"], config, expert_capacity, layer_id,
         geometry["cache_blocks"], geometry["requests"], geometry["table_pages"],
-        ep=topology["ep"], tp=topology["tp"], cache_layout=provider.layouts[0][next(iter(batch["cases"]))],
-        role=resolve_layer_role(layer_id), network_cache=True,
+        ep=topology["ep"], tp=topology["tp"], cache_layout=layout, role=role, network_cache=True,
     )
-    return make_network_l2_entries(entries, geometry["capacity"]), geometry, expert_capacity
+    definitions = make_network_l2_entries(entries, geometry["capacity"])
+    if definitions_cache is not None:
+        definitions_cache[key] = definitions
+    return definitions, geometry, expert_capacity
 
 
 def _compile_signature(provider, model_config, topology, engram_contracts):
@@ -75,6 +89,7 @@ class PrefillProgram:
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=False)
         self.stages, self._buckets = {}, {}
+        self._specializations, self._layer_definitions = {}, {}
         self.records = []
         self.compile_seconds = 0.0
         self.ready = False
@@ -91,9 +106,13 @@ class PrefillProgram:
         for name, function in definitions.items():
             if not name or "/" in name or "\\" in name or ".." in name:
                 raise ValueError("Compiled entries require safe names")
-            program = function.specialize()
-            parameter_names = tuple(function.param_names)
-            key = (ir.structural_hash(program), parameter_names)
+            identity = id(function)
+            if identity not in self._specializations:
+                program = function.specialize()
+                key = (ir.structural_hash(program), tuple(function.param_names))
+                # Retain the function so an object ID cannot be recycled during this program's lifetime.
+                self._specializations[identity] = (function, program, key)
+            _, program, key = self._specializations[identity]
             bucket = self._buckets.get(key, [])
             match = next((item for item in bucket if ir.structural_equal(item["ir"], program)), None)
             if stage in self.stages:
@@ -131,9 +150,10 @@ class PrefillProgram:
         text = dict(model_config["text_config"], image_sentinel_base_id=model_config["image_token_id"])
         geometry = provider.runtime_geometry()
         try:
-            self.bind("embedding", make_input_entries(geometry["capacity"], text, topology["tp"]))
+            self.bind("embedding", make_network_l2_entries(
+                make_input_entries(geometry["capacity"], text, topology["tp"]), geometry["capacity"], "embedding"))
             for layer in range(40):
-                definitions, _, _ = make_network_layer_entries(provider, text, topology, layer)
+                definitions, _, _ = make_network_layer_entries(provider, text, topology, layer, self._layer_definitions)
                 self.bind(f"layer{layer}", definitions)
             batch = provider.hash_batch()
             max_blocks = max(1, max(record["metadata"]["block_table"].shape[1]
@@ -147,7 +167,8 @@ class PrefillProgram:
                     provider.history.cache_rows, max_blocks, topology["tp"],
                 )
                 self.bind(f"engram{layer}", definitions)
-            self.bind("output", make_output_entries(geometry["capacity"], text, topology["tp"]))
+            self.bind("output", make_network_l2_entries(
+                make_output_entries(geometry["capacity"], text, topology["tp"]), geometry["capacity"], "output"))
             self._signature = signature
             self.ready = True
         finally:
@@ -162,6 +183,8 @@ class PrefillProgram:
                     l2_regions={name: [child for child, _ in steps] for name, steps in REGIONS.items()},
                     stages={stage: list(entries) for stage, entries in self.stages.items()},
                     unique_entries=len(self.records), stage_bindings=sum(map(len, self.stages.values())),
+                    layer_definition_specializations=len(self._layer_definitions),
+                    specialized_functions=len(self._specializations),
                     compile_seconds=self.compile_seconds, compile_phase="pypto_ir_pto_cpp_generation",
                     device_binary_build_and_weight_loading="not_measured_here", prepare_seconds=getattr(self, "prepare_seconds", None),
                     entries=self.records, device_execution="not_run", numerical_acceptance="not_run")

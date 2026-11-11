@@ -19,6 +19,15 @@ from pypto.ir.compiled_program import extract_param_infos
 
 # Each binding names one external tensor or scalar, shared by all uses in a region.
 REGIONS = {
+    "input_l2": (
+        ("reduce", ("gathered", "embedding", "active")),
+        ("initial_hc", ("embedding", "streams", "premix", "tp_rank", "physical", "active")),
+    ),
+    "head_l2": (
+        ("sp_unpack", ("gathered", "collapsed", "physical", "active")),
+        ("norm", ("collapsed", "norm_weight", "normalized", "active")),
+        ("projection", ("normalized", "weight", "local_logits", "active")),
+    ),
     "qkv_l2": (
         ("wq_a", ("q_input", "wq_a", "wq_a_scale", "wqa", "query_rows")),
         ("q_norm", ("wqa", "q_norm", "latent", "query_rows")),
@@ -54,6 +63,12 @@ REGIONS = {
         ("mask_moe", ("combined", "valid", "physical")),
         ("hc_post", ("combined", "changed", "post", "comb", "output", "physical")),
     ),
+}
+
+STAGE_REGIONS = {
+    "embedding": ("input_l2",),
+    "output": ("head_l2",),
+    "layer": ("qkv_l2", "attention_pack_l2", "output_projection_l2", "ffn_dispatch_l2", "moe_finish_l2"),
 }
 
 
@@ -140,11 +155,12 @@ def compose_l2(name, definitions, steps, capacity):
     return namespace[name]
 
 
-def make_network_l2_entries(definitions, capacity):
-    """Replace only computations covered by the five host-delimited regions."""
-    covered = {name for steps in REGIONS.values() for name, _ in steps}
+def make_network_l2_entries(definitions, capacity, stage="layer"):
+    """Compose each stage only between its existing host communication boundaries."""
+    regions = {name: REGIONS[name] for name in STAGE_REGIONS[stage]}
+    covered = {name for steps in regions.values() for name, _ in steps}
     entries = {name: function for name, function in definitions.items() if name not in covered}
-    entries.update({name: compose_l2(name, definitions, steps, capacity) for name, steps in REGIONS.items()})
+    entries.update({name: compose_l2(name, definitions, steps, capacity) for name, steps in regions.items()})
     return entries
 
 
@@ -160,6 +176,15 @@ def execute_region(runtime, name, rank, case, operations):
             child_case = operation[4] if len(operation) == 5 else case
             runtime["execute"](child, rank, child_case, arguments, outputs, role)
         return
+    arguments, outputs, roles = region_arguments(name, operations)
+    callback(name, rank, case, arguments, outputs, roles)
+
+
+def region_arguments(name, operations):
+    """Bind the shared child operands and observations without copying or changing tensors."""
+    steps = REGIONS[name]
+    if tuple(item[0] for item in operations) != tuple(item[0] for item in steps):
+        raise ValueError("L2 call order differs from the shared stage: " + name)
     values, outputs, roles = {}, {}, []
     for operation, (_, bindings) in zip(operations, steps):
         child, arguments, observed, role = operation[:4]
@@ -174,4 +199,4 @@ def execute_region(runtime, name, rank, case, operations):
             values[binding] = value
         outputs.update({child + "." + key: value for key, value in observed.items()})
         roles.extend([role] if isinstance(role, str) else role)
-    callback(name, rank, case, [values[binding] for binding in region_bindings(steps)], outputs, tuple(roles))
+    return [values[binding] for binding in region_bindings(steps)], outputs, tuple(roles)
