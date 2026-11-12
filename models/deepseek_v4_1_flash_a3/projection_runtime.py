@@ -12,23 +12,18 @@ The boundary widens BF16 storage exactly and invokes aten.linear on the NPU.
 Pooling, normalization, index projection, RoPE and publication remain in DSL.
 """
 
-if __package__ in (None, ""):
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    __package__ = "models.deepseek_v4_1_flash_a3"
-
 import argparse
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
 import torch
-
-from .runtime_utils import validate_device, file_sha as _sha, tensor_sha as _tensor_sha
+from .runtime_utils import file_sha as _sha, tensor_sha as _tensor_sha, validate_device
 
 
 def fp32_compressor_projection_host(

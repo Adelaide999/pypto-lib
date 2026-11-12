@@ -9,7 +9,6 @@
 """Schedule physical compressed Prefill with aliased raw caches and shared index state."""
 
 import torch
-
 from .runtime_utils import tensor_sha
 
 
@@ -82,12 +81,8 @@ def run_compressed_attention(
     views = physical_cache_views(raw, live["layout"])
     network = live.get("network_geometry")
     if network is not None:
-        from .prefill_network_cache import load_network_index, network_cache_geometry, owned_cache_pages
-        from .prefill_network_cache import (
-            raw_cache_matrix,
-            store_network_index,
-            validate_network_sparse_indices,
-        )
+        from .cache import load_network_index, network_cache_geometry, owned_cache_pages
+        from .cache import raw_cache_matrix, store_network_index, validate_network_sparse_indices
 
         if network != network_cache_geometry(live["layout"], role, cache_blocks):
             raise ValueError("Network producer geometry differs from the actual live raw aliases")
@@ -139,7 +134,7 @@ def run_compressed_attention(
         if ratio == 2:
             ring = raw_cache_matrix(raw, network["ring"]).reshape(cache_blocks, 32, 1024)
     elif ratio == 1:
-        from .prefill_cache_layout import physical_page_geometry
+        from .cache import physical_page_geometry
 
         geometry = physical_page_geometry(live["layout"], prefix, cache_blocks)
         dense = {}

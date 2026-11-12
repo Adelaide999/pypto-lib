@@ -9,7 +9,6 @@
 """Registered native QLI custom-op boundary for actual PyPTO operands."""
 
 from dataclasses import dataclass
-
 import torch
 
 

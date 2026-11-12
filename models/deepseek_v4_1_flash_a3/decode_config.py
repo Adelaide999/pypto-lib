@@ -8,8 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Runtime sizing controls for A2/A3 operator and Decode entry points."""
 
-from dataclasses import dataclass
 import sys
+from dataclasses import dataclass
 
 
 def _parse_parallel_size(name: str, default: int) -> int:

@@ -14,14 +14,12 @@ materializing packed V4.1 matrices in the per-core Mat buffer.
 """
 
 from __future__ import annotations
-
 from collections.abc import Mapping
-
 import pypto.language as pl
-
-from .decode_gemm import make_int8_linear_direct
-from .decode_norm_rope import make_rope, make_rmsnorm
-from .decode_swa_attention import make_swa_attention
+from .gemm import make_decode_int8_linear_direct as make_int8_linear_direct
+from .rmsnorm import make_decode_rmsnorm as make_rmsnorm
+from .rope import make_decode_rope as make_rope
+from .swa import make_decode_swa_attention as make_swa_attention
 
 ACT_TILE = 256
 
@@ -236,7 +234,7 @@ def make_index_quantize(capacity: int, heads: int, head_dim: int = 128):
 
 def make_swa(capacity: int, config: Mapping[str, object]):
     # Keep the product entrypoint independent from the Torch-only reference
-    # helpers in qkv.py.  This shape is a model boundary, not a runtime object.
+    # helpers in qkv_proj_rope.py. This shape is a model boundary.
     query_width = int(config["num_attention_heads"]) * int(config["head_dim"])
     head_dim = int(config["head_dim"])
     heads = int(config["num_attention_heads"])

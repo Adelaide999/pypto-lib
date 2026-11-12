@@ -9,26 +9,25 @@
 """DeepSeek V4.1 Flash A2/A3 single-step SWA Decode entry."""
 
 from __future__ import annotations
-
 import argparse
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    import torch
+from typing import Any, TYPE_CHECKING
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
+    __package__ = "models.deepseek_v4_1_flash_a3"
 import pypto.language as pl
-
 from .config import FLASH
-from .decode_gemm import make_int8_linear_direct
-from .decode_norm_rope import make_rope, make_rmsnorm
 from .decode_config import DECODE_PARALLEL, DecodeParallelConfig
 from .decode_projection import make_grouped_wo_a, make_swa
+from .gemm import make_decode_int8_linear_direct as make_int8_linear_direct
+from .rmsnorm import make_decode_rmsnorm as make_rmsnorm
+from .rope import make_decode_rope as make_rope
+
+if TYPE_CHECKING:
+    import torch
 
 
 # Model configuration.
@@ -192,10 +191,10 @@ def validate_decode_state(values: dict[str, torch.Tensor | int]) -> None:
 def decode_step_reference(values: dict[str, torch.Tensor | int]) -> None:
     """Reference one SWA Decode step and update only the declared state."""
 
-    from .decode_output_proj import output_projection_reference
-    from .decode_qkv import qkv_reference
-    from .decode_swa_attention import swa_attention_reference
-    from .decode_swa_cache import gather_swa_cache_reference, write_swa_cache_reference
+    from .o_proj import decode_output_projection_reference as output_projection_reference
+    from .qkv_proj_rope import decode_qkv_reference as qkv_reference
+    from .swa import decode_swa_attention_reference as swa_attention_reference
+    from .swa import decode_gather_swa_cache_reference as gather_swa_cache_reference, decode_write_swa_cache_reference as write_swa_cache_reference
 
     validate_decode_state(values)
     active = int(values["active"])

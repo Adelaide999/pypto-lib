@@ -8,21 +8,39 @@
 # -----------------------------------------------------------------------------------------------------------
 """Engram lookup, projection, gating, Torch goldens and validation."""
 
-if __package__ in (None, ""):
-    import sys
-    from pathlib import Path
+import sys
+from pathlib import Path
 
+if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
-
-import torch
 import pypto.language as pl
-
+import torch
 from .qkv_proj_rope import make_bf16_projection_staged
 
 D, HC, COLS, ROW_WIDTH = 5120, 4, 24, 256
 K, N = COLS * ROW_WIDTH, (HC + 1) * D
 TILE, KT, NT, DT = 16, 128, 256, 512
+
+
+# Decoder aliases retain the standalone A2/A3 contract names while sharing
+# the same dimensions as the prefill Engram implementation above.
+HIDDEN, HASH_COLS, HEAD_DIM = D, COLS, ROW_WIDTH
+LOOKUP_WIDTH, KV_WIDTH = K, N
+M_TILE, GATE_TILE = TILE, DT
+
+
+# model config
+ENGRAM_ECOTECH_D, ENGRAM_ECOTECH_HC, ENGRAM_ECOTECH_COLS, WIDTH = 5120, 4, 24, 256
+ENGRAM_ECOTECH_K, ENGRAM_ECOTECH_N = ENGRAM_ECOTECH_COLS * WIDTH, (ENGRAM_ECOTECH_HC + 1) * ENGRAM_ECOTECH_D
+
+# tiling
+T_TILE, D_TILE, ROTATION_TILE = 16, 512, 32
+RESTORE_M_TILE = 16
+
+
+# tiling
+ENGRAM_D_TILE = 256
 
 
 def make_engram(capacity, table_rows):
@@ -111,13 +129,6 @@ def make_engram(capacity, table_rows):
         return lookup, kv, output
 
     return engram
-
-
-# Decoder aliases retain the standalone A2/A3 contract names while sharing
-# the same dimensions as the prefill Engram implementation above.
-HIDDEN, HASH_COLS, HEAD_DIM = D, COLS, ROW_WIDTH
-LOOKUP_WIDTH, KV_WIDTH = K, N
-M_TILE, GATE_TILE = TILE, DT
 
 
 def make_lookup(capacity: int, table_rows: int):
@@ -217,15 +228,6 @@ def make_gate(capacity: int, eps: float = 1.0e-20):
         return output
 
     return gate
-
-
-# model config
-ENGRAM_ECOTECH_D, ENGRAM_ECOTECH_HC, ENGRAM_ECOTECH_COLS, WIDTH = 5120, 4, 24, 256
-ENGRAM_ECOTECH_K, ENGRAM_ECOTECH_N = ENGRAM_ECOTECH_COLS * WIDTH, (ENGRAM_ECOTECH_HC + 1) * ENGRAM_ECOTECH_D
-
-# tiling
-T_TILE, D_TILE, ROTATION_TILE = 16, 512, 32
-RESTORE_M_TILE = 16
 
 
 def make_resident_int8_lookup(capacity, table_rows, columns=ENGRAM_ECOTECH_COLS, head_start=0, row_start=0):
@@ -450,10 +452,6 @@ def make_engram_ecotech_observed(capacity, table_rows, rms_norm_eps=1e-20):
         )
 
     return engram_ecotech_observed
-
-
-# tiling
-ENGRAM_D_TILE = 256
 
 
 def make_prefill_engram_hash(capacity, vocab, layers, cache_rows, max_blocks, image_id, image_pad_id, pad_id):
@@ -795,7 +793,7 @@ def golden_masked_gate_compare(active):
 
 def golden_prefill_engram_hash(tensors, *, image_id, image_pad_id, pad_id):
     """Use the independent host history/hash contract on bounded inputs."""
-    from .engram_hash import HashLayout, hash_ids, update_slot_history
+    from .engram_host import HashLayout, hash_ids, update_slot_history
 
     active, requests = int(tensors["active"]), int(tensors["requests"])
     tokens = tensors["token_ids"][:active]

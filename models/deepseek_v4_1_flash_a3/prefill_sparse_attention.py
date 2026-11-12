@@ -9,11 +9,10 @@
 """Own QKV/SWA, shared sparse Attention, and grouped output projection."""
 
 import pypto.language as pl
-
 from .compressor import make_compressed_cache_publish
+from .gemm import N_TILE
 from .o_proj import make_o_proj_inline
-from .linear_primitives import N_TILE
-from .qkv_w8a8 import make_qkv_w8a8_inline
+from .qkv_proj_rope import make_qkv_w8a8_inline
 from .sparse_attention import make_sparse_attention_inline
 
 

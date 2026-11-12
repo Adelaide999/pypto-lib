@@ -8,61 +8,16 @@
 # -----------------------------------------------------------------------------------------------------------
 """Shared MoE kernels, distinct phase boundaries, Torch goldens and validation."""
 
-if __package__ in (None, ""):
-    import sys
-    from pathlib import Path
+import sys
+from pathlib import Path
 
+if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
-
-
-import torch
 import pypto.language as pl
-
-from .gemm import (
-    make_fp32_dequantize as _moe_make_fp32_dequantize,
-    make_int8_gemm as _moe_make_int8_gemm,
-    make_pack_weight as _moe_make_pack_weight,
-)
-from .quant import make_dynamic_int8_quantize as _moe_make_dynamic_int8_quantize
-from .quant import w8a8_linear as _moe_w8a8_linear
-
-from .linear_primitives import make_cast_tile as _router_make_cast_tile
-
-from .linear_primitives import (
-    N_TILE as SHARED_N_TILE,
-    VEC_M_TILE as SHARED_VEC_M_TILE,
-    make_dequantize as _shared_make_dequantize,
-    make_dot as _shared_make_dot,
-    make_pack_weight as _shared_make_pack_weight,
-    make_quantize as _shared_make_quantize,
-)
-
-from .ecotech_linear import prepare_ecotech_dynamic_weight as _ecotech_shared_prepare_ecotech_dynamic_weight
-from .ecotech_linear_tail import prepare_ecotech_tail_weight as _ecotech_shared_prepare_ecotech_tail_weight
-from .linear_primitives import (
-    make_dequantize as _ecotech_shared_make_dequantize,
-    make_dot as _ecotech_shared_make_dot,
-    make_pack_weight as _ecotech_shared_make_pack_weight,
-    make_quantize as _ecotech_shared_make_quantize,
-)
-
-from .gemm import (
-    make_fp32_dequantize as _decode_moe_make_fp32_dequantize,
-    make_int8_gemm as _decode_moe_make_int8_gemm,
-    make_pack_weight as _decode_moe_make_pack_weight,
-)
-from .quant import make_decode_dynamic_int8_quantize as _decode_moe_make_dynamic_int8_quantize
-from .quant import w8a8_linear as _decode_moe_w8a8_linear
-
-from .linear_primitives import (
-    N_TILE as DECODE_SHARED_N_TILE,
-    VEC_M_TILE as DECODE_SHARED_VEC_M_TILE,
-    make_decode_dequantize as _decode_shared_make_dequantize,
-    make_dot as _decode_shared_make_dot,
-    make_pack_weight as _decode_shared_make_pack_weight,
-    make_decode_quantize as _decode_shared_make_quantize,
-)
+import torch
+from .gemm import N_TILE as DECODE_SHARED_N_TILE, N_TILE as SHARED_N_TILE, VEC_M_TILE as DECODE_SHARED_VEC_M_TILE, VEC_M_TILE as SHARED_VEC_M_TILE, make_blocked_weight_pack as _decode_shared_make_pack_weight, make_blocked_weight_pack as _ecotech_shared_make_pack_weight, make_blocked_weight_pack as _shared_make_pack_weight, make_dot as _decode_shared_make_dot, make_dot as _ecotech_shared_make_dot, make_dot as _shared_make_dot, make_fp32_dequantize as _decode_moe_make_fp32_dequantize, make_fp32_dequantize as _moe_make_fp32_dequantize, make_int8_gemm as _decode_moe_make_int8_gemm, make_int8_gemm as _moe_make_int8_gemm, make_pack_weight as _decode_moe_make_pack_weight, make_pack_weight as _moe_make_pack_weight, prepare_ecotech_dynamic_weight as _ecotech_shared_prepare_ecotech_dynamic_weight, prepare_ecotech_tail_weight as _ecotech_shared_prepare_ecotech_tail_weight
+from .quant import make_cast_tile as _router_make_cast_tile, make_decode_dequantize as _decode_shared_make_dequantize, make_decode_dynamic_int8_quantize as _decode_moe_make_dynamic_int8_quantize, make_decode_quantize as _decode_shared_make_quantize, make_dequantize as _ecotech_shared_make_dequantize, make_dequantize as _shared_make_dequantize, make_dynamic_int8_quantize as _moe_make_dynamic_int8_quantize, make_quantize as _ecotech_shared_make_quantize, make_quantize as _shared_make_quantize, w8a8_linear as _decode_moe_w8a8_linear, w8a8_linear as _moe_w8a8_linear
 
 
 MOE_VEC_M_TILE = 8

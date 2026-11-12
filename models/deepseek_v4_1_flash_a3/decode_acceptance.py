@@ -9,7 +9,6 @@
 """Independent DeepSeek V4.1 A3 Decode contract and product dependency scan."""
 
 from __future__ import annotations
-
 import argparse
 import ast
 import hashlib
@@ -22,11 +21,9 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-
-from .decode_candidates import CANDIDATES, SEARCH_K, validate_candidates
-from .decode_checkpoint_manifest import inspect_checkpoint
-from .decode_shape_contract import shape_matrix
 from .decode_config import DECODE_RUNTIME_CONTRACT
+from .decode_contract import CANDIDATES, SEARCH_K, shape_matrix, validate_candidates
+from .weights import inspect_checkpoint
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,17 +32,17 @@ TARGET_LAYERS = (0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25)
 PRODUCT_ENTRYPOINTS = (
     'decode_fwd.py',
     'decode_replay.py',
-    'decode_candidates.py',
+    'decode_contract.py',
     'decode_moe.py',
     'decode_swa.py',
 )
 VALIDATION_ENTRYPOINTS = (
     'decode_acceptance.py',
-    'decode_asset_contract.py',
+    'decode_contract.py',
     'decode_gate.py',
     'decode_reference.py',
     'decode_moe_compile.py',
-    'decode_layer_compile.py',
+    'decode_layer.py',
 )
 REFERENCE_ONLY_SUFFIXES = ("_runtime.py",)
 FORBIDDEN_PRODUCT_IMPORTS = ("vllm", "vllm_ascend", "torch_npu")
@@ -402,9 +399,7 @@ def source_hashes() -> dict[str, str]:
             MODEL_ROOT / 'decode_config.py',
             MODEL_ROOT / "decode_source_manifest.json",
             MODEL_ROOT / "decode_cherry_pick_receipt.json",
-            MODEL_ROOT / 'decode_checkpoint_manifest.py',
-            MODEL_ROOT / 'decode_weights.py',
-            MODEL_ROOT / 'decode_weight_abi.py',
+            MODEL_ROOT / 'weights.py',
         ]
     )
     return {

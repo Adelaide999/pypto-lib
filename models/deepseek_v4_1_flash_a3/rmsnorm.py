@@ -9,9 +9,11 @@
 """RMS normalization kernels and phase-specific output boundaries."""
 
 import pypto.language as pl
+import torch as decode_torch
 import torch
 from .config import FLASH as M
-from .linear_primitives import make_cast_tile, VEC_M_TILE
+from .operator_config import CONTRACT
+from .quant import VEC_M_TILE, make_cast_tile
 
 
 # model config
@@ -77,6 +79,12 @@ def make_rms_norm_tiled(output_dtype=pl.BF16):
 prefill_rms_norm_tiled = make_rms_norm_tiled()
 
 
+DECODE_D = M.hidden_size
+
+
+DECODE_EPS = M.rms_norm_eps
+
+
 @pl.jit.inline
 def rms_norm(
     x: pl.Tensor,
@@ -129,12 +137,6 @@ def make_blocked_rmsnorm(capacity, width, eps):
         return output
 
     return norm
-
-
-DECODE_D = M.hidden_size
-
-
-DECODE_EPS = M.rms_norm_eps
 
 
 @pl.jit.inline
@@ -330,9 +332,124 @@ def make_prefill_norm_cast(capacity, hidden):
     return prefill_norm_cast
 
 
+def make_decode_blocked_rmsnorm(capacity, width, eps):
+    """Specialize weighted FP32 RMSNorm with a BF16 output."""
+
+    @pl.jit.inline
+    def norm(
+        x: pl.Tensor[[capacity, width], pl.BF16],
+        weight: pl.Tensor[[width], pl.BF16],
+        output: pl.Tensor[[capacity, width], pl.BF16],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for block in pl.spmd((active + VEC_M_TILE - 1) // VEC_M_TILE, name_hint="a2_rms_norm"):
+            t0 = block * VEC_M_TILE
+            rows = pl.min(VEC_M_TILE, active - t0)
+            source = pl.slice(x, [VEC_M_TILE, width], [t0, 0], valid_shape=[rows, width])
+            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), VEC_M_TILE, width)
+            value = pl.cast(source, pl.FP32)
+            square = pl.mul(value, value)
+            mean = pl.mul(pl.row_sum(square), 1.0 / width)
+            inverse = pl.rsqrt(pl.add(mean, eps), high_precision=True)
+            normalized = pl.row_expand_mul(value, inverse)
+            gamma = pl.reshape(pl.cast(weight[:], pl.FP32), [1, width])
+            weighted = pl.col_expand_mul(normalized, gamma)
+            narrowed = pl.cast(weighted, pl.BF16, mode="rint")
+            output[t0 : t0 + VEC_M_TILE, :] = pl.set_validshape(narrowed, rows, width)
+        return output
+
+    return norm
+
+
+def make_rmsnorm(capacity: int, width: int, eps: float = 1e-6):
+    if capacity % CONTRACT.rmsnorm_m_tile:
+        raise ValueError("capacity must be divisible by 8")
+
+    @pl.jit.inline
+    def norm(
+        value: pl.Tensor[[capacity, width], pl.BF16],
+        weight: pl.Tensor[[width], pl.BF16],
+        output: pl.Tensor[[capacity, width], pl.BF16],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for block in pl.spmd((active + 7) // 8, name_hint="dsv41_a2a3_rmsnorm"):
+            t0 = block * 8
+            rows = pl.min(8, active - t0)
+            source = pl.slice(value, [8, width], [t0, 0], valid_shape=[rows, width])
+            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 8, width)
+            source_fp32 = pl.cast(source, pl.FP32)
+            mean = pl.mul(pl.row_sum(pl.mul(source_fp32, source_fp32)), 1.0 / width)
+            inverse = pl.reshape(pl.rsqrt(pl.add(mean, eps), high_precision=True), [8, 1])
+            gamma = pl.reshape(pl.cast(weight[:], pl.FP32), [1, width])
+            normalized = pl.col_expand_mul(pl.row_expand_mul(source_fp32, inverse), gamma)
+            output[t0 : t0 + 8, :] = pl.set_validshape(pl.cast(normalized, pl.BF16, mode="rint"), rows, width)
+        return output
+
+    return norm
+
+
+def make_rmsnorm_entry(capacity: int, width: int, eps: float):
+    norm = make_rmsnorm(capacity, width, eps)
+
+    @pl.jit
+    def kernel(
+        value: pl.Tensor[[capacity, width], pl.BF16],
+        weight: pl.Tensor[[width], pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        norm(value, weight, output, active)
+        return output
+
+    return kernel
+
+
+def make_decode_rmsnorm(capacity: int, width: int, eps: float = 1e-6):
+    if capacity % CONTRACT.rmsnorm_m_tile:
+        raise ValueError("capacity must be divisible by 8")
+
+    @pl.jit.inline
+    def norm(
+        value: pl.Tensor[[capacity, width], pl.BF16],
+        weight: pl.Tensor[[width], pl.BF16],
+        output: pl.Tensor[[capacity, width], pl.BF16],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for block in pl.spmd((active + 7) // 8, name_hint="dsv41_a2a3_rmsnorm"):
+            t0 = block * 8
+            rows = pl.min(8, active - t0)
+            source = pl.slice(value, [8, width], [t0, 0], valid_shape=[rows, width])
+            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 8, width)
+            source_fp32 = pl.cast(source, pl.FP32)
+            mean = pl.mul(pl.row_sum(pl.mul(source_fp32, source_fp32)), 1.0 / width)
+            inverse = pl.reshape(pl.rsqrt(pl.add(mean, eps), high_precision=True), [8, 1])
+            gamma = pl.reshape(pl.cast(weight[:], pl.FP32), [1, width])
+            normalized = pl.col_expand_mul(pl.row_expand_mul(source_fp32, inverse), gamma)
+            output[t0 : t0 + 8, :] = pl.set_validshape(pl.cast(normalized, pl.BF16, mode="rint"), rows, width)
+        return output
+
+    return norm
+
+
 def golden_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = M.rms_norm_eps) -> torch.Tensor:
     """Apply RMSNorm in FP32 and restore the activation dtype."""
     dtype = x.dtype
     value = x.float()
     value = value * torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + eps)
     return (value * weight.float()).to(dtype)
+
+
+def rms_norm_reference(value: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    source = value.float()
+    inverse = torch.rsqrt(source.square().mean(dim=-1, keepdim=True) + eps)
+    return (source * inverse * weight.float()).to(torch.bfloat16)
+
+
+def decode_rms_norm_reference(
+    value: decode_torch.Tensor, weight: decode_torch.Tensor, eps: float = 1e-6
+) -> decode_torch.Tensor:
+    import torch
+
+    source = value.float()
+    inverse = torch.rsqrt(source.square().mean(dim=-1, keepdim=True) + eps)
+    return (source * inverse * weight.float()).to(torch.bfloat16)

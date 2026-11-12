@@ -9,20 +9,13 @@
 """Fail-closed entry point for the independent A3 Decode topology gates."""
 
 from __future__ import annotations
-
 import argparse
 import json
 import os
 from pathlib import Path
 from typing import Any
-
-from .decode_acceptance import (
-    CONTRACT,
-    TOPOLOGIES,
-    checkpoint_asset_report,
-    runtime_identity,
-)
-from .decode_asset_contract import validate_assets
+from .decode_acceptance import CONTRACT, TOPOLOGIES, checkpoint_asset_report, runtime_identity
+from .decode_contract import validate_assets
 
 
 REQUIRED_ASSETS = (

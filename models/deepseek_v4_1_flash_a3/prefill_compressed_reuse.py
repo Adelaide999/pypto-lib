@@ -9,13 +9,12 @@
 """Eco-Tech Prefill QKV publication and BF16 sparse output projection."""
 
 import pypto.language as pl
-
 from .compressor import make_compressed_cache_publish
-from .prefill_swa import GEOMETRY, make_builders
 from .hc import make_hc_post_inline
 from .prefill_indexer import make_sparse_controls
-from .rmsnorm import make_prefill_norm
 from .prefill_sparse_attention import make_consumer_sparse_core
+from .prefill_swa import GEOMETRY, make_builders
+from .rmsnorm import make_prefill_norm
 
 
 # tiling
@@ -168,9 +167,9 @@ def make_physical_consumer_entries(
     network_cache=False,
 ):
     """Build full-head compressed attention with readonly source selection and own SWA."""
-    from .norm_rope import make_rope_tables
+    from .rope import make_rope_tables
     from .prefill_indexer import make_sparse_index_pack
-    from .prefill_layer_state import resolve_layer_role
+    from .cache import resolve_layer_role
     from .swa import make_swa_read
 
     role = resolve_layer_role(layer_id, role)
@@ -196,7 +195,7 @@ def make_physical_consumer_entries(
         compressed_attention=make_swa_read(capacity, cache_blocks, dict(config, sliding_window=640)),
     )
     if compress_ratio == 1 and not network_cache:
-        from .prefill_cache_layout import make_paged_cache_copy, physical_consumer_geometry
+        from .cache import make_paged_cache_copy, physical_consumer_geometry
 
         geometry = physical_consumer_geometry(
             cache_layout, f"model.layers.{layer_id}.self_attn.", source_prefix, cache_blocks
@@ -217,7 +216,7 @@ def make_physical_consumer_entries(
             first_page=geometry["first_owned"],
         )
     if role["mode"] == "reindex":
-        from .prefill_cache_layout import physical_index_geometry
+        from .cache import physical_index_geometry
         from .prefill_indexer import make_physical_index_query_entries
 
         entries.update(
@@ -236,7 +235,7 @@ def make_physical_consumer_entries(
                     dtype=dtype,
                 )
     if network_cache:
-        from .prefill_network_cache import make_network_cache_entries, network_cache_geometry
+        from .cache import make_network_cache_entries, network_cache_geometry
 
         geometry = network_cache_geometry(cache_layout, role, cache_blocks)
         del entries["compressed_attention"]

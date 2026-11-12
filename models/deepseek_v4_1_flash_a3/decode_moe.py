@@ -15,7 +15,6 @@ this module.
 """
 
 from __future__ import annotations
-
 import argparse
 import os
 import sys
@@ -24,31 +23,13 @@ from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
+    __package__ = "models.deepseek_v4_1_flash_a3"
 import pypto.language as pl
 import pypto.language.distributed as pld
-
 from .config import FLASH
-from .moe import make_decode_moe_router_inline as make_moe_router_inline
-from .moe import make_decode_shared_moe_w8a8_inline as make_shared_moe_w8a8_inline
+from .expert_routed import decode_expert_routed_tile as expert_routed_tile, expert_routed_inline
+from .moe import decode_moe_routed_expert_reference as routed_expert_reference, decode_moe_shared_expert_reference as shared_expert_reference, decode_moe_w8a8_expert_linear as w8a8_expert_linear, make_decode_dispatch_layout as make_dispatch_layout, make_decode_moe_router as make_moe_router, make_decode_moe_router_inline as make_moe_router_inline, make_decode_route_restore as make_route_restore, make_decode_routed_expert_projection as make_routed_expert_projection, make_decode_routed_expert_w8a8 as make_routed_expert_w8a8, make_decode_shared_expert_projection as make_shared_expert_projection, make_decode_shared_expert_w8a8 as make_shared_expert_w8a8, make_decode_shared_moe_w8a8 as make_shared_moe_w8a8, make_decode_shared_moe_w8a8_inline as make_shared_moe_w8a8_inline, make_decode_w8a8_expert_projection as make_w8a8_expert_projection
 from .quant import make_decode_dynamic_int8_quantize as make_dynamic_int8_quantize
-from .moe import (
-    make_decode_routed_expert_projection as make_routed_expert_projection,
-    make_decode_routed_expert_w8a8 as make_routed_expert_w8a8,
-    make_decode_shared_expert_projection as make_shared_expert_projection,
-    make_decode_shared_expert_w8a8 as make_shared_expert_w8a8,
-    make_decode_w8a8_expert_projection as make_w8a8_expert_projection,
-    decode_moe_routed_expert_reference as routed_expert_reference,
-    decode_moe_shared_expert_reference as shared_expert_reference,
-    decode_moe_w8a8_expert_linear as w8a8_expert_linear,
-)
-from .moe import make_decode_moe_router as make_moe_router
-from .moe import make_decode_shared_moe_w8a8 as make_shared_moe_w8a8
-from .decode_expert_routed import expert_routed_inline
-from .moe import (
-    make_decode_dispatch_layout as make_dispatch_layout,
-    make_decode_route_restore as make_route_restore,
-)
 
 
 # EP2 product topology and Decode capacity.
@@ -71,7 +52,6 @@ COUNT_PAD = 16
 # variables are read only while importing that leaf and never change the ABI.
 os.environ["A2_MOE_LOCAL_EXPERTS"] = str(N_LOCAL_EXPERTS)
 os.environ["A2_MOE_RECV_MAX"] = str(RECV_MAX)
-from .decode_expert_routed import expert_routed_tile
 
 
 _ROUTER_CONFIG = asdict(FLASH)
@@ -633,10 +613,6 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 __all__ = [
     "D",
     "EP_SIZE",
@@ -670,3 +646,7 @@ __all__ = [
     "shared_expert_reference",
     "w8a8_expert_linear",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

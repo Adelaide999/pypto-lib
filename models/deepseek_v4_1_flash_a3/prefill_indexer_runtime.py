@@ -9,8 +9,7 @@
 """Schedule index queries and selection against existing physical key caches."""
 
 import torch
-
-from .indexer_select import KEY_CAPACITY
+from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY
 
 
 def validate_refresh_candidates(contract):

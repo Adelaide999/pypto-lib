@@ -8,25 +8,20 @@
 # -----------------------------------------------------------------------------------------------------------
 """Stage actual PyPTO operands through the native A2 MoE dispatch runtime."""
 
-if __package__ in (None, ""):
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    __package__ = "models.deepseek_v4_1_flash_a3"
-
 import argparse
 import json
 import os
-from pathlib import Path
 import platform
 import subprocess
+import sys
+from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
 import torch
-
 from .moe_boundary import dispatch_full384
-from .runtime_utils import validate_device, file_sha as _sha, tensor_sha as _tensor_sha
-
+from .runtime_utils import file_sha as _sha, tensor_sha as _tensor_sha, validate_device
 
 
 def dispatch_host_full384(hidden, route_ids, *, runtime_config, output_dir):

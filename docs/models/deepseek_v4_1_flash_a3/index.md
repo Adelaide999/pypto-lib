@@ -50,24 +50,28 @@ The original source names in this manifest are intentional provenance.
 
 | Responsibility | Implementation |
 | --- | --- |
-| Public whole-network forward and reusable compilation | `prefill_fwd.prefill_fwd`, `prefill_fwd.compile_prefill`, `prefill_program.py` |
-| Shared-computation L2 regions and exact argument bindings | `prefill_l2.py` |
+| Public whole-network forward and reusable compilation | `prefill_fwd.prefill_fwd`, `prefill_fwd.compile_prefill`, `prefill_fwd.PrefillProgram` |
+| Shared-computation L2 regions and exact argument bindings | `prefill_layer.py` (L2 regions denote orchestration, not physical layer 2) |
 | Complete layer | `prefill_layer.make_prefill_layer_entries`, `run_prefill_layer_inmemory` |
-| Original 40-layer composition | `prefill_layer.run_prefill_network_inmemory` |
-| Actual checkpoint, persistent state, HCCL and L39 head | `prefill_network_runtime.run_network_runtime` |
-| Input embedding / HC and final output kernels | `prefill_embedding.py`, `prefill_network_input.py`, `prefill_output.py` |
+| Original 40-layer composition | `prefill_fwd.run_prefill_network_inmemory` |
+| Actual checkpoint, persistent state, HCCL and L39 head | `prefill_fwd.run_network_runtime` |
+| Input embedding / HC and final output kernels | `input_pack.py`, `prefill_network_input.py`, `lm_head.py` |
 | SWA and C2/C1 attention | `prefill_swa.py`, `prefill_c2a.py`, `prefill_compressed_reuse.py`, `prefill_sparse_attention.py`, `compressor.py` |
-| Persistent source/cache ownership | `prefill_network_state.py`, `prefill_network_cache.py`, `prefill_layer_state.py` |
-| Two Engram slots and singleton history | `engram_host.py`, `prefill_network_engram.py`, `prefill_engram_runtime.py`, `engram_storage.py` |
+| Persistent source/cache ownership | `state.py`, `cache.py` |
+| Two Engram slots and singleton history | `engram_host.py`, `prefill_network_engram.py`, `prefill_engram_runtime.py` |
 | EP MoE and actual communication | `prefill_moe.py`, `moe.py`, `moe_transport.py` |
-| Shared primitives | `quant.py`, `ecotech_linear*.py`, `qkv*.py`, `hc.py`, `gemm.py` |
+| Shared primitives | `quant.py`, `gemm.py`, `qkv_proj_rope.py`, `rope.py`, `rmsnorm.py`, `hc.py` |
 
 Compression projection/pooling/publication now share `compressor.py`; Indexer
 cache/query/candidate operations share `indexer.py`; Engram device kernels and
 their validators share `engram.py`; all checkpoint readers and the EP2 Decode
 weight ABI live in `weights.py`. Normalization variants share `rmsnorm.py`.
-This removes 28 fragmented Python modules while preserving the separate phase
-numerical boundaries. See the
+The latest responsibility consolidation reduces the package from 123 to 83 Python
+modules (151 before the earlier operator consolidation). The complete network
+loop, reusable compilation and runtime now live in `prefill_fwd.py`; exact L2
+argument bindings live with the layer composition. Input packing, output heads,
+linear operations, normalization and rotary embeddings have independent owners.
+Phase-specific numerical boundaries are preserved. See the
 [ownership map](../../../models/deepseek_v4_1_flash_a3/MODULE_ALIGNMENT.md)
 for the official structure comparison and retained distinctions.
 
@@ -349,8 +353,8 @@ Run bounded host controls and operator checks from the repository root:
 python -B -m models.deepseek_v4_1_flash_a3.validate
 python -m models.deepseek_v4_1_flash_a3.hc -p a2a3 --cpu-only
 python -m models.deepseek_v4_1_flash_a3.swa -p a2a3 --cpu-only
-python -m models.deepseek_v4_1_flash_a3.indexer_select -p a2a3 --cpu-only
-python -m models.deepseek_v4_1_flash_a3.prefill_embedding -p a2a3 -d 0
+python -m models.deepseek_v4_1_flash_a3.indexer -p a2a3 --cpu-only
+python -m models.deepseek_v4_1_flash_a3.input_pack -p a2a3 -d 0
 ```
 
 `validate` uses only the standard library. It checks the maintained import DAG,
@@ -451,7 +455,7 @@ the resource lifetime used by A5 `prefill_fwd.py::generate`, while retaining
 A3 Eco-Tech W8A8, DP4/TP4/EP16 and the existing arithmetic. A3 does not import
 A5 MXFP8/MXFP4 operands or substitute its communication order.
 
-- `prefill_resident_weights.py` preloads all forty compute layer banks, all 384
+- `weights.py` preloads all forty compute layer banks, all 384
   routed experts per layer on their actual EP owner, one shared expert replica
   per rank, and the vocabulary shards. Expert source tensors are released
   after upload; device operands persist until generation ends. Nonexpert host
@@ -537,7 +541,7 @@ Compilation retained 76 unique entries for 947 stage bindings. Compute-weight
 allocations totaled 653,354,818,560 bytes across the sixteen ranks. Both Engram
 tables remained shared host mappings, totaling 221,190,580,800 bytes of unique
 codes and scales. Their cold preparation still copies and SHA-256 checks whole
-table shards in `engram_storage.py`, even with ordinary tensor diagnostics
+table shards in `engram_host.py`, even with ordinary tensor diagnostics
 disabled. None of these counters is a measured whole-device HBM peak.
 
 All forty layers and the output head executed for the first token of each

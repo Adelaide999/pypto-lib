@@ -8,20 +8,17 @@
 # -----------------------------------------------------------------------------------------------------------
 """Validate import contracts, model roles and bounded HOST controls without device imports."""
 
-if __package__ in (None, ""):
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    __package__ = "models.deepseek_v4_1_flash_a3"
-
 import ast
 import json
+import sys
 from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
+from . import smla_scheduler as smla_scheduler, swa_scheduler as swa_scheduler
 from .config import FLASH
 from .runtime_config import ExpertParallelConfig
-from . import smla_scheduler, swa_scheduler
 
 
 ROOT = Path(__file__).resolve().parent
@@ -75,7 +72,6 @@ def check_sources():
                        for target in ast.walk(node) if isinstance(target, ast.Name) and isinstance(target.ctx, ast.Store))
         require(symbol in defined, "Missing public symbol: " + public)
     return dict(modules=len(modules), import_graph="acyclic", public_exports=len(ast.literal_eval(mapping)))
-
 
 
 def check_layer_plan():
@@ -145,7 +141,6 @@ def check_controls():
     return dict(expert_topologies=len(topologies), experts=384, scheduling_requests=16, scheduling_active_rows=128)
 
 
-
 def check_runtime_configuration():
     """Check explicit TP and device binding without inherited process configuration."""
     import importlib
@@ -153,7 +148,7 @@ def check_runtime_configuration():
     import sys
     from unittest.mock import patch
 
-    from . import runtime_config
+    from . import runtime_config as runtime_config
 
     original = sys.argv
     try:
@@ -195,12 +190,12 @@ def check_chunk_continuation():
     from types import ModuleType, SimpleNamespace
     from unittest.mock import patch
 
-    from . import prefill_fwd
+    from . import prefill_fwd as prefill_fwd
 
-    source = ast.parse((ROOT / "prefill_network_runtime.py").read_text(encoding="utf-8"))
+    source = ast.parse((ROOT / "prefill_fwd.py").read_text(encoding="utf-8"))
     runner = next(node for node in source.body if isinstance(node, ast.FunctionDef)
                   and node.name == "run_network_runtime")
-    code = compile(ast.Module(body=[runner], type_ignores=[]), "prefill_network_runtime.py", "exec")
+    code = compile(ast.Module(body=[runner], type_ignores=[]), "prefill_fwd.py", "exec")
     topology = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
     modes = dict(real_w8a8=True)
     fixtures = 0
@@ -355,13 +350,11 @@ def check_chunk_continuation():
                 validate_host_lookup=lambda *args: None,
                 torch=SimpleNamespace(load=lambda path, **kwargs: json.loads(Path(path).read_text())))
             exec(code, namespace)
-            module = ModuleType(__package__ + ".prefill_network_runtime")
-            module.run_network_runtime = namespace["run_network_runtime"]
             transport = ModuleType(__package__ + ".moe_transport")
             transport.CANNMemory = SimpleNamespace
             resident_module = ModuleType(__package__ + ".prefill_resident")
             resident_module.ResidentNetworkRuntime = Resident
-            resident_weights = ModuleType(__package__ + ".prefill_resident_weights")
+            resident_weights = ModuleType(__package__ + ".weights")
             resident_weights.ResidentNetworkWeights = Weights
             for packet in packets:
                 packet["inputs"]["engram_lookup"] = {"host_prepared": True}
@@ -370,12 +363,13 @@ def check_chunk_continuation():
             continuation = packets[1] if legacy else continuations()
             if count == 1:
                 continuation = [] if empty else None
-            modules = {module.__name__: module, transport.__name__: transport,
+            modules = {transport.__name__: transport,
                        resident_module.__name__: resident_module, resident_weights.__name__: resident_weights}
             try:
                 first_inputs = dict(packets[0]["inputs"])
                 ready_rows = first_inputs.pop("engram_lookup")
-                with patch.dict(os.environ, {}, clear=True), patch.dict(sys.modules, modules):
+                with patch.dict(os.environ, {}, clear=True), patch.dict(sys.modules, modules), \
+                        patch.object(prefill_fwd, "run_network_runtime", namespace["run_network_runtime"]):
                     result = prefill_fwd.run_prefill(first_inputs, weights=checkpoint or "original-checkpoint",
                         cache=cache, config=packets[0]["contract"], devices=list(range(16)),
                         output=directory / "output", continuation=continuation, engram_lookup=ready_rows)
@@ -460,7 +454,7 @@ def check_chunk_configuration():
     from types import SimpleNamespace
     from unittest.mock import patch
 
-    from . import prefill_fwd
+    from . import prefill_fwd as prefill_fwd
 
     with TemporaryDirectory(prefix="a3-prefill-config-") as temporary:
         root = Path(temporary)
@@ -521,18 +515,17 @@ def check_chunk_configuration():
 
 
 def check_automatic_entry():
-    """Check lazy automatic-input dispatch without importing Torch, PyPTO or devices."""
+    """Check lazy automatic-input dispatch without executing kernels or allocating devices."""
     import os
     import sys
     from tempfile import TemporaryDirectory
     from types import ModuleType
     from unittest.mock import patch
 
-    from . import prefill_fwd
+    from . import prefill_fwd as prefill_fwd
 
     observed = []
     prepare = ModuleType(__package__ + ".prefill_prepare")
-    runtime = ModuleType(__package__ + ".prefill_network_runtime")
 
     def chunks(inputs, **kwargs):
         require(inputs == list(range(32)), "Automatic entry changed the token IDs")
@@ -550,10 +543,11 @@ def check_automatic_entry():
             observed.append(packet["inputs"]["input_contract"]["epoch"])
         return dict(completed=list(observed))
 
-    prepare.prepare_token_chunks, runtime.run_network_runtime = chunks, execute
+    prepare.prepare_token_chunks = chunks
     with TemporaryDirectory(prefix="a3-automatic-entry-") as temporary:
         config = dict(topology=dict(ep=16), chunk_size=16, dp_rank=2)
-        with patch.dict(sys.modules, {prepare.__name__: prepare, runtime.__name__: runtime}), \
+        with patch.dict(sys.modules, {prepare.__name__: prepare}), \
+                patch.object(prefill_fwd, "run_network_runtime", execute), \
                 patch.dict(os.environ, {}, clear=True):
             result = prefill_fwd.run_prefill(list(range(32)), weights="checkpoint", cache={}, config=config,
                 devices=list(range(16)), output=Path(temporary) / "new-output")
@@ -575,11 +569,9 @@ def check_automatic_compile():
     from types import ModuleType
     from unittest.mock import patch
 
-    from . import prefill_fwd
+    from . import prefill_fwd as prefill_fwd
 
     prepare = ModuleType(__package__ + ".prefill_prepare")
-    runtime = ModuleType(__package__ + ".prefill_network_runtime")
-    program = ModuleType(__package__ + ".prefill_program")
     seen, temporary_paths = [], []
 
     def chunks(inputs, **kwargs):
@@ -610,11 +602,12 @@ def check_automatic_compile():
             seen.append("compiled")
             return self
 
-    prepare.prepare_token_chunks, runtime.prepare_network_provider = chunks, provider
-    program.PrefillProgram = Program
-    modules = {module.__name__: module for module in (prepare, runtime, program)}
+    prepare.prepare_token_chunks = chunks
+    modules = {prepare.__name__: prepare}
     with TemporaryDirectory(prefix="a3-compile-entry-") as temporary, patch.dict(sys.modules, modules), \
-            patch.dict(os.environ, {}, clear=True):
+            patch.dict(os.environ, {}, clear=True), \
+            patch.object(prefill_fwd, "prepare_network_provider", provider), \
+            patch.object(prefill_fwd, "PrefillProgram", Program):
         config = dict(topology=dict(ep=16), model_config={}, chunk_size=8, dp_rank=2)
         _reject(lambda: prefill_fwd.compile_prefill([1], cache={}, config=config, output=temporary),
                 "Automatic compile-only accepted a missing checkpoint")

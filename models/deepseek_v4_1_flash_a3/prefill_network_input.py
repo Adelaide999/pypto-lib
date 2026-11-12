@@ -8,21 +8,17 @@
 # -----------------------------------------------------------------------------------------------------------
 """Compose vocabulary lookup, TP exchange, PyPTO summation and initial SP/HC streams."""
 
-if __package__ in (None, ""):
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    __package__ = "models.deepseek_v4_1_flash_a3"
-
 import argparse
 import json
+import sys
 from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
 import torch
-
-from .prefill_embedding import make_input_entries
-from .prefill_l2 import region_arguments
+from .input_pack import make_input_entries
+from .prefill_layer import region_arguments
 from .runtime_utils import Executable, communicate, file_sha, loaded_source_files, tensor_sha, write_json
 from .weights import CheckpointOperands
 

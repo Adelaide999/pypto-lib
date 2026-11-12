@@ -6,15 +6,14 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Look up vocabulary shards and initialize sequence-parallel HC streams."""
+"""Token embedding, input packing and initial HC computations."""
+
+import sys
+from pathlib import Path
 
 if __package__ in (None, ""):
-    import sys
-    from pathlib import Path
-
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
-
 import pypto.language as pl
 
 
@@ -47,8 +46,8 @@ def make_vocab_embedding(capacity, hidden, vocabulary, tp):
                 if local_id >= 0:
                     if local_id < local_rows:
                         row = pl.cast(local_id, pl.INDEX)
-                        tile = weight[row:row + 1, column:column + D_TILE]
-            output[token:token + 1, column:column + D_TILE] = tile
+                        tile = weight[row : row + 1, column : column + D_TILE]
+            output[token : token + 1, column : column + D_TILE] = tile
         return output
 
     return embedding
@@ -76,9 +75,9 @@ def make_initial_hc(capacity, hidden, hc_mult):
             source = tp_rank * physical + token
             tile = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
             if source < active:
-                tile = embedding[source:source + 1, column:column + D_TILE]
+                tile = embedding[source : source + 1, column : column + D_TILE]
             offset = lane * hidden + column
-            flattened[token:token + 1, offset:offset + D_TILE] = tile
+            flattened[token : token + 1, offset : offset + D_TILE] = tile
         for instance in pl.spmd(1, name_hint="prefill_initial_premix"):
             for token in pl.range(physical):
                 for lane in pl.unroll(hc_mult):
@@ -108,9 +107,9 @@ def make_vocab_reduce(capacity, hidden, tp):
             total = pl.full([1, D_TILE], dtype=pl.FP32, value=0.0)
             for peer in pl.unroll(tp):
                 row = peer * capacity + token
-                shard = gathered[row:row + 1, column:column + D_TILE]
+                shard = gathered[row : row + 1, column : column + D_TILE]
                 total = pl.add(total, pl.cast(shard, pl.FP32))
-            output[token:token + 1, column:column + D_TILE] = pl.cast(total, pl.BF16, mode="rint")
+            output[token : token + 1, column : column + D_TILE] = pl.cast(total, pl.BF16, mode="rint")
         return output
 
     return reduce_embedding
@@ -119,9 +118,11 @@ def make_vocab_reduce(capacity, hidden, tp):
 def make_input_entries(capacity, config, tp):
     """Build vocabulary-parallel lookup and initial local HC streams."""
     hidden, vocabulary = config["hidden_size"], config["vocab_size"]
-    return dict(lookup=make_vocab_embedding(capacity, hidden, vocabulary, tp),
-                reduce=make_vocab_reduce(capacity, hidden, tp),
-                initial_hc=make_initial_hc(capacity, hidden, config["hc_mult"]))
+    return dict(
+        lookup=make_vocab_embedding(capacity, hidden, vocabulary, tp),
+        reduce=make_vocab_reduce(capacity, hidden, tp),
+        initial_hc=make_initial_hc(capacity, hidden, config["hc_mult"]),
+    )
 
 
 def golden_vocab_embedding(tensors):
@@ -181,7 +182,7 @@ def embedding_golden_cases(checkpoint=None):
         name = "embed.weight"
         index = json.loads((checkpoint / "quant_model_weights.safetensors.index.json").read_text())
         with safe_open(checkpoint / index["weight_map"][name], framework="pt", device="cpu") as source:
-            return source.get_slice(name)[start:start + rows].contiguous()
+            return source.get_slice(name)[start : start + rows].contiguous()
 
     for tp, rank, active in ((1, 0, 0), (1, 0, 16), (2, 1, 7), (4, 0, 1), (4, 3, 16)):
         rows, start = vocabulary // tp, rank * (vocabulary // tp)
@@ -192,16 +193,22 @@ def embedding_golden_cases(checkpoint=None):
         specs = [
             TensorSpec("token_ids", [capacity], torch.int64, init_value=ids),
             TensorSpec("live", [capacity], torch.int32, init_value=live),
-            TensorSpec("weight", [rows, hidden], torch.bfloat16, init_value=lambda p=tp, r=rank: weight_shard(p, r)),
+            TensorSpec(
+                "weight", [rows, hidden], torch.bfloat16, init_value=lambda p=tp, r=rank: weight_shard(p, r)
+            ),
             TensorSpec("output", [capacity, hidden], torch.bfloat16, init_value=-12.5),
             ScalarSpec("vocab_start", torch.int32, start, compile_runtime=True),
             ScalarSpec("active", torch.int32, active, compile_runtime=True),
         ]
-        yield dict(name=f"embedding-tp{tp}-rank{rank}-active{active}",
-                   fn=make_vocab_embedding(capacity, hidden, vocabulary, tp),
-                   specs=specs, golden_fn=golden_vocab_embedding)
+        yield dict(
+            name=f"embedding-tp{tp}-rank{rank}-active{active}",
+            fn=make_vocab_embedding(capacity, hidden, vocabulary, tp),
+            specs=specs,
+            golden_fn=golden_vocab_embedding,
+        )
 
     for tp, active in ((1, 16), (2, 7), (4, 1), (4, 0)):
+
         def gathered_fixture(p=tp):
             value = torch.zeros(p, capacity, hidden, dtype=torch.bfloat16)
             columns = (torch.arange(hidden) % 257 - 128).float() / 64.0
@@ -214,9 +221,12 @@ def embedding_golden_cases(checkpoint=None):
             TensorSpec("output", [capacity, hidden], torch.bfloat16, init_value=-12.5),
             ScalarSpec("active", torch.int32, active, compile_runtime=True),
         ]
-        yield dict(name=f"embedding-reduce-tp{tp}-active{active}",
-                   fn=make_vocab_reduce(capacity, hidden, tp), specs=specs, golden_fn=golden_vocab_reduce)
-
+        yield dict(
+            name=f"embedding-reduce-tp{tp}-active{active}",
+            fn=make_vocab_reduce(capacity, hidden, tp),
+            specs=specs,
+            golden_fn=golden_vocab_reduce,
+        )
 
     def embedding_fixture():
         return (torch.arange(capacity * hidden).reshape(capacity, hidden) % 31).to(torch.bfloat16)
@@ -231,8 +241,12 @@ def embedding_golden_cases(checkpoint=None):
             ScalarSpec("physical", torch.int32, physical, compile_runtime=True),
             ScalarSpec("active", torch.int32, active, compile_runtime=True),
         ]
-        yield dict(name=f"initial-hc-tp{tp}-rank{rank}-active{active}",
-                   fn=make_initial_hc(capacity, hidden, hc_mult), specs=specs, golden_fn=golden_initial_hc)
+        yield dict(
+            name=f"initial-hc-tp{tp}-rank{rank}-active{active}",
+            fn=make_initial_hc(capacity, hidden, hc_mult),
+            specs=specs,
+            golden_fn=golden_initial_hc,
+        )
 
 
 def validate(*, device=0, compile_only=False, checkpoint=None, platform="a2a3", sim=False):
@@ -249,10 +263,112 @@ def validate(*, device=0, compile_only=False, checkpoint=None, platform="a2a3", 
             rtol=0.0,
             atol=0.0,
         )
-        records.append(dict(name=name, passed=result.passed, work_dir=str(result.work_dir), error=str(result.error)))
+        records.append(
+            dict(name=name, passed=result.passed, work_dir=str(result.work_dir), error=str(result.error))
+        )
         if not result.passed:
             raise RuntimeError(f"{name}: {result.error}")
     return records
+
+
+def make_sp_masked_zero(capacity, width):
+    """Zero masked physical SP rows and preserve valid and inactive rows."""
+
+    @pl.jit
+    def masked_zero(
+        value: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        valid: pl.Scalar[pl.INT32],
+        physical: pl.Scalar[pl.INT32],
+    ):
+        for block in pl.spmd((physical - valid) * (width // D_TILE), name_hint="prefill_sp_masked_zero"):
+            token = valid + block // (width // D_TILE)
+            column = block % (width // D_TILE) * D_TILE
+            tile = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
+            value[token : token + 1, column : column + D_TILE] = tile
+        return value
+
+    return masked_zero
+
+
+def make_head_pack(capacity, heads, head_dim, tp):
+    """Pack all local CP heads into fixed equal peer buckets."""
+    local_width = heads // tp * head_dim
+
+    @pl.jit
+    def head_pack(
+        value: pl.Tensor[[capacity, heads * head_dim], pl.BF16],
+        packed: pl.InOut[pl.Tensor[[tp * capacity, local_width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for block in pl.spmd(tp * capacity * (local_width // D_TILE), name_hint="prefill_cp_head_pack"):
+            column = block % (local_width // D_TILE) * D_TILE
+            row = block // (local_width // D_TILE)
+            peer = row // capacity
+            token = row % capacity
+            tile = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
+            if token < active:
+                source = peer * local_width + column
+                tile = value[token : token + 1, source : source + D_TILE]
+            packed[row : row + 1, column : column + D_TILE] = tile
+        return packed
+
+    return head_pack
+
+
+def make_sp_gather_unpack(capacity, width, tp, dtype=pl.BF16, tile=D_TILE):
+    """Compact fixed peer buckets into contiguous physical token order."""
+    scalar_rows = width < 8
+
+    @pl.jit
+    def gather_unpack(
+        packet: pl.Tensor[[tp * capacity, width], dtype],
+        output: pl.InOut[pl.Tensor[[capacity, width], dtype]],
+        physical: pl.Scalar[pl.INT32],
+        active: pl.Scalar[pl.INT32],
+    ):
+        if scalar_rows:
+            for _block in pl.spmd(1, name_hint="prefill_sp_state_unpack"):
+                for token in pl.range(active):
+                    source = token // physical * capacity + token % physical
+                    for column in pl.range(width):
+                        state_value = pl.read(packet, [source, column])
+                        pl.write(output, [token, column], state_value)
+        else:
+            for block in pl.spmd(active * (width // tile), name_hint="prefill_sp_gather_unpack"):
+                token = block // (width // tile)
+                column = block % (width // tile) * tile
+                source = token // physical * capacity + token % physical
+                vector_value = packet[source : source + 1, column : column + tile]
+                output[token : token + 1, column : column + tile] = vector_value
+        return output
+
+    return gather_unpack
+
+
+def make_sp_reduce_pack(capacity, hidden, tp):
+    """Pad full Wo-B partial sums into equal reduce-scatter peer buckets."""
+
+    @pl.jit
+    def reduce_pack(
+        value: pl.Tensor[[capacity, hidden], pl.BF16],
+        packed: pl.InOut[pl.Tensor[[tp * capacity, hidden], pl.BF16]],
+        physical: pl.Scalar[pl.INT32],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for block in pl.spmd(tp * capacity * (hidden // D_TILE), name_hint="prefill_sp_reduce_pack"):
+            row = block // (hidden // D_TILE)
+            column = block % (hidden // D_TILE) * D_TILE
+            peer = row // capacity
+            local = row % capacity
+            source = peer * physical + local
+            tile = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
+            if local < physical:
+                if source < active:
+                    tile = value[source : source + 1, column : column + D_TILE]
+            packed[row : row + 1, column : column + D_TILE] = tile
+        return packed
+
+    return reduce_pack
 
 
 if __name__ == "__main__":
@@ -268,6 +384,14 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
-    records = validate(device=args.device, compile_only=args.compile_only, checkpoint=args.checkpoint, platform=args.platform, sim=args.sim)
+    records = validate(
+        device=args.device,
+        compile_only=args.compile_only,
+        checkpoint=args.checkpoint,
+        platform=args.platform,
+        sim=args.sim,
+    )
     if args.report is not None:
-        args.report.write_text(json.dumps(dict(compile_only=args.compile_only, cases=records), indent=2) + "\n")
+        args.report.write_text(
+            json.dumps(dict(compile_only=args.compile_only, cases=records), indent=2) + "\n"
+        )

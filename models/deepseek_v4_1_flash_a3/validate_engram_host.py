@@ -8,15 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Validate CPU table lookup, chunk history and ready-row forward admission."""
 
+import json
 from copy import deepcopy
 from hashlib import sha256
-import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
-
 import torch
-
 from .engram_host import HostEngram, lookup_columns
 
 

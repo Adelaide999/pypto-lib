@@ -6,40 +6,294 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Complete physical L0 Decode composition for the two-rank EP2 gate.
-
-The attention and FFN residual streams stay rank-local.  The MoE child owns
-the only cross-rank transport and receives the normalized FFN stream.  This
-entry is a product path: all model computation is emitted through PyPTO.
-"""
-
-from __future__ import annotations
+"""Decode attention composition and complete SWA block."""
 
 from dataclasses import asdict
-
 import pypto.language as pl
 import pypto.language.distributed as pld
-
-from .decode_attention_block import make_attention_block
 from .config import FLASH
-from .decode_moe import (
-    AUX_PAD,
-    COUNT_PAD,
-    D,
-    EP_SIZE,
-    LANE_ROWS,
-    MOE_INTER,
-    N_EXPERTS,
-    N_LOCAL_EXPERTS,
-    T,
-    TOPK,
-    decode_ep2_rank,
-)
-from .hc import (
-    make_decode_hc_post_inline as make_hc_post_inline,
-    make_decode_hc_pre_inline as make_hc_pre_inline,
-)
-from .rmsnorm import NORM_T_TILE, rms_norm_tiled_with_fp32
+from .decode_moe import AUX_PAD, COUNT_PAD, D as DECODE_D, EP_SIZE, LANE_ROWS, MOE_INTER, N_EXPERTS, N_LOCAL_EXPERTS, T, TOPK, decode_ep2_rank
+from .hc import make_decode_hc_post_inline as make_hc_post_inline, make_decode_hc_pre_inline as make_hc_pre_inline
+from .o_proj import make_decode_output_projection_bf16 as make_output_projection_bf16
+from .qkv_proj_rope import make_decode_qkv_w8a8_inline as make_qkv_w8a8_inline
+from .rmsnorm import DECODE_D as D, DECODE_EPS as EPS, NORM_T_TILE, rms_norm_tiled, rms_norm_tiled_with_fp32
+from .swa import make_decode_swa_inline as make_swa_inline
+
+
+def make_attention_block(capacity, config):
+    """Build the layer-zero attention block with delayed HC coefficients."""
+    hidden = config["hidden_size"]
+    latent = config["q_lora_rank"]
+    head_dim = config["head_dim"]
+    heads = config["num_attention_heads"]
+    width = heads * head_dim
+    pairs = config["qk_rope_head_dim"] // 2
+    window = config["sliding_window"]
+    groups = config["o_groups"]
+    group_input = width // groups
+    rank = config["o_lora_rank"]
+    hc = config["hc_mult"]
+    channels = (hc + 2) * hc
+    if hidden != D or config["rms_norm_eps"] != EPS:
+        raise ValueError("The shared model RMSNorm configuration must match this block")
+    pre = make_hc_pre_inline(capacity, config)
+    attention = make_attention_inline(capacity, config)
+    post_fn = make_hc_post_inline(capacity, config)
+
+    @pl.jit
+    def attention_block(
+        x_hc: pl.Tensor[[capacity, hc, hidden], pl.BF16],
+        hc_function: pl.Tensor[[channels, hc * hidden], pl.FP32],
+        hc_scale: pl.Tensor[[3], pl.FP32],
+        hc_base: pl.Tensor[[channels], pl.FP32],
+        incoming: pl.Tensor[[capacity, hc], pl.FP32],
+        norm_weight: pl.Tensor[[hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, width], pl.INT8],
+        wq_b_scale: pl.Tensor[[width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        wo_a: pl.Tensor[[groups, group_input, rank], pl.BF16],
+        wo_b: pl.Tensor[[groups * rank, hidden], pl.BF16],
+        rope_cos: pl.Tensor[[capacity, pairs], pl.FP32],
+        rope_sin: pl.Tensor[[capacity, pairs], pl.FP32],
+        slots: pl.Tensor[[capacity, 2], pl.INT64],
+        indices: pl.Tensor[[capacity, window], pl.INT32],
+        sink: pl.Tensor[[heads], pl.FP32],
+        positions: pl.InOut[pl.Tensor[[capacity], pl.INT64]],
+        query_latent: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        query: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        window_kv: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        cache: pl.InOut[pl.Tensor[[2, 128, 1, head_dim], pl.BF16]],
+        cache_lens: pl.InOut[pl.Tensor[[2], pl.INT32]],
+        output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
+        next_pre: pl.InOut[pl.Tensor[[capacity, hc], pl.FP32]],
+        post: pl.InOut[pl.Tensor[[capacity, hc], pl.FP32]],
+        comb: pl.InOut[pl.Tensor[[capacity, hc, hc], pl.FP32]],
+        collapsed: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
+        normed: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
+        hidden_output: pl.InOut[pl.Tensor[[capacity, hc, hidden], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+
+        collapsed_fp32 = pl.create_tensor([capacity, hidden], dtype=pl.FP32)
+        pre(
+            x_hc,
+            hc_function,
+            hc_scale,
+            hc_base,
+            incoming,
+            next_pre,
+            post,
+            comb,
+            collapsed,
+            collapsed_fp32,
+            active,
+        )
+        for block in pl.spmd((active + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="a2_block_norm"):
+            rms_norm_tiled(collapsed, norm_weight, normed, block, active)
+        attention(
+            normed,
+            wq_a,
+            wq_a_scale,
+            q_norm_weight,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            wkv_scale,
+            kv_norm_weight,
+            wo_a,
+            wo_b,
+            rope_cos,
+            rope_sin,
+            slots,
+            indices,
+            sink,
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            cache,
+            cache_lens,
+            output,
+            active,
+        )
+        post_fn(output, x_hc, post, comb, hidden_output, active)
+        return (
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            cache,
+            cache_lens,
+            output,
+            next_pre,
+            post,
+            comb,
+            collapsed,
+            normed,
+            hidden_output,
+        )
+
+    return attention_block
+
+
+def make_attention_inline(capacity, config):
+    """Build QKV, paged SWA, inverse RoPE and both output projections."""
+    hidden = config["hidden_size"]
+    latent = config["q_lora_rank"]
+    head_dim = config["head_dim"]
+    heads = config["num_attention_heads"]
+    width = heads * head_dim
+    pairs = config["qk_rope_head_dim"] // 2
+    window = config["sliding_window"]
+    groups = config["o_groups"]
+    group_input = width // groups
+    rank = config["o_lora_rank"]
+    qkv = make_qkv_w8a8_inline(capacity, config)
+    swa = make_swa_inline(capacity, 2, config)
+    project = make_output_projection_bf16(
+        capacity,
+        heads,
+        head_dim,
+        config["qk_rope_head_dim"],
+        groups,
+        rank,
+        hidden,
+    )
+
+    @pl.jit.inline
+    def attention_inline(
+        x: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, width], pl.INT8],
+        wq_b_scale: pl.Tensor[[width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        wo_a: pl.Tensor[[groups, group_input, rank], pl.BF16],
+        wo_b: pl.Tensor[[groups * rank, hidden], pl.BF16],
+        rope_cos: pl.Tensor[[capacity, pairs], pl.FP32],
+        rope_sin: pl.Tensor[[capacity, pairs], pl.FP32],
+        slots: pl.Tensor[[capacity, 2], pl.INT64],
+        indices: pl.Tensor[[capacity, window], pl.INT32],
+        sink: pl.Tensor[[heads], pl.FP32],
+        positions: pl.Tensor[[capacity], pl.INT64],
+        query_latent: pl.Tensor[[capacity, latent], pl.BF16],
+        query: pl.Tensor[[capacity, width], pl.BF16],
+        window_kv: pl.Tensor[[capacity, head_dim], pl.BF16],
+        cache: pl.Tensor[[2, 128, 1, head_dim], pl.BF16],
+        cache_lens: pl.Tensor[[2], pl.INT32],
+        output: pl.Tensor[[capacity, hidden], pl.BF16],
+        active: pl.Scalar[pl.INT32],
+    ):
+        flat_cache = pl.reshape(cache, [2, 128, head_dim])
+        qkv(
+            x,
+            wq_a,
+            wq_a_scale,
+            q_norm_weight,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            wkv_scale,
+            kv_norm_weight,
+            rope_cos,
+            rope_sin,
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            flat_cache,
+            cache_lens,
+            active,
+        )
+        attended = pl.create_tensor([capacity, width], dtype=pl.BF16)
+        swa(query, window_kv, slots, indices, sink, cache, attended, active)
+        rotated = pl.create_tensor([capacity, width], dtype=pl.BF16)
+        grouped = pl.create_tensor([capacity, groups * rank], dtype=pl.BF16)
+        project(attended, wo_a, wo_b, rope_cos, rope_sin, rotated, grouped, output, active)
+        return positions, query_latent, query, window_kv, cache, cache_lens, output
+
+    return attention_inline
+
+
+def make_attention(capacity, config):
+    """Build the standalone JIT wrapper for shared inline attention."""
+    hidden = config["hidden_size"]
+    latent = config["q_lora_rank"]
+    head_dim = config["head_dim"]
+    heads = config["num_attention_heads"]
+    width = heads * head_dim
+    pairs = config["qk_rope_head_dim"] // 2
+    window = config["sliding_window"]
+    groups = config["o_groups"]
+    group_input = width // groups
+    rank = config["o_lora_rank"]
+    compute = make_attention_inline(capacity, config)
+
+    @pl.jit
+    def attention(
+        x: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, width], pl.INT8],
+        wq_b_scale: pl.Tensor[[width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        wo_a: pl.Tensor[[groups, group_input, rank], pl.BF16],
+        wo_b: pl.Tensor[[groups * rank, hidden], pl.BF16],
+        rope_cos: pl.Tensor[[capacity, pairs], pl.FP32],
+        rope_sin: pl.Tensor[[capacity, pairs], pl.FP32],
+        slots: pl.Tensor[[capacity, 2], pl.INT64],
+        indices: pl.Tensor[[capacity, window], pl.INT32],
+        sink: pl.Tensor[[heads], pl.FP32],
+        positions: pl.InOut[pl.Tensor[[capacity], pl.INT64]],
+        query_latent: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        query: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        window_kv: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        cache: pl.InOut[pl.Tensor[[2, 128, 1, head_dim], pl.BF16]],
+        cache_lens: pl.InOut[pl.Tensor[[2], pl.INT32]],
+        output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+
+        compute(
+            x,
+            wq_a,
+            wq_a_scale,
+            q_norm_weight,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            wkv_scale,
+            kv_norm_weight,
+            wo_a,
+            wo_b,
+            rope_cos,
+            rope_sin,
+            slots,
+            indices,
+            sink,
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            cache,
+            cache_lens,
+            output,
+            active,
+        )
+        return positions, query_latent, query, window_kv, cache, cache_lens, output
+
+    return attention
 
 
 CONFIG = asdict(FLASH)
@@ -104,30 +358,30 @@ def decode_layer_ep2_rank(
     ffn_comb: pl.InOut[pl.Tensor[[T, HC, HC], pl.FP32]],
     ffn_collapsed: pl.InOut[pl.Tensor[[T, HIDDEN], pl.BF16]],
     ffn_normed: pl.InOut[pl.Tensor[[T, HIDDEN], pl.BF16]],
-    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_weight: pl.Tensor[[N_EXPERTS, DECODE_D], pl.FP32],
     text_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     vision_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     input_ids: pl.Tensor[[T], pl.INT64],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, DECODE_D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, DECODE_D], pl.INT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, 2560], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
-    shared_gate_up: pl.Tensor[[D, MOE_INTER * 2], pl.INT8],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, DECODE_D, 2560], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, DECODE_D], pl.FP32],
+    shared_gate_up: pl.Tensor[[DECODE_D, MOE_INTER * 2], pl.INT8],
     shared_gate_up_scale: pl.Tensor[[MOE_INTER * 2], pl.FP32],
-    shared_down: pl.Tensor[[MOE_INTER, D], pl.INT8],
-    shared_down_scale: pl.Tensor[[D], pl.FP32],
-    lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
+    shared_down: pl.Tensor[[MOE_INTER, DECODE_D], pl.INT8],
+    shared_down_scale: pl.Tensor[[DECODE_D], pl.FP32],
+    lane_x: pld.DistributedTensor[[LANE_ROWS, DECODE_D], pl.INT8],
     lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[EP_SIZE, COUNT_PAD], pl.INT32],
     lane_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
-    slot_out: pld.DistributedTensor[[T * TOPK, D], pl.FP32],
+    slot_out: pld.DistributedTensor[[T * TOPK, DECODE_D], pl.FP32],
     return_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
     logits: pl.InOut[pl.Tensor[[T, N_EXPERTS], pl.FP32]],
     route_ids: pl.InOut[pl.Tensor[[T, TOPK], pl.INT32]],
     route_weights: pl.InOut[pl.Tensor[[T, TOPK], pl.FP32]],
-    moe_output: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    moe_output: pl.Out[pl.Tensor[[T, DECODE_D], pl.BF16]],
     output: pl.Out[pl.Tensor[[T, HC, HIDDEN], pl.BF16]],
     active: pl.Scalar[pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -274,42 +528,42 @@ def decode_layer_ep2(
     ffn_comb: pl.InOut[pl.Tensor[[EP_SIZE, T, HC, HC], pl.FP32]],
     ffn_collapsed: pl.InOut[pl.Tensor[[EP_SIZE, T, HIDDEN], pl.BF16]],
     ffn_normed: pl.InOut[pl.Tensor[[EP_SIZE, T, HIDDEN], pl.BF16]],
-    gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, D], pl.FP32],
+    gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, DECODE_D], pl.FP32],
     text_bias: pl.Tensor[[EP_SIZE, N_EXPERTS], pl.FP32],
     vision_bias: pl.Tensor[[EP_SIZE, N_EXPERTS], pl.FP32],
     input_ids: pl.Tensor[[EP_SIZE, T], pl.INT64],
-    routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MOE_INTER, DECODE_D], pl.INT8],
     routed_w1_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w3: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MOE_INTER, DECODE_D], pl.INT8],
     routed_w3_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, D, 2560], pl.INT8],
-    routed_w2_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, D], pl.FP32],
-    shared_gate_up: pl.Tensor[[EP_SIZE, D, MOE_INTER * 2], pl.INT8],
+    routed_w2: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, DECODE_D, 2560], pl.INT8],
+    routed_w2_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, DECODE_D], pl.FP32],
+    shared_gate_up: pl.Tensor[[EP_SIZE, DECODE_D, MOE_INTER * 2], pl.INT8],
     shared_gate_up_scale: pl.Tensor[[EP_SIZE, MOE_INTER * 2], pl.FP32],
-    shared_down: pl.Tensor[[EP_SIZE, MOE_INTER, D], pl.INT8],
-    shared_down_scale: pl.Tensor[[EP_SIZE, D], pl.FP32],
+    shared_down: pl.Tensor[[EP_SIZE, MOE_INTER, DECODE_D], pl.INT8],
+    shared_down_scale: pl.Tensor[[EP_SIZE, DECODE_D], pl.FP32],
     logits: pl.Out[pl.Tensor[[EP_SIZE, T, N_EXPERTS], pl.FP32]],
     route_ids: pl.Out[pl.Tensor[[EP_SIZE, T, TOPK], pl.INT32]],
     route_weights: pl.Out[pl.Tensor[[EP_SIZE, T, TOPK], pl.FP32]],
-    moe_output: pl.Out[pl.Tensor[[EP_SIZE, T, D], pl.BF16]],
+    moe_output: pl.Out[pl.Tensor[[EP_SIZE, T, DECODE_D], pl.BF16]],
     output: pl.Out[pl.Tensor[[EP_SIZE, T, HC, HIDDEN], pl.BF16]],
     active: pl.Scalar[pl.INT32],
     epoch: pl.Scalar[pl.INT32],
 ):
     """Launch the complete L0 Decode layer across the two EP ranks."""
 
-    lane_x_buf = pld.alloc_window_buffer([LANE_ROWS, D], dtype=pl.INT8)
+    lane_x_buf = pld.alloc_window_buffer([LANE_ROWS, DECODE_D], dtype=pl.INT8)
     lane_aux_buf = pld.alloc_window_buffer([LANE_ROWS, AUX_PAD], dtype=pl.FP32)
     lane_count_buf = pld.alloc_window_buffer([EP_SIZE, COUNT_PAD], dtype=pl.INT32)
     lane_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
-    slot_out_buf = pld.alloc_window_buffer([T * TOPK, D], dtype=pl.FP32)
+    slot_out_buf = pld.alloc_window_buffer([T * TOPK, DECODE_D], dtype=pl.FP32)
     return_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(EP_SIZE):
-        lane_x = pld.window(lane_x_buf, [LANE_ROWS, D], dtype=pl.INT8)
+        lane_x = pld.window(lane_x_buf, [LANE_ROWS, DECODE_D], dtype=pl.INT8)
         lane_aux = pld.window(lane_aux_buf, [LANE_ROWS, AUX_PAD], dtype=pl.FP32)
         lane_count = pld.window(lane_count_buf, [EP_SIZE, COUNT_PAD], dtype=pl.INT32)
         lane_ready = pld.window(lane_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
-        slot_out = pld.window(slot_out_buf, [T * TOPK, D], dtype=pl.FP32)
+        slot_out = pld.window(slot_out_buf, [T * TOPK, DECODE_D], dtype=pl.FP32)
         return_ready = pld.window(return_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
         decode_layer_ep2_rank(
             x_hc[rank],
@@ -406,6 +660,3 @@ def product_contract() -> dict[str, object]:
         "reference_process": "independent vLLM-Ascend process",
         "formal_accuracy": "not_run",
     }
-
-
-__all__ = ["decode_layer_ep2", "decode_layer_ep2_rank", "product_contract"]

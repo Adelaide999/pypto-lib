@@ -6,10 +6,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Paged sparse attention with TP-sharded BF16 and INT8 cache variants."""
+"""Shared sparse-attention computation and Torch reference."""
 
-import torch
 import pypto.language as pl
+import torch
 from .config import FLASH as M
 from .operator_config import T_DYN
 from .runtime_config import validate_tp
@@ -49,7 +49,6 @@ def make_sparse_attention_inline(tp=1):
 
     WORKERS = 32
 
-
     @pl.jit.inline(auto_scope=False)
     def _attend_cube(
         query: pl.Tensor[[T_DYN, CUBE_HEADS * HEAD_DIM], pl.BF16],
@@ -68,23 +67,28 @@ def make_sparse_attention_inline(tp=1):
         kflat = pl.reshape(selected, [cache_rows, HEAD_DIM])
         oflat = pl.reshape(output, [head_rows, HEAD_DIM])
         workers = pl.max(1, pl.min(num_tokens * ((CUBE_HEADS + HEAD_TILE - 1) // HEAD_TILE), WORKERS))
-        with pl.spmd(workers, name_hint="sparse_online_cube", deps=[selected_ready, query_ready], optimizations=[pl.cross_core_slot(slot_num=1)]) as attended:
+        with pl.spmd(
+            workers,
+            name_hint="sparse_online_cube",
+            deps=[selected_ready, query_ready],
+            optimizations=[pl.cross_core_slot(slot_num=1)],
+        ) as attended:
             worker = pl.tile.get_block_idx()
             for block in pl.range(worker, num_tokens * ((CUBE_HEADS + HEAD_TILE - 1) // HEAD_TILE), workers):
                 token = block // ((CUBE_HEADS + HEAD_TILE - 1) // HEAD_TILE)
                 head = block % ((CUBE_HEADS + HEAD_TILE - 1) // HEAD_TILE) * HEAD_TILE
                 q0 = token * CUBE_HEADS + head
-                q = qflat[q0:q0 + HEAD_TILE, :]
-                maximum = pl.reshape(sink[head:head + HEAD_TILE], [1, HEAD_TILE])
+                q = qflat[q0 : q0 + HEAD_TILE, :]
+                maximum = pl.reshape(sink[head : head + HEAD_TILE], [1, HEAD_TILE])
                 denominator = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=1.0)
                 numerator = pl.full([HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
                 for part in pl.range(SELECTED_KEYS // KEY_TILE):
                     k0 = token * SELECTED_KEYS + part * KEY_TILE
-                    kv = kflat[k0:k0 + KEY_TILE, :]
+                    kv = kflat[k0 : k0 + KEY_TILE, :]
                     qk = pl.matmul(q, kv, b_trans=True, out_dtype=pl.FP32)
                     scores = pl.mul(qk, SCALE)
                     idx0 = part * KEY_TILE
-                    idx = pl.cast(indices[token:token + 1, idx0:idx0 + KEY_TILE], pl.FP32)
+                    idx = pl.cast(indices[token : token + 1, idx0 : idx0 + KEY_TILE], pl.FP32)
                     valid = pl.add(idx, 1.0)
                     valid = pl.maximum(valid, 0.0)
                     valid = pl.minimum(valid, 1.0)
@@ -111,9 +115,8 @@ def make_sparse_attention_inline(tp=1):
                 multiplier = pl.reshape(normalized, [HEAD_TILE, 1])
                 result = pl.row_expand_mul(numerator, multiplier)
                 result = pl.cast(result, pl.BF16, mode="rint")
-                oflat[q0:q0 + HEAD_TILE, :] = result
+                oflat[q0 : q0 + HEAD_TILE, :] = result
         return attended
-
 
     @pl.jit.inline(auto_scope=False)
     def _attend_padded(
@@ -145,13 +148,19 @@ def make_sparse_attention_inline(tp=1):
                 q0 = token * LOCAL_H
                 pq0 = token * CUBE_HEADS
                 q = pl.full([CUBE_HEADS, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                q[0:LOCAL_H, :] = qflat[q0:q0 + LOCAL_H, :]
-                pqflat[pq0:pq0 + CUBE_HEADS, :] = q
+                q[0:LOCAL_H, :] = qflat[q0 : q0 + LOCAL_H, :]
+                pqflat[pq0 : pq0 + CUBE_HEADS, :] = q
 
         padded_output = pl.create_tensor([rows, CUBE_HEADS * HEAD_DIM], dtype=pl.BF16)
         cube_ready = _attend_cube(
-            padded_query, selected, indices, padded_sink, padded_output,
-            num_tokens, selected_ready, padded,
+            padded_query,
+            selected,
+            indices,
+            padded_sink,
+            padded_output,
+            num_tokens,
+            selected_ready,
+            padded,
         )
         poflat = pl.reshape(padded_output, [rows * CUBE_HEADS, HEAD_DIM])
         oflat = pl.reshape(output, [rows * LOCAL_H, HEAD_DIM])
@@ -160,12 +169,10 @@ def make_sparse_attention_inline(tp=1):
             for token in pl.range(worker, num_tokens, workers):
                 p0 = token * CUBE_HEADS
                 o0 = token * LOCAL_H
-                oflat[o0:o0 + LOCAL_H, :] = poflat[p0:p0 + LOCAL_H, :]
+                oflat[o0 : o0 + LOCAL_H, :] = poflat[p0 : p0 + LOCAL_H, :]
         return attended
 
-
     attend_selected = _attend_cube if LOCAL_H >= 16 else _attend_padded
-
 
     @pl.jit.inline(auto_scope=False)
     def _attend_bf16_block(
@@ -189,8 +196,8 @@ def make_sparse_attention_inline(tp=1):
             worker = pl.tile.get_block_idx()
             for block in pl.range(worker, rows * (LOCAL_H // QUERY_HEAD_TILE), workers_q):
                 q0 = block * QUERY_HEAD_TILE
-                q_values = qflat[q0:q0 + QUERY_HEAD_TILE, :]
-                qbflat[q0:q0 + QUERY_HEAD_TILE, :] = pl.cast(q_values, pl.BF16, mode="rint")
+                q_values = qflat[q0 : q0 + QUERY_HEAD_TILE, :]
+                qbflat[q0 : q0 + QUERY_HEAD_TILE, :] = pl.cast(q_values, pl.BF16, mode="rint")
 
         wrows = pl.tensor.dim(window, 0) * 128
         crows = pl.tensor.dim(compressed, 0) * 128
@@ -237,10 +244,9 @@ def make_sparse_attention_inline(tp=1):
             worker = pl.tile.get_block_idx()
             for block in pl.range(worker, rows * (LOCAL_H // QUERY_HEAD_TILE), workers_q):
                 q0 = block * QUERY_HEAD_TILE
-                out_values = rflat[q0:q0 + QUERY_HEAD_TILE, :]
-                oflat[q0:q0 + QUERY_HEAD_TILE, :] = pl.cast(out_values, pl.FP32)
+                out_values = rflat[q0 : q0 + QUERY_HEAD_TILE, :]
+                oflat[q0 : q0 + QUERY_HEAD_TILE, :] = pl.cast(out_values, pl.FP32)
         return converted
-
 
     @pl.jit.inline(auto_scope=False)
     def attend_bf16(
@@ -259,7 +265,7 @@ def make_sparse_attention_inline(tp=1):
         marker = pl.create_tensor([1, 16], dtype=pl.FP32)
         with pl.spmd(1, name_hint="sparse_bf16_ready") as ready:
             block = pl.tile.get_block_idx()
-            marker[block:block + 1, :] = qflat[0:1, 0:16]
+            marker[block : block + 1, :] = qflat[0:1, 0:16]
 
         for offset in pl.range(0, rows, TOKEN_TILE):
             count = pl.min(TOKEN_TILE, rows - offset)
@@ -271,48 +277,7 @@ def make_sparse_attention_inline(tp=1):
             ready = _attend_bf16_block(q, window, widx, compressed, cidx, sink, limits, out, ready)
         return output
 
-
     return attend_bf16
-
-
-def sparse_attention_reference(
-    query: torch.Tensor,
-    window: torch.Tensor,
-    window_indices: torch.Tensor,
-    compressed: torch.Tensor,
-    compressed_indices: torch.Tensor,
-    sink: torch.Tensor,
-    *,
-    active: int | None = None,
-) -> torch.Tensor:
-    """CPU reference for decoder ratio-2 sparse attention."""
-
-    if query.ndim != 3:
-        raise ValueError("query must have shape [T, H, D]")
-    tokens, heads, head_dim = query.shape
-    if window.shape != (tokens, window_indices.shape[1], head_dim):
-        raise ValueError("window and window_indices shapes do not match query")
-    if compressed.shape != (tokens, compressed_indices.shape[1], head_dim):
-        raise ValueError("compressed and compressed_indices shapes do not match query")
-    if sink.shape != (heads,):
-        raise ValueError(f"sink must have shape {(heads,)}, got {tuple(sink.shape)}")
-    count = tokens if active is None else int(active)
-    if not 0 <= count <= tokens:
-        raise ValueError("active must be within query rows")
-
-    output = torch.zeros_like(query)
-    if count == 0:
-        return output
-    keys = torch.cat((window[:count], compressed[:count]), dim=1).float()
-    indices = torch.cat((window_indices[:count], compressed_indices[:count]), dim=1)
-    valid = indices.ge(0)
-    scores = torch.einsum("thd,tkd->thk", query[:count].float(), keys)
-    scores.mul_(head_dim**-0.5)
-    scores.masked_fill_(~valid[:, None, :], float("-inf"))
-    sink_scores = sink.float().view(1, heads, 1).expand(count, -1, -1)
-    probabilities = torch.softmax(torch.cat((scores, sink_scores), dim=-1), dim=-1)
-    output[:count] = torch.einsum("thk,tkd->thd", probabilities[..., :-1], keys).to(torch.bfloat16)
-    return output
 
 
 def make_sparse_attention(
@@ -354,14 +319,11 @@ def make_sparse_attention(
         output: pl.InOut[pl.Tensor[[capacity, heads, value_dim], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(active * (heads // head_tile),
-                             name_hint="dsv41_a2a3_ratio2_sparse_attention"):
+        for block in pl.spmd(active * (heads // head_tile), name_hint="dsv41_a2a3_ratio2_sparse_attention"):
             token = block // (heads // head_tile)
             head = (block % (heads // head_tile)) * head_tile
-            q = pl.reshape(query[token:token + 1, head:head + head_tile, :], [head_tile, head_dim])
-            q_padded = pl.concat(
-                pl.full([head_tile, value_padding], dtype=pl.BF16, value=0.0), q
-            )
+            q = pl.reshape(query[token : token + 1, head : head + head_tile, :], [head_tile, head_dim])
+            q_padded = pl.concat(pl.full([head_tile, value_padding], dtype=pl.BF16, value=0.0), q)
             running_m = pl.full([1, head_tile], dtype=pl.FP32, value=-1.0e30)
             running_l = pl.full([1, head_tile], dtype=pl.FP32, value=0.0)
             running_o = pl.full([value_dim, head_tile], dtype=pl.FP32, value=0.0)
@@ -370,9 +332,9 @@ def make_sparse_attention(
             ):
                 offset = chunk * key_tile
                 keys_padded = pl.reshape(
-                    window_rows[token:token + 1, offset:offset + key_tile, :], [key_tile, value_dim]
+                    window_rows[token : token + 1, offset : offset + key_tile, :], [key_tile, value_dim]
                 )
-                key_indices = window_indices[token:token + 1, offset:offset + key_tile]
+                key_indices = window_indices[token : token + 1, offset : offset + key_tile]
                 scores = pl.mul(pl.matmul(q_padded, keys_padded, b_trans=True, out_dtype=pl.FP32), scale)
                 valid = pl.minimum(pl.maximum(pl.add(pl.cast(key_indices, pl.FP32), 1.0), 0.0), 1.0)
                 scores = pl.col_expand_add(scores, pl.mul(pl.sub(valid, 1.0), 1.0e30))
@@ -402,9 +364,9 @@ def make_sparse_attention(
             ):
                 offset = chunk * key_tile
                 keys_padded = pl.reshape(
-                    compressed_rows[token:token + 1, offset:offset + key_tile, :], [key_tile, value_dim]
+                    compressed_rows[token : token + 1, offset : offset + key_tile, :], [key_tile, value_dim]
                 )
-                key_indices = compressed_indices[token:token + 1, offset:offset + key_tile]
+                key_indices = compressed_indices[token : token + 1, offset : offset + key_tile]
                 scores = pl.mul(pl.matmul(q_padded, keys_padded, b_trans=True, out_dtype=pl.FP32), scale)
                 valid = pl.minimum(pl.maximum(pl.add(pl.cast(key_indices, pl.FP32), 1.0), 0.0), 1.0)
                 scores = pl.col_expand_add(scores, pl.mul(pl.sub(valid, 1.0), 1.0e30))
@@ -429,7 +391,7 @@ def make_sparse_attention(
                     pl.col_expand_mul(block_o, beta),
                 )
                 running_m, running_l, running_o = pl.yield_(next_m, running_l, running_o)
-            sink_score = pl.reshape(sink[head:head + head_tile], [1, head_tile])
+            sink_score = pl.reshape(sink[head : head + head_tile], [1, head_tile])
             final_max = pl.maximum(running_m, sink_score)
             correction = pl.exp(pl.sub(running_m, final_max))
             denominator = pl.add(
@@ -437,15 +399,53 @@ def make_sparse_attention(
                 pl.exp(pl.sub(sink_score, final_max)),
             )
             correction = pl.div(correction, denominator)
-            result = pl.transpose(
-                pl.col_expand_mul(running_o, correction), axis1=0, axis2=1
-            )
-            output[token:token + 1, head:head + head_tile, :] = pl.cast(
+            result = pl.transpose(pl.col_expand_mul(running_o, correction), axis1=0, axis2=1)
+            output[token : token + 1, head : head + head_tile, :] = pl.cast(
                 pl.reshape(result, [1, head_tile, value_dim]), pl.BF16, mode="rint"
             )
-            output[token:token + 1, head:head + head_tile, :value_padding] = pl.full(
+            output[token : token + 1, head : head + head_tile, :value_padding] = pl.full(
                 [1, head_tile, value_padding], dtype=pl.BF16, value=0.0
             )
         return output
 
     return attend
+
+
+def sparse_attention_reference(
+    query: torch.Tensor,
+    window: torch.Tensor,
+    window_indices: torch.Tensor,
+    compressed: torch.Tensor,
+    compressed_indices: torch.Tensor,
+    sink: torch.Tensor,
+    *,
+    active: int | None = None,
+) -> torch.Tensor:
+    """CPU reference for decoder ratio-2 sparse attention."""
+
+    if query.ndim != 3:
+        raise ValueError("query must have shape [T, H, D]")
+    tokens, heads, head_dim = query.shape
+    if window.shape != (tokens, window_indices.shape[1], head_dim):
+        raise ValueError("window and window_indices shapes do not match query")
+    if compressed.shape != (tokens, compressed_indices.shape[1], head_dim):
+        raise ValueError("compressed and compressed_indices shapes do not match query")
+    if sink.shape != (heads,):
+        raise ValueError(f"sink must have shape {(heads,)}, got {tuple(sink.shape)}")
+    count = tokens if active is None else int(active)
+    if not 0 <= count <= tokens:
+        raise ValueError("active must be within query rows")
+
+    output = torch.zeros_like(query)
+    if count == 0:
+        return output
+    keys = torch.cat((window[:count], compressed[:count]), dim=1).float()
+    indices = torch.cat((window_indices[:count], compressed_indices[:count]), dim=1)
+    valid = indices.ge(0)
+    scores = torch.einsum("thd,tkd->thk", query[:count].float(), keys)
+    scores.mul_(head_dim**-0.5)
+    scores.masked_fill_(~valid[:, None, :], float("-inf"))
+    sink_scores = sink.float().view(1, heads, 1).expand(count, -1, -1)
+    probabilities = torch.softmax(torch.cat((scores, sink_scores), dim=-1), dim=-1)
+    output[:count] = torch.einsum("thk,tkd->thd", probabilities[..., :-1], keys).to(torch.bfloat16)
+    return output

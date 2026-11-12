@@ -8,15 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Prepare single-request chunk inputs and persistent paged-cache coordinates."""
 
-from copy import deepcopy
 import json
+from copy import deepcopy
 from pathlib import Path
-
 import torch
-
-from .prefill_layer_state import resolve_layer_role
-from .prefill_network_guard import build_state_regions
+from .cache import resolve_layer_role
 from .runtime_utils import file_sha, write_json
+from .state import build_state_regions
 
 
 MAX_CONTEXT = 2048
@@ -189,8 +187,8 @@ def validate_host():
     """Check 2048-token planning, all layer coordinates and exact state write boundaries."""
     from tempfile import TemporaryDirectory
 
-    from .prefill_network_state import NetworkCacheProvider, _check_layout
-    from .prefill_network_cache import network_cache_geometry, owned_cache_pages
+    from .state import NetworkCacheProvider, _check_layout
+    from .cache import network_cache_geometry, owned_cache_pages
     from .prefill_indexer_runtime import validate_live_refresh_candidates
 
     views = {}

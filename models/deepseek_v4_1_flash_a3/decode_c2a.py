@@ -15,40 +15,20 @@ path as the complete SWA layer.
 """
 
 from __future__ import annotations
-
 from dataclasses import asdict
-
 import pypto.language as pl
 import pypto.language.distributed as pld
-
-from .config import FLASH
-from .decode_swa import (
-    AUX_PAD,
-    COUNT_PAD,
-    D,
-    EP_SIZE,
-    LANE_ROWS,
-    MOE_INTER,
-    N_EXPERTS,
-    N_LOCAL_EXPERTS,
-    TOPK,
-    decode_ep2_rank,
-)
-from .engram import K as ENGRAM_K, N as ENGRAM_N, make_gate
-from .hc import (
-    make_decode_hc_post_inline as make_hc_post_inline,
-    make_decode_hc_pre_inline as make_hc_pre_inline,
-)
-from .indexer import make_indexer_prepare
-from .decode_indexer_projection import make_indexer_projection
-from .decode_indexer_projection import make_indexer_query_quantize
-from .indexer import make_indexer_select
 from .compressor import make_decode_c2_index_publish_inline as make_c2_index_publish_inline
-from .decode_output_proj import make_output_projection_bf16
-from .decode_qkv_w8a8 import make_qkv_w8a8_inline
+from .config import FLASH
+from .decode_swa import AUX_PAD, COUNT_PAD, DECODE_D as D, EP_SIZE, LANE_ROWS, MOE_INTER, N_EXPERTS, N_LOCAL_EXPERTS, TOPK, decode_ep2_rank
+from .engram import K as ENGRAM_K, N as ENGRAM_N, make_gate
+from .hc import make_decode_hc_post_inline as make_hc_post_inline, make_decode_hc_pre_inline as make_hc_pre_inline
+from .indexer import make_indexer_prepare, make_indexer_projection, make_indexer_query_quantize_fp16_scale as make_indexer_query_quantize, make_indexer_select
+from .o_proj import make_decode_output_projection_bf16 as make_output_projection_bf16
+from .qkv_proj_rope import make_decode_qkv_w8a8_inline as make_qkv_w8a8_inline
 from .rmsnorm import NORM_T_TILE, rms_norm_tiled, rms_norm_tiled_with_fp32
-from .decode_sparse_attention import make_sparse_attention
-from .decode_swa_cache import make_swa_cache_publish
+from .sparse_attention import make_sparse_attention
+from .swa import make_decode_swa_cache_publish as make_swa_cache_publish
 
 
 CONFIG = asdict(FLASH)

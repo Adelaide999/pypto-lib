@@ -15,13 +15,10 @@ import argparse
 import json
 from pathlib import Path
 from time import perf_counter
-
 import torch
-
-from .prefill_network_runtime import network_parameter_abi
-from .rmsnorm import make_prefill_norm
+from .prefill_fwd import network_parameter_abi
 from .prefill_resident import ResidentNetworkRuntime
-from .rmsnorm import golden_rms_norm
+from .rmsnorm import golden_rms_norm, make_prefill_norm
 from .runtime_config import configure_devices
 from .runtime_utils import Executable
 

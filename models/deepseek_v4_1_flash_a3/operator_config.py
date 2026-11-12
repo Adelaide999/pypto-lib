@@ -9,7 +9,6 @@
 """A2/A3 operator shapes, tiling defaults, and dtype boundaries."""
 
 from dataclasses import dataclass
-
 import pypto.language as pl
 
 

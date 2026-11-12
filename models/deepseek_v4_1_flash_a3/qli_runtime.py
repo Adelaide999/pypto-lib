@@ -8,28 +8,24 @@
 # -----------------------------------------------------------------------------------------------------------
 """Stage actual product index operands through registered A2 QLI operators."""
 
-if __package__ in (None, ""):
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    __package__ = "models.deepseek_v4_1_flash_a3"
-
 import argparse
-from dataclasses import asdict
 import hashlib
 import importlib
 import json
 import os
-from pathlib import Path
 import platform
 import subprocess
+import sys
+from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
 import torch
-
-from .runtime_utils import validate_device, file_sha as _sha
 from .qli_boundary import QLIContract, run_qli_native_boundary
+from .runtime_utils import file_sha as _sha, validate_device
 
 
 def _tensor_sha(value):

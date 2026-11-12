@@ -6,15 +6,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Compose shared HC collapse, final RMSNorm and vocabulary projection."""
+"""Final HC collapse, normalization, vocabulary projection and output unpacking."""
 
 import pypto.language as pl
-
-from .hc import make_hc_collapse_inline
-from .prefill_cp import make_sp_gather_unpack
-from .rmsnorm import make_prefill_norm
-from .rmsnorm import D, EPS
 from .gemm import make_bf16_linear
+from .hc import make_hc_collapse_inline
+from .input_pack import make_sp_gather_unpack
+from .rmsnorm import D, EPS, make_prefill_norm
 
 
 def make_output_entries(capacity, config, tp):

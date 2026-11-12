@@ -8,18 +8,16 @@
 # -----------------------------------------------------------------------------------------------------------
 """Audit original export provenance or the explicitly recorded maintenance baseline."""
 
-if __package__ in (None, ""):
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    __package__ = "models.deepseek_v4_1_flash_a3"
-
 import argparse
 import ast
 import hashlib
 import json
+import sys
 from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
 
 ROOT = Path(__file__).resolve().parent
 

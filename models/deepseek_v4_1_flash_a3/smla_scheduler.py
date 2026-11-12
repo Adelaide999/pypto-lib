@@ -9,7 +9,7 @@
 """A2 single-layer dependencies extracted from the shared model operators."""
 
 from .scheduler_utils import require
-from .swa_scheduler import HEAD_DIM, HEADS, PAGE_ROWS, WINDOW, build as build_window
+from .swa_scheduler import HEADS, HEAD_DIM, PAGE_ROWS, WINDOW, build as build_window
 
 
 TOPK = 512

@@ -6,16 +6,25 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Checkpoint readers and explicit Prefill and EP2 Decode weight layouts."""
+"""Checkpoint readers, phase weight layouts and resident operand ownership."""
 
-from __future__ import annotations
-
-
+import argparse
+import hashlib
 import json
+import re
+import struct
+from collections import Counter
+from collections.abc import Iterator as decode_Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
-
+from time import perf_counter
+from typing import Any, Iterator, Mapping
 import torch
+from .cache import resolve_layer_role
+from .gemm import prepare_ecotech_dynamic_weight
+from .runtime_config import ExpertParallelConfig
+from .runtime_utils import tensor_sha
+from .utils import pack_nz
 
 
 _DTYPES = {
@@ -226,11 +235,6 @@ def load_attention_weights(checkpoint: RawCheckpoint, layer: int) -> dict[str, t
 
 
 load_decoder_layer_weights = load_attention_weights
-from time import perf_counter
-from typing import Mapping
-from contextlib import contextmanager
-
-from .runtime_utils import tensor_sha
 
 
 class CheckpointOperands:
@@ -466,9 +470,6 @@ def open_layer0_moe(path: str | Path):
         yield router, expert_provider
 
 
-from typing import Iterator
-
-
 class DecodeSafetensorsCheckpoint:
     """Resolve and lazily load tensors from an indexed Aurora export."""
 
@@ -560,10 +561,6 @@ class DecodeSafetensorsCheckpoint:
             if len(names) != 1:
                 raise ValueError(f"expected one tensor in {path}, found {names}")
             return handle.get_tensor(names[0])
-
-
-from collections.abc import Iterator as decode_Iterator
-from .utils import pack_nz
 
 
 HIDDEN = 5120
@@ -799,3 +796,449 @@ def abi_summary() -> dict[str, Any]:
         },
         "router": {"gate_weight": [EXPERTS, HIDDEN], "bias": [EXPERTS]},
     }
+
+
+TARGET_LAYERS = (0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25)
+METADATA_FILES = (
+    "config.json",
+    "quant_model_weights.safetensors.index.json",
+    "quant_model_description.json",
+    "aurora_export_manifest.json",
+)
+SHARD_PATTERN = re.compile(r"quant_model_weights-(\d{5})-of-(\d{5})\.safetensors$")
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _safetensors_header(path: Path) -> tuple[int, str, dict[str, Any]]:
+    with path.open("rb") as stream:
+        raw_length = stream.read(8)
+        if len(raw_length) != 8:
+            raise ValueError(f"truncated safetensors length prefix: {path}")
+        header_length = struct.unpack("<Q", raw_length)[0]
+        header = stream.read(header_length)
+        if len(header) != header_length:
+            raise ValueError(f"truncated safetensors header: {path}")
+    try:
+        payload = json.loads(header)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid safetensors header: {path}") from exc
+    if not isinstance(payload, dict):
+        raise TypeError(f"safetensors header must be an object: {path}")
+    return header_length, hashlib.sha256(raw_length + header).hexdigest(), payload
+
+
+def _config_summary(config: dict[str, Any]) -> dict[str, Any]:
+    text = config.get("text_config", {})
+    keys = (
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "q_lora_rank",
+        "o_lora_rank",
+        "n_routed_experts",
+        "n_shared_experts",
+        "num_experts_per_tok",
+        "moe_intermediate_size",
+        "compress_ratios",
+        "kv_source_layer_ids",
+        "index_source_layer_ids",
+        "index_n_heads",
+        "index_head_dim",
+        "index_topk",
+        "candidate_source_layer_id",
+        "engram_layer_ids",
+        "engram_num_embeddings",
+        "engram_n_heads",
+        "engram_head_dim",
+    )
+    return {key: text.get(key) for key in keys}
+
+
+def inspect_checkpoint(root: str | Path) -> dict[str, Any]:
+    """Return a metadata and header manifest for one Aurora export."""
+
+    checkpoint_root = Path(root).expanduser().resolve()
+    if not checkpoint_root.is_dir():
+        raise FileNotFoundError(f"checkpoint directory does not exist: {checkpoint_root}")
+    missing = [name for name in METADATA_FILES if not (checkpoint_root / name).is_file()]
+    if missing:
+        raise FileNotFoundError(f"checkpoint metadata is missing: {', '.join(missing)}")
+
+    config = _read_json(checkpoint_root / "config.json")
+    index = _read_json(checkpoint_root / "quant_model_weights.safetensors.index.json")
+    description = _read_json(checkpoint_root / "quant_model_description.json")
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict):
+        raise TypeError("safetensors index does not contain an object weight_map")
+
+    shard_paths: dict[str, Path] = {}
+    for path in sorted(checkpoint_root.glob("quant_model_weights-*-of-*.safetensors")):
+        match = SHARD_PATTERN.fullmatch(path.name)
+        if match:
+            shard_paths[path.name] = path
+    expected_shards = {
+        name for name in weight_map.values() if isinstance(name, str) and SHARD_PATTERN.fullmatch(name)
+    }
+    declared_totals = {int(SHARD_PATTERN.fullmatch(name).group(2)) for name in expected_shards}
+    if len(declared_totals) != 1:
+        raise ValueError(f"inconsistent shard totals in index: {sorted(declared_totals)}")
+    declared_shard_total = declared_totals.pop()
+    if not expected_shards:
+        raise ValueError("safetensors index contains no quantized weight shards")
+    missing_shards = sorted(expected_shards - shard_paths.keys())
+
+    headers: dict[str, dict[str, Any]] = {}
+    for name, path in shard_paths.items():
+        headers[name] = {
+            "bytes": path.stat().st_size,
+            "header_scanned": False,
+        }
+
+    target_layer_files: dict[str, list[str]] = {}
+    target_tensor_samples: dict[str, dict[str, Any]] = {}
+    scanned_headers: dict[str, dict[str, Any]] = {}
+    for layer in TARGET_LAYERS:
+        prefix = f"layers.{layer}."
+        names = sorted(name for name in weight_map if name.startswith(prefix))
+        files = {weight_map[name] for name in names}
+        target_layer_files[str(layer)] = sorted(files)
+        sample_names = [
+            name
+            for name in (
+                f"layers.{layer}.attn.wq_a.weight",
+                f"layers.{layer}.attn.wq_a.weight_scale",
+                f"layers.{layer}.attn.wq_b.weight",
+                f"layers.{layer}.attn.wkv.weight",
+                f"layers.{layer}.attn.wo_a.weight",
+                f"layers.{layer}.attn.wo_b.weight",
+                f"layers.{layer}.attn.indexer.wk.weight",
+                f"layers.{layer}.attn.indexer.wq_b.weight",
+                f"layers.{layer}.ffn.experts.0.w1.weight",
+            )
+            if name in weight_map
+        ]
+        samples: dict[str, Any] = {}
+        for name in sample_names:
+            shard = weight_map[name]
+            if shard not in scanned_headers:
+                header_bytes, header_sha256, header = _safetensors_header(checkpoint_root / shard)
+                tensors = {key: value for key, value in header.items() if key != "__metadata__"}
+                scanned_headers[shard] = header
+                headers[shard].update(
+                    {
+                        "header_bytes": header_bytes,
+                        "header_sha256": header_sha256,
+                        "tensor_count": len(tensors),
+                        "header_scanned": True,
+                    }
+                )
+            header = scanned_headers[shard]
+            tensor = header[name]
+            samples[name] = {
+                "shard": shard,
+                "dtype": tensor.get("dtype"),
+                "shape": tensor.get("shape"),
+            }
+        target_tensor_samples[str(layer)] = samples
+
+    quant_modes = Counter(value for value in description.values() if isinstance(value, str))
+    engram_files = sorted(
+        name
+        for name in (
+            "engram_embed_weight_l1.safetensors",
+            "engram_embed_scale_l1.safetensors",
+            "engram_embed_weight_l14.safetensors",
+            "engram_embed_scale_l14.safetensors",
+        )
+        if (checkpoint_root / name).is_file()
+    )
+    engram_records = []
+    for name in engram_files:
+        path = checkpoint_root / name
+        header_bytes, header_sha256, header = _safetensors_header(path)
+        engram_records.append(
+            {
+                "file": name,
+                "bytes": path.stat().st_size,
+                "header_bytes": header_bytes,
+                "header_sha256": header_sha256,
+                "tensors": {
+                    key: {"dtype": value.get("dtype"), "shape": value.get("shape")}
+                    for key, value in header.items()
+                    if key != "__metadata__"
+                },
+            }
+        )
+    return {
+        "schema_version": 1,
+        "status": "metadata_verified" if not missing_shards else "incomplete",
+        "root": str(checkpoint_root),
+        "payload_hashing": "omitted; safetensors payloads are immutable external assets",
+        "metadata": {
+            name: {
+                "bytes": (checkpoint_root / name).stat().st_size,
+                "sha256": _sha256(checkpoint_root / name),
+            }
+            for name in METADATA_FILES
+        },
+        "config": _config_summary(config),
+        "quantization": {
+            "config": config.get("quantization_config"),
+            "description_modes": dict(sorted(quant_modes.items())),
+        },
+        "index": {
+            "weight_map_entries": len(weight_map),
+            "total_size": index.get("metadata", {}).get("total_size"),
+            "weight_shards": len(expected_shards),
+            "declared_shard_total": declared_shard_total,
+            "present_shards": len(shard_paths),
+            "missing_shards": missing_shards,
+        },
+        "shards": headers,
+        "engram_files": engram_records,
+        "target_layer_files": target_layer_files,
+        "target_tensor_samples": target_tensor_samples,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args(argv)
+    result = inspect_checkpoint(args.root)
+    encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(encoded, encoding="utf-8")
+    print(encoded, end="")
+    return 0 if result["status"] == "metadata_verified" else 1
+
+
+class ResidentCheckpointOperands(CheckpointOperands):
+    """Cache model boundary weights while streaming expert source tensors once."""
+
+    def __init__(self, root):
+        super().__init__(root, diagnostics=False)
+        self.boundaries = {}
+
+    def load(self, name):
+        if name in self.boundaries:
+            return self.boundaries[name]
+        value = super().load(name)
+        if name in ("embed.weight", "norm.weight", "head.weight"):
+            self.boundaries[name] = value
+        return value
+
+
+class ResidentNetworkWeights:
+    """Retain complete compute weights, with routed experts sharded by their actual EP owner."""
+
+    def __init__(self, checkpoint, topology, model_config, runtime):
+        self.reader = ResidentCheckpointOperands(checkpoint)
+        self.layout = ExpertParallelConfig(topology["dp"], topology["tp"], topology["ep"], 384)
+        self.model_config, self.runtime = model_config, runtime
+        self.layers, self.experts, self.heads = {}, {}, {}
+        self.layer_receipts = {}
+        self.load_seconds, self.load_calls = 0.0, 0
+        self.ready = False
+
+    def preload(self, progress=None):
+        """Stream each checkpoint operand into its persistent compute owner before token execution."""
+        if self.ready or self.layers:
+            raise ValueError("Resident weight preload is a single generation-scoped operation")
+        begin = perf_counter()
+        world, tp = self.layout.ep, self.layout.tp
+        ranks = range(world)
+        for layer in range(40):
+            if progress is not None:
+                progress(dict(stage="loading_resident_weights", layer=layer, epoch=0))
+            prefix = f"layers.{layer}."
+            names = [
+                name
+                for name in self.reader.index
+                if name.startswith(prefix) and ".ffn.experts." not in name and ".engram.embed." not in name
+            ]
+            raw = {name: self.reader.load(name) for name in names}
+            operands = prepare_product_operands(raw, layer, role=resolve_layer_role(layer))
+            raw[prefix + "ffn.gate.weight"] = raw[prefix + "ffn.gate.weight"].float()
+            for name in (
+                "hc_ffn_fn",
+                "hc_ffn_scale",
+                "hc_ffn_base",
+                "ffn_norm.weight",
+                "ffn.gate.weight",
+                "ffn.gate.bias",
+                "ffn.gate.bias_vl",
+            ):
+                self.runtime.pin(raw[prefix + name], ranks, readonly=True, name=prefix + name)
+            for name, value in operands.items():
+                if name in ("wo_a", "wo_a_grouped_prefill", "wo_b"):
+                    continue
+                self.runtime.pin(value, ranks, readonly=True, name=prefix + name)
+            for rank in ranks:
+                lane = rank % tp
+                groups, width = 8 // tp, 8192 // tp
+                for name, value in (
+                    ("wo_a", operands["wo_a_grouped_prefill"][lane * groups : (lane + 1) * groups]),
+                    ("wo_b", operands["wo_b"][lane * width : (lane + 1) * width]),
+                ):
+                    self.runtime.pin(value, [rank], readonly=True, name=prefix + name)
+            role = resolve_layer_role(layer)
+            if role["engram_slot"] is not None:
+                engram = prefix + "engram"
+                projection = raw[engram + ".wkv.weight"].T.contiguous()
+                operands["engram_projection"] = projection
+                self.runtime.pin(projection, ranks, readonly=True, name=engram + ".wkv.kn")
+                for name in ("q_weight", "k_weight"):
+                    self.runtime.pin(raw[engram + "." + name], ranks, readonly=True, name=engram + "." + name)
+            self.layers[layer] = dict(
+                raw=raw,
+                operands=operands,
+                expert=lambda rank, expert, layer=layer: self.expert(layer, rank, expert),
+            )
+            shared = self.reader.expert(prefix + "ffn.shared_experts")
+            for rank in ranks:
+                self.experts[layer, rank, None] = tuple(self.runtime.weight(value, rank) for value in shared)
+            del shared
+            for rank in ranks:
+                for expert, _ in self.layout.ownership(rank):
+                    values = self.reader.expert(prefix + f"ffn.experts.{expert}")
+                    self.experts[layer, rank, expert] = tuple(
+                        self.runtime.weight(value, rank) for value in values
+                    )
+            self.layer_receipts[layer] = dict(
+                original_names=names,
+                policy="generation-scoped resident compute weights",
+                routed_experts=384,
+                shared_replicas=world,
+            )
+        embedding, norm, head = (
+            self.reader.load(name) for name in ("embed.weight", "norm.weight", "head.weight")
+        )
+        rows = embedding.shape[0] // tp
+        for rank in ranks:
+            lane = rank % tp
+            self.runtime.pin(
+                embedding.narrow(0, lane * rows, rows), [rank], readonly=True, name="embed.weight"
+            )
+            self.runtime.pin(norm, [rank], readonly=True, name="norm.weight")
+            if lane not in self.heads:
+                self.heads[lane] = head.narrow(0, lane * rows, rows).T.contiguous()
+            self.runtime.pin(self.heads[lane], [rank], readonly=True, name="head.weight.kn")
+        self.ready = True
+        self.load_seconds = perf_counter() - begin
+        self.load_calls = self.reader.read_calls
+        self.runtime.stats.update(
+            weight_preload_seconds=self.load_seconds,
+            checkpoint_preload_read_calls=self.reader.read_calls,
+            checkpoint_preload_read_seconds=self.reader.read_seconds,
+        )
+
+    def for_layer(self, layer):
+        if not self.ready or layer not in self.layers:
+            raise ValueError("Every resident layer must be loaded before execution")
+        return self.layers[layer]
+
+    def raw_for_layer(self, layer):
+        return self.for_layer(layer)["raw"]
+
+    def projection_for_layer(self, layer):
+        return self.for_layer(layer)["operands"]["engram_projection"]
+
+    def expert(self, layer, rank, expert):
+        if expert is not None and self.layout.owner(expert) != rank:
+            raise ValueError("Resident expert belongs to another EP rank")
+        return self.experts[layer, rank, expert]
+
+    def head_for_rank(self, rank):
+        return self.heads[rank % self.layout.tp]
+
+    def release_current(self):
+        """Preserve generation-scoped layers across all layer and token boundaries."""
+
+    def close(self):
+        self.layers.clear()
+        self.experts.clear()
+        self.heads.clear()
+        self.reader.boundaries.clear()
+
+
+def prepare_product_operands(raw, layer_id=0, *, role=None):
+    """Adapt CPU source weights to complete KN and grouped Prefill layouts."""
+    from .cache import resolve_layer_role
+
+    role = resolve_layer_role(layer_id, role)
+    layer = f"layers.{layer_id}"
+    prepared = {}
+    for projection in ("wq_a", "wq_b", "wkv"):
+        prefix = f"{layer}.attn.{projection}."
+        weight, scale = prepare_ecotech_dynamic_weight(
+            raw[prefix + "weight"],
+            raw[prefix + "weight_scale"],
+            raw[prefix + "weight_offset"],
+        )
+        prepared[projection] = weight
+        prepared[projection + "_scale"] = scale
+    wo_a, wo_b = raw[f"{layer}.attn.wo_a.weight"], raw[f"{layer}.attn.wo_b.weight"]
+    if wo_a.dtype != torch.bfloat16 or wo_b.dtype != torch.bfloat16:
+        raise ValueError("Output projections require original BF16 weights")
+    if tuple(wo_a.shape) != (8192, 4096) or tuple(wo_b.shape) != (5120, 8192):
+        raise ValueError("Output projection geometry differs")
+    prepared["wo_a"] = wo_a.reshape(8, 1024, 4096).transpose(1, 2).contiguous()
+    prepared["wo_a_grouped_prefill"] = wo_a.reshape(8, 1024, 4096).contiguous()
+    prepared["wo_b"] = wo_b.T.contiguous()
+    names = dict(
+        attn_norm=f"{layer}.attn_norm.weight",
+        q_norm=f"{layer}.attn.q_norm.weight",
+        kv_norm=f"{layer}.attn.kv_norm.weight",
+        sink=f"{layer}.attn.attn_sink",
+        hc_function=f"{layer}.hc_attn_fn",
+        hc_scale=f"{layer}.hc_attn_scale",
+        hc_base=f"{layer}.hc_attn_base",
+    )
+    for target, source in names.items():
+        prepared[target] = raw[source].contiguous()
+    if role["mode"] == "full":
+        compressor = f"{layer}.attn.compressor"
+        indexer = f"{layer}.attn.indexer"
+        prepared["compressor_wkv"] = raw[compressor + ".wkv.weight"].T.contiguous()
+        if role["ratio"] == 2:
+            prepared["compressor_wgate"] = raw[compressor + ".wgate.weight"].T.contiguous()
+        prepared["compressor_norm"] = raw[compressor + ".norm.weight"].contiguous()
+        prepared["index_wk"] = raw[indexer + ".wk.weight"].T.contiguous()
+        prepared["index_norm"] = raw[indexer + ".k_norm.weight"].contiguous()
+        prepared["index_weights"] = raw[indexer + ".weights_proj.weight"].T.contiguous()
+        prepared["index_wqb"], prepared["index_wqb_scale"] = prepare_ecotech_dynamic_weight(
+            raw[indexer + ".wq_b.weight"],
+            raw[indexer + ".wq_b.weight_scale"],
+            raw[indexer + ".wq_b.weight_offset"],
+        )
+    if role["mode"] == "reindex":
+        indexer = f"{layer}.attn.indexer"
+        prepared["index_weights"] = raw[indexer + ".weights_proj.weight"].T.contiguous()
+        prepared["index_wqb"], prepared["index_wqb_scale"] = prepare_ecotech_dynamic_weight(
+            raw[indexer + ".wq_b.weight"],
+            raw[indexer + ".wq_b.weight_scale"],
+            raw[indexer + ".wq_b.weight_offset"],
+        )
+    if any(value.device.type != "cpu" for value in prepared.values()):
+        raise ValueError("Operand preparation requires CPU tensors")
+    return prepared
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

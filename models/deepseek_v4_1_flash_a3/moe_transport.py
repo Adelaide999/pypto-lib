@@ -8,24 +8,19 @@
 # -----------------------------------------------------------------------------------------------------------
 """Transport contiguous PyPTO route buckets through CANN memory and HCCL bytes."""
 
-if __package__ in (None, ""):
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    __package__ = "models.deepseek_v4_1_flash_a3"
-
 import argparse
-from contextlib import contextmanager
 import ctypes
 import json
 import os
-from pathlib import Path
 import sys
 import time
+from contextlib import contextmanager
+from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
 import torch
-
 from .runtime_config import configure_devices
 from .runtime_utils import file_sha
 

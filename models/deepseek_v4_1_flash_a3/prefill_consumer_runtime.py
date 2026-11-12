@@ -9,7 +9,6 @@
 """Schedule consumer SWA publication and attention over its readonly source state."""
 
 import torch
-
 from .prefill_compressed_runtime import physical_cache_views
 
 
@@ -40,8 +39,8 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
     long_descriptor = live["layout"]["views"][long_name]
     network = live.get("network_geometry")
     if network is not None:
-        from .prefill_network_cache import load_network_index, network_cache_geometry, owned_cache_pages
-        from .prefill_network_cache import raw_cache_matrix, validate_network_sparse_indices
+        from .cache import load_network_index, network_cache_geometry, owned_cache_pages
+        from .cache import raw_cache_matrix, validate_network_sparse_indices
 
         if network != network_cache_geometry(live["layout"], role, cache_blocks):
             raise ValueError("Network consumer geometry differs from its actual source and own cache aliases")
@@ -56,7 +55,7 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
         source_cache = raw_cache_matrix(raw, network["long"])
         cache = raw_cache_matrix(raw, network["own"])
     elif role["ratio"] == 1:
-        from .prefill_cache_layout import physical_consumer_geometry
+        from .cache import physical_consumer_geometry
 
         geometry = physical_consumer_geometry(live["layout"], own_prefix, source_prefix, cache_blocks)
         raw_cache = raw[geometry["storage_key"]].view(torch.bfloat16).reshape(cache_blocks, geometry["stride"])
@@ -91,7 +90,7 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
     positions = pad(original["positions"][start:start + query_rows])
     query_requests = pad(request_ids[start:start + query_rows], -1)
     if role["mode"] == "reindex":
-        from .prefill_cache_layout import physical_index_geometry
+        from .cache import physical_index_geometry
         from .prefill_indexer_runtime import run_index_query_selection
 
         if network is not None:

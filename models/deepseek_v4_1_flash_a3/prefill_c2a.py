@@ -9,21 +9,17 @@
 """Prefill compressed attention, source observation and cache readback."""
 
 import pypto.language as pl
-from .compressor import COMPRESSOR_PROJECTION_HEAD_DIM as HEAD_DIM, INDEX_WIDTH, make_fp32_projection
-from .compressor import make_compressed_cache_publish
-from .linear_primitives import VEC_M_TILE, N_TILE, make_dequantize, make_dot, make_pack_weight, make_quantize
-from .rmsnorm import make_blocked_rmsnorm as make_norm
-from .norm_rope import make_adjacent_rope as make_rope
-from .compressor import RING_ROWS_DYN
-from .compressor import compressor_ratio2_prefill
-from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN
-from .qkv_proj_rope import make_bf16_projection_staged
-from .prefill_indexer import INDEX_HEADS, WEIGHT_ROWS_TILE, QUANT_ROWS_TILE
-from .prefill_swa import GEOMETRY, make_builders
+from .compressor import COMPRESSOR_PROJECTION_HEAD_DIM as HEAD_DIM, INDEX_WIDTH, RING_ROWS_DYN, compressor_ratio2_prefill, make_compressed_cache_publish, make_fp32_projection
+from .gemm import N_TILE, VEC_M_TILE, make_blocked_weight_pack as make_pack_weight, make_dot
 from .hc import make_hc_post_inline
-from .prefill_indexer import make_empty_selection, make_sparse_controls
-from .rmsnorm import make_prefill_norm
+from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN
+from .prefill_indexer import INDEX_HEADS, QUANT_ROWS_TILE, WEIGHT_ROWS_TILE, make_empty_selection, make_sparse_controls
 from .prefill_sparse_attention import make_consumer_sparse_core
+from .prefill_swa import GEOMETRY, make_builders
+from .qkv_proj_rope import make_bf16_projection_staged
+from .quant import make_dequantize, make_quantize
+from .rmsnorm import make_blocked_rmsnorm as make_norm, make_prefill_norm
+from .rope import make_adjacent_rope as make_rope
 
 
 def make_readback_entries(entries, active_rows):
@@ -911,10 +907,10 @@ def make_physical_compressed_entries(
     network_cache=False,
 ):
     """Build paged physical-layer C2, index packing and full-head compressed attention entries."""
-    from .indexer_select import KEY_CAPACITY, make_indexer_select
-    from .norm_rope import make_rope_tables
+    from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY, make_prefill_indexer_select as make_indexer_select
+    from .rope import make_rope_tables
     from .rmsnorm import make_blocked_rmsnorm as make_norm
-    from .norm_rope import make_adjacent_rope as make_rope
+    from .rope import make_adjacent_rope as make_rope
     from .compressor import make_c2_pool_observed
     from .compressor import make_index_cache_publish_observed
     from .prefill_indexer import make_index_key_gather, make_physical_index_query_entries
@@ -945,7 +941,7 @@ def make_physical_compressed_entries(
         raise ValueError("Physical compressed attention supports ratio1 or ratio2")
     if compress_ratio == 1:
         from .indexer import make_candidate_block_pool, make_candidate_pool_publish
-        from .prefill_cache_layout import make_paged_cache_copy, physical_page_geometry
+        from .cache import make_paged_cache_copy, physical_page_geometry
 
         geometry = (
             None
@@ -977,8 +973,8 @@ def make_physical_compressed_entries(
                 cache_blocks, payload, payload, stride, destination_offset=offset, dtype=dtype
             )
     if network_cache:
-        from .prefill_layer_state import resolve_layer_role
-        from .prefill_network_cache import make_network_cache_entries, network_cache_geometry
+        from .cache import resolve_layer_role
+        from .cache import make_network_cache_entries, network_cache_geometry
 
         role = resolve_layer_role(layer_id)
         if compress_ratio != role["ratio"]:

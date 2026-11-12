@@ -9,13 +9,11 @@
 """Bind host-prepared Engram rows to device projection and gating."""
 
 from pathlib import Path
-
 import torch
-
-from .engram_hash import update_slot_history
+from .cache import resolve_layer_role
 from .engram import make_prefill_engram_entries
+from .engram_host import update_slot_history
 from .prefill_engram_runtime import engram_owner, load_rotation
-from .prefill_layer_state import resolve_layer_role
 from .runtime_utils import Executable
 
 

@@ -8,35 +8,22 @@
 # -----------------------------------------------------------------------------------------------------------
 """Compose PyPTO prefill MoE routing, EP dispatch, W8A8 experts, and token restoration."""
 
-if __package__ in (None, ""):
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    __package__ = "models.deepseek_v4_1_flash_a3"
-
 import argparse
 import json
-from pathlib import Path
 import shlex
 import sys
+from pathlib import Path
 
-import torch
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
 import pypto.language as pl
-
-from .moe import make_moe_combine
-from .moe import DISPATCH_MAP_PAD as MAP_PAD, make_ep_dispatch_pack, make_ep_dispatch_unpack, make_ep_return_pack
-from .moe import validate_received_routes, validate_returned_routes
-from .moe import make_moe_router
-from .moe import make_shared_moe_w8a8
+import torch
+from .moe import DISPATCH_MAP_PAD as MAP_PAD, make_ep_dispatch_pack, make_ep_dispatch_unpack, make_ep_return_pack, make_moe_combine, make_moe_router, make_shared_moe_w8a8, validate_received_routes, validate_returned_routes
 from .moe_transport import CANNMemory
 from .runtime_config import ExpertParallelConfig, configure_devices
-from .runtime_utils import Executable as _Executable, communicate as _communicate
-from .runtime_utils import loaded_source_files as _loaded_source_files, write_json as _json
-from .runtime_utils import file_sha, tensor_sha
+from .runtime_utils import Executable as _Executable, communicate as _communicate, file_sha, loaded_source_files as _loaded_source_files, tensor_sha, write_json as _json
 from .weights import CheckpointOperands
-
-
 
 
 def _prepare(args, contract):
@@ -58,8 +45,6 @@ def _prepare(args, contract):
     _json(path, runtime)
     (args.output / "command.txt").write_text(shlex.join(runtime["command"]) + "\n")
     return layout, runtime, path
-
-
 
 
 def main():

@@ -6,20 +6,26 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""A2 single-layer dependencies extracted from the shared model operators."""
+"""QKV projection, grouped projections and their rotary-embedding compositions."""
+
+import sys
+from dataclasses import dataclass
+from math import gcd
+from pathlib import Path
+from typing import Any, Mapping
 
 if __package__ in (None, ""):
-    import sys
-    from pathlib import Path
-
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
-
-from math import gcd
-
 import pypto.language as pl
+import torch
 from .config import FLASH as M
+from .gemm import N_TILE as QKV_W8A8_N_TILE, make_blocked_weight_pack as make_pack_weight, make_dot, make_fp32_dequantize, make_int8_gemm, make_pack_weight as qkv_make_pack_weight
 from .operator_config import T_DYN
+from .quant import int8_matmul, make_decode_dequantize as decode_make_dequantize, make_decode_dynamic_int8_quantize as decode_make_dynamic_int8_quantize, make_decode_quantize as decode_make_quantize, make_dequantize, make_dynamic_int8_quantize, make_quantize, quantize_per_token_int8
+from .rmsnorm import decode_rms_norm_reference, make_blocked_rmsnorm as make_norm, make_decode_blocked_rmsnorm as decode_make_norm, make_decode_rmsnorm as decode_make_rmsnorm, make_rmsnorm, rms_norm_reference
+from .rope import decode_rope_reference, make_adjacent_rope as qkv_w8a8_make_rope, make_decode_adjacent_rope as decode_make_rope, make_decode_rope as decode_qkv_make_rope, make_rope as qkv_make_rope, rope_reference
+from .runtime_config import validate_tp
 
 
 # model config
@@ -33,6 +39,35 @@ N_TILE = 128
 K_TILE = 64
 BF16_N_TILE = 16
 BF16_K_TILE = 512
+
+
+DECODE_HEAD_DIM = M.head_dim
+
+
+DECODE_ROPE_DIM = M.qk_rope_head_dim
+
+
+DECODE_K_TILE = 256
+
+
+@dataclass(frozen=True)
+class QKVShape:
+    """Static dimensions required by the layer-0 QKV leaf."""
+
+    hidden_size: int
+    q_lora_rank: int
+    num_attention_heads: int
+    head_dim: int
+    qk_rope_head_dim: int
+    rms_norm_eps: float = 1.0e-20
+
+    @property
+    def query_width(self) -> int:
+        return self.num_attention_heads * self.head_dim
+
+    @property
+    def rope_pairs(self) -> int:
+        return self.qk_rope_head_dim // 2
 
 
 def _make_rope_block(heads, inverse, head_dim, rope_dim):
@@ -61,9 +96,7 @@ def _make_rope_block(heads, inverse, head_dim, rope_dim):
         rotated = pl.full([1, rope_dim], dtype=pl.FP32, value=0.0)
         rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
         rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-        output[t : t + 1, base + nope_dim : base + head_dim] = pl.cast(
-            rotated, pl.BF16, mode="rint"
-        )
+        output[t : t + 1, base + nope_dim : base + head_dim] = pl.cast(rotated, pl.BF16, mode="rint")
         return output
 
     return rotate_block
@@ -142,21 +175,776 @@ def make_bf16_projection_staged(width, output_width, *, capacity=None):
                 a = pl.slice(source, [M_TILE, k_tile], [row, k], valid_shape=[rows, k_tile])
                 a = pl.cast(a, pl.FP32)
                 a = pl.cast(a, pl.BF16, mode="rint")
-                b = weight[k:k + k_tile, col:col + n_tile]
+                b = weight[k : k + k_tile, col : col + n_tile]
                 acc = pl.matmul_acc(acc, a, b, init_cond=(step == 0))
             transferred = pl.mul(acc, 1.0)
             transferred = pl.set_validshape(transferred, rows, n_tile)
-            accumulation[row:row + M_TILE, col:col + n_tile] = transferred
+            accumulation[row : row + M_TILE, col : col + n_tile] = transferred
         for block in pl.spmd(blocks, name_hint="prefill_bf16_projection_cast", deps=[cube_tid]):
             row = block // (output_width // n_tile) * M_TILE
             col = block % (output_width // n_tile) * n_tile
             rows = pl.min(M_TILE, num_tokens - row)
             result = pl.slice(accumulation, [M_TILE, n_tile], [row, col], valid_shape=[rows, n_tile])
             narrowed = pl.cast(result, pl.BF16, mode="rint")
-            output[row:row + M_TILE, col:col + n_tile] = narrowed
+            output[row : row + M_TILE, col : col + n_tile] = narrowed
         return output
 
     return project
+
+
+def make_prefill_grouped_output(tp=1):
+    """Specialize grouped Wo-A for an explicit TP1/2/4 shard."""
+    validate_tp(tp)
+    LOCAL_H = M.num_attention_heads // tp
+
+    LOCAL_O_GROUPS = M.o_groups // tp
+
+    LOCAL_O_WIDTH = M.o_groups // tp * M.o_lora_rank
+
+    HEAD_DIM = M.head_dim
+
+    O_LORA = M.o_lora_rank
+
+    O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
+
+    @pl.jit.inline
+    def prefill_grouped_output(
+        x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+        weight: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        """Stage Wo-A values with Vector startup and FP32 Vector stores before narrowing."""
+        tokens = pl.tensor.dim(x, 0)
+        accumulated = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.FP32)
+        blocks = (num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE)
+        with pl.spmd(blocks, name_hint="prefill_grouped_o_a_cube") as cube_tid:
+            block = pl.tile.get_block_idx()
+            t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
+            n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
+            group = n0 // O_LORA
+            local_n = n0 % O_LORA
+            rows = pl.min(M_TILE, num_tokens - t0)
+            acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
+            for kb in pl.range(O_GROUP_IN // K_TILE):
+                k0 = kb * K_TILE
+                a = pl.slice(x, [M_TILE, K_TILE], [t0, group * O_GROUP_IN + k0], valid_shape=[rows, K_TILE])
+                a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
+                w = pl.reshape(
+                    weight[group : group + 1, local_n : local_n + N_TILE, k0 : k0 + K_TILE], [N_TILE, K_TILE]
+                )
+                acc = pl.matmul_acc(acc, a, w, b_trans=True, init_cond=(kb == 0))
+            accumulated[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(
+                pl.mul(acc, 1.0), rows, N_TILE
+            )
+        with pl.spmd(blocks, name_hint="prefill_grouped_o_a_cast", deps=[cube_tid]):
+            block = pl.tile.get_block_idx()
+            t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
+            n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
+            rows = pl.min(M_TILE, num_tokens - t0)
+            value = pl.slice(accumulated, [M_TILE, N_TILE], [t0, n0], valid_shape=[rows, N_TILE])
+            output[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.cast(value, pl.BF16, mode="rint")
+        return output
+
+    return prefill_grouped_output
+
+
+def make_qkv_w8a8_inline(capacity, config):
+    """Build shared inline QKV compute with canonical [K,N] INT8 weights."""
+    hidden = config["hidden_size"]
+    latent = config["q_lora_rank"]
+    heads = config["num_attention_heads"]
+    head_dim = config["head_dim"]
+    rope_dim = config["qk_rope_head_dim"]
+    query_width = heads * head_dim
+    pair_width = rope_dim // 2
+    eps = config["rms_norm_eps"]
+    qa_packed_rows = hidden * (latent // QKV_W8A8_N_TILE)
+    qb_packed_rows = latent * (query_width // QKV_W8A8_N_TILE)
+    kv_packed_rows = hidden * (head_dim // QKV_W8A8_N_TILE)
+
+    quant_x = make_quantize(capacity, hidden)
+    quant_q = make_quantize(capacity, latent)
+    pack_qa = make_pack_weight(hidden, latent)
+    pack_qb = make_pack_weight(latent, query_width)
+    pack_kv = make_pack_weight(hidden, head_dim)
+    dot_qa = make_dot(capacity, hidden, latent)
+    dot_qb = make_dot(capacity, latent, query_width)
+    dot_kv = make_dot(capacity, hidden, head_dim)
+    dequant_qa = make_dequantize(capacity, latent)
+    dequant_qb = make_dequantize(capacity, query_width, combine_scales=True)
+    dequant_kv = make_dequantize(capacity, head_dim)
+    norm_q = make_norm(capacity, latent, eps)
+    norm_kv = make_norm(capacity, head_dim, eps)
+    rope_q = qkv_w8a8_make_rope(capacity, heads, head_dim, rope_dim)
+    rope_kv = qkv_w8a8_make_rope(capacity, 1, head_dim, rope_dim)
+
+    @pl.jit.inline
+    def qkv_w8a8_inline(
+        x: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, query_width], pl.INT8],
+        wq_b_scale: pl.Tensor[[query_width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        rope_cos: pl.Tensor[[capacity, pair_width], pl.FP32],
+        rope_sin: pl.Tensor[[capacity, pair_width], pl.FP32],
+        positions: pl.Tensor[[capacity], pl.INT64],
+        query_latent: pl.Tensor[[capacity, latent], pl.BF16],
+        query: pl.Tensor[[capacity, query_width], pl.BF16],
+        window_kv: pl.Tensor[[capacity, head_dim], pl.BF16],
+        cache: pl.Tensor[[2, 128, head_dim], pl.BF16],
+        cache_lens: pl.Tensor[[2], pl.INT32],
+        active: pl.Scalar[pl.INT32],
+    ):
+        x_i8 = pl.create_tensor([capacity, hidden], dtype=pl.INT8)
+        x_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
+        quant_x(x, x_i8, x_scale, active)
+
+        qa_packed = pl.create_tensor([qa_packed_rows, QKV_W8A8_N_TILE], dtype=pl.INT8)
+        pack_qa(wq_a, qa_packed)
+        qa_int = pl.create_tensor([capacity, latent], dtype=pl.INT32)
+        dot_qa(x_i8, qa_packed, qa_int, active)
+        qa_bf16 = pl.create_tensor([capacity, latent], dtype=pl.BF16)
+        dequant_qa(qa_int, wq_a_scale, x_scale, qa_bf16, active)
+        norm_q(qa_bf16, q_norm_weight, query_latent, active)
+
+        q_i8 = pl.create_tensor([capacity, latent], dtype=pl.INT8)
+        q_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
+        quant_q(query_latent, q_i8, q_scale, active)
+        qb_packed = pl.create_tensor([qb_packed_rows, QKV_W8A8_N_TILE], dtype=pl.INT8)
+        pack_qb(wq_b, qb_packed)
+        qb_int = pl.create_tensor([capacity, query_width], dtype=pl.INT32)
+        dot_qb(q_i8, qb_packed, qb_int, active)
+        qb_bf16 = pl.create_tensor([capacity, query_width], dtype=pl.BF16)
+        dequant_qb(qb_int, wq_b_scale, q_scale, qb_bf16, active)
+        rope_q(qb_bf16, rope_cos, rope_sin, query, active)
+
+        kv_packed = pl.create_tensor([kv_packed_rows, QKV_W8A8_N_TILE], dtype=pl.INT8)
+        pack_kv(wkv, kv_packed)
+        kv_int = pl.create_tensor([capacity, head_dim], dtype=pl.INT32)
+        dot_kv(x_i8, kv_packed, kv_int, active)
+        kv_bf16 = pl.create_tensor([capacity, head_dim], dtype=pl.BF16)
+        dequant_kv(kv_int, wkv_scale, x_scale, kv_bf16, active)
+        kv_normalized = pl.create_tensor([capacity, head_dim], dtype=pl.BF16)
+        norm_kv(kv_bf16, kv_norm_weight, kv_normalized, active)
+        rope_kv(kv_normalized, rope_cos, rope_sin, window_kv, active)
+        return positions, query_latent, query, window_kv, cache, cache_lens
+
+    return qkv_w8a8_inline
+
+
+def make_qkv_w8a8(capacity, config):
+    """Build the standalone JIT wrapper for shared inline QKV compute."""
+    hidden = config["hidden_size"]
+    latent = config["q_lora_rank"]
+    head_dim = config["head_dim"]
+    width = config["num_attention_heads"] * head_dim
+    pairs = config["qk_rope_head_dim"] // 2
+    compute = make_qkv_w8a8_inline(capacity, config)
+
+    @pl.jit
+    def qkv_w8a8(
+        x: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, width], pl.INT8],
+        wq_b_scale: pl.Tensor[[width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        rope_cos: pl.Tensor[[capacity, pairs], pl.FP32],
+        rope_sin: pl.Tensor[[capacity, pairs], pl.FP32],
+        positions: pl.InOut[pl.Tensor[[capacity], pl.INT64]],
+        query_latent: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        query: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        window_kv: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        cache: pl.InOut[pl.Tensor[[2, 128, head_dim], pl.BF16]],
+        cache_lens: pl.InOut[pl.Tensor[[2], pl.INT32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        compute(
+            x,
+            wq_a,
+            wq_a_scale,
+            q_norm_weight,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            wkv_scale,
+            kv_norm_weight,
+            rope_cos,
+            rope_sin,
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            cache,
+            cache_lens,
+            active,
+        )
+        return positions, query_latent, query, window_kv, cache, cache_lens
+
+    return qkv_w8a8
+
+
+def make_decode_rope(
+    heads,
+    inverse=False,
+    *,
+    head_dim=DECODE_HEAD_DIM,
+    rope_dim=DECODE_ROPE_DIM,
+    max_workers=None,
+    name_hint="attention_rope",
+):
+    """Specialize adjacent-pair RoPE with direct or capped strided scheduling."""
+    rotate_block = _make_rope_block(heads, inverse, head_dim, rope_dim)
+    worker_limit = 2**31 - 1 if max_workers is None else max_workers
+
+    @pl.jit.inline
+    def rotate(
+        x: pl.Tensor[[T_DYN, heads * head_dim], pl.BF16],
+        cos: pl.Tensor[[T_DYN, rope_dim // 2], pl.FP32],
+        sin: pl.Tensor[[T_DYN, rope_dim // 2], pl.FP32],
+        output: pl.Tensor[[T_DYN, heads * head_dim], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        blocks = num_tokens * heads
+        workers = pl.min(blocks, worker_limit)
+        for worker in pl.spmd(workers, name_hint=name_hint):
+            for block in pl.range(worker, blocks, workers):
+                rotate_block(x, cos, sin, output, block)
+        return output
+
+    return rotate
+
+
+def make_decode_bf16_projection_staged(width, output_width):
+    """Stage FP32 projection values before a separate BF16 narrowing task.
+
+    The BF16 operand passes through Vector before Cube starts its result transfer
+    (hw-native-sys/pypto#2829). Store FP32 values through Vector as well: direct
+    Acc-to-GM stores were unstable in the concurrent A5 prefill workload.
+    Accumulation and RNE rounding are unchanged.
+    """
+    n_tile = min(N_TILE, output_width)
+    k_tile = min(DECODE_K_TILE, width)
+
+    @pl.jit.inline
+    def project(
+        source: pl.Tensor[[T_DYN, width], pl.BF16],
+        weight: pl.Tensor[[width, output_width], pl.BF16],
+        output: pl.Tensor[[T_DYN, output_width], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        tokens = pl.tensor.dim(source, 0)
+        accumulated = pl.create_tensor([tokens, output_width], dtype=pl.FP32)
+        blocks = (num_tokens + M_TILE - 1) // M_TILE * (output_width // n_tile)
+        with pl.spmd(blocks, name_hint="prefill_bf16_projection_cube") as cube_tid:
+            block = pl.tile.get_block_idx()
+            row = block // (output_width // n_tile) * M_TILE
+            col = block % (output_width // n_tile) * n_tile
+            rows = pl.min(M_TILE, num_tokens - row)
+            acc = pl.create_tensor([M_TILE, n_tile], dtype=pl.FP32)
+            for k in pl.range(0, width, k_tile):
+                a = pl.slice(source, [M_TILE, k_tile], [row, k], valid_shape=[rows, k_tile])
+                # Preserve BF16 values while establishing Vector-to-Cube startup.
+                a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
+                b = pl.slice(weight, [k_tile, n_tile], [k, col])
+                acc = pl.matmul_acc(acc, a, b, init_cond=(k == 0))
+            accumulated[row : row + M_TILE, col : col + n_tile] = pl.set_validshape(
+                pl.mul(acc, 1.0), rows, n_tile
+            )
+        with pl.spmd(blocks, name_hint="prefill_bf16_projection_cast", deps=[cube_tid]):
+            block = pl.tile.get_block_idx()
+            row = block // (output_width // n_tile) * M_TILE
+            col = block % (output_width // n_tile) * n_tile
+            rows = pl.min(M_TILE, num_tokens - row)
+            value = pl.slice(accumulated, [M_TILE, n_tile], [row, col], valid_shape=[rows, n_tile])
+            output[row : row + M_TILE, col : col + n_tile] = pl.cast(value, pl.BF16, mode="rint")
+        return output
+
+    return project
+
+
+def make_decode_qkv_w8a8_inline(capacity, config):
+    """Build shared inline QKV compute with canonical [K,N] INT8 weights."""
+    hidden = config["hidden_size"]
+    latent = config["q_lora_rank"]
+    heads = config["num_attention_heads"]
+    head_dim = config["head_dim"]
+    rope_dim = config["qk_rope_head_dim"]
+    query_width = heads * head_dim
+    pair_width = rope_dim // 2
+    eps = config["rms_norm_eps"]
+    qa_packed_rows = hidden * (latent // QKV_W8A8_N_TILE)
+    qb_packed_rows = latent * (query_width // QKV_W8A8_N_TILE)
+    kv_packed_rows = hidden * (head_dim // QKV_W8A8_N_TILE)
+
+    quant_x = decode_make_quantize(capacity, hidden)
+    quant_q = decode_make_quantize(capacity, latent)
+    pack_qa = make_pack_weight(hidden, latent)
+    pack_qb = make_pack_weight(latent, query_width)
+    pack_kv = make_pack_weight(hidden, head_dim)
+    dot_qa = make_dot(capacity, hidden, latent)
+    dot_qb = make_dot(capacity, latent, query_width)
+    dot_kv = make_dot(capacity, hidden, head_dim)
+    dequant_qa = decode_make_dequantize(capacity, latent)
+    dequant_qb = decode_make_dequantize(capacity, query_width, combine_scales=True)
+    dequant_kv = decode_make_dequantize(capacity, head_dim)
+    norm_q = decode_make_norm(capacity, latent, eps)
+    norm_kv = decode_make_norm(capacity, head_dim, eps)
+    rope_q = decode_make_rope(capacity, heads, head_dim, rope_dim)
+    rope_kv = decode_make_rope(capacity, 1, head_dim, rope_dim)
+
+    @pl.jit.inline
+    def qkv_w8a8_inline(
+        x: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, query_width], pl.INT8],
+        wq_b_scale: pl.Tensor[[query_width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        rope_cos: pl.Tensor[[capacity, pair_width], pl.FP32],
+        rope_sin: pl.Tensor[[capacity, pair_width], pl.FP32],
+        positions: pl.Tensor[[capacity], pl.INT64],
+        query_latent: pl.Tensor[[capacity, latent], pl.BF16],
+        query: pl.Tensor[[capacity, query_width], pl.BF16],
+        window_kv: pl.Tensor[[capacity, head_dim], pl.BF16],
+        cache: pl.Tensor[[2, 128, head_dim], pl.BF16],
+        cache_lens: pl.Tensor[[2], pl.INT32],
+        active: pl.Scalar[pl.INT32],
+    ):
+        x_i8 = pl.create_tensor([capacity, hidden], dtype=pl.INT8)
+        x_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
+        quant_x(x, x_i8, x_scale, active)
+
+        qa_packed = pl.create_tensor([qa_packed_rows, QKV_W8A8_N_TILE], dtype=pl.INT8)
+        pack_qa(wq_a, qa_packed)
+        qa_int = pl.create_tensor([capacity, latent], dtype=pl.INT32)
+        dot_qa(x_i8, qa_packed, qa_int, active)
+        qa_bf16 = pl.create_tensor([capacity, latent], dtype=pl.BF16)
+        dequant_qa(qa_int, wq_a_scale, x_scale, qa_bf16, active)
+        norm_q(qa_bf16, q_norm_weight, query_latent, active)
+
+        q_i8 = pl.create_tensor([capacity, latent], dtype=pl.INT8)
+        q_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
+        quant_q(query_latent, q_i8, q_scale, active)
+        qb_packed = pl.create_tensor([qb_packed_rows, QKV_W8A8_N_TILE], dtype=pl.INT8)
+        pack_qb(wq_b, qb_packed)
+        qb_int = pl.create_tensor([capacity, query_width], dtype=pl.INT32)
+        dot_qb(q_i8, qb_packed, qb_int, active)
+        qb_bf16 = pl.create_tensor([capacity, query_width], dtype=pl.BF16)
+        dequant_qb(qb_int, wq_b_scale, q_scale, qb_bf16, active)
+        rope_q(qb_bf16, rope_cos, rope_sin, query, active)
+
+        kv_packed = pl.create_tensor([kv_packed_rows, QKV_W8A8_N_TILE], dtype=pl.INT8)
+        pack_kv(wkv, kv_packed)
+        kv_int = pl.create_tensor([capacity, head_dim], dtype=pl.INT32)
+        dot_kv(x_i8, kv_packed, kv_int, active)
+        kv_bf16 = pl.create_tensor([capacity, head_dim], dtype=pl.BF16)
+        dequant_kv(kv_int, wkv_scale, x_scale, kv_bf16, active)
+        kv_normalized = pl.create_tensor([capacity, head_dim], dtype=pl.BF16)
+        norm_kv(kv_bf16, kv_norm_weight, kv_normalized, active)
+        rope_kv(kv_normalized, rope_cos, rope_sin, window_kv, active)
+        return positions, query_latent, query, window_kv, cache, cache_lens
+
+    return qkv_w8a8_inline
+
+
+def make_decode_qkv_w8a8(capacity, config):
+    """Build the standalone JIT wrapper for shared inline QKV compute."""
+    hidden = config["hidden_size"]
+    latent = config["q_lora_rank"]
+    head_dim = config["head_dim"]
+    width = config["num_attention_heads"] * head_dim
+    pairs = config["qk_rope_head_dim"] // 2
+    compute = make_decode_qkv_w8a8_inline(capacity, config)
+
+    @pl.jit
+    def qkv_w8a8(
+        x: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, width], pl.INT8],
+        wq_b_scale: pl.Tensor[[width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        rope_cos: pl.Tensor[[capacity, pairs], pl.FP32],
+        rope_sin: pl.Tensor[[capacity, pairs], pl.FP32],
+        positions: pl.InOut[pl.Tensor[[capacity], pl.INT64]],
+        query_latent: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        query: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        window_kv: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        cache: pl.InOut[pl.Tensor[[2, 128, head_dim], pl.BF16]],
+        cache_lens: pl.InOut[pl.Tensor[[2], pl.INT32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        compute(
+            x,
+            wq_a,
+            wq_a_scale,
+            q_norm_weight,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            wkv_scale,
+            kv_norm_weight,
+            rope_cos,
+            rope_sin,
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            cache,
+            cache_lens,
+            active,
+        )
+        return positions, query_latent, query, window_kv, cache, cache_lens
+
+    return qkv_w8a8
+
+
+def qkv_shape(config: Mapping[str, Any] | QKVShape) -> QKVShape:
+    """Normalize a model config or an already materialized shape object."""
+
+    if isinstance(config, QKVShape):
+        return config
+    return QKVShape(
+        hidden_size=int(config["hidden_size"]),
+        q_lora_rank=int(config["q_lora_rank"]),
+        num_attention_heads=int(config["num_attention_heads"]),
+        head_dim=int(config["head_dim"]),
+        qk_rope_head_dim=int(config["qk_rope_head_dim"]),
+        rms_norm_eps=float(config.get("rms_norm_eps", 1.0e-20)),
+    )
+
+
+def make_prefill_qkv_with_state_guards(capacity: int, config: Mapping[str, Any] | QKVShape):
+    """Build the standalone layer-0 QKV W8A8 PyPTO entry point.
+
+    ``cache`` and ``cache_lens`` are opaque state guards here.  The QKV leaf
+    does not write SWA state; cache publication is intentionally performed by
+    :mod:`swa` so its slot mapping can be validated independently.
+    """
+
+    shape = qkv_shape(config)
+    if capacity <= 0 or capacity % 16:
+        raise ValueError("QKV capacity must be a positive multiple of 16 for the INT8 GEMM tile")
+    if shape.qk_rope_head_dim % 2 or shape.qk_rope_head_dim > shape.head_dim:
+        raise ValueError("qk_rope_head_dim must be even and no larger than head_dim")
+
+    hidden = shape.hidden_size
+    latent = shape.q_lora_rank
+    heads = shape.num_attention_heads
+    head_dim = shape.head_dim
+    query_width = shape.query_width
+    rope_pairs = shape.rope_pairs
+    rope_dim = shape.qk_rope_head_dim
+
+    quant_x = make_dynamic_int8_quantize(capacity, hidden)
+    quant_q = make_dynamic_int8_quantize(capacity, latent)
+    pack_qa = qkv_make_pack_weight(hidden, latent)
+    pack_qb = qkv_make_pack_weight(latent, query_width)
+    pack_kv = qkv_make_pack_weight(hidden, head_dim)
+    dot_qa = make_int8_gemm(capacity, hidden, latent)
+    dot_qb = make_int8_gemm(capacity, latent, query_width)
+    dot_kv = make_int8_gemm(capacity, hidden, head_dim)
+    dequant_qa = make_fp32_dequantize(capacity, latent)
+    dequant_qb = make_fp32_dequantize(capacity, query_width)
+    dequant_kv = make_fp32_dequantize(capacity, head_dim)
+    norm_q = make_rmsnorm(capacity, latent, shape.rms_norm_eps)
+    norm_kv = make_rmsnorm(capacity, head_dim, shape.rms_norm_eps)
+    rope_q = qkv_make_rope(capacity, heads, head_dim, rope_dim)
+    rope_kv = qkv_make_rope(capacity, 1, head_dim, rope_dim)
+
+    @pl.jit.inline
+    def qkv_w8a8_inline(
+        value: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, query_width], pl.INT8],
+        wq_b_scale: pl.Tensor[[query_width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        cosine: pl.Tensor[[capacity, rope_pairs], pl.FP32],
+        sine: pl.Tensor[[capacity, rope_pairs], pl.FP32],
+        positions: pl.InOut[pl.Tensor[[capacity], pl.INT64]],
+        query_latent: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        query: pl.InOut[pl.Tensor[[capacity, query_width], pl.BF16]],
+        window_kv: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        wq_a_output: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        wq_b_output: pl.InOut[pl.Tensor[[capacity, query_width], pl.BF16]],
+        wkv_output: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        wkv_normed_output: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        cache: pl.InOut[pl.Tensor[[2, 128, head_dim], pl.BF16]],
+        cache_lens: pl.InOut[pl.Tensor[[2], pl.INT32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        x_i8 = pl.create_tensor([capacity, hidden], dtype=pl.INT8)
+        x_scale = pl.create_tensor([capacity, 1], dtype=pl.FP32)
+        quant_x(value, x_i8, x_scale, active)
+
+        qa_packed = pl.create_tensor([hidden * (latent // 64), 64], dtype=pl.INT8)
+        pack_qa(wq_a, qa_packed)
+        qa_i32 = pl.create_tensor([capacity, latent], dtype=pl.INT32)
+        dot_qa(x_i8, qa_packed, qa_i32, active)
+        dequant_qa(qa_i32, x_scale, wq_a_scale, wq_a_output, active)
+        norm_q(wq_a_output, q_norm_weight, query_latent, active)
+
+        q_i8 = pl.create_tensor([capacity, latent], dtype=pl.INT8)
+        q_scale = pl.create_tensor([capacity, 1], dtype=pl.FP32)
+        quant_q(query_latent, q_i8, q_scale, active)
+        qb_packed = pl.create_tensor([latent * (query_width // 64), 64], dtype=pl.INT8)
+        pack_qb(wq_b, qb_packed)
+        qb_i32 = pl.create_tensor([capacity, query_width], dtype=pl.INT32)
+        dot_qb(q_i8, qb_packed, qb_i32, active)
+        dequant_qb(qb_i32, q_scale, wq_b_scale, wq_b_output, active)
+        rope_q(wq_b_output, cosine, sine, query, active)
+
+        kv_packed = pl.create_tensor([hidden * (head_dim // 64), 64], dtype=pl.INT8)
+        pack_kv(wkv, kv_packed)
+        kv_i32 = pl.create_tensor([capacity, head_dim], dtype=pl.INT32)
+        dot_kv(x_i8, kv_packed, kv_i32, active)
+        dequant_kv(kv_i32, x_scale, wkv_scale, wkv_output, active)
+        norm_kv(wkv_output, kv_norm_weight, wkv_normed_output, active)
+        rope_kv(wkv_normed_output, cosine, sine, window_kv, active)
+        return (
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            wq_a_output,
+            wq_b_output,
+            wkv_output,
+            wkv_normed_output,
+            cache,
+            cache_lens,
+        )
+
+    @pl.jit
+    def qkv_w8a8(
+        value: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, query_width], pl.INT8],
+        wq_b_scale: pl.Tensor[[query_width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        cosine: pl.Tensor[[capacity, rope_pairs], pl.FP32],
+        sine: pl.Tensor[[capacity, rope_pairs], pl.FP32],
+        positions: pl.InOut[pl.Tensor[[capacity], pl.INT64]],
+        query_latent: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        query: pl.InOut[pl.Tensor[[capacity, query_width], pl.BF16]],
+        window_kv: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        wq_a_output: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        wq_b_output: pl.InOut[pl.Tensor[[capacity, query_width], pl.BF16]],
+        wkv_output: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        wkv_normed_output: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        cache: pl.InOut[pl.Tensor[[2, 128, head_dim], pl.BF16]],
+        cache_lens: pl.InOut[pl.Tensor[[2], pl.INT32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        return qkv_w8a8_inline(
+            value,
+            wq_a,
+            wq_a_scale,
+            q_norm_weight,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            wkv_scale,
+            kv_norm_weight,
+            cosine,
+            sine,
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            wq_a_output,
+            wq_b_output,
+            wkv_output,
+            wkv_normed_output,
+            cache,
+            cache_lens,
+            active,
+        )
+
+    qkv_w8a8.inline = qkv_w8a8_inline
+
+    return qkv_w8a8
+
+
+def make_decode_qkv_with_state_guards(capacity: int, config: Mapping[str, Any] | QKVShape):
+    """Build the standalone layer-0 QKV W8A8 PyPTO entry point.
+
+    ``cache`` and ``cache_lens`` are opaque state guards here.  The QKV leaf
+    does not write SWA state; cache publication is intentionally performed by
+    :mod:`swa` so its slot mapping can be validated independently.
+    """
+
+    shape = qkv_shape(config)
+    if capacity <= 0 or capacity % 16:
+        raise ValueError("QKV capacity must be a positive multiple of 16 for the INT8 GEMM tile")
+    if shape.qk_rope_head_dim % 2 or shape.qk_rope_head_dim > shape.head_dim:
+        raise ValueError("qk_rope_head_dim must be even and no larger than head_dim")
+
+    hidden = shape.hidden_size
+    latent = shape.q_lora_rank
+    heads = shape.num_attention_heads
+    head_dim = shape.head_dim
+    query_width = shape.query_width
+    rope_pairs = shape.rope_pairs
+    rope_dim = shape.qk_rope_head_dim
+
+    quant_x = decode_make_dynamic_int8_quantize(capacity, hidden)
+    quant_q = decode_make_dynamic_int8_quantize(capacity, latent)
+    pack_qa = qkv_make_pack_weight(hidden, latent)
+    pack_qb = qkv_make_pack_weight(latent, query_width)
+    pack_kv = qkv_make_pack_weight(hidden, head_dim)
+    dot_qa = make_int8_gemm(capacity, hidden, latent)
+    dot_qb = make_int8_gemm(capacity, latent, query_width)
+    dot_kv = make_int8_gemm(capacity, hidden, head_dim)
+    dequant_qa = make_fp32_dequantize(capacity, latent)
+    dequant_qb = make_fp32_dequantize(capacity, query_width)
+    dequant_kv = make_fp32_dequantize(capacity, head_dim)
+    norm_q = decode_make_rmsnorm(capacity, latent, shape.rms_norm_eps)
+    norm_kv = decode_make_rmsnorm(capacity, head_dim, shape.rms_norm_eps)
+    rope_q = decode_qkv_make_rope(capacity, heads, head_dim, rope_dim)
+    rope_kv = decode_qkv_make_rope(capacity, 1, head_dim, rope_dim)
+
+    @pl.jit.inline
+    def qkv_w8a8_inline(
+        value: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, query_width], pl.INT8],
+        wq_b_scale: pl.Tensor[[query_width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        cosine: pl.Tensor[[capacity, rope_pairs], pl.FP32],
+        sine: pl.Tensor[[capacity, rope_pairs], pl.FP32],
+        positions: pl.InOut[pl.Tensor[[capacity], pl.INT64]],
+        query_latent: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        query: pl.InOut[pl.Tensor[[capacity, query_width], pl.BF16]],
+        window_kv: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        wq_a_output: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        wq_b_output: pl.InOut[pl.Tensor[[capacity, query_width], pl.BF16]],
+        wkv_output: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        wkv_normed_output: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        cache: pl.InOut[pl.Tensor[[2, 128, head_dim], pl.BF16]],
+        cache_lens: pl.InOut[pl.Tensor[[2], pl.INT32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        x_i8 = pl.create_tensor([capacity, hidden], dtype=pl.INT8)
+        x_scale = pl.create_tensor([capacity, 1], dtype=pl.FP32)
+        quant_x(value, x_i8, x_scale, active)
+
+        qa_packed = pl.create_tensor([hidden * (latent // 64), 64], dtype=pl.INT8)
+        pack_qa(wq_a, qa_packed)
+        qa_i32 = pl.create_tensor([capacity, latent], dtype=pl.INT32)
+        dot_qa(x_i8, qa_packed, qa_i32, active)
+        dequant_qa(qa_i32, x_scale, wq_a_scale, wq_a_output, active)
+        norm_q(wq_a_output, q_norm_weight, query_latent, active)
+
+        q_i8 = pl.create_tensor([capacity, latent], dtype=pl.INT8)
+        q_scale = pl.create_tensor([capacity, 1], dtype=pl.FP32)
+        quant_q(query_latent, q_i8, q_scale, active)
+        qb_packed = pl.create_tensor([latent * (query_width // 64), 64], dtype=pl.INT8)
+        pack_qb(wq_b, qb_packed)
+        qb_i32 = pl.create_tensor([capacity, query_width], dtype=pl.INT32)
+        dot_qb(q_i8, qb_packed, qb_i32, active)
+        dequant_qb(qb_i32, q_scale, wq_b_scale, wq_b_output, active)
+        rope_q(wq_b_output, cosine, sine, query, active)
+
+        kv_packed = pl.create_tensor([hidden * (head_dim // 64), 64], dtype=pl.INT8)
+        pack_kv(wkv, kv_packed)
+        kv_i32 = pl.create_tensor([capacity, head_dim], dtype=pl.INT32)
+        dot_kv(x_i8, kv_packed, kv_i32, active)
+        dequant_kv(kv_i32, x_scale, wkv_scale, wkv_output, active)
+        norm_kv(wkv_output, kv_norm_weight, wkv_normed_output, active)
+        rope_kv(wkv_normed_output, cosine, sine, window_kv, active)
+        return (
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            wq_a_output,
+            wq_b_output,
+            wkv_output,
+            wkv_normed_output,
+            cache,
+            cache_lens,
+        )
+
+    @pl.jit
+    def qkv_w8a8(
+        value: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, query_width], pl.INT8],
+        wq_b_scale: pl.Tensor[[query_width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        cosine: pl.Tensor[[capacity, rope_pairs], pl.FP32],
+        sine: pl.Tensor[[capacity, rope_pairs], pl.FP32],
+        positions: pl.InOut[pl.Tensor[[capacity], pl.INT64]],
+        query_latent: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        query: pl.InOut[pl.Tensor[[capacity, query_width], pl.BF16]],
+        window_kv: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        wq_a_output: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        wq_b_output: pl.InOut[pl.Tensor[[capacity, query_width], pl.BF16]],
+        wkv_output: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        wkv_normed_output: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        cache: pl.InOut[pl.Tensor[[2, 128, head_dim], pl.BF16]],
+        cache_lens: pl.InOut[pl.Tensor[[2], pl.INT32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        return qkv_w8a8_inline(
+            value,
+            wq_a,
+            wq_a_scale,
+            q_norm_weight,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            wkv_scale,
+            kv_norm_weight,
+            cosine,
+            sine,
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            wq_a_output,
+            wq_b_output,
+            wkv_output,
+            wkv_normed_output,
+            cache,
+            cache_lens,
+            active,
+        )
+
+    qkv_w8a8.inline = qkv_w8a8_inline
+
+    return qkv_w8a8
 
 
 def golden_bf16_projection(tensors):
@@ -186,6 +974,104 @@ def golden_prefix_compare(active, *, rtol=0.05, atol=0.05):
     return compare
 
 
+def qkv_reference(
+    value: torch.Tensor,
+    weights: Mapping[str, torch.Tensor],
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    config: Mapping[str, Any] | QKVShape,
+) -> dict[str, torch.Tensor]:
+    """CPU/PyTorch golden for the same boundaries as :func:`make_qkv_w8a8`.
+
+    The returned tensors include the three projected BF16 values and the two
+    RoPE outputs.  All matrix products use an explicit INT32 accumulator and
+    FP32 token/channel dequantization, matching ``W8A8_DYNAMIC``.
+    """
+
+    shape = qkv_shape(config)
+    x_i8, x_scale = quantize_per_token_int8(value)
+    qa_i32 = int8_matmul(x_i8, weights["wq_a"].transpose(-2, -1).contiguous())
+    qa = (qa_i32.float() * x_scale.float() * weights["wq_a_scale"].float().reshape(1, -1)).to(torch.bfloat16)
+    latent = rms_norm_reference(qa, weights["q_norm_weight"], shape.rms_norm_eps)
+
+    q_i8, q_scale = quantize_per_token_int8(latent)
+    qb_i32 = int8_matmul(q_i8, weights["wq_b"].transpose(-2, -1).contiguous())
+    qb = (qb_i32.float() * q_scale.float() * weights["wq_b_scale"].float().reshape(1, -1)).to(torch.bfloat16)
+    query = rope_reference(
+        qb,
+        cosine,
+        sine,
+        shape.num_attention_heads,
+        shape.head_dim,
+        shape.qk_rope_head_dim,
+    )
+
+    kv_i32 = int8_matmul(x_i8, weights["wkv"].transpose(-2, -1).contiguous())
+    kv_linear = (kv_i32.float() * x_scale.float() * weights["wkv_scale"].float().reshape(1, -1)).to(
+        torch.bfloat16
+    )
+    kv_normed = rms_norm_reference(kv_linear, weights["kv_norm_weight"], shape.rms_norm_eps)
+    window_kv = rope_reference(kv_normed, cosine, sine, 1, shape.head_dim, shape.qk_rope_head_dim)
+    return {
+        "query_latent": latent,
+        "query": query,
+        "window_kv": window_kv,
+        "wq_a_output": qa,
+        "wq_b_output": qb,
+        "wkv_output": kv_linear,
+        "wkv_normed_output": kv_normed,
+    }
+
+
+def decode_qkv_reference(
+    value: torch.Tensor,
+    weights: Mapping[str, torch.Tensor],
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    config: Mapping[str, Any] | QKVShape,
+) -> dict[str, torch.Tensor]:
+    """CPU/PyTorch golden for the same boundaries as :func:`make_qkv_w8a8`.
+
+    The returned tensors include the three projected BF16 values and the two
+    RoPE outputs.  All matrix products use an explicit INT32 accumulator and
+    FP32 token/channel dequantization, matching ``W8A8_DYNAMIC``.
+    """
+
+    shape = qkv_shape(config)
+    x_i8, x_scale = quantize_per_token_int8(value)
+    qa_i32 = int8_matmul(x_i8, weights["wq_a"].transpose(-2, -1).contiguous())
+    qa = (qa_i32.float() * x_scale.float() * weights["wq_a_scale"].float().reshape(1, -1)).to(torch.bfloat16)
+    latent = decode_rms_norm_reference(qa, weights["q_norm_weight"], shape.rms_norm_eps)
+
+    q_i8, q_scale = quantize_per_token_int8(latent)
+    qb_i32 = int8_matmul(q_i8, weights["wq_b"].transpose(-2, -1).contiguous())
+    qb = (qb_i32.float() * q_scale.float() * weights["wq_b_scale"].float().reshape(1, -1)).to(torch.bfloat16)
+    query = decode_rope_reference(
+        qb,
+        cosine,
+        sine,
+        shape.num_attention_heads,
+        shape.head_dim,
+        shape.qk_rope_head_dim,
+    )
+
+    kv_i32 = int8_matmul(x_i8, weights["wkv"].transpose(-2, -1).contiguous())
+    kv_linear = (kv_i32.float() * x_scale.float() * weights["wkv_scale"].float().reshape(1, -1)).to(
+        torch.bfloat16
+    )
+    kv_normed = decode_rms_norm_reference(kv_linear, weights["kv_norm_weight"], shape.rms_norm_eps)
+    window_kv = decode_rope_reference(kv_normed, cosine, sine, 1, shape.head_dim, shape.qk_rope_head_dim)
+    return {
+        "query_latent": latent,
+        "query": query,
+        "window_kv": window_kv,
+        "wq_a_output": qa,
+        "wq_b_output": qb,
+        "wkv_output": kv_linear,
+        "wkv_normed_output": kv_normed,
+    }
+
+
 def bf16_projection_golden_cases():
     """Bound dynamic/static extents, empty work, partial tiles and BF16 rounding."""
     import torch
@@ -195,7 +1081,9 @@ def bf16_projection_golden_cases():
     for static, active in ((False, 0), (False, 17), (True, 1), (True, 32)):
         capacity, width, output_width = 32, 512, 128
         source = torch.empty((capacity, width), dtype=torch.bfloat16).uniform_(-0.5, 0.5, generator=generator)
-        weight = torch.empty((width, output_width), dtype=torch.bfloat16).uniform_(-0.5, 0.5, generator=generator)
+        weight = torch.empty((width, output_width), dtype=torch.bfloat16).uniform_(
+            -0.5, 0.5, generator=generator
+        )
         extent = capacity if static else None
         specs = [
             TensorSpec("source", [capacity, width], torch.bfloat16, init_value=source),
@@ -203,9 +1091,13 @@ def bf16_projection_golden_cases():
             TensorSpec("output", [capacity, output_width], torch.bfloat16, init_value=-12.5),
             ScalarSpec("num_tokens", torch.int32, active, compile_runtime=True),
         ]
-        yield dict(name=f"projection-{'static' if static else 'dynamic'}-{active}",
-                   fn=make_bf16_projection_staged(width, output_width, capacity=extent), specs=specs,
-                   golden_fn=golden_bf16_projection, compare_fn={"output": golden_prefix_compare(active)})
+        yield dict(
+            name=f"projection-{'static' if static else 'dynamic'}-{active}",
+            fn=make_bf16_projection_staged(width, output_width, capacity=extent),
+            specs=specs,
+            golden_fn=golden_bf16_projection,
+            compare_fn={"output": golden_prefix_compare(active)},
+        )
 
 
 def validate_bf16_projection(*, device=0, compile_only=False, platform="a2a3", sim=False):
@@ -232,61 +1124,6 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
-    validate_bf16_projection(device=args.device, compile_only=args.compile_only, platform=args.platform, sim=args.sim)
-
-
-from .runtime_config import validate_tp
-
-
-def make_prefill_grouped_output(tp=1):
-    """Specialize grouped Wo-A for an explicit TP1/2/4 shard."""
-    validate_tp(tp)
-    LOCAL_H = M.num_attention_heads // tp
-
-    LOCAL_O_GROUPS = M.o_groups // tp
-
-    LOCAL_O_WIDTH = M.o_groups // tp * M.o_lora_rank
-
-    HEAD_DIM = M.head_dim
-
-    O_LORA = M.o_lora_rank
-
-    O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
-
-
-    @pl.jit.inline
-    def prefill_grouped_output(
-        x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-        weight: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-        output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        """Stage Wo-A values with Vector startup and FP32 Vector stores before narrowing."""
-        tokens = pl.tensor.dim(x, 0)
-        accumulated = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.FP32)
-        blocks = (num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE)
-        with pl.spmd(blocks, name_hint="prefill_grouped_o_a_cube") as cube_tid:
-            block = pl.tile.get_block_idx()
-            t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
-            n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
-            group = n0 // O_LORA
-            local_n = n0 % O_LORA
-            rows = pl.min(M_TILE, num_tokens - t0)
-            acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-            for kb in pl.range(O_GROUP_IN // K_TILE):
-                k0 = kb * K_TILE
-                a = pl.slice(x, [M_TILE, K_TILE], [t0, group * O_GROUP_IN + k0], valid_shape=[rows, K_TILE])
-                a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
-                w = pl.reshape(weight[group : group + 1, local_n : local_n + N_TILE, k0 : k0 + K_TILE], [N_TILE, K_TILE])
-                acc = pl.matmul_acc(acc, a, w, b_trans=True, init_cond=(kb == 0))
-            accumulated[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE)
-        with pl.spmd(blocks, name_hint="prefill_grouped_o_a_cast", deps=[cube_tid]):
-            block = pl.tile.get_block_idx()
-            t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
-            n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
-            rows = pl.min(M_TILE, num_tokens - t0)
-            value = pl.slice(accumulated, [M_TILE, N_TILE], [t0, n0], valid_shape=[rows, N_TILE])
-            output[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.cast(value, pl.BF16, mode="rint")
-        return output
-
-    return prefill_grouped_output
+    validate_bf16_projection(
+        device=args.device, compile_only=args.compile_only, platform=args.platform, sim=args.sim
+    )

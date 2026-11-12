@@ -9,7 +9,7 @@
 """Concrete PrivateUse1 registration for full-head ordinary BF16 paged SWA."""
 
 from .scheduler_utils import require
-from .swa_scheduler import HEAD_DIM, HEADS, PAGE_ROWS, from_controls
+from .swa_scheduler import HEADS, HEAD_DIM, PAGE_ROWS, from_controls
 
 NAMESPACE = 'pypto_dsv41_swa_bf16_v1'
 QUALIFIED = NAMESPACE + '::attention'

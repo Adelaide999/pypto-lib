@@ -9,11 +9,11 @@
 """A2 index-query projection, quantization and sparse-index controls."""
 
 import pypto.language as pl
-
-from .linear_primitives import N_TILE, make_dequantize, make_dot, make_pack_weight, make_quantize
-from .norm_rope import make_adjacent_rope as make_rope
+from .gemm import N_TILE, make_blocked_weight_pack as make_pack_weight, make_dot
+from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY
 from .qkv_proj_rope import make_bf16_projection_staged
-from .indexer_select import KEY_CAPACITY
+from .quant import make_dequantize, make_quantize
+from .rope import make_adjacent_rope as make_rope
 
 
 # Model configuration.
@@ -322,9 +322,9 @@ def make_shared_index_publish(capacity, shared_rows=8192):
 
 def make_physical_index_query_entries(capacity, config, cache_blocks, requests, table_pages, compress_ratio=2):
     """Build index query, quantization, paged scoring and selection publication entries."""
-    from .ecotech_linear import make_ecotech_dynamic_linear
-    from .indexer_select import make_indexer_select
-    from .norm_rope import make_adjacent_rope as make_rope
+    from .gemm import make_ecotech_dynamic_linear
+    from .indexer import make_prefill_indexer_select as make_indexer_select
+    from .rope import make_adjacent_rope as make_rope
     from .qkv_proj_rope import make_bf16_projection_staged
 
     return dict(

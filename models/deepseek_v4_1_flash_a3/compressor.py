@@ -10,18 +10,12 @@
 
 import pypto.language as pl
 from .config import FLASH as M
+from .gemm import VEC_M_TILE
 from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN
-
-from .linear_primitives import make_quantize
-from .linear_primitives import make_decode_quantize as decode_make_quantize
-from .linear_primitives import VEC_M_TILE
-from .rmsnorm import make_blocked_rmsnorm as make_norm
-from .norm_rope import make_adjacent_rope as make_rope
-from .qkv_w8a8 import make_qkv_w8a8_inline
-from .qkv_proj_rope import make_bf16_projection_staged
-from .linear_primitives import make_decode_norm as decode_make_norm, make_decode_rope as decode_make_rope
-from .decode_qkv_w8a8 import make_qkv_w8a8_inline as decode_make_qkv_w8a8_inline
-from .decode_qkv_proj_rope import make_bf16_projection_staged as decode_make_bf16_projection_staged
+from .qkv_proj_rope import make_bf16_projection_staged, make_decode_bf16_projection_staged as decode_make_bf16_projection_staged, make_decode_qkv_w8a8_inline as decode_make_qkv_w8a8_inline, make_qkv_w8a8_inline
+from .quant import make_decode_quantize as decode_make_quantize, make_quantize
+from .rmsnorm import make_blocked_rmsnorm as make_norm, make_decode_blocked_rmsnorm as decode_make_norm
+from .rope import make_adjacent_rope as make_rope, make_decode_adjacent_rope as decode_make_rope
 
 
 STATE_WIDTH = 2 * M.head_dim

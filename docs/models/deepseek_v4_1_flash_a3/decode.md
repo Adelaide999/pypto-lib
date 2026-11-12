@@ -14,10 +14,10 @@ acceptance or an automatic Prefill-to-Decode state handoff.
 | Complete SWA / Engram / C2A / C1A blocks | `decode_swa.py`, `decode_engram.py`, `decode_c2a.py`, `decode_c1a.py` |
 | EP2 product orchestration | `decode_moe.py` |
 | Routing, dispatch layout and shared-expert variants | `moe.py` |
-| Routed expert kernels | `expert_routed.py`, `decode_expert_routed.py` |
-| Shared model, dtype, Engram and compressor contracts | `config.py`, `operator_config.py`, `engram.py`, `compressor_core.py` |
-| Decode-specific numerical/cache boundaries | `decode_quant.py`, `decode_gemm.py`, `decode_hc.py`, `decode_swa_cache.py`, `decode_compressor_c1.py`, `decode_compressor_c2.py` |
-| HOST contract and no-device dependency scan | `decode_acceptance.py`, `decode_asset_contract.py`, `decode_gate.py` |
+| Routed expert kernels | `expert_routed.py` |
+| Shared model, dtype, Engram and compressor contracts | `config.py`, `operator_config.py`, `engram.py`, `compressor.py` |
+| Decode-specific numerical/cache boundaries | `quant.py`, `gemm.py`, `hc.py`, `swa.py`, `compressor.py` |
+| HOST contract and no-device dependency scan | `decode_acceptance.py`, `decode_contract.py`, `decode_gate.py` |
 
 The phase-specific implementations retain the exact existing quantization,
 rounding, cache and topology contracts. Shared MoE kernels use explicit
@@ -58,7 +58,7 @@ The independent vLLM-Ascend capture is described by
 and is not imported by the product path.
 
 Callers must supply the actual independent request, checkpoint, history cache
-and reference capture required by `decode_asset_contract.py`. The package
+and reference capture required by `decode_contract.py`. The package
 contains no private capture runner or device queue. Metadata, compile-only
 results and the representative historical reports below do not complete the
 formal acceptance matrix.
@@ -72,15 +72,15 @@ captured Engram rows.
 ## Independent Decode acceptance
 
 The Decode session starts with every formal gate at `not_run`. Search K=2 is
-registered in [`decode_candidates.py`](../../../models/deepseek_v4_1_flash_a3/decode_candidates.py);
+registered in [`decode_contract.py`](../../../models/deepseek_v4_1_flash_a3/decode_contract.py);
 both candidates use PyPTO entry points and share the same page size, scale
 contract, input boundary, topology and tolerance. The acceptance contract and
-product dependency scan are executable without importing a model kernel:
+product dependency scan do not initialize devices or execute model kernels:
 The four-commit ancestry and tree IDs are recorded in
 [`decode_cherry_pick_receipt.json`](../../../models/deepseek_v4_1_flash_a3/decode_cherry_pick_receipt.json).
 The generated `git cherry-pick -x` proof is kept in a temporary clean clone;
 the product checkout still retains the requested source commit IDs unchanged.
-[`decode_shape_contract.py`](../../../models/deepseek_v4_1_flash_a3/decode_shape_contract.py)
+[`decode_contract.py`](../../../models/deepseek_v4_1_flash_a3/decode_contract.py)
 records the global dimensions, the TP1/TP2/TP4 matrix, EP2 expert ownership,
 the replicated single KV head, page layout, and dispatch/combine contract.
 `decode_config.py` records the constructed-runtime fields for sequence
@@ -153,7 +153,7 @@ Compile the bounded Decode ABI without allocating a device:
 ```bash
 PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_fwd -p a2a3 --sim --compile-only
 PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_moe_compile
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_layer_l0_compile
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_layer
 ```
 
 Compile the deterministic single-context state replay for each supported step

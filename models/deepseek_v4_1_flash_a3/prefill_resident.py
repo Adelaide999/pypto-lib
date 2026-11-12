@@ -8,11 +8,10 @@
 # -----------------------------------------------------------------------------------------------------------
 """Retain A3 workers, typed device allocations and HCCL groups across a complete generation."""
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
-import os
 from time import perf_counter
-
 import torch
 
 

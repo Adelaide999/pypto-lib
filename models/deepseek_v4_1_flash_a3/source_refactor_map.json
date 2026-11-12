@@ -5,31 +5,31 @@
     {
       "source": "ops.py",
       "definition": "make_cast_tile",
-      "target": "linear_primitives.py",
+      "target": "quant.py",
       "symbol": "make_cast_tile"
     },
     {
       "source": "ops.py",
       "definition": "make_quantize",
-      "target": "linear_primitives.py",
+      "target": "quant.py",
       "symbol": "make_quantize"
     },
     {
       "source": "ops.py",
       "definition": "make_pack_weight",
-      "target": "linear_primitives.py",
-      "symbol": "make_pack_weight"
+      "target": "gemm.py",
+      "symbol": "make_blocked_weight_pack"
     },
     {
       "source": "ops.py",
       "definition": "make_dot",
-      "target": "linear_primitives.py",
+      "target": "gemm.py",
       "symbol": "make_dot"
     },
     {
       "source": "ops.py",
       "definition": "make_dequantize",
-      "target": "linear_primitives.py",
+      "target": "quant.py",
       "symbol": "make_dequantize"
     },
     {
@@ -41,7 +41,7 @@
     {
       "source": "ops.py",
       "definition": "make_rope",
-      "target": "norm_rope.py",
+      "target": "rope.py",
       "symbol": "make_adjacent_rope"
     },
     {
@@ -61,7 +61,7 @@
     {
       "source": "staged.py",
       "definition": "make_grouped_wo_a",
-      "target": "output_proj.py",
+      "target": "o_proj.py",
       "symbol": "make_grouped_wo_a",
       "kind": "relocated"
     },
@@ -82,21 +82,21 @@
     {
       "source": "staged.py",
       "definition": "make_norm",
-      "target": "norm_rope.py",
+      "target": "rmsnorm.py",
       "symbol": "make_rmsnorm_entry",
       "kind": "relocated"
     },
     {
       "source": "staged.py",
       "definition": "make_rope_kernel",
-      "target": "norm_rope.py",
+      "target": "rope.py",
       "symbol": "make_rope_kernel",
       "kind": "relocated"
     },
     {
       "source": "staged.py",
       "definition": "make_swa",
-      "target": "swa_attention.py",
+      "target": "swa.py",
       "symbol": "make_swa_entry",
       "kind": "relocated"
     },

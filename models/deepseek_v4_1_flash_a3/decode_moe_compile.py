@@ -17,7 +17,6 @@ accuracy.
 """
 
 from __future__ import annotations
-
 import argparse
 import json
 import sys
@@ -25,20 +24,11 @@ from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
+    __package__ = "models.deepseek_v4_1_flash_a3"
 import torch
-from pypto.ir import DistributedConfig
 from golden import normalize_config
-
-from .decode_moe import (
-    D,
-    EP_SIZE,
-    MOE_INTER,
-    N_EXPERTS,
-    N_LOCAL_EXPERTS,
-    T,
-    decode_ep2,
-)
+from pypto.ir import DistributedConfig
+from .decode_moe import D, EP_SIZE, MOE_INTER, N_EXPERTS, N_LOCAL_EXPERTS, T, decode_ep2
 
 
 def _dummy_args() -> list[torch.Tensor | int]:

@@ -33,12 +33,11 @@ Full-network acceptance is not inferred from those independent-layer results.
 
 `ops.py` and `staged.py` were split by computation responsibility. Function
 bodies, arithmetic ordering, dtypes, quantization and rounding semantics remain
-unchanged. The distinct implementations are intentional: `linear_primitives`
-owns blocked INT8 quantization/packing/dequantization, while `gemm` owns direct
-and BF16/FP32 linear entries. `rmsnorm.make_blocked_rmsnorm` and
-`norm_rope.make_adjacent_rope` keep the former blocked semantics separately
-from the existing norm/RoPE contracts. `output_proj`, `activation`, `indexer`
-and `swa_attention` own the remaining staged computations. Pure direct-linear
+unchanged. Blocked INT8 quantization/dequantization now belongs to `quant`,
+and weight packing and linear computation to `gemm`.
+`rmsnorm.make_blocked_rmsnorm` and `rope.make_adjacent_rope` retain their
+distinct blocked semantics. `o_proj`, `activation`, `indexer` and `swa`
+own the remaining staged computations. Pure direct-linear
 forwarding now resolves directly to `gemm.make_int8_linear_direct`.
 
 The active compression kernels now belong to `compressor.py`; grouped

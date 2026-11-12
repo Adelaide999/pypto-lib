@@ -15,34 +15,9 @@ operations in this product entry.
 """
 
 from __future__ import annotations
-
 import pypto.language as pl
 import pypto.language.distributed as pld
-
-from .decode_swa import (
-    AUX_PAD,
-    ATTENTION,
-    CHANNELS,
-    COUNT_PAD,
-    D,
-    EP_SIZE,
-    EP2_RANK,
-    FFN_POST,
-    FFN_PRE,
-    HC,
-    HIDDEN,
-    LATENT,
-    LANE_ROWS,
-    MOE_INTER,
-    N_EXPERTS,
-    N_LOCAL_EXPERTS,
-    O_RANK,
-    ROPE_PAIRS,
-    T,
-    TOPK,
-    WIDTH,
-    WINDOW,
-)
+from .decode_swa import ATTENTION, AUX_PAD, CHANNELS, COUNT_PAD, DECODE_D as D, EP2_RANK, EP_SIZE, FFN_POST, FFN_PRE, HC, HIDDEN, LANE_ROWS, LATENT, MOE_INTER, N_EXPERTS, N_LOCAL_EXPERTS, O_RANK, ROPE_PAIRS, T, TOPK, WIDTH, WINDOW
 from .engram import COLS, K as ENGRAM_K, N as ENGRAM_N, ROW_WIDTH, make_gate
 from .rmsnorm import NORM_T_TILE, rms_norm_tiled_with_fp32
 

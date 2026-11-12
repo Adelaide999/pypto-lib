@@ -11,36 +11,20 @@
 """Continuous A2/A3 SWA Decode state replay."""
 
 from __future__ import annotations
-
 import argparse
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    import torch
+from typing import Any, TYPE_CHECKING
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
+    __package__ = "models.deepseek_v4_1_flash_a3"
 import pypto.language as pl
-
-from .decode_fwd import (
-    BLOCK_SIZE,
-    CACHE_BLOCKS,
-    CAPACITY,
-    GROUPED_WIDTH,
-    HEAD_DIM,
-    HIDDEN,
-    LATENT,
-    ROPE_PAIRS,
-    WIDTH,
-    WINDOW,
-    decode_step_reference,
-    make_decode_step,
-    validate_decode_state,
-)
 from .config import FLASH
+from .decode_fwd import BLOCK_SIZE, CACHE_BLOCKS, CAPACITY, GROUPED_WIDTH, HEAD_DIM, HIDDEN, LATENT, ROPE_PAIRS, WIDTH, WINDOW, decode_step_reference, make_decode_step, validate_decode_state
+
+if TYPE_CHECKING:
+    import torch
 
 
 def make_decode_replay(steps: int, capacity: int = CAPACITY):

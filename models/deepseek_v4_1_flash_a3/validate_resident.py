@@ -12,9 +12,7 @@ import ctypes
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
-
 import torch
-
 from .prefill_resident import ResidentNetworkRuntime
 
 
@@ -161,7 +159,7 @@ def check_lifecycle():
 
 
 def check_weight_bank():
-    from . import prefill_resident_weights as module
+    from . import weights as module
 
     suffixes = ('hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'ffn_norm.weight',
                 'ffn.gate.weight', 'ffn.gate.bias', 'ffn.gate.bias_vl',

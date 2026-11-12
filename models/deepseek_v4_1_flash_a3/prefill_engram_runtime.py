@@ -10,12 +10,9 @@
 
 from contextlib import ExitStack
 from pathlib import Path
-
 import torch
-
-from .engram_host import lookup_columns
-from .engram_storage import SharedEngramArray
 from .engram import make_prefill_engram_entries
+from .engram_host import SharedEngramArray, lookup_columns
 from .runtime_utils import Executable, file_sha
 
 
@@ -51,7 +48,7 @@ def engram_owner(contract, layer_id, role=None):
         ):
             raise ValueError("Require the actual physical Engram owner in the original hash layout")
     else:
-        from .prefill_layer_state import resolve_layer_role
+        from .cache import resolve_layer_role
 
         role = resolve_layer_role(layer_id, role)
         if role["engram_slot"] is None or layer_id not in layer_ids:

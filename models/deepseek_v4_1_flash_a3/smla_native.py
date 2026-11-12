@@ -9,7 +9,7 @@
 """Full64 head BF16 ratio1 paged SMLA with its own fresh metadata."""
 
 from .scheduler_utils import require
-from .smla_scheduler import HEAD_DIM, HEADS, PAGE_ROWS, TOPK, from_controls
+from .smla_scheduler import HEADS, HEAD_DIM, PAGE_ROWS, TOPK, from_controls
 
 NAMESPACE = 'pypto_dsv41_ratio1_smla_bf16_v1'
 QUALIFIED = NAMESPACE + '::attention'

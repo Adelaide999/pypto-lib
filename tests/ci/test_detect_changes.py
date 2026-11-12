@@ -125,7 +125,7 @@ def test_manual_driver_is_excluded_but_remains_in_the_dependency_graph(source_tr
 
 def test_a3_embedding_entry_has_a2a3_platform_ownership(monkeypatch):
     monkeypatch.chdir(REPO)
-    entry = "models/deepseek_v4_1_flash_a3/prefill_embedding.py"
+    entry = "models/deepseek_v4_1_flash_a3/input_pack.py"
     assert detect.platforms_for(entry) == ["a2a3"]
     assert entry in detect.select_runnable([entry], "a2a3")
     assert detect.select_runnable([entry], "a5") == []

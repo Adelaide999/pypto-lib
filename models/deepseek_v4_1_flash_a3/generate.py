@@ -9,22 +9,20 @@
 """Feed actual greedy output tokens through persistent complete-network Prefill chunks."""
 
 import argparse
-from datetime import datetime, timezone
 import json
 import math
 import os
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
-import traceback
-
 import torch
 from tokenizers import Tokenizer
 from torch.utils._python_dispatch import _disable_current_modes
-
 from .prefill_fwd import prefill_fwd
-from .prefill_network_guard import build_state_regions
 from .prefill_prepare import build_chunk_metadata, reserve_cache_layouts
 from .runtime_utils import file_sha, write_json
+from .state import build_state_regions
 
 
 TOPOLOGY = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
@@ -169,7 +167,7 @@ def main():
         history, current = [], list(prompt["input_token_ids"])
         chunk = builder.chunk(0, current, history, None)
         if args.check_only:
-            from .prefill_network_runtime import prepare_network_provider
+            from .prefill_fwd import prepare_network_provider
 
             provider = prepare_network_provider(dict(chunk["inputs"], **chunk["cache"]), chunk["contract"],
                                                 "generation-readiness", geometry_only=True)
