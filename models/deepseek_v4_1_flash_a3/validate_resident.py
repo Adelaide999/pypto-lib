@@ -10,8 +10,6 @@
 
 import ctypes
 import json
-from contextlib import nullcontext
-import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -223,62 +221,6 @@ def check_weight_bank():
                 operands='small synthetic lifecycle fixtures, not numerical evidence')
 
 
-def check_mapped_lifetime():
-    """Check worker reuse without extending either Engram host-registration lifetime."""
-    created = []
-
-    class LookupWorker:
-        def __init__(self):
-            self.initializations, self.finalizations, self.handles = 0, 0, []
-            created.append(self)
-
-        def init(self, *args):
-            self.initializations += 1
-
-        def register_callable(self, compiled):
-            handle = object()
-            self.handles.append(handle)
-            return handle
-
-        def unregister_callable(self, handle):
-            self.handles.remove(handle)
-
-        def finalize(self):
-            self.finalizations += 1
-            require(not self.handles, "Lookup worker finalized before its registrations retired")
-
-    class Array:
-        def __init__(self):
-            self.live = set()
-
-        def register(self, memory, rank):
-            self.live.add(rank)
-            return 16
-
-        def unregister(self, memory, rank):
-            self.live.discard(rank)
-
-    modules = {
-        'simpler.task_interface': SimpleNamespace(ChipWorker=LookupWorker),
-        'simpler_setup.runtime_builder': SimpleNamespace(RuntimeBuilder=lambda arch: SimpleNamespace(get_binaries=lambda name: None)),
-    }
-    memory = SimpleNamespace(interval=lambda *args: nullcontext(), select=lambda rank: None)
-    entry = SimpleNamespace(compiled=SimpleNamespace(runtime_name='test', chip_callable=object()))
-    arrays = [Array() for _ in range(4)]
-    with patch.dict(sys.modules, modules):
-        with ResidentNetworkRuntime([0, 1], dict(dp=1, tp=2, ep=2), worker_factory=HostWorker) as runtime:
-            for _ in range(2):
-                for slot in range(2):
-                    codes, scales = arrays[slot * 2:slot * 2 + 2]
-                    with runtime.mapped_lookup(entry, codes, scales, 0, memory):
-                        require(codes.live == scales.live == {0}, "Engram ranges were not registered")
-                    require(not codes.live and not scales.live, "Engram registration leaked into the next slot/token")
-            require(len(created) == 1 and created[0].initializations == 1, "Lookup workers were recreated per slot/token")
-            require(created[0].finalizations == 0, "A borrowed lookup worker was finalized per call")
-    require(created[0].finalizations == 1, "Generation did not finalize the shared lookup worker exactly once")
-    return dict(lookup_worker='reused across 2 slots and 2 tokens', registrations='retired after every lookup')
-
-
 def check_hccl_cleanup():
     from . import moe_transport as transport
 
@@ -325,7 +267,7 @@ def check_hccl_cleanup():
 
 def main():
     print(json.dumps(dict(lifecycle=check_lifecycle(), weight_bank=check_weight_bank(),
-                          mapped_lookup=check_mapped_lifetime(), hccl_cleanup=check_hccl_cleanup(),
+                          hccl_cleanup=check_hccl_cleanup(),
                           device_initialization='not_run', NPU_numerics='not_run', performance='not_measured')))
 
 

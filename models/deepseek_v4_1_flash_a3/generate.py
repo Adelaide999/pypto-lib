@@ -193,6 +193,10 @@ def main():
         report.update(task_id=submission["task_id"], lease=str(lease_path), lease_at_start=lease,
                       actual_devices=devices, logical_rank_mapping=list(range(16)), status="executing")
 
+        from .engram_host import HostEngram
+
+        host = HostEngram(args.checkpoint, chunk["cache"]["engram_contracts"], args.output.name)
+
         def feedback():
             nonlocal chunk, current, history
             for epoch in range(256):
@@ -240,11 +244,16 @@ def main():
                 history += current
                 current = [token]
                 chunk = builder.chunk(epoch + 1, current, history, chunk["contract"]["input_contract_sha256"])
+                chunk["inputs"]["engram_lookup"] = host.lookup(chunk["inputs"], cache=chunk["cache"], config=chunk["contract"])
                 yield {name: chunk[name] for name in ("inputs", "contract", "metadata_sources")}
 
-        result = prefill_fwd(chunk["inputs"], weights=args.checkpoint, cache=chunk["cache"],
-            config=chunk["contract"], devices=devices, output=args.output / "network",
-            continuation=feedback(), diagnostics=False, progress=publish)
+        try:
+            chunk["inputs"]["engram_lookup"] = host.lookup(chunk["inputs"], cache=chunk["cache"], config=chunk["contract"])
+            result = prefill_fwd(chunk["inputs"], weights=args.checkpoint, cache=chunk["cache"],
+                config=chunk["contract"], devices=devices, output=args.output / "network",
+                continuation=feedback(), diagnostics=False, progress=publish)
+        finally:
+            host.close()
         report["compilation"] = result["compilation"]
         report["resident_runtime"] = result["resident_runtime"]
         publish(dict(stage="generation_terminal", exit_code=0))

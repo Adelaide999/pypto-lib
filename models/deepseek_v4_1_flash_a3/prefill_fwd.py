@@ -63,7 +63,7 @@ def _merge_inputs(inputs, cache):
 
 
 def prefill_fwd(inputs, *, weights, cache, config, devices, output, compiled=None,
-                continuation=None, diagnostics=False, progress=None):
+                continuation=None, diagnostics=False, progress=None, engram_lookup=None):
     """Execute the existing network using explicit checkpoint and cache-state providers.
 
     ``inputs`` accepts raw completion text, 1..2048 token IDs, or prepared
@@ -75,30 +75,43 @@ def prefill_fwd(inputs, *, weights, cache, config, devices, output, compiled=Non
     Engram contracts. No historical task release or layer receipt is required.
     ``continuation`` accepts one prepared chunk or a lazy iterable of chunks;
     each chunk follows the preceding input's hash and next epoch.
+    ``engram_lookup`` contains host-gathered BF16 rows for both slots.
+    Each prepared continuation supplies its own rows in inputs["engram_lookup"].
+    The forward performs only device projection/gating on these ready rows.
     Ordinary execution preloads all compute weights and retains workers,
     caches and communication groups until the complete stream ends.
     Diagnostics retain the streaming checkpoint path for independent capture.
     """
     from .runtime_config import configure_devices
 
-    configure_devices(devices, world=config["topology"]["ep"])
-    if isinstance(inputs, (str, list, tuple)):
-        from .prefill_prepare import prepare_token_chunks
+    chunks = None
+    try:
+        configure_devices(devices, world=config["topology"]["ep"])
+        if isinstance(inputs, (str, list, tuple)):
+            from .prefill_prepare import prepare_token_chunks
 
-        if continuation is not None or Path(output).exists():
-            raise ValueError("Automatic Prefill needs a new output directory and owns its continuation stream")
-        chunks = prepare_token_chunks(inputs, checkpoint=weights, cache=cache, config=config,
-            output=Path(output) / "prepared", chunk_size=config.get("chunk_size", 16), dp_rank=config.get("dp_rank", 0))
-        first = next(chunks)
-        inputs, cache, config = first["inputs"], first["cache"], first["contract"]
-        output, continuation = Path(output) / "network", chunks
-    from .prefill_network_runtime import run_network_runtime
+            if continuation is not None or Path(output).exists():
+                raise ValueError("Automatic Prefill needs a new output directory and owns its continuation stream")
+            chunks = prepare_token_chunks(inputs, checkpoint=weights, cache=cache, config=config,
+                output=Path(output) / "prepared", chunk_size=config.get("chunk_size", 16), dp_rank=config.get("dp_rank", 0),
+                prepare_engram=True)
+            first = next(chunks)
+            inputs, cache, config = first["inputs"], first["cache"], first["contract"]
+            output, continuation = Path(output) / "network", chunks
+        from .prefill_network_runtime import run_network_runtime
 
-    return run_network_runtime(
-        _merge_inputs(inputs, cache), contract=config, checkpoint=weights,
-        devices=devices, output=output, compiled=compiled, continuation=continuation,
-        diagnostics=diagnostics, progress=progress,
-    )
+        if engram_lookup is not None:
+            if "engram_lookup" in inputs:
+                raise ValueError("Pass host Engram rows once, as an argument or prepared input field")
+            inputs = dict(inputs, engram_lookup=engram_lookup)
+        return run_network_runtime(
+            _merge_inputs(inputs, cache), contract=config, checkpoint=weights,
+            devices=devices, output=output, compiled=compiled, continuation=continuation,
+            diagnostics=diagnostics, progress=progress,
+        )
+    finally:
+        if chunks is not None:
+            chunks.close()
 
 
 # Preserve the published entry name for callers of the original package API.
@@ -221,8 +234,26 @@ def main():
         print(json.dumps(program.summary()))
         return
     continuation = load_continuations(settings["continuations"]) if settings.get("continuations") else None
-    result = prefill_fwd(inputs, weights=settings["checkpoint"], cache=cache, config=contract,
-                         devices=settings["devices"], output=settings["output"], continuation=continuation)
+    if isinstance(inputs, dict):
+        from .engram_host import HostEngram
+
+        with HostEngram(settings["checkpoint"], cache["engram_contracts"], settings["output"].name) as host:
+            ready = host.lookup(inputs, cache=cache, config=contract)
+            source_chunks = continuation
+
+            def prepared_continuations():
+                for chunk in source_chunks:
+                    payloads = [torch.load(row["path"], map_location="cpu", weights_only=True)
+                                for row in chunk["metadata_sources"]]
+                    ready = host.lookup(chunk["inputs"], cache=dict(cache, cache_ABI=payloads), config=chunk["contract"])
+                    yield dict(chunk, inputs=dict(chunk["inputs"], engram_lookup=ready))
+
+            result = prefill_fwd(inputs, weights=settings["checkpoint"], cache=cache, config=contract,
+                devices=settings["devices"], output=settings["output"], engram_lookup=ready,
+                continuation=prepared_continuations() if source_chunks is not None else None)
+    else:
+        result = prefill_fwd(inputs, weights=settings["checkpoint"], cache=cache, config=contract,
+                             devices=settings["devices"], output=settings["output"])
     print(json.dumps(dict(completed_layers=result["completed_layers"], final_output_files=result["final_output_files"],
                           numerical_acceptance=result["formal_accuracy"])))
 

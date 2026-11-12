@@ -9,126 +9,14 @@
 """Run complete shared-host Engram lookup and compose its physical Prefill observations."""
 
 from contextlib import ExitStack
-import ctypes
 from pathlib import Path
 
 import torch
 
+from .engram_host import lookup_columns
 from .engram_storage import SharedEngramArray
-from .moe_transport import _check
 from .prefill_engram import make_prefill_engram_entries
 from .runtime_utils import Executable, file_sha
-
-
-class MappedLookup:
-    """Own public ChipWorker calls, resolved descriptors and registered host storage."""
-
-    def __init__(self, executable, codes, scales, rank, memory, *, worker=None):
-        from simpler.task_interface import ChipWorker
-
-        self.executable, self.codes, self.scales = executable, codes, scales
-        self.rank, self.memory = rank, memory
-        self.owns_worker = worker is None
-        self.worker = ChipWorker() if worker is None else worker
-        self.buffers = []
-        self.handle = None
-        self.arguments = None
-        self.run_pending = False
-
-    def __enter__(self):
-        from simpler_setup.runtime_builder import RuntimeBuilder
-
-        try:
-            with self.memory.interval(self.rank, "load", "engram_lookup/init"):
-                compiled = self.executable.compiled
-                bins = RuntimeBuilder("a2a3").get_binaries(compiled.runtime_name)
-                if self.owns_worker:
-                    self.worker.init(self.rank, bins)
-                self.handle = self.worker.register_callable(compiled.chip_callable)
-                self.code_address = self.codes.register(self.memory, self.rank)
-                self.scale_address = self.scales.register(self.memory, self.rank)
-            return self
-        except BaseException as error:
-            self.__exit__(type(error), error, error.__traceback__)
-            raise
-
-    def _device_copy(self, value):
-        pointer = ctypes.c_void_p()
-        count = value.numel() * value.element_size()
-        lib = self.memory.library
-        _check(lib.aclrtMalloc(ctypes.byref(pointer), count, 0), "aclrtMalloc/Engram")
-        self.buffers.append(pointer)
-        _check(lib.aclrtMemcpy(pointer, count, value.data_ptr(), count, 1), "aclrtMemcpy/Engram-H2D")
-        return pointer.value
-
-    def execute(self, ids, lookup, active, capture, report):
-        from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, DataType, TensorTransfer
-
-        self.memory.select(self.rank)
-        descriptors = ChipStorageTaskArgs()
-        with self.memory.interval(self.rank, "load", "engram_lookup/arguments"):
-            values = (
-                (self._device_copy(ids), ids.shape, DataType.INT32),
-                (self.code_address, self.codes.shape, DataType.INT8),
-                (self.scale_address, self.scales.shape, DataType.FLOAT32),
-                (self._device_copy(lookup), lookup.shape, DataType.BFLOAT16),
-            )
-            for address, shape, dtype in values:
-                tensor = ChipTensor.make(data=address, shapes=tuple(shape), dtype=dtype, child_memory=True)
-                descriptors.add_tensor(tensor, transfer=TensorTransfer.NONE)
-            descriptors.add_scalar(active)
-        self.memory.sample(self.rank, "engram_lookup/execute/before")
-        self.arguments = descriptors
-        self.run_pending = True
-        with self.memory.interval(self.rank, "execute", "engram_lookup"):
-            self.worker.run(self.handle, descriptors)
-        self.run_pending = False
-        count = lookup.numel() * lookup.element_size()
-        address = descriptors.tensor(3).data
-        arguments = [lookup.data_ptr(), count, address, count, 2]
-        _check(self.memory.library.aclrtMemcpy(*arguments), "aclrtMemcpy/Engram-D2H")
-        self.memory.sample(self.rank, "engram_lookup/execute/after")
-        arguments = [{"address": int(descriptors.tensor(i).data), "shape": list(descriptors.tensor(i).shapes),
-                      "dtype": str(descriptors.tensor(i).dtype), "transfer": str(descriptors.transfer(i))}
-                     for i in range(descriptors.tensor_count())]
-        arguments.append(active)
-        self.executable.record(arguments, dict(lookup=lookup), self.rank,
-                               ["engram_lookup"], capture, report)
-        self.arguments = None
-        while self.buffers:
-            _check(self.memory.library.aclrtFree(self.buffers[-1]), "aclrtFree/Engram-call")
-            self.buffers.pop()
-
-    def _retire_arguments(self):
-        """Retire registered host ranges and caller-owned argument allocations."""
-        self.memory.select(self.rank)
-        self.scales.unregister(self.memory, self.rank)
-        self.codes.unregister(self.memory, self.rank)
-        while self.buffers:
-            _check(self.memory.library.aclrtFree(self.buffers[-1]), "aclrtFree/Engram")
-            self.buffers.pop()
-
-    def __exit__(self, exc_type, exc, traceback):
-        if not self.run_pending:
-            try:
-                try:
-                    if self.handle is not None:
-                        self.worker.unregister_callable(self.handle)
-                        self.handle = None
-                finally:
-                    self._retire_arguments()
-            finally:
-                if self.owns_worker:
-                    self.worker.finalize()
-        else:
-            # A failed native run retains arguments through successful teardown.
-            self.worker.finalize()
-            self.handle = None
-            self.arguments = None
-            self.run_pending = False
-            # Owned-device teardown has already reclaimed caller device buffers.
-            self.buffers.clear()
-            self._retire_arguments()
 
 
 def load_rotation(checkpoint, hidden_size):
@@ -251,15 +139,14 @@ def run_prefill_engram(contract, raw, output, reports, memory, exchange, layer_i
             for rank in ranks:
                 reports[rank]["engram_storage"] = dict(codes=codes.receipt, scales=scales.receipt,
                                                        DP_sharing_ranks=ranks, rotation=rotation_receipt)
-                name = f"engram_lookup_{tp_rank}"
-                with MappedLookup(entries[name], codes, scales, rank, memory) as mapped:
-                    for case, state in states[rank].items():
-                        total = len(state["original"]["full_input_ids"])
-                        lookup = zeros(capacity, 6144 // tp)
-                        path = output / "captures" / f"rank-{rank}-{case}-{name}.pt"
-                        mapped.execute(state["hashes"][:, slot, :].contiguous(), lookup, total, path, reports[rank])
-                        packets[rank][case] = lookup
-                reports[rank]["engram_storage"]["unregistered"] = True
+                for case, state in states[rank].items():
+                    total = len(state["original"]["full_input_ids"])
+                    lookup = zeros(capacity, 6144 // tp)
+                    begin, end = shard["head_range"]
+                    ids = state["hashes"][:total, slot, begin:end]
+                    lookup[:total] = lookup_columns(codes, scales, ids).flatten(1)
+                    packets[rank][case] = lookup
+                reports[rank]["engram_storage"]["lookup"] = "host_INT8_FP32_group32_to_BF16"
         gathered = exchange("engram-column-gather", packets, "all_gather", "tp")
     for rank, records in enumerate(states):
         reports[rank]["engram_storage"]["closed_after_all_DP_peers"] = True

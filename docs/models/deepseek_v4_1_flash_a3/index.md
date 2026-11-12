@@ -57,7 +57,7 @@ The original source names in this manifest are intentional provenance.
 | Input embedding / HC and final output kernels | `prefill_embedding.py`, `prefill_network_input.py`, `prefill_output.py` |
 | SWA and C2/C1 attention | `prefill_swa.py`, `prefill_full2*.py`, `prefill_consumer*.py`, `prefill_ratio1.py` |
 | Persistent source/cache ownership | `prefill_network_state.py`, `prefill_network_cache.py`, `prefill_layer_state.py` |
-| Two Engram slots and singleton history | `prefill_network_engram.py`, `prefill_engram_runtime.py`, `engram_storage.py` |
+| Two Engram slots and singleton history | `engram_host.py`, `prefill_network_engram.py`, `prefill_engram_runtime.py`, `engram_storage.py` |
 | EP MoE and actual communication | `prefill_moe_ep.py`, `moe_dispatch.py`, `moe_transport.py` |
 | Shared primitives | `quant.py`, `ecotech_linear*.py`, `qkv*.py`, `hc.py`, `gemm.py` |
 
@@ -66,8 +66,8 @@ for existing callers. It explicitly accepts inputs,
 checkpoint weights, canonical cache state, numerical configuration, physical
 device IDs and a new output directory. It has no dependency on historical
 `formal_layer_receipts`, task releases, `TASK_DEVICE` or `DS41_JOB_ROOT`.
-The runtime forwards those IDs in `assigned_devices` to both HCCL workers and
-Engram preparation. Each uses the same explicit mapping in logical rank order;
+The runtime forwards those IDs in `assigned_devices` to HCCL and compute workers.
+They use the same explicit mapping in logical rank order;
 duplicate IDs, rank-count mismatches and conflicting existing
 `ASCEND_RT_VISIBLE_DEVICES` mappings are rejected before device initialization.
 Historical release and continuation admission can be checked separately with
@@ -190,6 +190,41 @@ match the actual allocated tensors. The JSON `contract` supplies `topology`,
 requires canonical cache-layout and Engram templates. The automatic entry below
 prepares request metadata and tokenizes raw text from these templates; a checkpoint
 and prompt alone do not define cache ownership or a generation scheduler.
+
+Engram table lookup runs on the host **before** the prepared forward call.
+`engram_host.py::HostEngram` owns the complete shared CPU INT8/FP32 tables,
+hashes the explicit request history, gathers selected entries and applies group32
+dequantization with BF16 rounding. Pass the resulting rows to `prefill_fwd`:
+
+```python
+from models.deepseek_v4_1_flash_a3.engram_host import HostEngram
+from models.deepseek_v4_1_flash_a3.prefill_fwd import prefill_fwd
+
+with HostEngram(checkpoint, cache_state["engram_contracts"], "generation") as host:
+    rows = host.lookup(inputs, cache=cache_state, config=network_contract)
+    result = prefill_fwd(
+        inputs, weights=checkpoint, cache=cache_state, config=network_contract,
+        devices=devices, output="build_output/ds41-host-rows", engram_lookup=rows,
+    )
+```
+
+Each continuation prepares fresh rows for its actual tokens and history, then
+supplies them as `chunk["inputs"]["engram_lookup"]`. The host owner can retain
+both tables across the entire stream; returned BF16 rows have independent storage.
+The CLI, automatic input preparation and `generate` caller perform this step.
+No Engram table is registered with CANN or passed as a device address. Forward
+kernels consume rank-local `[capacity, 6144]` BF16 rows for projection and gating;
+the forward also publishes the existing compressed slot history once per chunk.
+The A3 package currently has no `decode_fwd` entry: single-token feedback uses
+this same ready-row Prefill interface. A future Decode entry can consume the
+same host-prepared rows without moving the table into its graph.
+
+`python -m models.deepseek_v4_1_flash_a3.validate_engram_host` checks small real
+safetensors backings, exact group32 row values, chunk history, image masks,
+TP placement, empty DP replicas, teardown and forward admission on CPU.
+These checks do not establish complete-network NPU accuracy or token latency.
+Add `--compile-only` to compile the full-size projection and gate without a
+device, or pass `--device` with an allocated device ID for the bounded NPU check.
 
 Weights retain the existing streaming policy: one host layer and the real
 owned active experts are loaded as needed. Full weight residency is not added.
@@ -418,8 +453,10 @@ A5 MXFP8/MXFP4 operands or substitute its communication order.
   existing gather, all-to-all and BF16/FP32 sum semantics. They do not write
   transport packets to files or launch new transport processes.
 - Both full Engram tables retain their existing INT8/FP32 shared-host contract.
-  Their mappings and lookup workers persist across tokens. These are host
-  tables; compute-weight residency is not an all-model-HBM acceptance claim.
+  The input caller retains their CPU mappings across tokens and passes only
+  gathered BF16 rows into the forward. No Engram lookup worker or device table
+  registration is created. Compute-weight residency is not an all-model-HBM
+  acceptance claim.
 - Existing cache typed views bind to their complete owning byte allocation.
   Current host consumers still receive writable state readback. CPU metadata,
   active-expert selection and the layer scheduler remain on the host. Each

@@ -248,6 +248,9 @@ def check_chunk_continuation():
             observed = dict(completed=[], consumed=[], providers=[], weights=[], continuity=[], outputs=[], programs=[])
 
             class Provider:
+                def hash_batch(self):
+                    return {}
+
                 def __init__(self, *args, **kwargs):
                     class History(list):
                         caches = []
@@ -311,14 +314,14 @@ def check_chunk_continuation():
 
             def prepare_provider(inputs, contract, allocation_id, *, geometry_only=False):
                 if geometry_only:
-                    return SimpleNamespace(geometry_only=True)
+                    return SimpleNamespace(geometry_only=True, hash_batch=lambda: {})
                 provider = Provider()
                 provider.begin_chunk(epoch=0, token_map_id=contract["input_contract_sha256"])
                 return provider
 
-            def snapshot(provider, storage, *, diagnostics=True):
+            def snapshot(provider, *, diagnostics=True):
                 return dict(kv_owner=id(provider.kv), kv=provider.kv.hex(), history_owner=id(provider.history),
-                    history=list(provider.history), table_owner=id(storage), tables=list(storage or {}))
+                    history=list(provider.history))
 
             def run_chunk(inputs, **kwargs):
                 epoch, provider = kwargs["epoch"], kwargs["provider"]
@@ -327,11 +330,6 @@ def check_chunk_continuation():
                 require(kwargs["weights"] is observed["weights"][0], "Chunk replaced the weight provider")
                 require(kwargs["program"] is observed["programs"][0], "Chunk replaced the compiled program")
                 require(len(kwargs["program"].bindings) == epoch + 1, "Chunk skipped its compiled geometry check")
-                storage = kwargs["table_storage"]
-                if epoch and storage is not None:
-                    require("retained-engram" in storage, "Chunk lost the retained Engram table")
-                if storage is not None:
-                    storage["retained-engram"] = True
                 provider.kv.append(epoch)
                 provider.history.extend(inputs["input_contract"]["tokens"])
                 provider.finished = epoch
@@ -354,6 +352,7 @@ def check_chunk_continuation():
                 prepare_network_provider=prepare_provider, PrefillProgram=Program,
                 attach_network_cache_geometry=lambda provider: None, _network_owner_snapshot=snapshot,
                 _run_network_chunk=run_chunk, write_json=write_result,
+                validate_host_lookup=lambda *args: None,
                 torch=SimpleNamespace(load=lambda path, **kwargs: json.loads(Path(path).read_text())))
             exec(code, namespace)
             module = ModuleType(__package__ + ".prefill_network_runtime")
@@ -364,6 +363,8 @@ def check_chunk_continuation():
             resident_module.ResidentNetworkRuntime = Resident
             resident_weights = ModuleType(__package__ + ".prefill_resident_weights")
             resident_weights.ResidentNetworkWeights = Weights
+            for packet in packets:
+                packet["inputs"]["engram_lookup"] = {"host_prepared": True}
             cache = dict(cache_ABI=[], cache_ABI_sources=[],
                 engram_contracts={layer: dict(topology=topology, engram_shards=[0] * 4) for layer in (1, 14)})
             continuation = packets[1] if legacy else continuations()
@@ -372,10 +373,12 @@ def check_chunk_continuation():
             modules = {module.__name__: module, transport.__name__: transport,
                        resident_module.__name__: resident_module, resident_weights.__name__: resident_weights}
             try:
+                first_inputs = dict(packets[0]["inputs"])
+                ready_rows = first_inputs.pop("engram_lookup")
                 with patch.dict(os.environ, {}, clear=True), patch.dict(sys.modules, modules):
-                    result = prefill_fwd.run_prefill(packets[0]["inputs"], weights=checkpoint or "original-checkpoint",
+                    result = prefill_fwd.run_prefill(first_inputs, weights=checkpoint or "original-checkpoint",
                         cache=cache, config=packets[0]["contract"], devices=list(range(16)),
-                        output=directory / "output", continuation=continuation)
+                        output=directory / "output", continuation=continuation, engram_lookup=ready_rows)
                 expected = list(range(2 if legacy else count))
                 require(observed["completed"] == expected, "Chunk execution was skipped or duplicated")
                 require(result["epoch"] == expected[-1], "Result does not describe the last completed chunk")

@@ -18,7 +18,7 @@ if __package__ in (None, ""):
 import pypto.language as pl
 
 from .engram_ecotech import (
-    COLS, D, HC, K, N, WIDTH, make_resident_int8_lookup,
+    COLS, D, HC, K, N, WIDTH,
     make_original_basis_gate, make_original_basis_hidden,
 )
 from .qkv_proj_rope import make_bf16_projection_staged
@@ -204,17 +204,14 @@ def make_prefill_engram_gate(capacity, eps):
 
 
 def make_prefill_engram_entries(capacity, constants, config, shards, cache_rows, max_blocks, tp=4):
-    """Construct hash, complete-shard lookup, layout, projection and gate entries."""
+    """Construct bounded hash/layout diagnostics and ready-row projection/gate entries."""
     if tp not in (1, 2, 4) or len(shards) != tp or COLS % tp:
         raise ValueError("Require complete TP1/2/4 Engram column ownership")
     columns = COLS // tp
     entries = {}
     for rank, shard in enumerate(shards):
-        start, stop = shard["row_range"]
         if shard["head_range"] != [rank * columns, (rank + 1) * columns]:
             raise ValueError("Require contiguous whole-column Engram shards")
-        entry = make_resident_int8_lookup(capacity, stop - start, columns, rank * columns, start)
-        entries[f"engram_lookup_{rank}"] = entry
     image_id = config["image_token_id"]
     image_pad_id = config.get("image_pad_token_id", image_id + 1)
     hash_args = (capacity, len(constants["token_map"]), len(constants["layer_ids"]), cache_rows, max_blocks)

@@ -166,7 +166,7 @@ class PrefillProgram:
                     geometry["capacity"], contract["hash_constants"], config, contract["engram_shards"],
                     provider.history.cache_rows, max_blocks, topology["tp"],
                 )
-                self.bind(f"engram{layer}", definitions)
+                self.bind(f"engram{layer}", {name: definitions[name] for name in ("engram_projection", "engram_gate")})
             self.bind("output", make_network_l2_entries(
                 make_output_entries(geometry["capacity"], text, topology["tp"]), geometry["capacity"], "output"))
             self._signature = signature

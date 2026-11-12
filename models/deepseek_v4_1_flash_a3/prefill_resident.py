@@ -50,7 +50,7 @@ class ResidentNetworkRuntime:
         self.workers, self.pinned, self.channels = [], {}, {}
         self.device_owners = {}
         self.staging_workers = {}
-        self.lookup_workers, self.rotations = {}, {}
+        self.rotations = {}
         self._stack = ExitStack()
         self._closed = False
         self._select = lambda rank: None
@@ -83,7 +83,6 @@ class ResidentNetworkRuntime:
                 self._stack.callback(self._close_worker, rank, worker)
                 self.workers.append(worker)
                 self.stats["worker_initializations"] += 1
-            self.table_stack = self._stack.enter_context(ExitStack())
             self.stats["worker_initialization_seconds"] = perf_counter() - begin
         except BaseException:
             self.close()
@@ -108,7 +107,6 @@ class ResidentNetworkRuntime:
             self.pinned.clear()
             self.device_owners.clear()
             self.rotations.clear()
-            self.lookup_workers.clear()
             self.staging_workers.clear()
 
     def pin(self, value, ranks, *, readonly, name):
@@ -238,20 +236,6 @@ class ResidentNetworkRuntime:
         if group not in groups:
             raise ValueError("Unknown resident HCCL group: " + group)
         return groups[group]
-
-    def mapped_lookup(self, entry, codes, scales, rank, memory):
-        """Reuse lookup workers while retaining the original scoped host-registration lifetime."""
-        from simpler.task_interface import ChipWorker
-        from simpler_setup.runtime_builder import RuntimeBuilder
-
-        from .prefill_engram_runtime import MappedLookup
-
-        if rank not in self.lookup_workers:
-            worker = ChipWorker()
-            self._stack.callback(worker.finalize)
-            worker.init(rank, RuntimeBuilder("a2a3").get_binaries(entry.compiled.runtime_name))
-            self.lookup_workers[rank] = worker
-        return MappedLookup(entry, codes, scales, rank, memory, worker=self.lookup_workers[rank])
 
     def load_rotation(self, checkpoint, hidden_size):
         """Retain the validated checkpoint rotation for both slots and subsequent tokens."""

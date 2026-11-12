@@ -6,9 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Own complete shared INT8/FP32 checkpoint backings and same-process CANN mappings."""
+"""Own complete shared INT8/FP32 checkpoint backings for CPU row lookup."""
 
-import ctypes
 import hashlib
 import json
 import mmap
@@ -17,11 +16,7 @@ from pathlib import Path
 import struct
 import tempfile
 
-from .moe_transport import _bind, _check
-
-
-# CANN standard host registration flags.
-HOST_REGISTER_FLAGS = 0x10000002
+import torch
 
 # Host byte-copy chunk.
 COPY_TILE = 16 * 1024 * 1024
@@ -55,8 +50,8 @@ class SharedEngramArray:
         self.path = None
         self.mapping = None
         self.view = None
-        self.live = set()
-        self.host_pointer = 0
+        self.tensor = None
+        self.row_start = begin
         available = os.statvfs("/dev/shm")
         if self.byte_count > available.f_bavail * available.f_frsize:
             raise RuntimeError("Insufficient shared host capacity for complete Engram array")
@@ -87,7 +82,7 @@ class SharedEngramArray:
             actual_sha = digest.hexdigest()
             if actual_sha != expected_sha:
                 raise ValueError("Complete assigned Engram bytes differ from frozen checkpoint: " + name)
-            self.host_pointer = ctypes.addressof(ctypes.c_ubyte.from_buffer(self.mapping))
+            self.tensor = torch.frombuffer(self.mapping, dtype={"I8": torch.int8, "F32": torch.float32}[dtype]).reshape(self.shape)
             stat = self.path.stat()
             self.receipt = {"checkpoint_file": str(path), "tensor": name, "row_range": list(row_range),
                             "shape": list(self.shape), "dtype": dtype, "bytes": self.byte_count,
@@ -97,43 +92,19 @@ class SharedEngramArray:
             self.close()
             raise
 
-    def register(self, memory, rank):
-        """Register this full host range in the calling PID and current rank context."""
-        if rank in self.live or self.mapping is None:
-            raise RuntimeError("Engram mapping is already registered or closed")
-        memory.select(rank)
-        lib = memory.library
-        pointer, u64, u32 = ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32
-        register = _bind(lib, "aclrtHostRegisterV2", [pointer, u64, u32])
-        mapped = _bind(lib, "aclrtHostGetDevicePointer", [pointer, ctypes.POINTER(pointer), u32])
-        unregister = _bind(lib, "aclrtHostUnregister", [pointer])
-        host = pointer(self.host_pointer)
-        _check(register(host, self.byte_count, HOST_REGISTER_FLAGS), "aclrtHostRegisterV2/Engram")
-        self.live.add(rank)
-        device = pointer()
-        try:
-            _check(mapped(host, ctypes.byref(device), 0), "aclrtHostGetDevicePointer/Engram")
-            if not device.value:
-                raise RuntimeError("CANN returned an empty Engram mapped address")
-        except BaseException:
-            _check(unregister(host), "aclrtHostUnregister/partial-Engram")
-            self.live.remove(rank)
-            raise
-        return device.value
-
-    def unregister(self, memory, rank):
-        """Unregister only after the owning synchronous ChipWorker has retired."""
-        if rank not in self.live:
-            return
-        memory.select(rank)
-        function = _bind(memory.library, "aclrtHostUnregister", [ctypes.c_void_p])
-        _check(function(ctypes.c_void_p(self.host_pointer)), "aclrtHostUnregister/Engram")
-        self.live.remove(rank)
+    def gather(self, rows):
+        """Copy selected global rows; returned tensors do not alias the host mapping."""
+        if self.tensor is None or rows.device.type != "cpu" or rows.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Lookup requires an open host table and CPU integer row IDs")
+        local = rows.to(torch.int64) - self.row_start
+        valid = (local >= 0) & (local < self.shape[0])
+        result = torch.zeros((*rows.shape, self.shape[1]), dtype=self.tensor.dtype)
+        result[valid] = self.tensor[local[valid]]
+        return result
 
     def close(self):
-        """Release shared storage after every DP peer registration has closed."""
-        if self.live:
-            raise RuntimeError("Cannot close complete Engram storage with live rank mappings")
+        """Release CPU views and shared storage after the host lookup owner closes."""
+        self.tensor = None
         if self.view is not None:
             self.view.release()
             self.view = None
@@ -143,4 +114,3 @@ class SharedEngramArray:
         if self.path is not None:
             self.path.unlink(missing_ok=True)
             self.path = None
-        self.host_pointer = 0

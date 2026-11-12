@@ -125,7 +125,7 @@ def build_chunk_metadata(template, layout, allocations, *, tokens, context, tp_r
                 query_start_loc=starts, hash_constants=template["hash_constants"])
 
 
-def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_size=16, dp_rank=0):
+def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_size=16, dp_rank=0, prepare_engram=False):
     """Yield prepared chunks lazily while retaining a complete fixed page reservation."""
     topology = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
     if (config["topology"] != topology or type(chunk_size) is not int or not 1 <= chunk_size <= 16
@@ -141,39 +141,48 @@ def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_siz
                   ("config.json", "quant_model_weights.safetensors.index.json", "tokenizer.json")
                   if (checkpoint / name).is_file()}
     output.mkdir(parents=True, exist_ok=False)
-    predecessor = None
-    for epoch, begin in enumerate(range(0, len(tokens), chunk_size)):
-        directory = output / f"chunk-{epoch}"
-        directory.mkdir()
-        current = tokens[begin:begin + chunk_size]
-        request = dict(request_slot=0, token_ids=current, position_ids=list(range(begin, begin + len(current))),
-                       live_token_mask=[1] * len(current), initial_context_length=begin, history_tokens=tokens[:begin])
-        engines = [dict(dp_rank=rank, active=len(current) if rank == dp_rank else 0,
-                        requests=[request] if rank == dp_rank else []) for rank in range(4)]
-        actual_input = dict(topology=topology, checkpoint=str(checkpoint), checkpoint_sha256=identities,
-            epoch=epoch, predecessor_input_sha256=predecessor, DP_engines=engines)
-        input_path = directory / "input-contract.json"
-        write_json(input_path, actual_input)
-        identity = file_sha(input_path)
-        payloads, sources = [], []
-        for rank, template in enumerate(cache["cache_ABI"]):
-            payload = build_chunk_metadata(template, layouts[rank], allocations[rank], tokens=current, context=begin,
-                tp_rank=rank % 4, active=rank // 4 == dp_rank, reserved=reserved)
-            path = directory / f"rank-{rank}-metadata.pt"
-            torch.save(payload, path)
-            sources.append(dict(rank=rank, path=str(path), sha256=file_sha(path)))
-            payloads.append(payload)
-        regions = build_state_regions(payloads, identity)
-        region_path = directory / "state-regions.json"
-        write_json(region_path, regions)
-        contract = dict(config, checkpoint=str(checkpoint), input_contract_path=str(input_path),
-            input_contract_sha256=identity, state_regions=dict(path=str(region_path), sha256=file_sha(region_path)))
-        prepared_inputs = dict(input_contract=actual_input, prepare_input_stage=True)
-        prepared_cache = dict(cache, cache_ABI=payloads,
-            cache_ABI_sources=[dict(rank=row["rank"], payload_sha256=row["sha256"], report_sha256=row["sha256"])
-                               for row in sources])
-        yield dict(inputs=prepared_inputs, contract=contract, metadata_sources=sources, cache=prepared_cache)
-        predecessor = identity
+    from contextlib import ExitStack
+
+    from .engram_host import HostEngram
+
+    with ExitStack() as stack:
+        host = (stack.enter_context(HostEngram(checkpoint, cache["engram_contracts"], output.name))
+                if prepare_engram else None)
+        predecessor = None
+        for epoch, begin in enumerate(range(0, len(tokens), chunk_size)):
+            directory = output / f"chunk-{epoch}"
+            directory.mkdir()
+            current = tokens[begin:begin + chunk_size]
+            request = dict(request_slot=0, token_ids=current, position_ids=list(range(begin, begin + len(current))),
+                           live_token_mask=[1] * len(current), initial_context_length=begin, history_tokens=tokens[:begin])
+            engines = [dict(dp_rank=rank, active=len(current) if rank == dp_rank else 0,
+                            requests=[request] if rank == dp_rank else []) for rank in range(4)]
+            actual_input = dict(topology=topology, checkpoint=str(checkpoint), checkpoint_sha256=identities,
+                epoch=epoch, predecessor_input_sha256=predecessor, DP_engines=engines)
+            input_path = directory / "input-contract.json"
+            write_json(input_path, actual_input)
+            identity = file_sha(input_path)
+            payloads, sources = [], []
+            for rank, template in enumerate(cache["cache_ABI"]):
+                payload = build_chunk_metadata(template, layouts[rank], allocations[rank], tokens=current, context=begin,
+                    tp_rank=rank % 4, active=rank // 4 == dp_rank, reserved=reserved)
+                path = directory / f"rank-{rank}-metadata.pt"
+                torch.save(payload, path)
+                sources.append(dict(rank=rank, path=str(path), sha256=file_sha(path)))
+                payloads.append(payload)
+            regions = build_state_regions(payloads, identity)
+            region_path = directory / "state-regions.json"
+            write_json(region_path, regions)
+            contract = dict(config, checkpoint=str(checkpoint), input_contract_path=str(input_path),
+                input_contract_sha256=identity, state_regions=dict(path=str(region_path), sha256=file_sha(region_path)))
+            prepared_inputs = dict(input_contract=actual_input, prepare_input_stage=True)
+            prepared_cache = dict(cache, cache_ABI=payloads,
+                cache_ABI_sources=[dict(rank=row["rank"], payload_sha256=row["sha256"], report_sha256=row["sha256"])
+                                   for row in sources])
+            if host is not None:
+                prepared_inputs["engram_lookup"] = host.lookup(prepared_inputs, cache=prepared_cache, config=contract)
+            yield dict(inputs=prepared_inputs, contract=contract, metadata_sources=sources, cache=prepared_cache)
+            predecessor = identity
 
 
 def validate_host():

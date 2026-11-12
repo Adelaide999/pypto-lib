@@ -24,7 +24,7 @@ from .prefill_layer import run_prefill_network_inmemory
 from .prefill_layer_state import resolve_layer_role
 from .prefill_l2 import execute_region
 from .prefill_network_cache import attach_network_cache_geometry
-from .prefill_network_engram import prepare_network_engram
+from .prefill_network_engram import prepare_network_engram, validate_host_lookup
 from .prefill_network_discrete_observer import (
     begin_product_observation, end_product_observation, product_engram_observation,
 )
@@ -508,9 +508,9 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
     return dict(files=files, logits=actual_logits)
 
 
-def _network_owner_snapshot(provider, storage, *, diagnostics=True):
+def _network_owner_snapshot(provider, *, diagnostics=True):
     """Bind persistent allocation identities, with optional diagnostic byte hashes."""
-    result = {"provider": id(provider), "history": id(provider.history), "arrays": {}, "tables": {}}
+    result = {"provider": id(provider), "history": id(provider.history), "arrays": {}}
     for family, values in (("raw", provider.arenas), ("shared", provider.shared), ("history", provider.history.caches)):
         for rank, cases in enumerate(values):
             for case, tensors in cases.items():
@@ -522,11 +522,6 @@ def _network_owner_snapshot(provider, storage, *, diagnostics=True):
                     if diagnostics:
                         record["sha256"] = tensor_sha(value)
                     result["arrays"][key] = record
-    for key, record in storage.items():
-        value = record["array"]
-        if value.mapping is None or value.live:
-            raise ValueError("Retained Engram table must be open with valid registration ownership")
-        result["tables"][str(key)] = dict(object_id=id(value), receipt=dict(value.receipt), host_pointer=value.host_pointer)
     return result
 
 
@@ -569,6 +564,8 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
     Each item supplies inputs, its contract and every rank's metadata sources.
     The iterable advances only after the preceding complete chunk returns.
     """
+    if "engram_lookup" not in inputs:
+        raise ValueError("Prepare Engram rows on the host before calling the forward")
     if continuation is None:
         following_chunks = iter(())
     elif isinstance(continuation, Mapping):
@@ -595,6 +592,7 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
     if progress is not None:
         progress(dict(stage="compiling_network", epoch=0))
     provider = prepare_network_provider(inputs, contract, output.name, geometry_only=True)
+    validate_host_lookup(inputs["engram_lookup"], inputs["engram_contracts"][1], provider.hash_batch())
     program = compiled if compiled is not None else PrefillProgram(output / "compiled")
     if compiled is not None and not compiled.ready:
         raise ValueError("The supplied Prefill program is incomplete")
@@ -613,8 +611,7 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
             weights = ResidentNetworkWeights(contract["checkpoint"], topology, contract["model_config"], resident)
             stack.callback(weights.close)
             weights.preload(progress)
-            for family, values in (("raw", provider.arenas), ("shared", provider.shared),
-                                   ("history", provider.history.caches)):
+            for family, values in (("raw", provider.arenas), ("shared", provider.shared)):
                 for rank, cases in enumerate(values):
                     for case, tensors in cases.items():
                         items = tensors.items() if isinstance(tensors, dict) else (("history", tensors),)
@@ -622,12 +619,10 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
                             resident.pin(value, [rank], readonly=False, name=f"{family}/{rank}/{case}/{name}")
         memory = CANNMemory(diagnostics=diagnostics)
         ownership = [weights.layout.ownership(rank) for rank in range(16)]
-        table_storage = {} if continuation is not None or resident is not None else None
-        table_stack = resident.table_stack if resident is not None else (stack if continuation is not None else None)
         first = _run_network_chunk(inputs, contract=contract, output=output, provider=provider,
             weights=weights, memory=memory, ownership=ownership, assigned=assigned,
-            engram_contracts=inputs["engram_contracts"], program=program, epoch=0, table_storage=table_storage,
-            table_stack=table_stack, diagnostics=diagnostics, progress=progress, resident=resident)
+            engram_contracts=inputs["engram_contracts"], program=program, epoch=0,
+            diagnostics=diagnostics, progress=progress, resident=resident)
         if continuation is None:
             return first
         completed = [first]
@@ -666,14 +661,17 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
                     raise ValueError("Actual continuation metadata source changed")
                 metadata.append(torch.load(record["path"], map_location="cpu", weights_only=True))
                 receipts.append(dict(rank=rank, metadata_sha256=record["sha256"]))
+            if "engram_lookup" not in following:
+                raise ValueError("Each continuation requires fresh host-prepared Engram rows")
             following = dict(following, cache_ABI=metadata)
-            before = _network_owner_snapshot(provider, table_storage, diagnostics=diagnostics)
+            before = _network_owner_snapshot(provider, diagnostics=diagnostics)
             provider.begin_chunk(epoch=epoch, token_map_id=next_contract["input_contract_sha256"],
                 input_by_case={"fresh": actual_input}, metadata_by_case={"fresh": metadata},
                 metadata_sources_by_case={"fresh": receipts})
-            after = _network_owner_snapshot(provider, table_storage, diagnostics=diagnostics)
+            after = _network_owner_snapshot(provider, diagnostics=diagnostics)
             if before != after:
-                raise RuntimeError("Chunk admission changed persistent raw/shared/history/table owners or bytes")
+                raise RuntimeError("Chunk admission changed persistent raw/shared/history owners or bytes")
+            validate_host_lookup(following["engram_lookup"], inputs["engram_contracts"][1], provider.hash_batch())
             program.compile(provider, next_contract["model_config"], topology, inputs["engram_contracts"])
             chunk_output = output / f"continuation-chunk{epoch}"
             chunk_output.mkdir(exist_ok=False)
@@ -683,7 +681,7 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
             result = _run_network_chunk(following, contract=next_contract, output=chunk_output,
                 provider=provider, weights=weights, memory=memory, ownership=ownership, assigned=assigned,
                 engram_contracts=inputs["engram_contracts"], program=program, epoch=epoch,
-                table_storage=table_storage, table_stack=table_stack, diagnostics=diagnostics,
+                diagnostics=diagnostics,
                 progress=progress, resident=resident)
             completed.append(result)
             previous_contract = next_contract
@@ -693,7 +691,7 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
 
 
 def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, ownership,
-                       assigned, engram_contracts, program, epoch, table_storage, table_stack,
+                       assigned, engram_contracts, program, epoch,
                        diagnostics=True, progress=None, resident=None):
     """Execute embedding, the complete backbone and the final head with persistent owners."""
     begin = perf_counter()
@@ -768,11 +766,10 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
                        entries_for_stage=program.entries_for_stage, execute_entry=executor.execute_entry,
                        projection_for_layer=weights.projection_for_layer)
     if resident is not None:
-        eng_runtime["mapped_lookup"] = resident.mapped_lookup
         eng_runtime["load_rotation"] = resident.load_rotation
     prepared_engram = prepare_network_engram(
         common_engram, hash_batch, provider.history, engram_contracts, weights.raw_for_layer, eng_runtime,
-        storage=table_storage, storage_stack=table_stack, storage_namespace=provider.allocation_id,
+        lookup=inputs["engram_lookup"],
     )
     for layer in (1, 14):
         prepared_engram.attach(layer, provider.state_handles_for_layer(layer))
