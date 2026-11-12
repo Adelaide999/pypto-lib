@@ -26,6 +26,7 @@ from .quant import int8_matmul, make_decode_dequantize as decode_make_dequantize
 from .rmsnorm import decode_rms_norm_reference, make_blocked_rmsnorm as make_norm, make_decode_blocked_rmsnorm as decode_make_norm, make_decode_rmsnorm as decode_make_rmsnorm, make_rmsnorm, rms_norm_reference
 from .rope import decode_rope_reference, make_adjacent_rope as qkv_w8a8_make_rope, make_decode_adjacent_rope as decode_make_rope, make_decode_rope as decode_qkv_make_rope, make_rope as qkv_make_rope, rope_reference
 from .runtime_config import validate_tp
+from .utils import unpack_blocked_weight
 
 
 # model config
@@ -938,15 +939,29 @@ def qkv_reference(
     cosine: torch.Tensor,
     sine: torch.Tensor,
     config: Mapping[str, Any] | QKVShape,
+    *,
+    weight_layout: str = "blocked",
 ) -> dict[str, torch.Tensor]:
     """CPU/PyTorch golden for the same boundaries as :func:`make_qkv_w8a8`.
 
     The returned tensors include the three projected BF16 values and the two
     RoPE outputs.  All matrix products use an explicit INT32 accumulator and
     FP32 token/channel dequantization, matching ``W8A8_DYNAMIC``.
+    Weights use the loader's blocked layout; ``weight_layout="kn"`` selects
+    logical ``[K, N]`` operands for direct-tile callers.
     """
 
     shape = qkv_shape(config)
+    if weight_layout not in ("blocked", "kn"):
+        raise ValueError("QKV weight_layout must be 'blocked' or 'kn'")
+    if weight_layout == "blocked":
+        weights = dict(weights)
+        for name, input_width, output_width in (
+            ("wq_a", shape.hidden_size, shape.q_lora_rank),
+            ("wq_b", shape.q_lora_rank, shape.query_width),
+            ("wkv", shape.hidden_size, shape.head_dim),
+        ):
+            weights[name] = unpack_blocked_weight(weights[name], input_width, output_width)
     x_i8, x_scale = quantize_per_token_int8(value)
     qa_i32 = int8_matmul(x_i8, weights["wq_a"].transpose(-2, -1).contiguous())
     qa = (qa_i32.float() * x_scale.float() * weights["wq_a_scale"].float().reshape(1, -1)).to(torch.bfloat16)
@@ -987,15 +1002,29 @@ def decode_qkv_reference(
     cosine: torch.Tensor,
     sine: torch.Tensor,
     config: Mapping[str, Any] | QKVShape,
+    *,
+    weight_layout: str = "blocked",
 ) -> dict[str, torch.Tensor]:
     """CPU/PyTorch golden for the same boundaries as :func:`make_qkv_w8a8`.
 
     The returned tensors include the three projected BF16 values and the two
     RoPE outputs.  All matrix products use an explicit INT32 accumulator and
     FP32 token/channel dequantization, matching ``W8A8_DYNAMIC``.
+    Weights use the loader's blocked layout; ``weight_layout="kn"`` selects
+    logical ``[K, N]`` operands for direct-tile callers.
     """
 
     shape = qkv_shape(config)
+    if weight_layout not in ("blocked", "kn"):
+        raise ValueError("QKV weight_layout must be 'blocked' or 'kn'")
+    if weight_layout == "blocked":
+        weights = dict(weights)
+        for name, input_width, output_width in (
+            ("wq_a", shape.hidden_size, shape.q_lora_rank),
+            ("wq_b", shape.q_lora_rank, shape.query_width),
+            ("wkv", shape.hidden_size, shape.head_dim),
+        ):
+            weights[name] = unpack_blocked_weight(weights[name], input_width, output_width)
     x_i8, x_scale = quantize_per_token_int8(value)
     qa_i32 = int8_matmul(x_i8, weights["wq_a"].transpose(-2, -1).contiguous())
     qa = (qa_i32.float() * x_scale.float() * weights["wq_a_scale"].float().reshape(1, -1)).to(torch.bfloat16)

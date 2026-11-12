@@ -613,8 +613,11 @@ def decode_moe_shared_expert_reference(
     down_scale: torch.Tensor,
     clamp_limit: float = 10.0,
 ) -> torch.Tensor:
-    """Reference for a shared W8A8 SwiGLU expert."""
+    """Reference a shared W8A8 expert using the loader's blocked operands."""
 
+    intermediate = gate_up_scale.numel() // 2
+    gate_up_weight = unpack_blocked_weight(gate_up_weight, value.shape[-1], intermediate * 2).T.contiguous()
+    down_weight = unpack_blocked_weight(down_weight, intermediate, down_scale.numel()).T.contiguous()
     gate_up = decode_moe_w8a8_expert_linear(value, gate_up_weight, gate_up_scale, torch.bfloat16).float()
     gate, up = gate_up.chunk(2, dim=-1)
     gate = gate.clamp(max=clamp_limit)

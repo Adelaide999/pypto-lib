@@ -144,6 +144,14 @@ QKV channel scales retain the existing BF16-to-FP32 conversion, while expert
 loaders retain their original FP32 scales. Tail padding and scale multiplication
 order remain unchanged.
 
+The QKV and shared-expert Torch reference interfaces accept these loader
+outputs directly and unpack only for reference computation. The QKV references
+also accept explicit `weight_layout="kn"` for the bounded Decode direct-tile
+entry. Shared-expert references restore the logical intermediate extent from
+the packed down operand without changing activation rounding. Routed-expert
+references continue to take the documented output-major checkpoint tensors;
+their separate NZ or blocked device operands are not interchangeable.
+
 `ResidentNetworkWeights.preload` prepares these operands once per generation.
 Layer and chunk calls reuse the pinned projection tensors and each EP owner's
 resident expert handles, without repacking or uploading the fixed weights.

@@ -198,7 +198,9 @@ def decode_step_reference(values: dict[str, torch.Tensor | int]) -> None:
         name: values[name]
         for name in ("wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv", "wkv_scale", "kv_norm_weight")
     }
-    qkv = qkv_reference(values["value"], qkv_weights, values["cosine"], values["sine"], MODEL)
+    qkv = qkv_reference(
+        values["value"], qkv_weights, values["cosine"], values["sine"], MODEL, weight_layout="kn"
+    )
     cache_after = write_swa_cache_reference(values["cache"], qkv["window_kv"][:active], values["slots"][:active])
     selected = gather_swa_cache_reference(cache_after, values["indices"])
     attended = swa_attention_reference(
