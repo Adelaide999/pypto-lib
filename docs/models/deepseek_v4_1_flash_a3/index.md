@@ -115,6 +115,33 @@ The streaming-weight diagnostic alternative and task-directory compiler reuse
 manifests are removed. Runtime dtype, shape, rank, alias, write-direction,
 source-version and lifecycle checks remain in force.
 
+### Fixed INT8 weight layout
+
+Initialization packs QKV, Indexer query and Prefill shared/routed expert
+weights on the CPU before uploading their final compute operands. Decode
+shared-expert and packed-QKV builders accept the same blocked operands.
+For logical `[K, N]` INT8 weights, the layout is `[N/64, K, 64]`, flattened
+to `[K*(N/64), 64]`. `utils.pack_blocked_weight` performs only a byte reorder.
+`prepare_ecotech_dynamic_weight` and the expert loaders return this packed
+shape; callers must not pass the original `[K, N]` matrix to these builders.
+QKV channel scales retain the existing BF16-to-FP32 conversion, while expert
+loaders retain their original FP32 scales. Tail padding and scale multiplication
+order remain unchanged.
+
+`ResidentNetworkWeights.preload` prepares these operands once per generation.
+Layer and chunk calls reuse the pinned projection tensors and each EP owner's
+resident expert handles, without repacking or uploading the fixed weights.
+Activation quantization and routed-token dispatch packing still run per call.
+Decode routed experts retain their separate FRACTAL_NZ format, including down
+projection padding. The bounded `decode_fwd` direct-tile GEMMs retain logical
+`[K, N]` weights and do not perform a whole-weight pack. A5 FP8/FP4 layouts are
+not used by these A3 W8A8 kernels.
+
+Changing this operand ABI requires fresh compilation and reloading weights;
+compiled programs created for the former canonical-weight ABI are incompatible.
+Device accuracy and latency require separate A3 validation; CPU byte checks
+and compilation alone do not establish a speedup.
+
 ### Engram and continuation
 
 Engram lookup runs on the host before the prepared forward call. `HostEngram`

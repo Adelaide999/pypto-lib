@@ -16,8 +16,9 @@ if __package__ in (None, ""):
     __package__ = "models.deepseek_v4_1_flash_a3"
 import pypto.language as pl
 import torch
-from .gemm import N_TILE as DECODE_SHARED_N_TILE, N_TILE as SHARED_N_TILE, VEC_M_TILE as DECODE_SHARED_VEC_M_TILE, VEC_M_TILE as SHARED_VEC_M_TILE, make_blocked_weight_pack as _decode_shared_make_pack_weight, make_blocked_weight_pack as _ecotech_shared_make_pack_weight, make_blocked_weight_pack as _shared_make_pack_weight, make_dot as _decode_shared_make_dot, make_dot as _ecotech_shared_make_dot, make_dot as _shared_make_dot, make_fp32_dequantize as _decode_moe_make_fp32_dequantize, make_fp32_dequantize as _moe_make_fp32_dequantize, make_int8_gemm as _decode_moe_make_int8_gemm, make_int8_gemm as _moe_make_int8_gemm, make_pack_weight as _decode_moe_make_pack_weight, make_pack_weight as _moe_make_pack_weight, prepare_ecotech_dynamic_weight as _ecotech_shared_prepare_ecotech_dynamic_weight, prepare_ecotech_tail_weight as _ecotech_shared_prepare_ecotech_tail_weight
+from .gemm import VEC_M_TILE as DECODE_SHARED_VEC_M_TILE, VEC_M_TILE as SHARED_VEC_M_TILE, make_dot as _decode_shared_make_dot, make_dot as _ecotech_shared_make_dot, make_dot as _shared_make_dot, make_fp32_dequantize as _decode_moe_make_fp32_dequantize, make_fp32_dequantize as _moe_make_fp32_dequantize, make_int8_gemm as _decode_moe_make_int8_gemm, make_int8_gemm as _moe_make_int8_gemm, prepare_ecotech_dynamic_weight as _ecotech_shared_prepare_ecotech_dynamic_weight, prepare_ecotech_tail_weight as _ecotech_shared_prepare_ecotech_tail_weight
 from .quant import make_cast_tile as _router_make_cast_tile, make_decode_dequantize as _decode_shared_make_dequantize, make_decode_dynamic_int8_quantize as _decode_moe_make_dynamic_int8_quantize, make_decode_quantize as _decode_shared_make_quantize, make_dequantize as _ecotech_shared_make_dequantize, make_dequantize as _shared_make_dequantize, make_dynamic_int8_quantize as _moe_make_dynamic_int8_quantize, make_quantize as _ecotech_shared_make_quantize, make_quantize as _shared_make_quantize, w8a8_linear as _decode_moe_w8a8_linear, w8a8_linear as _moe_w8a8_linear
+from .utils import pack_blocked_weight, unpack_blocked_weight
 
 
 MOE_VEC_M_TILE = 8
@@ -92,7 +93,7 @@ def make_w8a8_expert_projection(capacity: int, input_width: int, output_width: i
     @pl.jit.inline
     def projection(
         value: pl.Tensor[[capacity, input_width], pl.BF16],
-        packed_weight: pl.Tensor[[input_width, output_width], pl.INT8],
+        packed_weight: pl.Tensor[[input_width * (output_width // 64), 64], pl.INT8],
         channel_scale: pl.Tensor[[output_width], pl.FP32],
         payload: pl.Tensor[[capacity, input_width], pl.INT8],
         token_scale: pl.Tensor[[capacity, 1], pl.FP32],
@@ -139,8 +140,6 @@ def make_shared_expert_w8a8(
     gate_up_width = intermediate * 2
     quant_x = _moe_make_dynamic_int8_quantize(capacity, hidden)
     quant_hidden = _moe_make_dynamic_int8_quantize(capacity, intermediate)
-    pack_gate_up = _moe_make_pack_weight(hidden, gate_up_width)
-    pack_down = _moe_make_pack_weight(intermediate, hidden)
     dot_gate_up = _moe_make_int8_gemm(capacity, hidden, gate_up_width)
     dot_down = _moe_make_int8_gemm(capacity, intermediate, hidden)
     dequant_gate_up = _moe_make_fp32_dequantize(capacity, gate_up_width)
@@ -149,9 +148,9 @@ def make_shared_expert_w8a8(
     @pl.jit
     def shared_expert(
         value: pl.Tensor[[capacity, hidden], pl.BF16],
-        gate_up_weight: pl.Tensor[[hidden, gate_up_width], pl.INT8],
+        gate_up_weight: pl.Tensor[[hidden * (gate_up_width // 64), 64], pl.INT8],
         gate_up_scale: pl.Tensor[[gate_up_width], pl.FP32],
-        down_weight: pl.Tensor[[intermediate, hidden], pl.INT8],
+        down_weight: pl.Tensor[[intermediate * (hidden // 64), 64], pl.INT8],
         down_scale: pl.Tensor[[hidden], pl.FP32],
         output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
@@ -160,10 +159,8 @@ def make_shared_expert_w8a8(
         x_scale = pl.create_tensor([capacity, 1], dtype=pl.FP32)
         quant_x(value, x_payload, x_scale, active)
 
-        gate_up_packed = pl.create_tensor([hidden * (gate_up_width // 64), 64], dtype=pl.INT8)
-        pack_gate_up(gate_up_weight, gate_up_packed)
         gate_up_acc = pl.create_tensor([capacity, gate_up_width], dtype=pl.INT32)
-        dot_gate_up(x_payload, gate_up_packed, gate_up_acc, active)
+        dot_gate_up(x_payload, gate_up_weight, gate_up_acc, active)
         gate_up = pl.create_tensor([capacity, gate_up_width], dtype=pl.BF16)
         dequant_gate_up(gate_up_acc, x_scale, gate_up_scale, gate_up, active)
 
@@ -196,10 +193,8 @@ def make_shared_expert_w8a8(
         hidden_payload = pl.create_tensor([capacity, intermediate], dtype=pl.INT8)
         hidden_scale = pl.create_tensor([capacity, 1], dtype=pl.FP32)
         quant_hidden(activation, hidden_payload, hidden_scale, active)
-        down_packed = pl.create_tensor([intermediate * (hidden // 64), 64], dtype=pl.INT8)
-        pack_down(down_weight, down_packed)
         down_acc = pl.create_tensor([capacity, hidden], dtype=pl.INT32)
-        dot_down(hidden_payload, down_packed, down_acc, active)
+        dot_down(hidden_payload, down_weight, down_acc, active)
         dequant_down(down_acc, hidden_scale, down_scale, output, active)
         return output
 
@@ -700,15 +695,11 @@ def make_shared_moe_w8a8_inline(capacity, config, *, fused_activation=False, fus
     intermediate = config["moe_intermediate_size"]
     gate_up_width = intermediate * 2
     limit = config["swiglu_limit"]
-    gate_up_packed_rows = hidden * (gate_up_width // SHARED_N_TILE)
-    down_packed_rows = intermediate * (hidden // SHARED_N_TILE)
     activation_dtype = pl.FP32 if fused_activation else pl.BF16
     activate = _make_shared_activation(capacity, intermediate, limit, fused_activation, fused_channel_dtype)
 
     quant_x = _shared_make_quantize(capacity, hidden)
     quant_hidden = _shared_make_quantize(capacity, intermediate, activation_dtype)
-    pack_gate_up = _shared_make_pack_weight(hidden, gate_up_width)
-    pack_down = _shared_make_pack_weight(intermediate, hidden)
     dot_gate_up = _shared_make_dot(capacity, hidden, gate_up_width)
     dot_down = _shared_make_dot(capacity, intermediate, hidden)
     channel_dtype = fused_channel_dtype if fused_activation else pl.FP32
@@ -717,9 +708,9 @@ def make_shared_moe_w8a8_inline(capacity, config, *, fused_activation=False, fus
     @pl.jit.inline
     def shared_moe_w8a8_inline(
         x: pl.Tensor[[capacity, hidden], pl.BF16],
-        gate_up_weight: pl.Tensor[[hidden, gate_up_width], pl.INT8],
+        gate_up_weight: pl.Tensor[[hidden * (gate_up_width // 64), 64], pl.INT8],
         gate_up_scale: pl.Tensor[[gate_up_width], pl.FP32],
-        down_weight: pl.Tensor[[intermediate, hidden], pl.INT8],
+        down_weight: pl.Tensor[[intermediate * (hidden // 64), 64], pl.INT8],
         down_scale: pl.Tensor[[hidden], pl.FP32],
         output: pl.Tensor[[capacity, hidden], pl.BF16],
         active: pl.Scalar[pl.INT32],
@@ -728,20 +719,16 @@ def make_shared_moe_w8a8_inline(capacity, config, *, fused_activation=False, fus
         x_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
         quant_x(x, x_payload, x_scale, active)
 
-        gate_up_packed = pl.create_tensor([gate_up_packed_rows, SHARED_N_TILE], dtype=pl.INT8)
-        pack_gate_up(gate_up_weight, gate_up_packed)
         gate_up_acc = pl.create_tensor([capacity, gate_up_width], dtype=pl.INT32)
-        dot_gate_up(x_payload, gate_up_packed, gate_up_acc, active)
+        dot_gate_up(x_payload, gate_up_weight, gate_up_acc, active)
         activation = pl.create_tensor([capacity, intermediate], dtype=activation_dtype)
         activate(gate_up_acc, gate_up_scale, x_scale, activation, active)
 
         hidden_payload = pl.create_tensor([capacity, intermediate], dtype=pl.INT8)
         hidden_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
         quant_hidden(activation, hidden_payload, hidden_scale, active)
-        down_packed = pl.create_tensor([down_packed_rows, SHARED_N_TILE], dtype=pl.INT8)
-        pack_down(down_weight, down_packed)
         down_acc = pl.create_tensor([capacity, hidden], dtype=pl.INT32)
-        dot_down(hidden_payload, down_packed, down_acc, active)
+        dot_down(hidden_payload, down_weight, down_acc, active)
         dequant_down(down_acc, down_scale, hidden_scale, output, active)
         return output
 
@@ -763,9 +750,9 @@ def make_shared_moe_w8a8(capacity, config, *, fused_activation=False, fused_chan
     @pl.jit
     def shared_moe_w8a8(
         x: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
-        gate_up_weight: pl.Tensor[[hidden, gate_up_width], pl.INT8],
+        gate_up_weight: pl.Tensor[[hidden * (gate_up_width // 64), 64], pl.INT8],
         gate_up_scale: pl.Tensor[[gate_up_width], pl.FP32],
-        down_weight: pl.Tensor[[intermediate, hidden], pl.INT8],
+        down_weight: pl.Tensor[[intermediate * (hidden // 64), 64], pl.INT8],
         down_scale: pl.Tensor[[hidden], pl.FP32],
         output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
@@ -851,23 +838,19 @@ def make_ecotech_shared_inline(capacity, hidden, intermediate, *, limit=10.0):
         raise ValueError("Require local intermediate/32 and the source clamp10")
     width = intermediate * 2
     padded_intermediate = ((intermediate + 255) // 256) * 256
-    gate_packed_rows = hidden * (width // 64)
-    down_packed_rows = padded_intermediate * (hidden // 64)
     quantize_input = _ecotech_shared_make_quantize(capacity, hidden)
-    pack_gate = _ecotech_shared_make_pack_weight(hidden, width)
     dot_gate = _ecotech_shared_make_dot(capacity, hidden, width)
     activate = ecotech_shared_make_shared_activation(capacity, intermediate, padded_intermediate, limit)
     quantize_down = _ecotech_shared_make_quantize(capacity, padded_intermediate, pl.FP32)
-    pack_down = _ecotech_shared_make_pack_weight(padded_intermediate, hidden)
     dot_down = _ecotech_shared_make_dot(capacity, padded_intermediate, hidden)
     dequantize_down = _ecotech_shared_make_dequantize(capacity, hidden)
 
     @pl.jit.inline
     def shared(
         x: pl.Tensor[[capacity, hidden], pl.BF16],
-        gate_weight: pl.Tensor[[hidden, width], pl.INT8],
+        gate_weight: pl.Tensor[[hidden * (width // 64), 64], pl.INT8],
         gate_scale: pl.Tensor[[width], pl.FP32],
-        down_weight: pl.Tensor[[padded_intermediate, hidden], pl.INT8],
+        down_weight: pl.Tensor[[padded_intermediate * (hidden // 64), 64], pl.INT8],
         down_scale: pl.Tensor[[hidden], pl.FP32],
         output: pl.Tensor[[capacity, hidden], pl.BF16],
         active: pl.Scalar[pl.INT32],
@@ -875,19 +858,15 @@ def make_ecotech_shared_inline(capacity, hidden, intermediate, *, limit=10.0):
         input_payload = pl.create_tensor([capacity, hidden], dtype=pl.INT8)
         input_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
         quantize_input(x, input_payload, input_scale, active)
-        gate_packed = pl.create_tensor([gate_packed_rows, 64], dtype=pl.INT8)
-        pack_gate(gate_weight, gate_packed)
         gate_accumulator = pl.create_tensor([capacity, width], dtype=pl.INT32)
-        dot_gate(input_payload, gate_packed, gate_accumulator, active)
+        dot_gate(input_payload, gate_weight, gate_accumulator, active)
         activation = pl.create_tensor([capacity, padded_intermediate], dtype=pl.FP32)
         activate(gate_accumulator, gate_scale, input_scale, activation, active)
         down_payload = pl.create_tensor([capacity, padded_intermediate], dtype=pl.INT8)
         down_token_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
         quantize_down(activation, down_payload, down_token_scale, active)
-        down_packed = pl.create_tensor([down_packed_rows, 64], dtype=pl.INT8)
-        pack_down(down_weight, down_packed)
         down_accumulator = pl.create_tensor([capacity, hidden], dtype=pl.INT32)
-        dot_down(down_payload, down_packed, down_accumulator, active)
+        dot_down(down_payload, down_weight, down_accumulator, active)
         dequantize_down(down_accumulator, down_scale, down_token_scale, output, active)
         return (
             output,
@@ -911,9 +890,9 @@ def make_ecotech_shared(capacity, hidden, intermediate):
     @pl.jit
     def shared(
         x: pl.Tensor[[capacity, hidden], pl.BF16],
-        gate_weight: pl.Tensor[[hidden, width], pl.INT8],
+        gate_weight: pl.Tensor[[hidden * (width // 64), 64], pl.INT8],
         gate_scale: pl.Tensor[[width], pl.FP32],
-        down_weight: pl.Tensor[[padded_intermediate, hidden], pl.INT8],
+        down_weight: pl.Tensor[[padded_intermediate * (hidden // 64), 64], pl.INT8],
         down_scale: pl.Tensor[[hidden], pl.FP32],
         output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
@@ -951,7 +930,7 @@ def make_decode_w8a8_expert_projection(capacity: int, input_width: int, output_w
     @pl.jit.inline
     def projection(
         value: pl.Tensor[[capacity, input_width], pl.BF16],
-        packed_weight: pl.Tensor[[input_width, output_width], pl.INT8],
+        packed_weight: pl.Tensor[[input_width * (output_width // 64), 64], pl.INT8],
         channel_scale: pl.Tensor[[output_width], pl.FP32],
         payload: pl.Tensor[[capacity, input_width], pl.INT8],
         token_scale: pl.Tensor[[capacity, 1], pl.FP32],
@@ -998,8 +977,6 @@ def make_decode_shared_expert_w8a8(
     gate_up_width = intermediate * 2
     quant_x = _decode_moe_make_dynamic_int8_quantize(capacity, hidden)
     quant_hidden = _decode_moe_make_dynamic_int8_quantize(capacity, intermediate)
-    pack_gate_up = _decode_moe_make_pack_weight(hidden, gate_up_width)
-    pack_down = _decode_moe_make_pack_weight(intermediate, hidden)
     dot_gate_up = _decode_moe_make_int8_gemm(capacity, hidden, gate_up_width)
     dot_down = _decode_moe_make_int8_gemm(capacity, intermediate, hidden)
     dequant_gate_up = _decode_moe_make_fp32_dequantize(capacity, gate_up_width)
@@ -1008,9 +985,9 @@ def make_decode_shared_expert_w8a8(
     @pl.jit
     def shared_expert(
         value: pl.Tensor[[capacity, hidden], pl.BF16],
-        gate_up_weight: pl.Tensor[[hidden, gate_up_width], pl.INT8],
+        gate_up_weight: pl.Tensor[[hidden * (gate_up_width // 64), 64], pl.INT8],
         gate_up_scale: pl.Tensor[[gate_up_width], pl.FP32],
-        down_weight: pl.Tensor[[intermediate, hidden], pl.INT8],
+        down_weight: pl.Tensor[[intermediate * (hidden // 64), 64], pl.INT8],
         down_scale: pl.Tensor[[hidden], pl.FP32],
         output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
@@ -1019,10 +996,8 @@ def make_decode_shared_expert_w8a8(
         x_scale = pl.create_tensor([capacity, 1], dtype=pl.FP32)
         quant_x(value, x_payload, x_scale, active)
 
-        gate_up_packed = pl.create_tensor([hidden * (gate_up_width // 64), 64], dtype=pl.INT8)
-        pack_gate_up(gate_up_weight, gate_up_packed)
         gate_up_acc = pl.create_tensor([capacity, gate_up_width], dtype=pl.INT32)
-        dot_gate_up(x_payload, gate_up_packed, gate_up_acc, active)
+        dot_gate_up(x_payload, gate_up_weight, gate_up_acc, active)
         gate_up = pl.create_tensor([capacity, gate_up_width], dtype=pl.BF16)
         dequant_gate_up(gate_up_acc, x_scale, gate_up_scale, gate_up, active)
 
@@ -1062,10 +1037,8 @@ def make_decode_shared_expert_w8a8(
         hidden_payload = pl.create_tensor([capacity, intermediate], dtype=pl.INT8)
         hidden_scale = pl.create_tensor([capacity, 1], dtype=pl.FP32)
         quant_hidden(activation, hidden_payload, hidden_scale, active)
-        down_packed = pl.create_tensor([intermediate * (hidden // 64), 64], dtype=pl.INT8)
-        pack_down(down_weight, down_packed)
         down_acc = pl.create_tensor([capacity, hidden], dtype=pl.INT32)
-        dot_down(hidden_payload, down_packed, down_acc, active)
+        dot_down(hidden_payload, down_weight, down_acc, active)
         dequant_down(down_acc, hidden_scale, down_scale, output, active)
         return output
 
@@ -1391,15 +1364,11 @@ def make_decode_shared_moe_w8a8_inline(capacity, config, *, fused_activation=Fal
     intermediate = config["moe_intermediate_size"]
     gate_up_width = intermediate * 2
     limit = config["swiglu_limit"]
-    gate_up_packed_rows = hidden * (gate_up_width // DECODE_SHARED_N_TILE)
-    down_packed_rows = intermediate * (hidden // DECODE_SHARED_N_TILE)
     activation_dtype = pl.FP32 if fused_activation else pl.BF16
     activate = decode_shared_make_shared_activation(capacity, intermediate, limit, fused_activation)
 
     quant_x = _decode_shared_make_quantize(capacity, hidden)
     quant_hidden = _decode_shared_make_quantize(capacity, intermediate, activation_dtype)
-    pack_gate_up = _decode_shared_make_pack_weight(hidden, gate_up_width)
-    pack_down = _decode_shared_make_pack_weight(intermediate, hidden)
     dot_gate_up = _decode_shared_make_dot(capacity, hidden, gate_up_width)
     dot_down = _decode_shared_make_dot(capacity, intermediate, hidden)
     # vLLM's quantized down projection emits BF16 before the shared/routed
@@ -1412,9 +1381,9 @@ def make_decode_shared_moe_w8a8_inline(capacity, config, *, fused_activation=Fal
         @pl.jit.inline
         def shared_moe_w8a8_inline_fused(
             x: pl.Tensor[[capacity, hidden], pl.BF16],
-            gate_up_weight: pl.Tensor[[hidden, gate_up_width], pl.INT8],
+            gate_up_weight: pl.Tensor[[hidden * (gate_up_width // 64), 64], pl.INT8],
             gate_up_scale: pl.Tensor[[gate_up_width], pl.FP32],
-            down_weight: pl.Tensor[[intermediate, hidden], pl.INT8],
+            down_weight: pl.Tensor[[intermediate * (hidden // 64), 64], pl.INT8],
             down_scale: pl.Tensor[[hidden], pl.FP32],
             output: pl.Tensor[[capacity, hidden], pl.BF16],
             active: pl.Scalar[pl.INT32],
@@ -1423,20 +1392,16 @@ def make_decode_shared_moe_w8a8_inline(capacity, config, *, fused_activation=Fal
             x_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
             quant_x(x, x_payload, x_scale, active)
 
-            gate_up_packed = pl.create_tensor([gate_up_packed_rows, DECODE_SHARED_N_TILE], dtype=pl.INT8)
-            pack_gate_up(gate_up_weight, gate_up_packed)
             gate_up_acc = pl.create_tensor([capacity, gate_up_width], dtype=pl.INT32)
-            dot_gate_up(x_payload, gate_up_packed, gate_up_acc, active)
+            dot_gate_up(x_payload, gate_up_weight, gate_up_acc, active)
             activation = pl.create_tensor([capacity, intermediate], dtype=activation_dtype)
             activate(gate_up_acc, gate_up_scale, x_scale, activation, active)
 
             hidden_payload = pl.create_tensor([capacity, intermediate], dtype=pl.INT8)
             hidden_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
             quant_hidden(activation, hidden_payload, hidden_scale, active)
-            down_packed = pl.create_tensor([down_packed_rows, DECODE_SHARED_N_TILE], dtype=pl.INT8)
-            pack_down(down_weight, down_packed)
             down_acc = pl.create_tensor([capacity, hidden], dtype=pl.INT32)
-            dot_down(hidden_payload, down_packed, down_acc, active)
+            dot_down(hidden_payload, down_weight, down_acc, active)
             dequant_down(down_acc, down_scale, hidden_scale, output, active)
             return output
 
@@ -1445,9 +1410,9 @@ def make_decode_shared_moe_w8a8_inline(capacity, config, *, fused_activation=Fal
     @pl.jit.inline
     def shared_moe_w8a8_inline(
         x: pl.Tensor[[capacity, hidden], pl.BF16],
-        gate_up_weight: pl.Tensor[[hidden, gate_up_width], pl.INT8],
+        gate_up_weight: pl.Tensor[[hidden * (gate_up_width // 64), 64], pl.INT8],
         gate_up_scale: pl.Tensor[[gate_up_width], pl.FP32],
-        down_weight: pl.Tensor[[intermediate, hidden], pl.INT8],
+        down_weight: pl.Tensor[[intermediate * (hidden // 64), 64], pl.INT8],
         down_scale: pl.Tensor[[hidden], pl.FP32],
         output: pl.Tensor[[capacity, hidden], pl.BF16],
         active: pl.Scalar[pl.INT32],
@@ -1456,20 +1421,16 @@ def make_decode_shared_moe_w8a8_inline(capacity, config, *, fused_activation=Fal
         x_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
         quant_x(x, x_payload, x_scale, active)
 
-        gate_up_packed = pl.create_tensor([gate_up_packed_rows, DECODE_SHARED_N_TILE], dtype=pl.INT8)
-        pack_gate_up(gate_up_weight, gate_up_packed)
         gate_up_acc = pl.create_tensor([capacity, gate_up_width], dtype=pl.INT32)
-        dot_gate_up(x_payload, gate_up_packed, gate_up_acc, active)
+        dot_gate_up(x_payload, gate_up_weight, gate_up_acc, active)
         activation = pl.create_tensor([capacity, intermediate], dtype=activation_dtype)
         activate(gate_up_acc, gate_up_scale, x_scale, activation, active)
 
         hidden_payload = pl.create_tensor([capacity, intermediate], dtype=pl.INT8)
         hidden_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
         quant_hidden(activation, hidden_payload, hidden_scale, active)
-        down_packed = pl.create_tensor([down_packed_rows, DECODE_SHARED_N_TILE], dtype=pl.INT8)
-        pack_down(down_weight, down_packed)
         down_acc = pl.create_tensor([capacity, hidden], dtype=pl.INT32)
-        dot_down(hidden_payload, down_packed, down_acc, active)
+        dot_down(hidden_payload, down_weight, down_acc, active)
         dequant_down(down_acc, down_scale, hidden_scale, output, active)
         return output
 
@@ -1486,9 +1447,9 @@ def make_decode_shared_moe_w8a8(capacity, config, *, fused_activation=False):
     @pl.jit
     def shared_moe_w8a8(
         x: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
-        gate_up_weight: pl.Tensor[[hidden, gate_up_width], pl.INT8],
+        gate_up_weight: pl.Tensor[[hidden * (gate_up_width // 64), 64], pl.INT8],
         gate_up_scale: pl.Tensor[[gate_up_width], pl.FP32],
-        down_weight: pl.Tensor[[intermediate, hidden], pl.INT8],
+        down_weight: pl.Tensor[[intermediate * (hidden // 64), 64], pl.INT8],
         down_scale: pl.Tensor[[hidden], pl.FP32],
         output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
@@ -1682,7 +1643,8 @@ def golden_shared_moe_w8a8(tensors, *, fused_activation=False, fused_channel_dty
         return quantized, scale
 
     def dot(payload, weight, channels, scale):
-        accumulator = payload @ weight.to(torch.int32)
+        logical = unpack_blocked_weight(weight, payload.shape[-1], channels.numel())
+        accumulator = payload @ logical.to(torch.int32)
         channel = accumulator.float() * channels.float()
         if fused_activation and fused_channel_dtype == pl.FP16:
             channel = channel.to(torch.float16).float()
@@ -1985,8 +1947,8 @@ def validate_shared_moe(*, device=0, compile_only=False, platform="a2a3", sim=Fa
     for fused, channel_dtype in ((False, pl.FP32), (True, pl.FP16), (True, pl.FP32)):
         for active in (0, 1, 7, 16):
             x = torch.randn(capacity, hidden, dtype=torch.bfloat16)
-            gate_up = torch.randint(-32, 33, (hidden, 2 * intermediate), dtype=torch.int8)
-            down = torch.randint(-32, 33, (intermediate, hidden), dtype=torch.int8)
+            gate_up = pack_blocked_weight(torch.randint(-32, 33, (hidden, 2 * intermediate), dtype=torch.int8))
+            down = pack_blocked_weight(torch.randint(-32, 33, (intermediate, hidden), dtype=torch.int8))
             specs = [
                 TensorSpec("x", list(x.shape), x.dtype, init_value=x),
                 TensorSpec("gate_up_weight", list(gate_up.shape), gate_up.dtype, init_value=gate_up),

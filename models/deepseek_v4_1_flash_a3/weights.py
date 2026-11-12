@@ -23,7 +23,7 @@ import torch
 from .cache import resolve_layer_role
 from .gemm import prepare_ecotech_dynamic_weight
 from .runtime_config import ExpertParallelConfig
-from .utils import pack_nz
+from .utils import pack_blocked_weight, pack_nz
 
 
 _DTYPES = {
@@ -120,8 +120,8 @@ def load_attention_weights(checkpoint: RawCheckpoint, layer: int) -> dict[str, t
     """Load A2/A3 attention tensors for any migrated decoder layer.
 
     Entries ending in ``_raw`` retain checkpoint output-major layout.  Entries
-    ending in ``_canonical`` are transposed to the ``[K, N]`` layout consumed
-    by the standalone PyPTO W8A8 helpers.
+    ending in ``_canonical`` retain logical ``[K, N]`` for reference use;
+    ``_packed`` entries are the blocked operands consumed by W8A8 helpers.
     """
 
     if layer < 0:
@@ -159,6 +159,7 @@ def load_attention_weights(checkpoint: RawCheckpoint, layer: int) -> dict[str, t
     result: dict[str, torch.Tensor] = dict(raw)
     for name in ("wq_a", "wq_b", "wkv"):
         result[f"{name}_canonical"] = raw[f"{prefix}.{name}.weight"].transpose(0, 1).contiguous()
+        result[f"{name}_packed"] = pack_blocked_weight(result[f"{name}_canonical"])
         result[f"{name}_scale"] = flatten_scale(
             raw[f"{prefix}.{name}.weight_scale"], f"{prefix}.{name}.weight_scale"
         )
@@ -267,7 +268,7 @@ class CheckpointOperands:
         return value
 
     def expert(self, prefix):
-        """Return canonical gate/up and down operands with the true channel scales."""
+        """Pack gate/up and down once while retaining the true channel scales."""
         operands = {}
         for stem in ("w1", "w2", "w3"):
             for suffix in ("weight", "weight_scale", "weight_offset"):
@@ -281,7 +282,7 @@ class CheckpointOperands:
         down_scale = operands["w2.weight_scale"].flatten().float()
         if gate_up.dtype != torch.int8 or down.dtype != torch.int8:
             raise TypeError("Expert checkpoint weights must remain INT8")
-        return gate_up, gate_scale, down, down_scale
+        return pack_blocked_weight(gate_up), gate_scale, pack_blocked_weight(down), down_scale
 
 
 def load_tensor_bundle(
@@ -315,9 +316,9 @@ def load_tensor_bundle(
 
 
 def load_layer0_qkv(path: str | Path):
-    """Load the prepared layer-0 QKV bundle used by the first decoder step."""
+    """Load a logical layer-0 QKV bundle and pack its fixed INT8 operands."""
 
-    return load_tensor_bundle(
+    bundle = load_tensor_bundle(
         path,
         {
             "wq_a": (torch.int8, (5120, 1280)),
@@ -330,12 +331,15 @@ def load_layer0_qkv(path: str | Path):
             "kv_norm_weight": (torch.bfloat16, (512,)),
         },
     )
+    for name in ("wq_a", "wq_b", "wkv"):
+        bundle[name] = pack_blocked_weight(bundle[name])
+    return bundle
 
 
 def load_layer0_shared_expert(path: str | Path):
-    """Load the prepared layer-0 shared W8A8 expert bundle."""
+    """Load a logical layer-0 shared expert bundle and pack its fixed weights."""
 
-    return load_tensor_bundle(
+    bundle = load_tensor_bundle(
         path,
         {
             "gate_up_weight": (torch.int8, (5120, 4608)),
@@ -344,6 +348,9 @@ def load_layer0_shared_expert(path: str | Path):
             "down_scale": (torch.float32, (5120,)),
         },
     )
+    for name in ("gate_up_weight", "down_weight"):
+        bundle[name] = pack_blocked_weight(bundle[name])
+    return bundle
 
 
 def load_layer0_output(path: str | Path):
@@ -718,7 +725,7 @@ def load_router(checkpoint: DecodeSafetensorsCheckpoint, layer: int) -> dict[str
 
 
 def load_shared_expert(checkpoint: DecodeSafetensorsCheckpoint, layer: int) -> dict[str, torch.Tensor]:
-    """Load shared W8A8 weights in the logical ABI consumed by ``moe_shared``."""
+    """Load shared W8A8 weights directly into the blocked GEMM operand ABI."""
 
     w1_name = _name(layer, "shared_experts.w1.weight")
     w3_name = _name(layer, "shared_experts.w3.weight")
@@ -745,14 +752,14 @@ def load_shared_expert(checkpoint: DecodeSafetensorsCheckpoint, layer: int) -> d
     w3_scale_name = _name(layer, "shared_experts.w3.weight_scale")
     w2_scale_name = _name(layer, "shared_experts.w2.weight_scale")
     return {
-        "shared_gate_up": torch.cat((w1.transpose(0, 1), w3.transpose(0, 1)), dim=1).contiguous(),
+        "shared_gate_up": pack_blocked_weight(torch.cat((w1.transpose(0, 1), w3.transpose(0, 1)), dim=1)),
         "shared_gate_up_scale": torch.cat(
             (
                 _scale(checkpoint.tensor(w1_scale_name), w1_scale_name, INTERMEDIATE),
                 _scale(checkpoint.tensor(w3_scale_name), w3_scale_name, INTERMEDIATE),
             )
         ).contiguous(),
-        "shared_down": w2.transpose(0, 1).contiguous(),
+        "shared_down": pack_blocked_weight(w2.transpose(0, 1)),
         "shared_down_scale": _scale(checkpoint.tensor(w2_scale_name), w2_scale_name, HIDDEN),
     }
 
@@ -789,9 +796,11 @@ def abi_summary() -> dict[str, Any]:
             "layout": "FRACTAL_NZ for all routed matrices; EP host shape flattens to [EP*LOCAL_EXPERTS, ...]",
         },
         "shared": {
-            "gate_up": [HIDDEN, INTERMEDIATE * 2],
-            "down": [INTERMEDIATE, HIDDEN],
-            "layout": "logical row-major; moe_shared packs at kernel entry",
+            "gate_up_logical": [HIDDEN, INTERMEDIATE * 2],
+            "down_logical": [INTERMEDIATE, HIDDEN],
+            "gate_up": [HIDDEN * (INTERMEDIATE * 2 // 64), 64],
+            "down": [INTERMEDIATE * (HIDDEN // 64), 64],
+            "layout": "blocked [N/64, K, 64] flattened to [K*(N/64), 64]; packed once by the loader",
         },
         "router": {"gate_weight": [EXPERTS, HIDDEN], "bias": [EXPERTS]},
     }
@@ -1044,7 +1053,7 @@ class ResidentCheckpointOperands(CheckpointOperands):
 
 
 class ResidentNetworkWeights:
-    """Retain complete compute weights, with routed experts sharded by their actual EP owner."""
+    """Retain prepacked compute weights, with routed experts sharded by their actual EP owner."""
 
     def __init__(self, checkpoint, topology, model_config, runtime):
         self.reader = ResidentCheckpointOperands(checkpoint)
@@ -1177,7 +1186,7 @@ class ResidentNetworkWeights:
 
 
 def prepare_product_operands(raw, layer_id=0, *, role=None):
-    """Adapt CPU source weights to complete KN and grouped Prefill layouts."""
+    """Pack fixed INT8 projections once and prepare grouped BF16 Prefill weights."""
     from .cache import resolve_layer_role
 
     role = resolve_layer_role(layer_id, role)

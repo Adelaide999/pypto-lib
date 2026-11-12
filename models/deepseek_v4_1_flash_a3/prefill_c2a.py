@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 from .compressor import COMPRESSOR_PROJECTION_HEAD_DIM as HEAD_DIM, INDEX_WIDTH, RING_ROWS_DYN, compressor_ratio2_prefill, make_compressed_cache_publish, make_fp32_projection
-from .gemm import N_TILE, VEC_M_TILE, make_blocked_weight_pack as make_pack_weight, make_dot
+from .gemm import VEC_M_TILE, make_dot
 from .hc import make_hc_post_inline
 from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN
 from .prefill_indexer import INDEX_HEADS, QUANT_ROWS_TILE, WEIGHT_ROWS_TILE, make_empty_selection, make_sparse_controls
@@ -170,7 +170,7 @@ def make_readback_entries(entries, active_rows):
     def readback_index_projection(
         x: pl.InOut[pl.Tensor[[16, 5120], pl.BF16]],
         query_latent: pl.InOut[pl.Tensor[[16, 1280], pl.BF16]],
-        index_wq_b: pl.InOut[pl.Tensor[[1280, 4096], pl.INT8]],
+        index_wq_b: pl.InOut[pl.Tensor[[1280 * (4096 // 64), 64], pl.INT8]],
         index_wq_b_scale: pl.InOut[pl.Tensor[[4096], pl.FP32]],
         weights_proj: pl.InOut[pl.Tensor[[5120, 32], pl.BF16]],
         cosine: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
@@ -382,7 +382,7 @@ def make_readback_entries(entries, active_rows):
     @pl.jit
     def readback_wkv(
         x: pl.InOut[pl.Tensor[[16, 5120], pl.BF16]],
-        weight: pl.InOut[pl.Tensor[[5120, 512], pl.INT8]],
+        weight: pl.InOut[pl.Tensor[[5120 * (512 // 64), 64], pl.INT8]],
         channel_scale: pl.InOut[pl.Tensor[[512], pl.FP32]],
         output: pl.InOut[pl.Tensor[[16, 512], pl.BF16]],
         active: pl.Scalar[pl.INT32],
@@ -409,7 +409,7 @@ def make_readback_entries(entries, active_rows):
     @pl.jit
     def readback_wq_a(
         x: pl.InOut[pl.Tensor[[16, 5120], pl.BF16]],
-        weight: pl.InOut[pl.Tensor[[5120, 1280], pl.INT8]],
+        weight: pl.InOut[pl.Tensor[[5120 * (1280 // 64), 64], pl.INT8]],
         channel_scale: pl.InOut[pl.Tensor[[1280], pl.FP32]],
         output: pl.InOut[pl.Tensor[[16, 1280], pl.BF16]],
         active: pl.Scalar[pl.INT32],
@@ -423,7 +423,7 @@ def make_readback_entries(entries, active_rows):
     @pl.jit
     def readback_wq_b(
         x: pl.InOut[pl.Tensor[[16, 1280], pl.BF16]],
-        weight: pl.InOut[pl.Tensor[[1280, 32768], pl.INT8]],
+        weight: pl.InOut[pl.Tensor[[1280 * (32768 // 64), 64], pl.INT8]],
         channel_scale: pl.InOut[pl.Tensor[[32768], pl.FP32]],
         output: pl.InOut[pl.Tensor[[16, 32768], pl.BF16]],
         active: pl.Scalar[pl.INT32],
@@ -623,10 +623,8 @@ def make_indexer_projection_observed(capacity, config):
     rope_width = config["qk_rope_head_dim"]
     pairs = rope_width // 2
     index_width = INDEX_HEADS * INDEX_WIDTH
-    packed_rows = latent * (index_width // N_TILE)
     weights_scale = INDEX_WIDTH ** (-0.5) * INDEX_HEADS ** (-0.5)
     quantize = make_quantize(capacity, latent)
-    pack = make_pack_weight(latent, index_width)
     dot = make_dot(capacity, latent, index_width)
     dequantize = make_dequantize(capacity, index_width)
     rotate = make_rope(capacity, INDEX_HEADS, INDEX_WIDTH, rope_width)
@@ -636,7 +634,7 @@ def make_indexer_projection_observed(capacity, config):
     def indexer_projection(
         x: pl.Tensor[[capacity, hidden], pl.BF16],
         query_latent: pl.Tensor[[capacity, latent], pl.BF16],
-        index_wq_b: pl.Tensor[[latent, index_width], pl.INT8],
+        index_wq_b: pl.Tensor[[latent * (index_width // 64), 64], pl.INT8],
         index_wq_b_scale: pl.Tensor[[index_width], pl.FP32],
         weights_proj: pl.Tensor[[hidden, INDEX_HEADS], pl.BF16],
         cosine: pl.Tensor[[capacity, pairs], pl.FP32],
@@ -650,10 +648,8 @@ def make_indexer_projection_observed(capacity, config):
         latent_i8 = pl.create_tensor([capacity, latent], dtype=pl.INT8)
         latent_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
         quantize(query_latent, latent_i8, latent_scale, active)
-        packed = pl.create_tensor([packed_rows, N_TILE], dtype=pl.INT8)
-        pack(index_wq_b, packed)
         accumulator = pl.create_tensor([capacity, index_width], dtype=pl.INT32)
-        dot(latent_i8, packed, accumulator, active)
+        dot(latent_i8, index_wq_b, accumulator, active)
         dequantize(accumulator, index_wq_b_scale, latent_scale, projected, active)
         query_flat = pl.reshape(query, [capacity, index_width])
         rotate(projected, cosine, sine, query_flat, active)

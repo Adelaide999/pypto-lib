@@ -610,12 +610,12 @@ def make_layer2_c1c2(capacity, config):
     @pl.jit
     def layer2_c1c2(
         x: pl.Tensor[[capacity, hidden], pl.BF16],
-        wq_a: pl.Tensor[[hidden, latent_width], pl.INT8],
+        wq_a: pl.Tensor[[hidden * (latent_width // 64), 64], pl.INT8],
         wq_a_scale: pl.Tensor[[latent_width], pl.FP32],
         q_norm_weight: pl.Tensor[[latent_width], pl.BF16],
-        wq_b: pl.Tensor[[latent_width, query_width], pl.INT8],
+        wq_b: pl.Tensor[[latent_width * (query_width // 64), 64], pl.INT8],
         wq_b_scale: pl.Tensor[[query_width], pl.FP32],
-        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv: pl.Tensor[[hidden * (head_dim // 64), 64], pl.INT8],
         wkv_scale: pl.Tensor[[head_dim], pl.FP32],
         kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
         rope_cos: pl.Tensor[[capacity, pair_width], pl.FP32],
@@ -888,12 +888,12 @@ def make_decode_layer2_c1c2(capacity, config):
     @pl.jit
     def layer2_c1c2(
         x: pl.Tensor[[capacity, hidden], pl.BF16],
-        wq_a: pl.Tensor[[hidden, latent_width], pl.INT8],
+        wq_a: pl.Tensor[[hidden * (latent_width // 64), 64], pl.INT8],
         wq_a_scale: pl.Tensor[[latent_width], pl.FP32],
         q_norm_weight: pl.Tensor[[latent_width], pl.BF16],
-        wq_b: pl.Tensor[[latent_width, query_width], pl.INT8],
+        wq_b: pl.Tensor[[latent_width * (query_width // 64), 64], pl.INT8],
         wq_b_scale: pl.Tensor[[query_width], pl.FP32],
-        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv: pl.Tensor[[hidden * (head_dim // 64), 64], pl.INT8],
         wkv_scale: pl.Tensor[[head_dim], pl.FP32],
         kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
         rope_cos: pl.Tensor[[capacity, pair_width], pl.FP32],

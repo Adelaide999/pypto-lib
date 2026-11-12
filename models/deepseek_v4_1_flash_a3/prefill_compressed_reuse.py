@@ -43,12 +43,12 @@ def make_qkv_publish(capacity, config):
     @pl.jit
     def qkv_publish(
         x: pl.Tensor[[capacity, 5120], pl.BF16],
-        wq_a: pl.Tensor[[5120, 1280], pl.INT8],
+        wq_a: pl.Tensor[[5120 * (1280 // 64), 64], pl.INT8],
         wq_a_scale: pl.Tensor[[1280], pl.FP32],
         q_norm: pl.Tensor[[1280], pl.BF16],
-        wq_b: pl.Tensor[[1280, 32768], pl.INT8],
+        wq_b: pl.Tensor[[1280 * (32768 // 64), 64], pl.INT8],
         wq_b_scale: pl.Tensor[[32768], pl.FP32],
-        wkv: pl.Tensor[[5120, 512], pl.INT8],
+        wkv: pl.Tensor[[5120 * (512 // 64), 64], pl.INT8],
         wkv_scale: pl.Tensor[[512], pl.FP32],
         kv_norm: pl.Tensor[[512], pl.BF16],
         cosine: pl.Tensor[[capacity, 32], pl.FP32],

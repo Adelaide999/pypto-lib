@@ -29,12 +29,12 @@ def make_consumer_qkv_publish(capacity, config):
     @pl.jit
     def consumer_qkv_publish(
         x: pl.Tensor[[capacity, hidden], pl.BF16],
-        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a: pl.Tensor[[hidden * (latent // 64), 64], pl.INT8],
         wq_a_scale: pl.Tensor[[latent], pl.FP32],
         q_norm: pl.Tensor[[latent], pl.BF16],
-        wq_b: pl.Tensor[[latent, width], pl.INT8],
+        wq_b: pl.Tensor[[latent * (width // 64), 64], pl.INT8],
         wq_b_scale: pl.Tensor[[width], pl.FP32],
-        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv: pl.Tensor[[hidden * (head_dim // 64), 64], pl.INT8],
         wkv_scale: pl.Tensor[[head_dim], pl.FP32],
         kv_norm: pl.Tensor[[head_dim], pl.BF16],
         rope_cos: pl.Tensor[[capacity, pairs], pl.FP32],

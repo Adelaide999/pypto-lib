@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Host-side NZ packing and per-row INT8 quantization utilities."""
+"""Host-side weight layouts and per-row INT8 quantization utilities."""
 
 import torch
 
@@ -19,6 +19,44 @@ NZ_FRACTAL_ROWS = 16
 
 
 NZ_C0_BYTES = 32
+
+
+BLOCKED_INT8_COLUMNS = 64
+
+
+def pack_blocked_weight(weight_kn: torch.Tensor) -> torch.Tensor:
+    """Pack CPU INT8 ``[K, N]`` into ``[N/64, K, 64]`` flattened to 2D.
+
+    This is the A3 blocked GEMM operand, distinct from the NZ expert layout.
+    Only byte order changes; checkpoint scales and offsets stay separate.
+    """
+    if weight_kn.device.type != "cpu" or weight_kn.dtype != torch.int8 or weight_kn.ndim != 2:
+        raise ValueError("Blocked weights require a CPU INT8 [K, N] tensor")
+    rows, columns = weight_kn.shape
+    if rows <= 0 or columns <= 0 or rows % 256 or columns % BLOCKED_INT8_COLUMNS:
+        raise ValueError("Blocked weights require positive K/256 and N/64")
+    blocks = columns // BLOCKED_INT8_COLUMNS
+    return (
+        weight_kn.reshape(rows, blocks, BLOCKED_INT8_COLUMNS)
+        .permute(1, 0, 2)
+        .contiguous()
+        .reshape(rows * blocks, BLOCKED_INT8_COLUMNS)
+    )
+
+
+def unpack_blocked_weight(packed: torch.Tensor, input_width: int, output_width: int) -> torch.Tensor:
+    """Restore the logical ``[K, N]`` weight for Torch golden computation."""
+    if input_width <= 0 or output_width <= 0 or input_width % 256 or output_width % BLOCKED_INT8_COLUMNS:
+        raise ValueError("Blocked weights require positive K/256 and N/64")
+    blocks = output_width // BLOCKED_INT8_COLUMNS
+    if packed.dtype != torch.int8 or tuple(packed.shape) != (input_width * blocks, BLOCKED_INT8_COLUMNS):
+        raise ValueError("Packed weight shape does not match the logical K and N")
+    return (
+        packed.reshape(blocks, input_width, BLOCKED_INT8_COLUMNS)
+        .permute(1, 0, 2)
+        .contiguous()
+        .reshape(input_width, output_width)
+    )
 
 
 def pack_nz(logical: torch.Tensor) -> torch.Tensor:

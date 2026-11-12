@@ -9,7 +9,7 @@
 """A2 index-query projection, quantization and sparse-index controls."""
 
 import pypto.language as pl
-from .gemm import N_TILE, make_blocked_weight_pack as make_pack_weight, make_dot
+from .gemm import make_dot
 from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY
 from .qkv_proj_rope import make_bf16_projection_staged
 from .quant import make_dequantize, make_quantize
@@ -34,10 +34,8 @@ def make_indexer_projection(capacity, config):
     rope_width = config["qk_rope_head_dim"]
     pairs = rope_width // 2
     index_width = INDEX_HEADS * INDEX_WIDTH
-    packed_rows = latent * (index_width // N_TILE)
     weights_scale = INDEX_WIDTH ** -0.5 * INDEX_HEADS ** -0.5
     quantize = make_quantize(capacity, latent)
-    pack = make_pack_weight(latent, index_width)
     dot = make_dot(capacity, latent, index_width)
     dequantize = make_dequantize(capacity, index_width)
     rotate = make_rope(capacity, INDEX_HEADS, INDEX_WIDTH, rope_width)
@@ -47,7 +45,7 @@ def make_indexer_projection(capacity, config):
     def indexer_projection(
         x: pl.Tensor[[capacity, hidden], pl.BF16],
         query_latent: pl.Tensor[[capacity, latent], pl.BF16],
-        index_wq_b: pl.Tensor[[latent, index_width], pl.INT8],
+        index_wq_b: pl.Tensor[[latent * (index_width // 64), 64], pl.INT8],
         index_wq_b_scale: pl.Tensor[[index_width], pl.FP32],
         weights_proj: pl.Tensor[[hidden, INDEX_HEADS], pl.BF16],
         cosine: pl.Tensor[[capacity, pairs], pl.FP32],
@@ -59,10 +57,8 @@ def make_indexer_projection(capacity, config):
         latent_i8 = pl.create_tensor([capacity, latent], dtype=pl.INT8)
         latent_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
         quantize(query_latent, latent_i8, latent_scale, active)
-        packed = pl.create_tensor([packed_rows, N_TILE], dtype=pl.INT8)
-        pack(index_wq_b, packed)
         accumulator = pl.create_tensor([capacity, index_width], dtype=pl.INT32)
-        dot(latent_i8, packed, accumulator, active)
+        dot(latent_i8, index_wq_b, accumulator, active)
         projected = pl.create_tensor([capacity, index_width], dtype=pl.BF16)
         dequantize(accumulator, index_wq_b_scale, latent_scale, projected, active)
         query_flat = pl.reshape(query, [capacity, index_width])
