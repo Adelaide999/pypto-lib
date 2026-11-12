@@ -18,8 +18,8 @@ and the final head from explicit request/cache metadata and checkpoint weights.
 same process without allocating the full cache buffers or running NPU work.
 The existing host communication and weight streaming boundaries remain;
 the Prefill interface does not claim a single device L2 graph.
-`decode_fwd.py` provides the bounded SWA step and `decode_layer.py` selects the
-complete Decode blocks; a full 40-layer Decode driver remains outside this scope.
+`decode_fwd.py` provides the bounded SWA step. Fixed EP2 Decode drivers have
+been removed; a full 40-layer EP16 Decode driver remains unimplemented.
 
 Run the device-free package checks from the repository root:
 

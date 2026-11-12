@@ -51,11 +51,7 @@ def validate_decode_contract(parallel: DecodeParallelConfig = DECODE_PARALLEL) -
     """Validate the supported topology and the fixed A2/A3 cache ABI."""
 
     parallel.validate()
-    if parallel.ep not in (2, 16):
-        raise ValueError("this entry supports only the EP2 gate and the DP8/TP2/EP16 contract")
-    if parallel.ep == 2 and (parallel.dp, parallel.tp) != (2, 1):
-        raise ValueError("EP2 requires DP2/TP1")
-    if parallel.ep == 16 and (parallel.dp, parallel.tp) not in ((16, 1), (8, 2), (4, 4)):
+    if (parallel.dp, parallel.tp) not in ((16, 1), (8, 2), (4, 4)):
         raise ValueError("EP16 requires DP16/TP1, DP8/TP2, or DP4/TP4")
     return parallel
 
@@ -298,11 +294,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dcp", type=int, default=1)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args(argv)
-    default_dp = 2 if args.ep == 2 else 8
-    default_tp = 1 if args.ep == 2 else 2
     parallel = DecodeParallelConfig(
-        dp=default_dp if args.dp is None else args.dp,
-        tp=default_tp if args.tp is None else args.tp,
+        dp=DECODE_PARALLEL.dp if args.dp is None else args.dp,
+        tp=DECODE_PARALLEL.tp if args.tp is None else args.tp,
         ep=args.ep,
         pp=args.pp,
         pcp=args.pcp,

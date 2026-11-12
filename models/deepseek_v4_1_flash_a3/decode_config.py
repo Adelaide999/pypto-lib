@@ -60,6 +60,8 @@ class DecodeParallelConfig:
             raise ValueError("A2/A3 Decode currently requires PP=1, PCP=1, and DCP=1")
         if self.dp * self.tp != self.ep:
             raise ValueError(f"Decode requires EP=DP*TP, got DP={self.dp}, TP={self.tp}, EP={self.ep}")
+        if self.ep != 16:
+            raise ValueError("A3 Decode requires EP16; the legacy EP2 path has been removed")
         if self.cache_block_size != 128:
             raise ValueError("A2/A3 Decode requires block_size=128")
         if not self.enable_expert_parallel:

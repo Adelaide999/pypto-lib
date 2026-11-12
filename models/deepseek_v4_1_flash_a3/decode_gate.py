@@ -63,14 +63,7 @@ def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]
         and implementation["formal_ready"]
         and asset_validation["status"] == "pass"
     )
-    command = (
-        f"task-submit --device auto --device-num {devices} --run "
-        f"'PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_moe "
-        "--contract'" if topology == "ep2_gate" else
-        f"'PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_fwd "
-        f"-p a2a3 --ep {topology_config['ep']} --dp {topology_config['dp']} "
-        f"--tp {topology_config['tp']}'"
-    )
+    command = None
     reference_command = (
         "task-submit --device auto --device-num "
         f"{devices} --run '<independent-vllm-ascend-reference> "
@@ -92,11 +85,7 @@ def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]
         "required_state_outputs": list(CONTRACT["state_outputs"]),
         "queue_command": command,
         "reference_command": reference_command,
-        "product_entrypoint": (
-            'models.deepseek_v4_1_flash_a3.decode_moe.decode_ep2'
-            if topology == "ep2_gate"
-            else 'models.deepseek_v4_1_flash_a3.decode_fwd'
-        ),
+        "product_entrypoint": implementation["formal_entrypoint"],
         "reference_process": {
             "status": "not_run",
             "commit": CONTRACT["runtime"]["vllm_reference_commit"],
@@ -112,7 +101,8 @@ def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]
         },
         "runtime_identity": runtime_identity(),
         "recovery": (
-            "Provide identical decode input and historical cache, and frozen "
+            "Implement the EP16 network driver before submission. Provide identical "
+            "decode input and historical cache, and frozen "
             "vLLM-Ascend reference capture; set DEEPSEEK_V41_CHECKPOINT to the "
             "verified Aurora export, submit "
             "this topology through task-submit, and record per-rank state."
@@ -122,7 +112,7 @@ def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--topology", choices=tuple(TOPOLOGIES), default="ep2_gate")
+    parser.add_argument("--topology", choices=tuple(TOPOLOGIES), default="main")
     parser.add_argument("--asset-root", type=Path)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--record", type=Path)

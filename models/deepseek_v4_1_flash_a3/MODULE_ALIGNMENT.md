@@ -11,7 +11,7 @@ Prefill and Decode compositions remain separate.
 This package follows that responsibility split. It retains the A3 Eco-Tech
 W8A8 implementation: the reference model's MXFP8/MXFP4 kernels, cache layouts
 and distributed topology are not substituted for the existing implementation.
-The package has 83 Python files, down from 123 at `5e463e4` and 151 at
+The package has 77 Python files, down from 123 at `5e463e4` and 151 at
 `c8297f4`. Removed modules are consolidated into their computation owners,
 without compatibility forwarding files or a second implementation directory.
 
@@ -20,8 +20,8 @@ without compatibility forwarding files or a second implementation directory.
 | Responsibility | Modules |
 | --- | --- |
 | Public forward and reusable Prefill compilation | `prefill_fwd.py` (network loop, compile reuse, runtime), `decode_fwd.py` (bounded Decode step) |
-| Generic layer selection and composition | `prefill_layer.py` (including L2 region bindings), `decode_layer.py`, `prefill_layer_plan.json` |
-| SWA and compressed attention composition | `prefill_swa.py`, `prefill_c2a.py`, `prefill_compressed_reuse.py`, `decode_swa.py`, `decode_c2a.py`, `decode_c1a.py` |
+| Generic layer selection and composition | `prefill_layer.py` (including L2 region bindings), `prefill_layer_plan.json` |
+| SWA and compressed attention composition | `prefill_swa.py`, `prefill_c2a.py`, `prefill_compressed_reuse.py`, `decode_swa.py` |
 | Input packing and final output head | `input_pack.py`, `lm_head.py` |
 | Compression projection, ratio-1/2 pooling and cache publication | `compressor.py` |
 | Index cache, query projection, candidate pooling and Decode selection | `indexer.py` |
@@ -29,7 +29,7 @@ without compatibility forwarding files or a second implementation directory.
 | Engram lookup, projection, gating and bounded validators | `engram.py` |
 | HOST Engram storage, hashing and row preparation | `engram_host.py` |
 | Shared MoE routing, dispatch, shared expert and combination | `moe.py` |
-| Phase MoE orchestration and routed expert computation | `prefill_moe.py`, `decode_moe.py`, `expert_routed.py` |
+| Phase MoE orchestration and routed expert computation | `prefill_moe.py`, `expert_routed.py` |
 | Linear, normalization, QKV and attention leaves | `gemm.py`, `quant.py`, `rmsnorm.py`, `rope.py`, `qkv_proj_rope.py`, `o_proj.py`, `swa.py`, `sparse_attention.py` |
 | Checkpoint readers and explicit phase weight layouts | `weights.py` |
 | Cache ownership, resource lifetime and communication | `cache.py`, `state.py`, `prefill_resident.py`, `moe_transport.py` |
@@ -76,9 +76,11 @@ files, and the maintained local import graph is acyclic.
 The former `decode_weight_abi.py` was introduced by Lun7777 in
 [`2fd4aa3`](https://github.com/Adelaide999/pypto-lib/commit/2fd4aa37d4e1c16564233f9c06985653bf42533d)
 and updated in `0284d5e`. Its current owner is `weights.py`.
-`load_ep2_rank_weights` still loads the real router, routed shard and shared
-expert operands for one EP2 rank. Moving that reader neither implements EP16
-Decode nor supplies a full-network Decode state and cache ownership plan.
+`load_decode_rank_weights` loads router/shared operands and one 24-expert
+EP16 shard. Per-expert arithmetic and packing remain unchanged. The old EP2
+drivers and fixed two-device compile interfaces are retired; their history
+remains at `2704263`. The maintained loader does not provide TP attention
+binding, network communication or source/cache ownership transitions.
 
 ## Preservation and validation
 
@@ -110,8 +112,9 @@ execute an NPU, establish end-to-end accuracy or measure performance.
   topology does not parse Decode command-line arguments. The TP-bound Decode
   sparse kernels remain separate, while their parameterized builder and Torch
   reference live in `sparse_attention.py`.
-- Existing EP2 Decode kernels and weight bindings remain EP2. This structural
-  consolidation does not add an EP16 or complete-network Decode implementation.
+- Fixed EP2 Decode orchestration and complete-layer wrappers are removed.
+  Local attention, routed/shared expert and other independent computation
+  remain available. EP16 full-network execution remains unimplemented.
 - This is not a single fused 40-layer L2 device graph. Existing communication,
   cache ownership and execution order are retained; compile and execution
   latency improvements require measurements on allocated hardware.

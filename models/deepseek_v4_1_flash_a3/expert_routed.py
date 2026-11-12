@@ -65,7 +65,7 @@ DECODE_T = B * S
 
 # EP layout / recv buffers (single-card view: kernel only sees the local shard)
 # Decode sets these before importing the leaf so the same W8A8 kernel covers
-# the complete EP2 local owner set.  The compact defaults remain useful for
+# a complete local expert owner set.  The compact defaults remain useful for
 # the standalone operator case.
 DECODE_N_LOCAL_EXPERTS = int(os.environ.get("A2_MOE_LOCAL_EXPERTS", "1"))
 if DECODE_N_LOCAL_EXPERTS <= 0:

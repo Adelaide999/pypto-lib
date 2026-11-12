@@ -65,7 +65,7 @@ def make_decode_dynamic_int8_quantize(capacity: int, width: int, *, cann_dispatc
     """Build a PyPTO kernel for BF16 to INT8 per-token quantization.
 
     The scale uses the vLLM/A2/A3 contract directly: one FP32 dequantization
-    scale per token, stored as ``[T, 1]``.  CANN's fused EP2 dispatch path
+    scale per token, stored as ``[T, 1]``.  CANN's fused dispatch path
     uses FP16 truncation before its rounded INT8 store; other paths retain
     the existing INT32 staging sequence.
     """

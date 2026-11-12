@@ -1,176 +1,92 @@
 # DeepSeek V4.1 Flash A3 Decode
 
-Decode and Prefill now reside in `models.deepseek_v4_1_flash_a3`. The former
-`models.deepseek_v4_1_flash_a2` package has been removed. Both source histories
-remain in Git; this is a source-organization change rather than new device
-acceptance or an automatic Prefill-to-Decode state handoff.
+Decode and Prefill reside in `models.deepseek_v4_1_flash_a3`. The old fixed
+EP2 product path, two-device compile drivers and complete-layer wrappers
+have been removed. Their source and historical results remain in Git at
+`2704263`; they are not current entry points or EP16 acceptance evidence.
 
 ## Entries and operator ownership
 
 | Responsibility | Maintained owner |
 | --- | --- |
 | Bounded single-step SWA Decode and state replay | `decode_fwd.py`, `decode_replay.py` |
-| Physical-layer dispatch | `decode_layer.get_layer_entry(layer_id)` |
-| Complete SWA / Engram / C2A / C1A blocks | `decode_swa.py`, `decode_engram.py`, `decode_c2a.py`, `decode_c1a.py` |
-| EP2 product orchestration | `decode_moe.py` |
-| Routing, dispatch layout and shared-expert variants | `moe.py` |
+| Local attention and mHC composition | `decode_swa.py` |
+| Routing, dispatch primitives and shared-expert variants | `moe.py` |
 | Routed expert kernels | `expert_routed.py` |
-| Shared model, dtype, Engram and compressor contracts | `config.py`, `operator_config.py`, `engram.py`, `compressor.py` |
-| Decode-specific numerical/cache boundaries | `quant.py`, `gemm.py`, `hc.py`, `swa.py`, `compressor.py` |
-| HOST contract and no-device dependency scan | `decode_acceptance.py`, `decode_contract.py`, `decode_gate.py` |
+| Compression, Indexer and Engram computation | `compressor.py`, `indexer.py`, `engram.py` |
+| Quantization, linear, normalization, RoPE and cache computation | `quant.py`, `gemm.py`, `rmsnorm.py`, `rope.py`, `qkv_proj_rope.py`, `o_proj.py`, `swa.py` |
+| Checkpoint and EP16 MoE weight layouts | `weights.py` |
+| HOST contracts and dependency scan | `decode_acceptance.py`, `decode_contract.py`, `decode_gate.py` |
 
-The phase-specific implementations retain the exact existing quantization,
-rounding, cache and topology contracts. Shared MoE kernels use explicit
-`make_decode_*` names where their semantics differ from Prefill. Existing
-A2/A3 dtype names, compiler hints and environment option names are ABI and
-provenance, not a claim that the hardware is A2. The bounded Decode forward
-is not a full 40-layer Decode driver.
+The retained numerical kernels preserve their arithmetic, rounding and cache
+semantics. The bounded SWA forward contains attention computation; it is not
+an EP16 MoE, a complete layer or a 40-layer Decode network. `decode_swa.py`
+composes local attention with mHC and does not import distributed MoE.
 
-## Acceptance and source provenance
+## EP16 contract and current limits
 
-This directory is the independent A3 Decode session. No historical Prefill,
-CPU, simulator, or private capture result is carried into its status. The
-formal status for layers **0, 1, 2, 3, 14, 15, 19, 20, 21, 24 and 25** starts at
-`not_run` and can only change after a same-input NPU PyPTO versus vLLM-Ascend
-reference comparison at the requested topology. The floating policy is
-`atol=0.05, rtol=0.05`; routes, lengths, masks, source IDs, readonly inputs,
-inactive rows and untouched cache regions are exact checks.
+The declared topology matrix is DP16/TP1/EP16, DP8/TP2/EP16 and
+DP4/TP4/EP16. A Decode configuration with EP2 is rejected. Declaring one of
+these EP16 configurations does not shard the bounded SWA kernel or provide
+a distributed network driver.
 
-`decode_source_manifest.json` maps each ported file to its original source digest.
-It also records unchanged definition AST digests, the native-call identities,
-and host changes needed for relocation. Its `decode_files` records identify the
-new PyPTO Decode entry points and explicitly keep their accuracy evidence
-separate from source migration. Dependencies extracted from the original
-parent model retain their compute definitions in this flat directory.
-The port includes the L1/L14 Engram observation interfaces, C2A source/reuse
-cache publication, and the C1A source/reindex/reuse candidate state boundary.
+`weights.load_decode_rank_weights(checkpoint, layer, rank)` loads the router,
+shared expert and one contiguous 24-expert MoE shard for an EP16 owner.
+Ranks 0 through 15 cover all 384 experts exactly once. This preserves the
+existing per-expert packing, scale handling and offset checks; it does not
+bind TP-sharded attention weights, source/cache lifetimes or a network plan.
+`weights.abi_summary()` describes that host layout without loading weights.
 
-The local tree contains bounded PyPTO L0 entries, complete layer composition
-entries for the retained L1/L2/L3/L14/L15/L19/L20/L21/L24/L25 EP2 matrix, and
-the independently compiled EP2 routed/shared MoE entry. The current paired
-representative replays pass for L1, L2, L3, L14, L19, L20, L21, L24 and L25.
-L15 reaches the complete replay but remains a precision failure because its
-observable `moe_output` exposes a PyPTO routed/shared split while the vLLM
-capture exposes a fused boundary. Composition and compile coverage do not
-promote a layer without a same-request replay.
-The independent vLLM-Ascend capture is described by
-[`decode_reference.py`](../../../models/deepseek_v4_1_flash_a3/decode_reference.py)
-and is not imported by the product path.
+The following requirements remain unimplemented or unverified:
 
-Callers must supply the actual independent request, checkpoint, history cache
-and reference capture required by `decode_contract.py`. The package
-contains no private capture runner or device queue. Metadata, compile-only
-results and the representative historical reports below do not complete the
-formal acceptance matrix.
+- Complete-network EP16 Decode dispatch, communication and output reduction.
+- Per-layer TP attention, cache ownership and Prefill-to-Decode handoff.
+- DecodeState binding and request/position/finished/epoch transitions.
+- Same-input NPU versus independent vLLM-Ascend reference captures.
+- Device memory peaks, resident model coverage and performance.
 
-Generic `layer_capture.npz` and `moe_capture.npz` files do not satisfy a
-non-SWA layer plan. C2A/C1A captures must also declare complete semantic
-`compressed_kv_cache`, `index_cache`, `index_scale` and (for C1A)
-`candidate_pool` state in `reference_capture.json`; L1/L14 must mark the
-captured Engram rows.
+`decode_gate.py` reports `ready_for_submission=false`, no product command and
+no formal network entry point while the EP16 driver is unavailable. It does
+not substitute a bounded operator run for the requested topology.
 
-## Independent Decode acceptance
+## Source and acceptance evidence
 
-The Decode session starts with every formal gate at `not_run`. Search K=2 is
-registered in [`decode_contract.py`](../../../models/deepseek_v4_1_flash_a3/decode_contract.py);
-both candidates use PyPTO entry points and share the same page size, scale
-contract, input boundary, topology and tolerance. The acceptance contract and
-product dependency scan do not initialize devices or execute model kernels:
-The four-commit ancestry and tree IDs are recorded in
-[`decode_cherry_pick_receipt.json`](../../../models/deepseek_v4_1_flash_a3/decode_cherry_pick_receipt.json).
-The generated `git cherry-pick -x` proof is kept in a temporary clean clone;
-the product checkout still retains the requested source commit IDs unchanged.
-[`decode_contract.py`](../../../models/deepseek_v4_1_flash_a3/decode_contract.py)
-records the global dimensions, the TP1/TP2/TP4 matrix, EP2 expert ownership,
-the replicated single KV head, page layout, and dispatch/combine contract.
-`decode_config.py` records the constructed-runtime fields for sequence
-parallel MoE, cache block size, request scheduling and communication groups;
-unresolved fields stay `not_run`. Capacity and per-rank peak memory are also
-left `not_run` until real checkpoint buffers are allocated.
+`decode_source_manifest.json` and `source_manifest.json` retain original
+export identities, including retired files. `package_refactor_map.json`
+records retired definitions separately from current owners. The original
+four-commit history is recorded in `decode_cherry_pick_receipt.json`.
+
+Historical two-card layer and MoE replays remain evidence for their exact
+old source, inputs and topology. They do not establish current EP16
+correctness. Every current formal layer and topology gate remains `not_run`.
+Floating comparisons use `rtol=0.05, atol=0.05`; discrete control, indices,
+readonly state, inactive rows and untouched cache regions remain exact.
+
+`decode_contract.py` still requires identical checkpoint, request, history
+cache and independent reference captures. C2A/C1A reference assets must
+include compressed KV, index and candidate state, and Engram layers must
+identify the captured rows. A contract scan or a CPU golden is not an NPU
+acceptance result.
+
+## Checks
+
+The following HOST reports initialize no devices:
 
 ```bash
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_acceptance --json
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_acceptance \
-  --record .pypto-a3-state/decode-acceptance.json
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_gate \
-  --topology ep2_gate --record .pypto-a3-state/decode-ep2-gate.json
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_gate \
-  --topology main --record .pypto-a3-state/decode-main-gate.json
+python -m models.deepseek_v4_1_flash_a3.decode_acceptance --json
+python -m models.deepseek_v4_1_flash_a3.decode_gate --topology main --json
 ```
 
-The scan rejects vLLM, vLLM-Ascend and Torch-NPU imports in the product import
-closure. Files ending in `_runtime.py` are reference-only and cannot be loaded
-by a product entry. The scan records Torch imports used by the golden/reference
-side separately; they do not establish product accuracy.
+The dependency scan rejects vLLM, vLLM-Ascend and Torch-NPU imports in the
+product closure. Independent reference capture remains in
+`decode_reference.py`; it is not part of product computation.
 
-`decode_gate.py` is intentionally fail-closed. It emits the required
-`task-submit --device auto --device-num 2/16` command and records missing
-checkpoint, cache, input, or reference assets; it never launches vLLM or
-claims a gate without a same-input capture. `decode_reference.py` records the
-separate reference process's Python path, source digest, mapped libraries,
-visible devices and runtime library path; it never imports vLLM in the product
-process.
-
-The bounded entries accept the full state ABI, while the independent
-`decode_moe.py` product entry owns the PyPTO EP2 dispatch/combine,
-192-expert-per-rank routed shard, and shared-expert merge. The real two-card
-MoE boundary has executed on A3 with the checkpoint and the vLLM-Ascend
-capture input; `logits`, `route_ids`, `route_weights`, and the merged MoE
-output pass the `rtol=0.05, atol=0.05` gate. The evidence is recorded in
-`.pypto-a3-state/product/decode-ep2-l0-v25e.json`.
-
-The same PyPTO MoE boundary replay has also passed for L1, L2, L3, L14, L15,
-L19, L20, L21, L24 and L25 using their layer-specific vLLM-Ascend captures.
-Those reports compare logits, exact top-six route IDs, route weights and the
-merged routed/shared output. They are component evidence only. The complete
-physical-layer replays currently pass for L1, L2, L3, L14, L19, L20, L21, L24
-and L25. L15 has a complete same-request replay with attention, cache/index,
-HC, routing and final output passing; its observable `moe_output` remains
-outside the fixed gate (`max_abs=0.132812`, `mean_abs=0.0017201`) because the
-reference capture fuses routed and shared expert results before exposing that
-boundary.
-
-The complete L0 composition has also executed on the same two-card A3
-topology with mHC attention, SWA cache read/write, FFN residual, routed/shared
-MoE, and output restoration. The representative result compares the layer
-output, router input, logits, route IDs and weights, MoE output, FFN state,
-and cache pages against the reference at `rtol=0.05, atol=0.05`; see
-`.pypto-a3-state/product/decode-layer-ep2-l0-v29.json`. The matching joint
-vLLM-Ascend contract is
-`.pypto-a3-state/reference/decode_ep2_l0_20261106_v29/reference_capture.json`.
-
-The formal EP2 status remains `not_run` until the required no-local-input
-collective, finished/inactive rows, unequal-length batch, slot reuse, and
-additional request-state cases are covered. The new C1A/C2A and Engram
-compositions still require same-request paired captures and NPU replay before
-they can change the layer precision status; CP/SP and the requested 16-device
-gates remain separate blockers.
-
-## Checks without a device
-
-Compile the bounded Decode ABI without allocating a device:
+The bounded SWA entry can be compiled with the existing
+[Golden Harness](../../run-and-validate/golden-harness.md):
 
 ```bash
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_fwd -p a2a3 --sim --compile-only
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_moe_compile
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_layer
+python -m models.deepseek_v4_1_flash_a3.decode_fwd -p a2a3 --sim --compile-only
+python -m models.deepseek_v4_1_flash_a3.decode_replay --steps 1 -p a2a3 --sim --compile-only
 ```
 
-Compile the deterministic single-context state replay for each supported step
-count. These commands exercise PyPTO code generation only; they are not NPU
-checkpoint accuracy evidence. The EP2 compiler entry reports physical
-FRACTAL_NZ lowering separately from execution.
-
-```bash
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_replay --steps 1 -p a2a3 --sim
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_replay --steps 2 -p a2a3 --sim
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_replay --steps 8 -p a2a3 --sim
-```
-
-The external A5-shaped validation tree is not part of this Decode session and
-must not be used as an acceptance shortcut. Actual operator validation should
-use the existing [Golden Harness](../../run-and-validate/golden-harness.md)
-only to compile the PyPTO entry, then compare NPU outputs and state against the
-independent reference manifest under the same checkpoint, layer, cache and
-topology. Native boundary reports verify identity and interface integrity;
-they do not replace numerical comparison against an independent reference.
+These are bounded operator checks, not EP16 or full-network acceptance.

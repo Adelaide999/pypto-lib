@@ -567,7 +567,8 @@ HIDDEN = 5120
 INTERMEDIATE = 2304
 INTERMEDIATE_PADDED = 2560
 EXPERTS = 384
-LOCAL_EXPERTS = 192
+DECODE_EP_SIZE = 16
+LOCAL_EXPERTS = EXPERTS // DECODE_EP_SIZE
 TOP_K = 6
 
 
@@ -618,7 +619,7 @@ def pack_routed_expert(
     layer: int,
     expert: int,
 ) -> dict[str, torch.Tensor]:
-    """Load and pack one routed expert for ``decode_ep2_rank``.
+    """Load and pack one routed expert in the Decode FRACTAL_NZ layout.
 
     W1/W3 are already in the kernel's logical ``[out, in]`` orientation.
     W2 is also ``[hidden, intermediate]``; only its reduction tail is padded
@@ -665,10 +666,10 @@ def iter_routed_experts(
     layer: int,
     rank: int,
 ) -> decode_Iterator[tuple[int, dict[str, torch.Tensor]]]:
-    """Yield the 192 owner experts without retaining a second full shard."""
+    """Yield one EP16 owner's experts without retaining a second full shard."""
 
-    if rank not in (0, 1):
-        raise ValueError(f"EP2 rank must be 0 or 1, got {rank}")
+    if not 0 <= rank < DECODE_EP_SIZE:
+        raise ValueError(f"Decode rank must be in [0, {DECODE_EP_SIZE}), got {rank}")
     first = rank * LOCAL_EXPERTS
     for expert in range(first, first + LOCAL_EXPERTS):
         yield expert, pack_routed_expert(checkpoint, layer, expert)
@@ -679,7 +680,7 @@ def load_routed_shard(
     layer: int,
     rank: int,
 ) -> dict[str, torch.Tensor]:
-    """Materialize one complete 192-expert EP2 shard in external NZ layout.
+    """Materialize one complete 24-expert EP16 shard in external NZ layout.
 
     The ``pl.NZ`` annotation is logical in the Python signature, but the
     distributed host ABI passes the compiler's physical five-dimensional
@@ -760,12 +761,12 @@ def load_shared_expert(checkpoint: DecodeSafetensorsCheckpoint, layer: int) -> d
     }
 
 
-def load_ep2_rank_weights(
+def load_decode_rank_weights(
     checkpoint: DecodeSafetensorsCheckpoint,
     layer: int,
     rank: int,
 ) -> dict[str, torch.Tensor]:
-    """Materialize all real checkpoint operands required by one EP2 rank."""
+    """Load an EP16 MoE shard; attention and cache bindings are separate."""
 
     result: dict[str, torch.Tensor] = {}
     result.update(load_router(checkpoint, layer))
@@ -779,6 +780,8 @@ def abi_summary() -> dict[str, Any]:
 
     return {
         "source": "Aurora safetensors W8A8_DYNAMIC",
+        "expert_parallel": DECODE_EP_SIZE,
+        "local_experts": LOCAL_EXPERTS,
         "offset_policy": "reject_nonzero",
         "routed": {
             "w1_w3_logical": [INTERMEDIATE, HIDDEN],

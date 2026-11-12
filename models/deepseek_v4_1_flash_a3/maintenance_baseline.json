@@ -1,8 +1,8 @@
 {
-  "base_commit": "5e463e4867e7bb67eb548d06163d2f82475ee161",
+  "base_commit": "2704263ca947488232a9c6eaecfeb4cd0010de96",
   "original_manifest_sha256": "aecf0c4665f0bb356d475e13124e3c9c01d998a2360f75baff810cc746c7151d",
   "decode_manifest_sha256": "c98ded60abe972431cc49cbfcffaf495b19e2b7abfd78ba68651f0c69ecd6fd8",
-  "package_refactor_map_sha256": "1900cf000e0777e20c5730d49f2fc4a940faabb449c90fe70d718b2c8fc7d341",
+  "package_refactor_map_sha256": "06e929e2b01aefff8491c51f5b9a164153d68b8cbac5bfb80ce05bfe3d36e026",
   "definitions": {
     "__init__.py": {
       "__getattr__": "d35d0640762b36b6b21572440ae07b0b1548e93854f00c14fe3849fc0b28aea5",
@@ -80,41 +80,22 @@
       "_module_name": "eb788c453fba480a720ce077699fe4d5261085e6f19d4e9938b90c0c2bcde44f",
       "_local_module": "b31a0eb7c2ed83ad513312b5038081dd0d96bdfa586c29e0ada8970dd9238973",
       "_import_targets": "32f6ffd861165c117b9937dbe7e30e4481b27aa3a7a508de92ca2b66634e2dfb",
-      "product_dependency_scan": "e145c87e514571ed1722046746d4cce2f6f0369027967c5f629a48b191730555",
+      "product_dependency_scan": "70136ebf38406f6cf83492bd4f6db6427abf7bf1c3aff36a8d3dd3085a925ac3",
       "runtime_identity": "64522fc8d592c293567722f680cce7ea232890cb5a63b7f88a25421c81ce54bc",
       "source_hashes": "fdc8db0f16d6402c3a4106e6d8d0d353064c1eec2ce1e793b00eb17a30b407ce",
       "checkpoint_asset_report": "a5e4f7f2bdcbba265add96253d9c239bec96df6edc921fbb588175d42bba9de5",
       "report": "91d696e79305a658005a15ec56ddf3aa31b60c3a120d49ac79d10b2f2f80ed7e",
       "main": "4a1510ebef81bd20ad0d29ff1597ae06230fb9f97f0ff70316b26f884d18da3c"
     },
-    "decode_c1a.py": {
-      "_pad_index_cache_c1": "43f494d7ee8a3f7a797b3c4e7c1fee72e59130cce50c0d443ba19db11a829ed6",
-      "_gather_rows_c1": "d1eb6741d3d2f09751ba9aebd81024b1a833ee27e209518e39e2e1497843847c",
-      "_gather_window_c1": "da1becbeee7faacf0fb5ad9d7da4f43133496049081168ae4fe080956d4bf302",
-      "_c1a_tail": "b9e8379f66437d8bc411aab502b2eb77ccdfcdf22407329a52cac967b7de62e9",
-      "_common_rank_args": "1bf767ce6e423f9f210f8778e352b4e01a105dbb09955ee3ec40ec7774375452",
-      "decode_layer_ep2_c1a_reuse_rank": "b7675b7e99bdbef57fd8b1686e27447c6620a464c9b889923ead156e260540da",
-      "decode_layer_ep2_c1a_reuse": "3db3b976b1eb412b949d66fa09e82bdc0feb1d5f1275787051ae39d3f783c2b0",
-      "decode_layer_ep2_c1a_full_rank": "217f7a0ea848ea45ba79fe372c07818f5a55995b63552af3f88fb88a2a1367c8",
-      "decode_layer_ep2_c1a_full": "a76af40c2d3a4c293295566bcb182be95a17d3ad1251e61c0c672711ddd6db0d"
-    },
-    "decode_c2a.py": {
-      "_engram_linear": "373e32408e26fab7a4a537647fbea22c30906ecb619e7940d4754b438ed2c86b",
-      "_pad_index_cache": "b832ff21be062eebd340efbe143d699f6aa0425beb15605216b6ef775ec208a6",
-      "_gather_rows": "e3bfd447ba5c184da411dab40f4d2a095cf92458719d9227d212ce0e9187fa9f",
-      "_gather_window": "987cb61bd7a799a3fa42c279c0ff182d288139049a7d8be85208b24a80102594",
-      "decode_layer_ep2_sparse_rank": "fd7f32dda229e07c905be3612aea7f001eed0c4224dd724001771e881a34eac7",
-      "decode_layer_ep2_sparse": "4626972089ea16e8eb73ad3ea749182a48e2c865b82d05b43f095bb49eaeb957"
-    },
     "decode_config.py": {
       "_parse_parallel_size": "551bba2aa1b2da64c2b95a0c8a22bc91884f43084931e043899f7d960b1e0ea7",
-      "DecodeParallelConfig": "6b2251953cdc8ea7465e359e814970c4b3bba6f3e1869e0ffcb9b3096399a86b"
+      "DecodeParallelConfig": "ae6add9524d38461f86cba450e1edaeadd3fdf4df306cfba5c205de79c1721ae"
     },
     "decode_contract.py": {
       "DecodeGlobalShape": "620c38d5a8d381d340344ee94d86095a3832a0f757876ec770211933e363283a",
       "DecodeRankShape": "f2787e4590a78fc95596305011e1cf6ec5ea4bf3a14bd1a16b952e7a591160d5",
-      "rank_shape": "991686134f49b18667bbd789cd189b338012f125bb23e2ada71f3def19d59dbe",
-      "shape_matrix": "6a7746113cb1a5597245ddd7e086580f86d720f8a11aa14c020b51a9877e96e4",
+      "rank_shape": "406da48ad88d952b9def7064f160bec9133aace336aa141df05f5f8dfa59d39e",
+      "shape_matrix": "7ccc3e54aee4312ead38dec9fae2966269517b2124e802d5f0466bd40414be4d",
       "DecodeCandidate": "683c240cca1accb6f8c8e55f3f06555aa3c13d73b23f7e6e3cd3e74d192fc73f",
       "validate_candidates": "40dfe64ef148ea8b3f2fc6e701506f0ec4d3aee40e38c475887f45dc0f595511",
       "_read_json": "eac9f7f60f0a8304a13a52707cfeee44e8f9b6f6889952499dde5ab605310c74",
@@ -125,45 +106,18 @@
       "_check_history_cache": "da185a13237d1a69c112c1054333f2c078e89aacfc5ffb2dfba18e8b15d51b74",
       "validate_assets": "b9883316a4f62e19988e5f5aa08caca2d9903a81fdd9c37d4a7cd9e4a0a9193d"
     },
-    "decode_engram.py": {
-      "_engram_linear": "a49f4180544a993b4bfb8ad997ec834d4e9a0f539c14a59699ddb3d0efe8fb05",
-      "decode_layer_ep2_engram_rank": "b5eaeadf08679a7539b5e0f3557c1db043dfb593a04199f6c6e0fdff5209bb97",
-      "decode_layer_ep2_engram": "413a680b313f465d1417a57b26bb583a0eb3036c1f3826dfa2504805d5e1ecc2"
-    },
     "decode_fwd.py": {
-      "validate_decode_contract": "1d5615cb4a0aed4f06f202d9a9de1b4a91abc803eea33e2a7879d8bd025a2ab1",
+      "validate_decode_contract": "955f9444e1fb69806e972d4538fc3d3deb346373c311ac4ceac414fe1d5ed093",
       "make_decode_step": "fec24ad1cb92238d46f4bf28d788d7efd85762fe43b8bf20f51e58cd5ec8e9f5",
       "validate_decode_state": "07ee85524f973a211dcd760702c7980bf40f688386f347263d642ef7bdb7ad3f",
       "decode_step_reference": "be0ab4cd51109acd5f4401d6f46e4768ed47e1b99461e10379e0df3bb9946dea",
       "_zero_specs": "3a2873b3529a9fc59efdb9694d76cb7e7b470858d5d3eaf53a4bd3762aef093c",
       "_golden": "cd33c2839ebff686b467269277a270fcbbf605554a89779339f477e9ba3922b5",
-      "main": "29e3c3098f0142461479253eb796313df060710307e32756c42c548983e739cb"
+      "main": "e32a1c87bf333d289b314f05064ccf0a1aa0d4a241947e5d220376f716f186ae"
     },
     "decode_gate.py": {
-      "gate_report": "6ef406603d7be752ebd4e214216714fec87b22fd722e68c552d5c95843fe8788",
-      "main": "0c42033e490a5dc0d079310a7e2d71a7aa05978419bcc9b8cbea3e631ecdb6b0"
-    },
-    "decode_layer.py": {
-      "get_layer_entry": "9141eb5d5b0e11f193e07ac1511664412e7081a16aa11a76bbfede7a7d67dcf0",
-      "_dummy_args": "a945fac740747fbc74476b7813f89dbd6438bc43bf7b52fc9071c5f330c8551f",
-      "compile_layer_ep2": "ec1e79fe775ba4dcf7cbd332817de918e9ba073010c46b74f00657a8e143ebd3",
-      "main": "c101e398c1b3213109eba80a1e124a356c82cc7f90c38bd52063aa7c5a69f989"
-    },
-    "decode_moe.py": {
-      "decode_ep2_pack": "f8eff6801ff914f4f61bcf0974d501857589f2d3c2cae8c7cc33e3a8d0feba60",
-      "decode_ep2_arrive": "cc5f64109ee239aedf481537eed2edaeac7bcaee8d1464946753888a27444217",
-      "decode_ep2_regroup": "fe34c2a8c9e5e710b563a93377c0cc0416126e8d6335cc4427bd8a20f6167244",
-      "decode_ep2_return": "6e7afa1b814c316588f909bb58a1fb7bb71207ae98df6f00b6144a1999bff9e7",
-      "decode_ep2_combine": "2eac1d288fe04dc273f20f3303dd583b78ad00c877161e5351166668456a296e",
-      "decode_ep2_rank": "6b7b78313a2a22d1db553b24758933a512d27610c73b1a72d49ad9bd4917ceca",
-      "decode_ep2": "eabe77689d8094d097ebc805e24c69ee26b8a60a6468370e33387cd9212c4eac",
-      "product_contract": "820512e57ac351b329c6fd7c9bb4ba2801037a4473a2e55aa99b1221c4afa8b8",
-      "main": "96e8bf2ca614e28a5c4621d11a1c35cd2302ad34d2dca17623b3f7db0da249c6"
-    },
-    "decode_moe_compile.py": {
-      "_dummy_args": "e34917ed963282fd3c5d3c94982c3aeb1797888a88cc0079047e0b5d54831367",
-      "compile_ep2": "6cb99f86468d1ced94a137ba7ecf2c1c6634d06a8a33df77d1267b27b634d3e6",
-      "main": "57fac0d45ba062b54ccd26c92a39b7d32666caf672786226fb90e512cd69934d"
+      "gate_report": "e46c66edeb92933bfd3ee5b2bf717f5a63b9ddaa5d9b718f99dd9b54d37e0ca4",
+      "main": "d78186f0d22a60b3308cd8b9042f2a0fd65eededbb8a87634e70c88e874ba784"
     },
     "decode_projection.py": {
       "make_linear": "6ba0653f271780b2e899b4558136c5794c6f6eb73d0878ed519596bd4e3c336f",
@@ -196,10 +150,7 @@
     "decode_swa.py": {
       "make_attention_block": "387fa3c0e92f00aa2cfa365b3fa6f5c9b5fd9641237c029713f58200117cd781",
       "make_attention_inline": "4c0e91b0575b07e7c2542146cb2e8b62635cc2561db6c6ab8a1d4864cde9c50e",
-      "make_attention": "b24468386eb5e916fe8577bf11e0b8e2669f86a0158ebe356a75eb3068a9f958",
-      "decode_layer_ep2_rank": "9508471ede9f93babae21996655ad13e93df0d80f41d668a157621f19180fbb8",
-      "decode_layer_ep2": "e60295dc695a27551aaf6d8e7e035079788148813a77b40f2c4d48cab11662c7",
-      "product_contract": "52e6e0e00310c75fa3cd2e2ea16ebf221ce54f7a01812b7f90478553e4863627"
+      "make_attention": "b24468386eb5e916fe8577bf11e0b8e2669f86a0158ebe356a75eb3068a9f958"
     },
     "engram.py": {
       "make_engram": "6ef710c4c163ccc8bfae6911997e71d0972667cda9d8a346dd8eb6bb70470a64",
@@ -826,12 +777,12 @@
       "_scale": "a2875bec41104321ee143225e6e09a9360fa1621fde9de8201e2ca16ffd0b967",
       "_pad_w2": "be77e0029b36b96b3d40de93f9b4c6c021d4725b7098f7a6cf56633facda7cda",
       "pack_routed_expert": "4aa419be8875433c3bde20a6de801a51e104929b6465cb4025216c15d2eae864",
-      "iter_routed_experts": "b6b94e9ad0b1e4dd3a76bd92b79588f91e5685891a75a3960485f7cfde8be012",
+      "iter_routed_experts": "17a962b6ed38680f3eabba7a329e1324fab9a05b13008478f17e9d0d2ca24318",
       "load_routed_shard": "f027f52b5e7a170de7abe13f325b589c9d1a0de9bc332bffe82667478d15b4f0",
       "load_router": "15ac1c280b3291cff999f291c002700d7f799dfd105444420127fa1ac1889ab4",
       "load_shared_expert": "d1f8c8e70c19fcd2342a3e47ba4e4042000c479934b8f02ef1a216564517128a",
-      "load_ep2_rank_weights": "3b76390e0230bfe126342c66d67f992ea1325d6c81b070fb2767163d4ee4af48",
-      "abi_summary": "f5ca46fa811462780f5726bba5b663541a0e6b068e32d73f4e9a7517143068fa",
+      "load_decode_rank_weights": "acd8128e828e010aa3f7e8638c8cec2a5b829ef3f9025380e67fa2eff1cc010d",
+      "abi_summary": "075c16b01705b34e27b99cc676d32c647b0a38e6280425817c46d93328b92cf0",
       "_sha256": "76d36457181ae8dc4c956b41c1587610ed04e6727c51ffaa68734ad79dbf2951",
       "_read_json": "bbb161cafdb7b2d1a5433401d44f0174d2350fe4304128aa92c88b42456cf9dc",
       "_safetensors_header": "960af51c5c68e554991c5e90aa647ff00017ad67f5fa08193c66a59109ca851a",
@@ -844,29 +795,23 @@
     }
   },
   "module_bindings": {
-    "__init__.py": "49942f746b2ef3f7d06c0636fd5d4cdf8da99730498a76900815773b4ec46c9d",
+    "__init__.py": "c6515d946ecc4a955653c8d095fb28184c77cbc8f0ba4e919314c63e14b19892",
     "activation.py": "a364d60efec67f3cb6e752464f1322fa801bc63de99b1ca9529397fa268ad96c",
     "audit_source.py": "c91f63a6b4236f0f7bf64c99bad1446d7363b53a5945c1b28e343fcca4dcf467",
     "audit_task.py": "fd6a339562132b954eb46f0eb28062e0f07d400c8d9c5c653f574bf9a443fa95",
     "cache.py": "30e3ec175b62cc44c673edccf996b712c03978ea2554d5943c976aa263559530",
     "compressor.py": "884a8f752e2b673bd78487342664691c20bc35be4b2753eb445bbf708aac339f",
     "config.py": "01aec1f4e8888317ed9b7d9bcf9045e5a6bfd031f6ae4e94066c91b016827878",
-    "decode_acceptance.py": "33ae8e21867cb1eebcaeacb8d339868cbf5cf73417e99231806e3f2bc93a7d52",
-    "decode_c1a.py": "878951f04d6f10464590b718e26dd922079f65792f11da048d2fd6d816e8f5e4",
-    "decode_c2a.py": "9ab0397a24378e2b7926548a1fbc7a2dd4e927d0da37ab32978251f98cbaa230",
+    "decode_acceptance.py": "2166ddfafc202a4300ee506d488d0622a30a02fb153f4b0be9f1720cba436948",
     "decode_config.py": "982b890cb22068dddb3c9a8941c086d66dd9dc9ec8e48bdfc5053a725241a5d6",
     "decode_contract.py": "97befe9b60095ed0f19c4530cf9b68fed6b4c8deb63a4dd62fb80ad6c7427b76",
-    "decode_engram.py": "64f2606541b84cff15a9c937cf787ffc83a90d64471c05da0aff85ec760f09a9",
     "decode_fwd.py": "3ccec3dfaeb72cae05c8bd2f0f9dc56ee7523aa1c5e31131915ac98f23ccab05",
     "decode_gate.py": "98e0ea391ccc8a9e7f33c586aa475ad06134d360951d88f204ec377788b00e03",
-    "decode_layer.py": "e9cea0780e77ba40ba03bdd7b254c383e556d8398f3c3744a6664fbb9faf600d",
-    "decode_moe.py": "e13741a00b39f1d54478337199aafe990b32fc5c0f568407b7f57f6822487c2f",
-    "decode_moe_compile.py": "d592d36b1e7df550217555de751017724097fa3f597d07f3f06893dbd2f2f7c8",
     "decode_projection.py": "318739b06d2299c237154b625857f9ad4b860e37e61c3a567b03998451510b88",
     "decode_reference.py": "c4bc65c4ec512f29514b3537df635acd7b6adf9b92199d3d468fb30422451bda",
     "decode_replay.py": "2d1be592263ff759cfc62f4227a880af857112585c9b560bcbc3757ea60acf34",
     "decode_sparse_attention.py": "4a175eaf6e31a7e51e2a957cdf33b116a24216af54fd74a7248fd1bb37fed4aa",
-    "decode_swa.py": "a3c44e987790da5be3f47b95c30d12fdc8972bca0c73298ea4ad9ba42c64ad8b",
+    "decode_swa.py": "bfdfb90c1e2d2ac94a036cba1cb072d5bbb9f12c80609354a8981aa4683063ef",
     "engram.py": "f423789775dbdfa875f297be3bca2e611d222a6eb34b134accc5842b4d1b4dd1",
     "engram_host.py": "e274bffafa23cca72c1645e6800c62489d72ba1d3bc5c09ef51f99c16c1c1aea",
     "expert_routed.py": "4e9968c01867ae0a7f78a71ab770c1f01dc1ce983f472e6e8c57fbb910bffdde",
@@ -926,6 +871,6 @@
     "validate_engram_host.py": "d7df43280f86a863cdd2544b4cae26875f430bc0047787d9b4f7a01ba2c2909a",
     "validate_resident.py": "810dc050cdac8209c5bc2e680b1c8998a138f7f37b8606a46b6cf418a4275fdc",
     "validate_resident_device.py": "309d621452b956c0f63ddb56fba380a579c1a048b4478acc6669f37dacffca4c",
-    "weights.py": "c3e8a0ff9fbcb346fafbf4a90ef92bed27329a97f22a174b59c5595895efb708"
+    "weights.py": "542b5245330d8774f6956a3300361740b724b08add6fc260bde8d32702ca1f3d"
   }
 }

@@ -66,8 +66,6 @@ _EXPORTS = {
     "compile_prefill": ("prefill_fwd", "compile_prefill"),
     "make_decode_step": ("decode_fwd", "make_decode_step"),
     "validate_decode_contract": ("decode_fwd", "validate_decode_contract"),
-    "decode_ep2": ("decode_moe", "decode_ep2"),
-    "get_layer_entry": ("decode_layer", "get_layer_entry"),
 }
 
 

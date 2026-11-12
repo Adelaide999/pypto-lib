@@ -33,7 +33,6 @@ PRODUCT_ENTRYPOINTS = (
     'decode_fwd.py',
     'decode_replay.py',
     'decode_contract.py',
-    'decode_moe.py',
     'decode_swa.py',
 )
 VALIDATION_ENTRYPOINTS = (
@@ -41,8 +40,6 @@ VALIDATION_ENTRYPOINTS = (
     'decode_contract.py',
     'decode_gate.py',
     'decode_reference.py',
-    'decode_moe_compile.py',
-    'decode_layer.py',
 )
 REFERENCE_ONLY_SUFFIXES = ("_runtime.py",)
 FORBIDDEN_PRODUCT_IMPORTS = ("vllm", "vllm_ascend", "torch_npu")
@@ -80,7 +77,6 @@ SOURCE_COMMITS = (
 )
 
 TOPOLOGIES = {
-    "ep2_gate": {"dp": 2, "tp": 1, "ep": 2, "pp": 1, "pcp": 1, "dcp": 1, "devices": 2},
     "main": {"dp": 8, "tp": 2, "ep": 16, "pp": 1, "pcp": 1, "dcp": 1, "devices": 16},
     "tp1_compat": {"dp": 16, "tp": 1, "ep": 16, "pp": 1, "pcp": 1, "dcp": 1, "devices": 16},
     "tp4_compat": {"dp": 4, "tp": 4, "ep": 16, "pp": 1, "pcp": 1, "dcp": 1, "devices": 16},
@@ -185,12 +181,12 @@ CONTRACT: dict[str, Any] = {
         "http_service": "not_run",
     },
     "implementation": {
-        "status": "ep2_composition_compile_pass_npu_not_run",
+        "status": "bounded_swa_only_ep16_network_not_implemented",
         "formal_ready": False,
-        "formal_entrypoint": 'models.deepseek_v4_1_flash_a3.decode_moe.decode_ep2',
+        "formal_entrypoint": None,
         "blockers": [
-            "EP2 driver NPU execution gate",
-            "same-input EP2 vLLM-Ascend reference capture",
+            "EP16 complete-network Decode driver and collectives",
+            "same-input EP16 vLLM-Ascend reference capture",
             "C1A/C2A compression and index refresh",
             "Engram state and cache ownership",
             "TP/DP/CP/SP runtime driver and state outputs",
@@ -212,7 +208,7 @@ CONTRACT: dict[str, Any] = {
         "single_machine_capacity": "not_run",
         "per_rank_peak": "not_run",
         "required_inputs": ["checkpoint.json", "decode_input.json", "history_cache.npz"],
-        "recovery": "Measure allocated bytes and peak live buffers in each queued EP2 and EP16 rank after the checkpoint and cache assets are supplied.",
+        "recovery": "Measure allocated bytes and peak live buffers in each queued EP16 rank after the checkpoint and cache assets are supplied.",
     },
     "layers": {str(layer): "not_run" for layer in TARGET_LAYERS},
     "topologies": {name: "not_run" for name in TOPOLOGIES},
@@ -293,7 +289,7 @@ def product_dependency_scan() -> dict[str, Any]:
         "host_reference_imports": host_reference,
         "subprocess_edges": subprocess_edges,
         "reference_edges": sorted(set(reference_edges)),
-        "product_compute_scope": "complete_l0_swa_mhc_and_ep2_moe_driver",
+        "product_compute_scope": "bounded_swa_step_and_attention_only",
         "reference_only_files": sorted(
             str(path.relative_to(ROOT))
             for path in MODEL_ROOT.glob("*_runtime.py")

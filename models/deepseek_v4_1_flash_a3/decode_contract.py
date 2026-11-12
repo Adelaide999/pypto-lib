@@ -62,6 +62,8 @@ GLOBAL = DecodeGlobalShape()
 def rank_shape(dp: int, tp: int, ep: int) -> DecodeRankShape:
     """Return the conservative local shape for one supported topology."""
 
+    if ep != 16:
+        raise ValueError("A3 Decode shape contracts require EP16")
     if min(dp, tp, ep) <= 0 or dp * tp != ep:
         raise ValueError(f"invalid Decode topology DP={dp}, TP={tp}, EP={ep}")
     if GLOBAL.attention_heads % tp or GLOBAL.routed_experts % ep:
@@ -91,7 +93,6 @@ def shape_matrix() -> dict[str, dict[str, object]]:
     rows: dict[str, dict[str, object]] = {}
     for name, dp, tp in (("DP16_TP1_EP16", 16, 1), ("DP8_TP2_EP16", 8, 2), ("DP4_TP4_EP16", 4, 4)):
         rows[name] = asdict(rank_shape(dp, tp, 16))
-    rows["DP2_TP1_EP2"] = asdict(rank_shape(2, 1, 2))
     return rows
 
 

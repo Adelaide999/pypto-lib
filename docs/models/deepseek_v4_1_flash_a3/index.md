@@ -64,14 +64,15 @@ The original source names in this manifest are intentional provenance.
 
 Compression projection/pooling/publication now share `compressor.py`; Indexer
 cache/query/candidate operations share `indexer.py`; Engram device kernels and
-their validators share `engram.py`; all checkpoint readers and the EP2 Decode
-weight ABI live in `weights.py`. Normalization variants share `rmsnorm.py`.
-The latest responsibility consolidation reduces the package from 123 to 83 Python
+their validators share `engram.py`; checkpoint readers and the EP16 Decode
+MoE weight layout live in `weights.py`. Normalization variants share `rmsnorm.py`.
+The latest responsibility consolidation reduces the package from 123 to 77 Python
 modules (151 before the earlier operator consolidation). The complete network
 loop, reusable compilation and runtime now live in `prefill_fwd.py`; exact L2
 argument bindings live with the layer composition. Input packing, output heads,
 linear operations, normalization and rotary embeddings have independent owners.
-Phase-specific numerical boundaries are preserved. See the
+Phase-specific numerical boundaries are preserved. The old EP2 Decode drivers
+have been removed; full-network EP16 Decode remains unimplemented. See the
 [ownership map](../../../models/deepseek_v4_1_flash_a3/MODULE_ALIGNMENT.md)
 for the official structure comparison and retained distinctions.
 

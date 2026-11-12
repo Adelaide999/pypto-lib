@@ -37,14 +37,7 @@
     "a2/decode_checkpoint_manifest": "weights",
     "a2/decode_fwd": "decode_fwd",
     "a2/decode_gate": "decode_gate",
-    "a2/decode_layer": "decode_layer",
-    "a2/decode_layer_c1a": "decode_c1a",
-    "a2/decode_layer_c2a": "decode_c2a",
-    "a2/decode_layer_engram": "decode_engram",
     "a2/decode_layer_l0": "decode_swa",
-    "a2/decode_layer_l0_compile": "decode_layer",
-    "a2/decode_moe": "decode_moe",
-    "a2/decode_moe_compile": "decode_moe_compile",
     "a2/decode_reference": "decode_reference",
     "a2/decode_replay": "decode_replay",
     "a2/decode_shape_contract": "decode_contract",
@@ -486,7 +479,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/decode_acceptance.py",
       "destination_definition": "product_dependency_scan",
       "source_ast_sha256": "7fe94d561153fb1793826f908aa0e95a0db5a075472cdf8cb7573d969307e7e6",
-      "relocated_ast_sha256": "7fe94d561153fb1793826f908aa0e95a0db5a075472cdf8cb7573d969307e7e6"
+      "relocated_ast_sha256": "5b3820e776683c725892767795f30edc7aa78217b923b62d646c983770b82d99"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_acceptance.py",
@@ -654,7 +647,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/decode_fwd.py",
       "destination_definition": "validate_decode_contract",
       "source_ast_sha256": "807f9d989d04988d0901f418110dfeef35c52ee7a61c86d91bbd4286116326a3",
-      "relocated_ast_sha256": "807f9d989d04988d0901f418110dfeef35c52ee7a61c86d91bbd4286116326a3"
+      "relocated_ast_sha256": "a0ee5b87e50d8c2c660dcfab99002458e6f683323c4bcd6a19dd56edfef459a2"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_fwd.py",
@@ -702,7 +695,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/decode_fwd.py",
       "destination_definition": "main",
       "source_ast_sha256": "384c739f4ecacc73ffe2afd4914e16828ad1578be6fb0f523572277fcdae1c8f",
-      "relocated_ast_sha256": "384c739f4ecacc73ffe2afd4914e16828ad1578be6fb0f523572277fcdae1c8f"
+      "relocated_ast_sha256": "93c52d259bdb9b8e8c7b80c0e7bce9574818110f820ae660904a76442590d7f1"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_gate.py",
@@ -710,7 +703,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/decode_gate.py",
       "destination_definition": "gate_report",
       "source_ast_sha256": "8da233529b49fe55976c161b187456d111cbd7fa4b983bf755640fab22a30eb3",
-      "relocated_ast_sha256": "97f13bac8b9a10488db201e2d9d1e69ec3e8c1731cf44cc6a6e1b4fa5981af8b"
+      "relocated_ast_sha256": "0a9e5f8df267efd454fce1dff96bc6e79069e549373054fa0e65160353bdb908"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_gate.py",
@@ -718,303 +711,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/decode_gate.py",
       "destination_definition": "main",
       "source_ast_sha256": "54dbd401ee3f859bcb89f7acb9e9ba9c92f26c892962c7c83fd8eb7043adcb79",
-      "relocated_ast_sha256": "54dbd401ee3f859bcb89f7acb9e9ba9c92f26c892962c7c83fd8eb7043adcb79"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer.py",
-      "definition": "get_layer_entry",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_layer.py",
-      "destination_definition": "get_layer_entry",
-      "source_ast_sha256": "f5d3ec2e3c6be0543aa77c1937920aef6d5866283303e818af5c5047cd755dd4",
-      "relocated_ast_sha256": "f5d3ec2e3c6be0543aa77c1937920aef6d5866283303e818af5c5047cd755dd4"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
-      "definition": "_pad_index_cache_c1",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
-      "destination_definition": "_pad_index_cache_c1",
-      "source_ast_sha256": "e25790451b52db900e458561dda57a95866c94163860cb0fb87ee5cfd988a8fa",
-      "relocated_ast_sha256": "e25790451b52db900e458561dda57a95866c94163860cb0fb87ee5cfd988a8fa"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
-      "definition": "_gather_rows_c1",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
-      "destination_definition": "_gather_rows_c1",
-      "source_ast_sha256": "db5fef4fd604e50b4a2b5eb3e29cd674fa00eeefdf752060f11f96cb9138a200",
-      "relocated_ast_sha256": "db5fef4fd604e50b4a2b5eb3e29cd674fa00eeefdf752060f11f96cb9138a200"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
-      "definition": "_gather_window_c1",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
-      "destination_definition": "_gather_window_c1",
-      "source_ast_sha256": "cb56f70401f4dfe251834f717181ba491c5419941c8a84d02286e33260e0c624",
-      "relocated_ast_sha256": "cb56f70401f4dfe251834f717181ba491c5419941c8a84d02286e33260e0c624"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
-      "definition": "_c1a_tail",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
-      "destination_definition": "_c1a_tail",
-      "source_ast_sha256": "0f840b329d904c6471187b1af6ab8d41f304153f04fa7c011f737d8bb9f392f1",
-      "relocated_ast_sha256": "0f840b329d904c6471187b1af6ab8d41f304153f04fa7c011f737d8bb9f392f1"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
-      "definition": "_common_rank_args",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
-      "destination_definition": "_common_rank_args",
-      "source_ast_sha256": "7be9487b1962491b7bcf91a85cb1ea91a2cacc70e0014d08e2ddf520363938aa",
-      "relocated_ast_sha256": "7be9487b1962491b7bcf91a85cb1ea91a2cacc70e0014d08e2ddf520363938aa"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
-      "definition": "decode_layer_ep2_c1a_reuse_rank",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
-      "destination_definition": "decode_layer_ep2_c1a_reuse_rank",
-      "source_ast_sha256": "12270598c884b2acae13a28d73a139b70ac1f7981367c09a56a7338136761f4e",
-      "relocated_ast_sha256": "12270598c884b2acae13a28d73a139b70ac1f7981367c09a56a7338136761f4e"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
-      "definition": "decode_layer_ep2_c1a_reuse",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
-      "destination_definition": "decode_layer_ep2_c1a_reuse",
-      "source_ast_sha256": "c291d2a3d66350c499ec7a377e91a3817b74d636dd9ad80f5c7b688a0f89722a",
-      "relocated_ast_sha256": "c291d2a3d66350c499ec7a377e91a3817b74d636dd9ad80f5c7b688a0f89722a"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
-      "definition": "decode_layer_ep2_c1a_full_rank",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
-      "destination_definition": "decode_layer_ep2_c1a_full_rank",
-      "source_ast_sha256": "14211e552c2ba21b0568c04594d215fddb12aaac42169b3185105c02617c32fb",
-      "relocated_ast_sha256": "14211e552c2ba21b0568c04594d215fddb12aaac42169b3185105c02617c32fb"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
-      "definition": "decode_layer_ep2_c1a_full",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
-      "destination_definition": "decode_layer_ep2_c1a_full",
-      "source_ast_sha256": "d17bfefe69feae9fc88eaaf12667f4f9249986f19c5af0a8e3b4582025f791ed",
-      "relocated_ast_sha256": "d17bfefe69feae9fc88eaaf12667f4f9249986f19c5af0a8e3b4582025f791ed"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c2a.py",
-      "definition": "_engram_linear",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c2a.py",
-      "destination_definition": "_engram_linear",
-      "source_ast_sha256": "58760c1bd1e1d4180ad422fcac241e79b45e06f3ecc5fd043bed3854b1041025",
-      "relocated_ast_sha256": "58760c1bd1e1d4180ad422fcac241e79b45e06f3ecc5fd043bed3854b1041025"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c2a.py",
-      "definition": "_pad_index_cache",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c2a.py",
-      "destination_definition": "_pad_index_cache",
-      "source_ast_sha256": "18de1dc7161a292511b542138385caaa64702023b783e3b3533fecb7eaa568ae",
-      "relocated_ast_sha256": "18de1dc7161a292511b542138385caaa64702023b783e3b3533fecb7eaa568ae"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c2a.py",
-      "definition": "_gather_rows",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c2a.py",
-      "destination_definition": "_gather_rows",
-      "source_ast_sha256": "9cfe7a1d96cc8c44eb5f7184dfa429e4bc094cae0d38dfaa167a8cb4c54c786e",
-      "relocated_ast_sha256": "9cfe7a1d96cc8c44eb5f7184dfa429e4bc094cae0d38dfaa167a8cb4c54c786e"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c2a.py",
-      "definition": "_gather_window",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c2a.py",
-      "destination_definition": "_gather_window",
-      "source_ast_sha256": "0207d2d7f8aba5cba058fbf38f01c1d75813d24173d930989bed9ca1824cb5ed",
-      "relocated_ast_sha256": "0207d2d7f8aba5cba058fbf38f01c1d75813d24173d930989bed9ca1824cb5ed"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c2a.py",
-      "definition": "decode_layer_ep2_sparse_rank",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c2a.py",
-      "destination_definition": "decode_layer_ep2_sparse_rank",
-      "source_ast_sha256": "3a7499ad7bda634959ab929f6cba723c66507b2d91799ad298df8eb37b7f9daf",
-      "relocated_ast_sha256": "3a7499ad7bda634959ab929f6cba723c66507b2d91799ad298df8eb37b7f9daf"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c2a.py",
-      "definition": "decode_layer_ep2_sparse",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c2a.py",
-      "destination_definition": "decode_layer_ep2_sparse",
-      "source_ast_sha256": "4b86635519bc334a32c35334bef20632875ad5f798e372c3418e54fdac677ead",
-      "relocated_ast_sha256": "4b86635519bc334a32c35334bef20632875ad5f798e372c3418e54fdac677ead"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_engram.py",
-      "definition": "_engram_linear",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_engram.py",
-      "destination_definition": "_engram_linear",
-      "source_ast_sha256": "0404bfb7844a2b196a8c93c0cb9f0c2b720e4a2765aefcf11532f88c95a97e9f",
-      "relocated_ast_sha256": "0404bfb7844a2b196a8c93c0cb9f0c2b720e4a2765aefcf11532f88c95a97e9f"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_engram.py",
-      "definition": "decode_layer_ep2_engram_rank",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_engram.py",
-      "destination_definition": "decode_layer_ep2_engram_rank",
-      "source_ast_sha256": "43bee82cef62ca50e34549b9802cd592b2aed8725b175556dafe57b68153aa6c",
-      "relocated_ast_sha256": "43bee82cef62ca50e34549b9802cd592b2aed8725b175556dafe57b68153aa6c"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_engram.py",
-      "definition": "decode_layer_ep2_engram",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_engram.py",
-      "destination_definition": "decode_layer_ep2_engram",
-      "source_ast_sha256": "dab56c91450b749e9ad59c0dc4fc3f2e3fa7ec5e27a8a152eb76e9d7898ae47b",
-      "relocated_ast_sha256": "dab56c91450b749e9ad59c0dc4fc3f2e3fa7ec5e27a8a152eb76e9d7898ae47b"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_l0.py",
-      "definition": "decode_layer_ep2_rank",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_swa.py",
-      "destination_definition": "decode_layer_ep2_rank",
-      "source_ast_sha256": "96e22c2b6a5b6407cab5decf0c70ad8d0e59c9f3bf427133011e5e23a0bd39fb",
-      "relocated_ast_sha256": "f8276bee08a3fdaeb81836320e52a586e058136405825346ec965871fef46a5a"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_l0.py",
-      "definition": "decode_layer_ep2",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_swa.py",
-      "destination_definition": "decode_layer_ep2",
-      "source_ast_sha256": "c7e2edc84de3eb5f7d12c47d7eb440ca3ceb73bf4e8183a6005d0beef8017a29",
-      "relocated_ast_sha256": "ecfcc17da11d058ac5f9a6a09f557e811e774899904a0114ed0f893a5317ecc7"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_l0.py",
-      "definition": "product_contract",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_swa.py",
-      "destination_definition": "product_contract",
-      "source_ast_sha256": "a2de74e439687d04c18a5989fe0ef80679d8863ac67e4597018c59d1850f2404",
-      "relocated_ast_sha256": "a2de74e439687d04c18a5989fe0ef80679d8863ac67e4597018c59d1850f2404"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_l0_compile.py",
-      "definition": "_dummy_args",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_layer.py",
-      "destination_definition": "_dummy_args",
-      "source_ast_sha256": "23b236e797c86f75835b23b2345e5ebb0e5e64fc05eb01248c96d19497cecaf2",
-      "relocated_ast_sha256": "23b236e797c86f75835b23b2345e5ebb0e5e64fc05eb01248c96d19497cecaf2"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_l0_compile.py",
-      "definition": "compile_layer_ep2",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_layer.py",
-      "destination_definition": "compile_layer_ep2",
-      "source_ast_sha256": "1a25cc33a0aacc76a7877544715019d59cd9f7116a5cab7d035b531991632eec",
-      "relocated_ast_sha256": "1a25cc33a0aacc76a7877544715019d59cd9f7116a5cab7d035b531991632eec"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_layer_l0_compile.py",
-      "definition": "main",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_layer.py",
-      "destination_definition": "main",
-      "source_ast_sha256": "75de5149bf961a568e2c0ba45065972f11781c85fbd5080453b5577474173949",
-      "relocated_ast_sha256": "75de5149bf961a568e2c0ba45065972f11781c85fbd5080453b5577474173949"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
-      "definition": "decode_ep2_pack",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
-      "destination_definition": "decode_ep2_pack",
-      "source_ast_sha256": "a25faa33967a23f7a81f6c1a68bd14b29181adfdc1f8053eaefd772b0cfdc0b4",
-      "relocated_ast_sha256": "a25faa33967a23f7a81f6c1a68bd14b29181adfdc1f8053eaefd772b0cfdc0b4"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
-      "definition": "decode_ep2_arrive",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
-      "destination_definition": "decode_ep2_arrive",
-      "source_ast_sha256": "79dffe2b7e8afaabeefbd76337db087d8fe964d2c6817f4c3a1de0c3dbd553b6",
-      "relocated_ast_sha256": "79dffe2b7e8afaabeefbd76337db087d8fe964d2c6817f4c3a1de0c3dbd553b6"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
-      "definition": "decode_ep2_regroup",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
-      "destination_definition": "decode_ep2_regroup",
-      "source_ast_sha256": "edc19bf711230a3b6ab07e12ad9a8a80437047840cd01408fbb42b49eb683f6a",
-      "relocated_ast_sha256": "edc19bf711230a3b6ab07e12ad9a8a80437047840cd01408fbb42b49eb683f6a"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
-      "definition": "decode_ep2_return",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
-      "destination_definition": "decode_ep2_return",
-      "source_ast_sha256": "2c60f082311934691144eb022e86553286018084d05b4d0e2956f4ecf168b675",
-      "relocated_ast_sha256": "2c60f082311934691144eb022e86553286018084d05b4d0e2956f4ecf168b675"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
-      "definition": "decode_ep2_combine",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
-      "destination_definition": "decode_ep2_combine",
-      "source_ast_sha256": "b1518730d4dfc81a9062449d0396e31c13f90241a4c413b0dcdf493b268edacd",
-      "relocated_ast_sha256": "b1518730d4dfc81a9062449d0396e31c13f90241a4c413b0dcdf493b268edacd"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
-      "definition": "decode_ep2_rank",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
-      "destination_definition": "decode_ep2_rank",
-      "source_ast_sha256": "af7cbcf5084f00f2b1329e4c0bfd970060964d8898c552391a3cb017401690b5",
-      "relocated_ast_sha256": "af7cbcf5084f00f2b1329e4c0bfd970060964d8898c552391a3cb017401690b5"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
-      "definition": "decode_ep2",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
-      "destination_definition": "decode_ep2",
-      "source_ast_sha256": "9781510d71ba7887711da7f9a9b74de9ca37637e7cc4625120e32bc45eb8cf44",
-      "relocated_ast_sha256": "9781510d71ba7887711da7f9a9b74de9ca37637e7cc4625120e32bc45eb8cf44"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
-      "definition": "product_contract",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
-      "destination_definition": "product_contract",
-      "source_ast_sha256": "ab0320ff86a51f43a4621e2ccf7f958dc875a032ec3e6ec9c30cf72a4e5a16c6",
-      "relocated_ast_sha256": "ab0320ff86a51f43a4621e2ccf7f958dc875a032ec3e6ec9c30cf72a4e5a16c6"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
-      "definition": "main",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
-      "destination_definition": "main",
-      "source_ast_sha256": "f95eec562a03c385099bfa9facb414ae2c9f6cedbf0b0e82e666af3d628e87bf",
-      "relocated_ast_sha256": "f95eec562a03c385099bfa9facb414ae2c9f6cedbf0b0e82e666af3d628e87bf"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_moe_compile.py",
-      "definition": "_dummy_args",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_moe_compile.py",
-      "destination_definition": "_dummy_args",
-      "source_ast_sha256": "3857b581ee64c57116367beece7172aa483571c48eb59096257fd3a040647c54",
-      "relocated_ast_sha256": "3857b581ee64c57116367beece7172aa483571c48eb59096257fd3a040647c54"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_moe_compile.py",
-      "definition": "compile_ep2",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_moe_compile.py",
-      "destination_definition": "compile_ep2",
-      "source_ast_sha256": "58dde97acf0be70ce9f7664aac88a90c5e2a306e373f3ee384bdd60fbf0a6224",
-      "relocated_ast_sha256": "58dde97acf0be70ce9f7664aac88a90c5e2a306e373f3ee384bdd60fbf0a6224"
-    },
-    {
-      "source": "models/deepseek_v4_1_flash_a2/decode_moe_compile.py",
-      "definition": "main",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_moe_compile.py",
-      "destination_definition": "main",
-      "source_ast_sha256": "5ad1982e0cf2db7dc75d990d39ef5f55df9c002681742976a3f22b63dea8d152",
-      "relocated_ast_sha256": "5ad1982e0cf2db7dc75d990d39ef5f55df9c002681742976a3f22b63dea8d152"
+      "relocated_ast_sha256": "58cac6055a0ba84cfaacc74a4de49c42088ddafda19ed8f5e48785cf5dc5377a"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_reference.py",
@@ -1094,7 +791,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/decode_contract.py",
       "destination_definition": "rank_shape",
       "source_ast_sha256": "1cd0a82dc1c52964f8708c07a3a18a756c573a636cd322732da16e3e88bdd0e7",
-      "relocated_ast_sha256": "1cd0a82dc1c52964f8708c07a3a18a756c573a636cd322732da16e3e88bdd0e7"
+      "relocated_ast_sha256": "bfe27bffea0a350e26b3423f725c21a3c76ed13d7ab7e866934228762fb6e5c8"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_shape_contract.py",
@@ -1102,7 +799,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/decode_contract.py",
       "destination_definition": "shape_matrix",
       "source_ast_sha256": "257f7c8a239fe1fc6c7499edd8eb9a5406d93e3a78121cddc815092233feed7b",
-      "relocated_ast_sha256": "257f7c8a239fe1fc6c7499edd8eb9a5406d93e3a78121cddc815092233feed7b"
+      "relocated_ast_sha256": "6bc2f0fed3eb914dbca8d222ad6803fec3310083b77550ff57317060ae1bac7a"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
@@ -1158,7 +855,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "pack_routed_expert",
       "source_ast_sha256": "986e1fc718a9d078ae216dffc0ceb242a7d7f95888a28183bfebb1893bff464d",
-      "relocated_ast_sha256": "986e1fc718a9d078ae216dffc0ceb242a7d7f95888a28183bfebb1893bff464d"
+      "relocated_ast_sha256": "a5911382d8ff14955e2da18a17ba8ac2851fcd1d87e65d1e29a1b3f666671114"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
@@ -1166,7 +863,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "iter_routed_experts",
       "source_ast_sha256": "7cdf4515ebbeec65d46793fc4005a033793b2acfcf889f5bc4930ac881142113",
-      "relocated_ast_sha256": "ef85c7e13afe13ad325aab7d33298d9c01149cb3da7267c49f0c53932848c0e3"
+      "relocated_ast_sha256": "2f699959fabbb4d90350e6847b3f90ccd2128c3ec99a8f70114b699c46a1aa9c"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
@@ -1174,7 +871,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "load_routed_shard",
       "source_ast_sha256": "0308fe1f3bc4de5ca40ff929dc6bec454378ad908d614ff9d38695375090611d",
-      "relocated_ast_sha256": "0308fe1f3bc4de5ca40ff929dc6bec454378ad908d614ff9d38695375090611d"
+      "relocated_ast_sha256": "ca69ca008297ecab903c5d1413376593c052982a1845ea7869574016c36afddf"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
@@ -1196,9 +893,9 @@
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
       "definition": "load_ep2_rank_weights",
       "destination": "models/deepseek_v4_1_flash_a3/weights.py",
-      "destination_definition": "load_ep2_rank_weights",
+      "destination_definition": "load_decode_rank_weights",
       "source_ast_sha256": "4dab3b6c86306053d72fa96073a322e39842cf9e69dc6e37b917c7e62e633107",
-      "relocated_ast_sha256": "4dab3b6c86306053d72fa96073a322e39842cf9e69dc6e37b917c7e62e633107"
+      "relocated_ast_sha256": "7b13255ca77cd7a0c313c5988a20ef75ef864dab8ac9d862a98f4231c5f66907"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
@@ -1206,7 +903,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "abi_summary",
       "source_ast_sha256": "027c1cbff41cb7e7403846d12987678e424a8f5ddd6993f1a1cf56ba7a324ea4",
-      "relocated_ast_sha256": "027c1cbff41cb7e7403846d12987678e424a8f5ddd6993f1a1cf56ba7a324ea4"
+      "relocated_ast_sha256": "9ec53793faed610b6ef238ab54c812d9427ee67b2a754afa46add10c73883ab8"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weights.py",
@@ -1910,7 +1607,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/quant.py",
       "destination_definition": "make_decode_dynamic_int8_quantize",
       "source_ast_sha256": "c3e5933b722c1c2f875f05445caf3e4436c09215f3593802a3524d89cc7a1b9c",
-      "relocated_ast_sha256": "7cdae374af6751091290637f27c1804c5f2d35959ddd1d6bbf6447c1b35c910f"
+      "relocated_ast_sha256": "d044f857e282c9a31ccfd2441a0e115366d62b5ac3eabc6c5b86df51b25d1cf7"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/ratio1_prefill.py",
@@ -1982,7 +1679,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/decode_config.py",
       "destination_definition": "DecodeParallelConfig",
       "source_ast_sha256": "5d0b2794b22f9fc140131a7cd1584c448bda18b49313b39867129f9b3cda8a48",
-      "relocated_ast_sha256": "5d0b2794b22f9fc140131a7cd1584c448bda18b49313b39867129f9b3cda8a48"
+      "relocated_ast_sha256": "b148a995f3ed96465c9877fa56de6767af8ea143749255eab547512dd0c89c9f"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/sparse_attention.py",
@@ -7489,7 +7186,8 @@
         "relocated_ast_sha256": "e5766e2a6fd044f362b4ba009801f158e185783bbd2abf8651a9f66355ddd8bf",
         "shared_identical_definition": false
       }
-    ]
+    ],
+    "status": "historical_before_ep2_retirement"
   },
   "responsibility_consolidation": {
     "base_commit": "5e463e4867e7bb67eb548d06163d2f82475ee161",
@@ -9742,6 +9440,391 @@
       "pypto_ir_comparison": "structural hashes identical",
       "contract_and_ci_tests": 22,
       "NPU": "not run"
+    },
+    "status": "historical_before_ep2_retirement"
+  },
+  "retired_definitions": [
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer.py",
+      "definition": "get_layer_entry",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_layer.py",
+      "destination_definition": "get_layer_entry",
+      "source_ast_sha256": "f5d3ec2e3c6be0543aa77c1937920aef6d5866283303e818af5c5047cd755dd4",
+      "relocated_ast_sha256": "f5d3ec2e3c6be0543aa77c1937920aef6d5866283303e818af5c5047cd755dd4",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
+      "definition": "_pad_index_cache_c1",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
+      "destination_definition": "_pad_index_cache_c1",
+      "source_ast_sha256": "e25790451b52db900e458561dda57a95866c94163860cb0fb87ee5cfd988a8fa",
+      "relocated_ast_sha256": "e25790451b52db900e458561dda57a95866c94163860cb0fb87ee5cfd988a8fa",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
+      "definition": "_gather_rows_c1",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
+      "destination_definition": "_gather_rows_c1",
+      "source_ast_sha256": "db5fef4fd604e50b4a2b5eb3e29cd674fa00eeefdf752060f11f96cb9138a200",
+      "relocated_ast_sha256": "db5fef4fd604e50b4a2b5eb3e29cd674fa00eeefdf752060f11f96cb9138a200",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
+      "definition": "_gather_window_c1",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
+      "destination_definition": "_gather_window_c1",
+      "source_ast_sha256": "cb56f70401f4dfe251834f717181ba491c5419941c8a84d02286e33260e0c624",
+      "relocated_ast_sha256": "cb56f70401f4dfe251834f717181ba491c5419941c8a84d02286e33260e0c624",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
+      "definition": "_c1a_tail",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
+      "destination_definition": "_c1a_tail",
+      "source_ast_sha256": "0f840b329d904c6471187b1af6ab8d41f304153f04fa7c011f737d8bb9f392f1",
+      "relocated_ast_sha256": "0f840b329d904c6471187b1af6ab8d41f304153f04fa7c011f737d8bb9f392f1",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
+      "definition": "_common_rank_args",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
+      "destination_definition": "_common_rank_args",
+      "source_ast_sha256": "7be9487b1962491b7bcf91a85cb1ea91a2cacc70e0014d08e2ddf520363938aa",
+      "relocated_ast_sha256": "7be9487b1962491b7bcf91a85cb1ea91a2cacc70e0014d08e2ddf520363938aa",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
+      "definition": "decode_layer_ep2_c1a_reuse_rank",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
+      "destination_definition": "decode_layer_ep2_c1a_reuse_rank",
+      "source_ast_sha256": "12270598c884b2acae13a28d73a139b70ac1f7981367c09a56a7338136761f4e",
+      "relocated_ast_sha256": "12270598c884b2acae13a28d73a139b70ac1f7981367c09a56a7338136761f4e",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
+      "definition": "decode_layer_ep2_c1a_reuse",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
+      "destination_definition": "decode_layer_ep2_c1a_reuse",
+      "source_ast_sha256": "c291d2a3d66350c499ec7a377e91a3817b74d636dd9ad80f5c7b688a0f89722a",
+      "relocated_ast_sha256": "c291d2a3d66350c499ec7a377e91a3817b74d636dd9ad80f5c7b688a0f89722a",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
+      "definition": "decode_layer_ep2_c1a_full_rank",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
+      "destination_definition": "decode_layer_ep2_c1a_full_rank",
+      "source_ast_sha256": "14211e552c2ba21b0568c04594d215fddb12aaac42169b3185105c02617c32fb",
+      "relocated_ast_sha256": "14211e552c2ba21b0568c04594d215fddb12aaac42169b3185105c02617c32fb",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c1a.py",
+      "definition": "decode_layer_ep2_c1a_full",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c1a.py",
+      "destination_definition": "decode_layer_ep2_c1a_full",
+      "source_ast_sha256": "d17bfefe69feae9fc88eaaf12667f4f9249986f19c5af0a8e3b4582025f791ed",
+      "relocated_ast_sha256": "d17bfefe69feae9fc88eaaf12667f4f9249986f19c5af0a8e3b4582025f791ed",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c2a.py",
+      "definition": "_engram_linear",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c2a.py",
+      "destination_definition": "_engram_linear",
+      "source_ast_sha256": "58760c1bd1e1d4180ad422fcac241e79b45e06f3ecc5fd043bed3854b1041025",
+      "relocated_ast_sha256": "58760c1bd1e1d4180ad422fcac241e79b45e06f3ecc5fd043bed3854b1041025",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c2a.py",
+      "definition": "_pad_index_cache",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c2a.py",
+      "destination_definition": "_pad_index_cache",
+      "source_ast_sha256": "18de1dc7161a292511b542138385caaa64702023b783e3b3533fecb7eaa568ae",
+      "relocated_ast_sha256": "18de1dc7161a292511b542138385caaa64702023b783e3b3533fecb7eaa568ae",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c2a.py",
+      "definition": "_gather_rows",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c2a.py",
+      "destination_definition": "_gather_rows",
+      "source_ast_sha256": "9cfe7a1d96cc8c44eb5f7184dfa429e4bc094cae0d38dfaa167a8cb4c54c786e",
+      "relocated_ast_sha256": "9cfe7a1d96cc8c44eb5f7184dfa429e4bc094cae0d38dfaa167a8cb4c54c786e",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c2a.py",
+      "definition": "_gather_window",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c2a.py",
+      "destination_definition": "_gather_window",
+      "source_ast_sha256": "0207d2d7f8aba5cba058fbf38f01c1d75813d24173d930989bed9ca1824cb5ed",
+      "relocated_ast_sha256": "0207d2d7f8aba5cba058fbf38f01c1d75813d24173d930989bed9ca1824cb5ed",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c2a.py",
+      "definition": "decode_layer_ep2_sparse_rank",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c2a.py",
+      "destination_definition": "decode_layer_ep2_sparse_rank",
+      "source_ast_sha256": "3a7499ad7bda634959ab929f6cba723c66507b2d91799ad298df8eb37b7f9daf",
+      "relocated_ast_sha256": "3a7499ad7bda634959ab929f6cba723c66507b2d91799ad298df8eb37b7f9daf",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_c2a.py",
+      "definition": "decode_layer_ep2_sparse",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_c2a.py",
+      "destination_definition": "decode_layer_ep2_sparse",
+      "source_ast_sha256": "4b86635519bc334a32c35334bef20632875ad5f798e372c3418e54fdac677ead",
+      "relocated_ast_sha256": "4b86635519bc334a32c35334bef20632875ad5f798e372c3418e54fdac677ead",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_engram.py",
+      "definition": "_engram_linear",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_engram.py",
+      "destination_definition": "_engram_linear",
+      "source_ast_sha256": "0404bfb7844a2b196a8c93c0cb9f0c2b720e4a2765aefcf11532f88c95a97e9f",
+      "relocated_ast_sha256": "0404bfb7844a2b196a8c93c0cb9f0c2b720e4a2765aefcf11532f88c95a97e9f",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_engram.py",
+      "definition": "decode_layer_ep2_engram_rank",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_engram.py",
+      "destination_definition": "decode_layer_ep2_engram_rank",
+      "source_ast_sha256": "43bee82cef62ca50e34549b9802cd592b2aed8725b175556dafe57b68153aa6c",
+      "relocated_ast_sha256": "43bee82cef62ca50e34549b9802cd592b2aed8725b175556dafe57b68153aa6c",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_engram.py",
+      "definition": "decode_layer_ep2_engram",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_engram.py",
+      "destination_definition": "decode_layer_ep2_engram",
+      "source_ast_sha256": "dab56c91450b749e9ad59c0dc4fc3f2e3fa7ec5e27a8a152eb76e9d7898ae47b",
+      "relocated_ast_sha256": "dab56c91450b749e9ad59c0dc4fc3f2e3fa7ec5e27a8a152eb76e9d7898ae47b",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_l0.py",
+      "definition": "decode_layer_ep2_rank",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_swa.py",
+      "destination_definition": "decode_layer_ep2_rank",
+      "source_ast_sha256": "96e22c2b6a5b6407cab5decf0c70ad8d0e59c9f3bf427133011e5e23a0bd39fb",
+      "relocated_ast_sha256": "f8276bee08a3fdaeb81836320e52a586e058136405825346ec965871fef46a5a",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_l0.py",
+      "definition": "decode_layer_ep2",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_swa.py",
+      "destination_definition": "decode_layer_ep2",
+      "source_ast_sha256": "c7e2edc84de3eb5f7d12c47d7eb440ca3ceb73bf4e8183a6005d0beef8017a29",
+      "relocated_ast_sha256": "ecfcc17da11d058ac5f9a6a09f557e811e774899904a0114ed0f893a5317ecc7",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_l0.py",
+      "definition": "product_contract",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_swa.py",
+      "destination_definition": "product_contract",
+      "source_ast_sha256": "a2de74e439687d04c18a5989fe0ef80679d8863ac67e4597018c59d1850f2404",
+      "relocated_ast_sha256": "a2de74e439687d04c18a5989fe0ef80679d8863ac67e4597018c59d1850f2404",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_l0_compile.py",
+      "definition": "_dummy_args",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_layer.py",
+      "destination_definition": "_dummy_args",
+      "source_ast_sha256": "23b236e797c86f75835b23b2345e5ebb0e5e64fc05eb01248c96d19497cecaf2",
+      "relocated_ast_sha256": "23b236e797c86f75835b23b2345e5ebb0e5e64fc05eb01248c96d19497cecaf2",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_l0_compile.py",
+      "definition": "compile_layer_ep2",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_layer.py",
+      "destination_definition": "compile_layer_ep2",
+      "source_ast_sha256": "1a25cc33a0aacc76a7877544715019d59cd9f7116a5cab7d035b531991632eec",
+      "relocated_ast_sha256": "1a25cc33a0aacc76a7877544715019d59cd9f7116a5cab7d035b531991632eec",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_layer_l0_compile.py",
+      "definition": "main",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_layer.py",
+      "destination_definition": "main",
+      "source_ast_sha256": "75de5149bf961a568e2c0ba45065972f11781c85fbd5080453b5577474173949",
+      "relocated_ast_sha256": "75de5149bf961a568e2c0ba45065972f11781c85fbd5080453b5577474173949",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
+      "definition": "decode_ep2_pack",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
+      "destination_definition": "decode_ep2_pack",
+      "source_ast_sha256": "a25faa33967a23f7a81f6c1a68bd14b29181adfdc1f8053eaefd772b0cfdc0b4",
+      "relocated_ast_sha256": "a25faa33967a23f7a81f6c1a68bd14b29181adfdc1f8053eaefd772b0cfdc0b4",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
+      "definition": "decode_ep2_arrive",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
+      "destination_definition": "decode_ep2_arrive",
+      "source_ast_sha256": "79dffe2b7e8afaabeefbd76337db087d8fe964d2c6817f4c3a1de0c3dbd553b6",
+      "relocated_ast_sha256": "79dffe2b7e8afaabeefbd76337db087d8fe964d2c6817f4c3a1de0c3dbd553b6",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
+      "definition": "decode_ep2_regroup",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
+      "destination_definition": "decode_ep2_regroup",
+      "source_ast_sha256": "edc19bf711230a3b6ab07e12ad9a8a80437047840cd01408fbb42b49eb683f6a",
+      "relocated_ast_sha256": "edc19bf711230a3b6ab07e12ad9a8a80437047840cd01408fbb42b49eb683f6a",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
+      "definition": "decode_ep2_return",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
+      "destination_definition": "decode_ep2_return",
+      "source_ast_sha256": "2c60f082311934691144eb022e86553286018084d05b4d0e2956f4ecf168b675",
+      "relocated_ast_sha256": "2c60f082311934691144eb022e86553286018084d05b4d0e2956f4ecf168b675",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
+      "definition": "decode_ep2_combine",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
+      "destination_definition": "decode_ep2_combine",
+      "source_ast_sha256": "b1518730d4dfc81a9062449d0396e31c13f90241a4c413b0dcdf493b268edacd",
+      "relocated_ast_sha256": "b1518730d4dfc81a9062449d0396e31c13f90241a4c413b0dcdf493b268edacd",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
+      "definition": "decode_ep2_rank",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
+      "destination_definition": "decode_ep2_rank",
+      "source_ast_sha256": "af7cbcf5084f00f2b1329e4c0bfd970060964d8898c552391a3cb017401690b5",
+      "relocated_ast_sha256": "af7cbcf5084f00f2b1329e4c0bfd970060964d8898c552391a3cb017401690b5",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
+      "definition": "decode_ep2",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
+      "destination_definition": "decode_ep2",
+      "source_ast_sha256": "9781510d71ba7887711da7f9a9b74de9ca37637e7cc4625120e32bc45eb8cf44",
+      "relocated_ast_sha256": "9781510d71ba7887711da7f9a9b74de9ca37637e7cc4625120e32bc45eb8cf44",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
+      "definition": "product_contract",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
+      "destination_definition": "product_contract",
+      "source_ast_sha256": "ab0320ff86a51f43a4621e2ccf7f958dc875a032ec3e6ec9c30cf72a4e5a16c6",
+      "relocated_ast_sha256": "ab0320ff86a51f43a4621e2ccf7f958dc875a032ec3e6ec9c30cf72a4e5a16c6",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_moe.py",
+      "definition": "main",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_moe.py",
+      "destination_definition": "main",
+      "source_ast_sha256": "f95eec562a03c385099bfa9facb414ae2c9f6cedbf0b0e82e666af3d628e87bf",
+      "relocated_ast_sha256": "f95eec562a03c385099bfa9facb414ae2c9f6cedbf0b0e82e666af3d628e87bf",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_moe_compile.py",
+      "definition": "_dummy_args",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_moe_compile.py",
+      "destination_definition": "_dummy_args",
+      "source_ast_sha256": "3857b581ee64c57116367beece7172aa483571c48eb59096257fd3a040647c54",
+      "relocated_ast_sha256": "3857b581ee64c57116367beece7172aa483571c48eb59096257fd3a040647c54",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_moe_compile.py",
+      "definition": "compile_ep2",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_moe_compile.py",
+      "destination_definition": "compile_ep2",
+      "source_ast_sha256": "58dde97acf0be70ce9f7664aac88a90c5e2a306e373f3ee384bdd60fbf0a6224",
+      "relocated_ast_sha256": "58dde97acf0be70ce9f7664aac88a90c5e2a306e373f3ee384bdd60fbf0a6224",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    },
+    {
+      "source": "models/deepseek_v4_1_flash_a2/decode_moe_compile.py",
+      "definition": "main",
+      "destination": "models/deepseek_v4_1_flash_a3/decode_moe_compile.py",
+      "destination_definition": "main",
+      "source_ast_sha256": "5ad1982e0cf2db7dc75d990d39ef5f55df9c002681742976a3f22b63dea8d152",
+      "relocated_ast_sha256": "5ad1982e0cf2db7dc75d990d39ef5f55df9c002681742976a3f22b63dea8d152",
+      "retirement_reason": "Fixed two-rank Decode orchestration removed by user request"
+    }
+  ],
+  "decode_ep2_retirement": {
+    "base_commit": "2704263ca947488232a9c6eaecfeb4cd0010de96",
+    "removed_modules": [
+      "decode_c1a",
+      "decode_c2a",
+      "decode_engram",
+      "decode_layer",
+      "decode_moe",
+      "decode_moe_compile"
+    ],
+    "removed_exports": [
+      "decode_ep2",
+      "get_layer_entry"
+    ],
+    "retired_module_map": {
+      "a2/decode_layer": "decode_layer",
+      "a2/decode_layer_c1a": "decode_c1a",
+      "a2/decode_layer_c2a": "decode_c2a",
+      "a2/decode_layer_engram": "decode_engram",
+      "a2/decode_layer_l0_compile": "decode_layer",
+      "a2/decode_moe": "decode_moe",
+      "a2/decode_moe_compile": "decode_moe_compile"
+    },
+    "retired_definition_count": 37,
+    "maintained_python_modules": 77,
+    "weight_interface": {
+      "previous": "load_ep2_rank_weights",
+      "current": "load_decode_rank_weights",
+      "ep": 16,
+      "local_experts": 24,
+      "scope": "MoE operands only; network driver and TP attention/cache bindings remain unimplemented"
+    },
+    "kernel_arithmetic": "retained computation definitions unchanged",
+    "NPU": "not run",
+    "local_checks": {
+      "retained_kernel_bodies": "unchanged",
+      "expert_ownership": "384 experts, 24 per owner, each expert covered once",
+      "shard_packing": "synthetic CPU W8A8 matrices and scales bitwise equal to the prior packer; first, middle and last owners checked",
+      "rejected_controls": [
+        "EP2 config",
+        "EP2 rank shape",
+        "retired EP2 gate",
+        "negative or out-of-range expert owner",
+        "nonzero affine offsets"
+      ],
+      "network_gate": "all three declared EP16 topologies report no formal entry point and no product command",
+      "NPU": "not_run"
     }
   }
 }
