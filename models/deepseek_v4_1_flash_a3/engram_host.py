@@ -61,7 +61,7 @@ class HostEngram:
                 raise ValueError("Host lookup requires the original Eco-Tech INT8/FP32 group32 tables")
             other = contract["hash_constants"]
             if (
-                other["layer_ids"] != [1, 14]
+                tuple(other["layer_ids"]) != (1, 14)
                 or other["pad_id"] != self.constants["pad_id"]
                 or any(
                     not torch.equal(other[key], self.constants[key])
