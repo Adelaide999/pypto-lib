@@ -15,6 +15,7 @@ from pathlib import Path
 import pypto.language as pl
 import torch
 from .swa import make_swa_leaves
+from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY
 
 
 # tiling
@@ -222,8 +223,6 @@ def validate_live_state(role, original, live, epoch, token_map_id):
             if tuple(live["versions"].get(name, ())) != (owner, epoch, token_map_id):
                 raise ValueError("Missing or stale live " + name + " ownership for this token map")
     if role["candidate_filter"]:
-        from .prefill_indexer_runtime import validate_live_refresh_candidates
-
         validate_live_refresh_candidates(original, live["shared"], role["kv_source"])
 
 
@@ -549,3 +548,22 @@ def attach_network_cache_geometry(provider):
         NPU="not_run",
         numerical="not_run",
     )
+
+
+def validate_live_refresh_candidates(original, shared, source_id):
+    """Preserve the short full-coverage guard against the actual live candidate buffer."""
+    starts = original["metadata"]["query_start_loc"].tolist()
+    metadata = original["cache_metadata"]["actual_metadata"]
+    prefix = f"model.layers.{source_id}.self_attn."
+    lengths = metadata[prefix + "indexer.k_cache"]["global_metadata"]["cache_seq_lens"].tolist()
+    if any(length < 0 or length > KEY_CAPACITY for length in lengths):
+        raise ValueError("Refresh history exceeds the supported index-key capacity")
+    start = original["cp_token_range"][0]
+    candidates = shared["candidates"]
+    for local in range(original["actual_local_query_rows"]):
+        token = start + local
+        request = next(i for i in range(len(starts) - 1) if starts[i] <= token < starts[i + 1])
+        visible = min(lengths[request], int(original["positions"][token]) + 1)
+        available = set(candidates[local].reshape(-1).tolist())
+        if not set(range((visible + 7) // 8)).issubset(available):
+            raise ValueError("This input requires candidate pruning; no dense substitute is supported")

@@ -20,7 +20,7 @@ from tokenizers import Tokenizer
 from torch.utils._python_dispatch import _disable_current_modes
 from .prefill_fwd import prefill_fwd
 from .prefill_prepare import build_chunk_metadata, reserve_cache_layouts
-from .runtime_utils import file_sha, write_json
+from .utils import file_sha, write_json
 
 
 TOPOLOGY = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)

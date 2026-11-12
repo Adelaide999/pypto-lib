@@ -21,7 +21,8 @@ if __package__ in (None, ""):
 import pypto.language as pl
 from .config import FLASH
 from .decode_config import DECODE_PARALLEL, DecodeParallelConfig
-from .decode_projection import make_grouped_wo_a, make_swa
+from .o_proj import make_grouped_wo_a
+from .swa import make_decode_swa_entry as make_swa
 from .gemm import make_decode_int8_linear_direct as make_int8_linear_direct
 from .rmsnorm import make_decode_rmsnorm as make_rmsnorm
 from .rope import make_decode_rope as make_rope

@@ -1,7 +1,7 @@
 # DeepSeek V4.1 Flash A3
 
 A3 Eco-Tech W8A8 operators, the complete 40-layer Prefill composition and
-persistent runtime, plus bounded Decode operators. The package has 56 Python
+persistent runtime, plus bounded Decode operators. The package has 45 Python
 modules organized by computation responsibility.
 
 - `prefill_fwd.prefill_fwd`: embedding, all 40 layers and vocabulary head.

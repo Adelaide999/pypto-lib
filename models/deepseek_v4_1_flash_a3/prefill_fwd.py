@@ -24,15 +24,100 @@ if __package__ in (None, ""):
     __package__ = "models.deepseek_v4_1_flash_a3"
 import torch
 from pypto import ir
+from pypto.backend import BackendType
+from pypto.runtime import ExecutionMode, RunConfig
 from .cache import attach_network_cache_geometry, network_cache_geometry, resolve_layer_role
 from .engram import make_prefill_engram_entries
 from .input_pack import make_input_entries
 from .lm_head import make_output_entries
-from .prefill_layer import REGIONS, execute_region, make_network_l2_entries, make_prefill_layer_entries, run_prefill_layer_inmemory
+from .prefill_layer import region_arguments, REGIONS, execute_region, make_network_l2_entries, make_prefill_layer_entries, run_prefill_layer_inmemory
 from .prefill_network_engram import prepare_network_engram, validate_host_lookup
-from .prefill_network_input import run_input_boundary
-from .runtime_utils import Executable, file_sha, loaded_source_files, tensor_sha, write_json
+from .utils import file_sha, tensor_sha, write_json
 from .state import NetworkCacheProvider
+
+
+class Executable:
+    """Compile one production operator definition and retain its compiler artifacts."""
+
+    def __init__(self, function, directory):
+        print({"stage": "compile", "operator": directory.name}, flush=True)
+        config = RunConfig(arch=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD,
+                           save_kernels=True, save_kernels_dir=str(directory))
+        self.compiled = function.compile(config=config)
+        self.artifacts = {}
+        for pattern in ("*.pto", "*.cpp", "*.so", "kernel_config.py"):
+            self.artifacts.update({str(path): file_sha(path) for path in sorted(directory.rglob(pattern))})
+        if not any(path.endswith(".pto") for path in self.artifacts):
+            raise RuntimeError("PyPTO compilation produced no retained PTO artifact")
+        print({"stage": "compiled", "operator": directory.name, "directory": str(directory)}, flush=True)
+
+
+def loaded_source_files(runtime):
+    root = Path(runtime["source_root"])
+    model = root / "models/deepseek_v4_1_flash_a3"
+    for module in list(sys.modules.values()):
+        path = getattr(module, "__file__", None)
+        if path is not None:
+            path = Path(path).resolve()
+            if path.is_relative_to(model) and path.suffix == ".py":
+                runtime["source_files"][str(path.relative_to(root))] = file_sha(path)
+
+
+def run_input_boundary(settings, *, config, capacity, reader, execute, exchange, execute_l2=None):
+    """Embed the actual request tokens and return rank-local HC inputs in memory."""
+    topology = settings["topology"]
+    dp, tp, world = topology["dp"], topology["tp"], topology["ep"]
+    hidden, vocabulary, hc_mult = config["hidden_size"], config["vocab_size"], config["hc_mult"]
+    if world != dp * tp or len(settings["DP_engines"]) != dp:
+        raise ValueError("Input request engines must match the complete network topology")
+    if any(not 0 <= engine["active"] <= capacity for engine in settings["DP_engines"]):
+        raise ValueError("Actual request tokens exceed the compiled Prefill capacity")
+    weight = reader.load("embed.weight")
+    if tuple(weight.shape) != (vocabulary, hidden) or weight.dtype != torch.bfloat16:
+        raise ValueError("Actual checkpoint embedding shape or dtype differs")
+    packets, rows_by_rank = [], []
+    for rank in range(world):
+        engine = settings["DP_engines"][rank // tp]
+        tokens = [token for request in engine["requests"] for token in request["token_ids"]]
+        masks = [value for request in engine["requests"] for value in request["live_token_mask"]]
+        if len(tokens) != engine["active"] or len(masks) != len(tokens):
+            raise ValueError("Request/token ownership differs from the actual prepared boundary")
+        if any(token < 0 or token >= vocabulary for token in tokens):
+            raise ValueError("Prepared token ID is outside the original vocabulary")
+        ids, live = torch.zeros(capacity, dtype=torch.int64), torch.zeros(capacity, dtype=torch.int32)
+        ids[:len(tokens)] = torch.tensor(tokens, dtype=torch.int64)
+        live[:len(tokens)] = torch.tensor(masks, dtype=torch.int32)
+        output = torch.zeros((capacity, hidden), dtype=torch.bfloat16)
+        start, count = rank % tp * (vocabulary // tp), vocabulary // tp
+        local_weight = weight.narrow(0, start, count).contiguous()
+        execute("lookup", rank, [ids, live, local_weight, output, start, len(tokens)], dict(lookup=output))
+        packets.append({"network-input": {"value": output}})
+        rows_by_rank.append(len(tokens))
+    gathered = exchange("input-vocabulary-TP-gather", packets)
+    result = []
+    for rank in range(world):
+        active = rows_by_rank[rank]
+        physical = max(1, (active + tp - 1) // tp)
+        embedding = torch.zeros((capacity, hidden), dtype=torch.bfloat16)
+        streams = torch.zeros((capacity, hc_mult, hidden), dtype=torch.bfloat16)
+        premix = torch.zeros((capacity, hc_mult), dtype=torch.float32)
+        operations = (
+            ("reduce", [gathered[rank]["network-input"]["value"], embedding, active], dict(embedding=embedding), "input"),
+            ("initial_hc", [embedding, streams, premix, rank % tp, physical, active],
+             dict(hidden=streams, pre_mix=premix), "input"),
+        )
+        if execute_l2 is None:
+            for name, arguments, outputs, _ in operations:
+                execute(name, rank, arguments, outputs)
+        else:
+            arguments, outputs, _ = region_arguments("input_l2", operations)
+            execute_l2("input_l2", rank, arguments, outputs)
+        valid = max(0, min(physical, active - rank % tp * physical))
+        result.append(dict(hidden=streams[:(active + tp - 1) // tp].clone(),
+            pre_mix=premix[:(active + tp - 1) // tp].clone(),
+            SP_physical_rows=(active + tp - 1) // tp, SP_kernel_rows=physical, SP_valid_rows=valid, DP_rank=rank // tp, TP_rank=rank % tp,
+            global_token_start=rank % tp * physical))
+    return result
 
 
 def compile_prefill(inputs, *, cache, config, output, weights=None):

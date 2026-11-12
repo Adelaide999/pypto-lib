@@ -301,7 +301,7 @@ def run_compressed_attention(
                 "physical_cache_store",
             )
 
-    from .prefill_indexer_runtime import run_index_query_selection
+    from .prefill_indexer import run_index_query_selection
 
     selection = run_index_query_selection(
         state,

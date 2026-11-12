@@ -1172,6 +1172,22 @@ def indexer_active_compare(active, *, exact=False):
     return compare
 
 
+def make_decode_index_quantize(capacity: int, heads: int, head_dim: int = 128):
+    quantize = make_decode_index_cache_quantize(capacity, heads, head_dim)
+
+    @pl.jit
+    def kernel(
+        value: pl.Tensor[[capacity, heads, head_dim], pl.BF16],
+        payload: pl.InOut[pl.Tensor[[capacity, heads, head_dim], pl.INT8]],
+        scales: pl.InOut[pl.Tensor[[capacity, heads], pl.FP16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        quantize(value, payload, scales, active)
+        return payload, scales
+
+    return kernel
+
+
 def validate_prefill_select(*, device=0, sim=False, compile_only=False, cpu_only=False):
     """Check causal selection at supported key capacities and active-row boundaries."""
     from golden import run

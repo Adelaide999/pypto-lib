@@ -576,3 +576,36 @@ def register(torch):
     implementation = torch.library.Library(NAMESPACE, "IMPL", "PrivateUse1")
     implementation.impl("linear", linear)
     return getattr(torch.ops, NAMESPACE).linear.default, (definition, implementation), trace
+
+
+def make_decode_bf16_linear(capacity: int, width: int, output_width: int):
+    """BF16-input/FP32-accumulate linear for compressor and Engram paths."""
+
+    if capacity % 16 or width % 256 or output_width % 32:
+        raise ValueError("BF16 linear dimensions are not A2/A3 aligned")
+    n_tile = 64 if output_width % 64 == 0 else 32
+    blocks = output_width // n_tile
+
+    @pl.jit
+    def linear(
+        value: pl.Tensor[[capacity, width], pl.BF16],
+        weight: pl.Tensor[[width, output_width], pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for block in pl.spmd(((active + 15) // 16) * blocks, name_hint="dsv41_a2a3_bf16_linear"):
+            t0 = (block // blocks) * 16
+            n0 = (block % blocks) * n_tile
+            rows = pl.min(16, active - t0)
+            acc = pl.create_tensor([16, n_tile], dtype=pl.FP32)
+            for k0 in pl.pipeline(0, width, 256, stage=2):
+                lhs = pl.slice(value, [16, 256], [t0, k0], valid_shape=[rows, 256])
+                lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), 16, 256)
+                rhs = pl.slice(weight, [256, n_tile], [k0, n0])
+                acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
+            output[t0 : t0 + 16, n0 : n0 + n_tile] = pl.set_validshape(
+                pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
+            )
+        return output
+
+    return linear

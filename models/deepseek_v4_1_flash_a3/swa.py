@@ -769,6 +769,49 @@ def make_decode_swa(capacity, cache_blocks, config):
     return swa
 
 
+def make_decode_swa_entry(capacity: int, config: Mapping[str, object]):
+    # Keep the product entrypoint independent from the Torch-only reference
+    # helpers in qkv_proj_rope.py. This shape is a model boundary.
+    query_width = int(config["num_attention_heads"]) * int(config["head_dim"])
+    head_dim = int(config["head_dim"])
+    heads = int(config["num_attention_heads"])
+    window = int(config["sliding_window"])
+    attend = make_decode_swa_attention(capacity, heads, head_dim, window, decode_state=True)
+
+    @pl.jit
+    def kernel(
+        query: pl.Tensor[[capacity, query_width], pl.BF16],
+        window_kv: pl.Tensor[[capacity, head_dim], pl.BF16],
+        slots: pl.Tensor[[capacity, 2], pl.INT64],
+        indices: pl.Tensor[[capacity, window], pl.INT32],
+        sink: pl.Tensor[[heads], pl.FP32],
+        positions: pl.Tensor[[capacity], pl.INT64],
+        request_ids: pl.Tensor[[capacity], pl.INT32],
+        cache_source_ids: pl.Tensor[[capacity], pl.INT32],
+        finished: pl.Tensor[[capacity], pl.INT8],
+        cache: pl.InOut[pl.Tensor[[2, 128, 1, head_dim], pl.BF16]],
+        output: pl.InOut[pl.Tensor[[capacity, query_width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        attend(
+            query,
+            window_kv,
+            slots,
+            indices,
+            sink,
+            positions,
+            request_ids,
+            cache_source_ids,
+            finished,
+            cache,
+            output,
+            active,
+        )
+        return cache, output
+
+    return kernel
+
+
 def golden_swa(tensors, *, config):
     """Publish legal slots and evaluate sink softmax with BF16 probability rounding."""
     import torch

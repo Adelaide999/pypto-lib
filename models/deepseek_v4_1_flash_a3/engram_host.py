@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Iterator, Sequence
 import numpy as np
 import torch
-from .runtime_utils import file_sha
+from .utils import file_sha
 
 
 def lookup_columns(codes, scales, rows):
@@ -830,6 +830,7 @@ def load_rotation(checkpoint, hidden_size):
             if not torch.equal(rotation[row : row + 32, col : col + 32], expected):
                 raise ValueError("Checkpoint rotation is not repeated block32")
     return block.float(), {"path": str(path), "sha256": file_sha(path)}
+
 
 def engram_owner(contract, layer_id, role=None):
     """Resolve the physical checkpoint prefix and original hash slot."""

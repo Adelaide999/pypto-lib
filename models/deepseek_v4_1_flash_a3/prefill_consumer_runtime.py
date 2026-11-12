@@ -91,7 +91,7 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
     query_requests = pad(request_ids[start:start + query_rows], -1)
     if role["mode"] == "reindex":
         from .cache import physical_index_geometry
-        from .prefill_indexer_runtime import run_index_query_selection
+        from .prefill_indexer import run_index_query_selection
 
         if network is not None:
             index_pages = owned_cache_pages(original, source_prefix + "indexer.k_cache", network["codes"])

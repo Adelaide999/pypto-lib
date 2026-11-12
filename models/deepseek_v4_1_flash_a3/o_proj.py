@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 import torch
-from .decode_projection import make_bf16_linear as decode_make_bf16_linear
+from .gemm import make_decode_bf16_linear as decode_make_bf16_linear
 from .gemm import K_TILE, M_TILE, N_TILE, make_bf16_linear, make_blocked_weight_pack as make_pack_weight, make_dot, make_fp32_dequantize, make_int8_gemm, make_pack_weight as output_proj_make_pack_weight
 from .quant import int8_matmul, make_decode_dynamic_int8_quantize as decode_make_dynamic_int8_quantize, make_dequantize, make_dynamic_int8_quantize, make_quantize, quantize_per_token_int8
 from .rope import decode_rope_reference, make_adjacent_rope as make_rope, rope_reference

@@ -151,7 +151,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     from .cache import invalidate_live_versions, publish_live_versions
     from .cache import resolve_layer_role, validate_live_state
     from .runtime_config import ExpertParallelConfig
-    from .swa_scheduler import from_controls
+    from .utils import window_schedule_from_controls as from_controls
 
     layer_id = role["physical_layer"]
     role = resolve_layer_role(layer_id, role)

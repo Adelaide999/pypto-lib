@@ -23,7 +23,7 @@ for the implemented Decode scope and remaining work.
 | Whole-network Prefill, compilation reuse and runtime | `prefill_fwd.py` |
 | Generic layer composition and L2 bindings | `prefill_layer.py`, `prefill_layer_plan.json` |
 | Bounded SWA Decode | `decode_fwd.py` |
-| Vocabulary embedding, initial HC and output head | `input_pack.py`, `prefill_network_input.py`, `lm_head.py` |
+| Vocabulary embedding, initial HC and output head | `input_pack.py`, `prefill_fwd.py`, `lm_head.py` |
 | Attention, compression and Indexer | `swa.py`, `sparse_attention.py`, `compressor.py`, `indexer.py`, phase compositions |
 | Phase MoE routing, dispatch and shared experts | `prefill_moe.py`, `decode_moe.py` |
 | Grouped routed-expert computation | `expert_routed.py` |
@@ -34,7 +34,7 @@ for the implemented Decode scope and remaining work.
 | Host Engram tables and row preparation | `engram_host.py` |
 | Device Engram projection and gating | `engram.py`, `prefill_network_engram.py` |
 
-The package has 56 Python modules. The
+The package has 45 Python modules. The
 [ownership map](../../../models/deepseek_v4_1_flash_a3/MODULE_ALIGNMENT.md)
 describes shared primitives and phase-specific numerical variants.
 Historical audits, independent-layer runners, reference-capture workers,

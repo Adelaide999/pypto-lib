@@ -13,7 +13,7 @@ from copy import deepcopy
 from pathlib import Path
 import torch
 from .cache import resolve_layer_role
-from .runtime_utils import file_sha, write_json
+from .utils import file_sha, write_json
 
 
 MAX_CONTEXT = 2048

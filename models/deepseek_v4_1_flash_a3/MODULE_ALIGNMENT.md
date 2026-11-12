@@ -27,11 +27,28 @@ MXFP8/MXFP4 kernels or topology.
 | Checkpoint readers and phase weight layouts | `weights.py` |
 | Cache and request lifetime | `cache.py`, `state.py` |
 | Persistent device workers and HCCL | `prefill_resident.py`, `moe_transport.py` |
+| Weight packing, integer window scheduling and host file utilities | `utils.py` |
 
-There are 56 Python modules. Standalone audits, independent-layer runners,
+There are 45 Python modules. Standalone audits, independent-layer runners,
 native reference-capture workers, state replay and identity manifests are
 removed. Historical code and provenance remain in Git history. Production
 request/cache checks and operator-local golden entries remain.
+
+The directory has 49 files in total: 45 Python modules, two Markdown documents
+and two JSON configurations. The A5 reference has 43 top-level Python modules;
+A3 retains separate W8A8 weight, cache and host-runtime owners for its supported
+execution path.
+
+Network input preparation and executable lifetime live in `prefill_fwd.py`.
+Indexer dispatch lives in `prefill_indexer.py`; live candidate ownership checks
+live in `cache.py`. Decode projection definitions live in their Linear, Norm,
+RoPE, activation, Indexer, attention or output-projection owner. There is no
+mixed `decode_projection.py` module or forwarding facade. Integer SWA scheduling
+and file identities use `utils.py`, which contains no PyPTO computation.
+
+Unused native SWA/QLI/SMLA adapters and their SMLA scheduling code are removed.
+The two small FP32/BF16 sparse staging kernels remain in `sparse_attention.py`;
+their casts and cache-publication boundaries are unchanged.
 
 ## Numerical variants
 
