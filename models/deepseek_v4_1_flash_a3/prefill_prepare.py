@@ -14,7 +14,6 @@ from pathlib import Path
 import torch
 from .cache import resolve_layer_role
 from .runtime_utils import file_sha, write_json
-from .state import build_state_regions
 
 
 MAX_CONTEXT = 2048
@@ -168,11 +167,8 @@ def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_siz
                 torch.save(payload, path)
                 sources.append(dict(rank=rank, path=str(path), sha256=file_sha(path)))
                 payloads.append(payload)
-            regions = build_state_regions(payloads, identity)
-            region_path = directory / "state-regions.json"
-            write_json(region_path, regions)
             contract = dict(config, checkpoint=str(checkpoint), input_contract_path=str(input_path),
-                input_contract_sha256=identity, state_regions=dict(path=str(region_path), sha256=file_sha(region_path)))
+                input_contract_sha256=identity)
             prepared_inputs = dict(input_contract=actual_input, prepare_input_stage=True)
             prepared_cache = dict(cache, cache_ABI=payloads,
                 cache_ABI_sources=[dict(rank=row["rank"], payload_sha256=row["sha256"], report_sha256=row["sha256"])
@@ -181,170 +177,3 @@ def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_siz
                 prepared_inputs["engram_lookup"] = host.lookup(prepared_inputs, cache=prepared_cache, config=contract)
             yield dict(inputs=prepared_inputs, contract=contract, metadata_sources=sources, cache=prepared_cache)
             predecessor = identity
-
-
-def validate_host():
-    """Check 2048-token planning, all layer coordinates and exact state write boundaries."""
-    from tempfile import TemporaryDirectory
-
-    from .state import NetworkCacheProvider, _check_layout
-    from .cache import network_cache_geometry, owned_cache_pages
-    from .prefill_indexer_runtime import validate_live_refresh_candidates
-
-    views = {}
-    groups = []
-    for layer in range(40):
-        root = f"model.layers.{layer}.self_attn."
-        groups.append(dict(group_id=len(groups), names=[root + "swa_cache"]))
-        views[root + "swa_cache"] = (128, 512, "torch.bfloat16")
-        role = resolve_layer_role(layer)
-        if role["mode"] == "full":
-            compressed = [root + "long_kv_cache", root + "indexer.k_cache"]
-            groups.append(dict(group_id=len(groups), names=compressed))
-            views[compressed[0]] = (128 // role["ratio"], 512, "torch.bfloat16")
-            views[compressed[1]] = [(128 // role["ratio"], 128, "torch.int8"),
-                                    (128 // role["ratio"], 1, "torch.float16")]
-            if role["ratio"] == 2:
-                groups.append(dict(group_id=len(groups), names=[root + "compressor.state_cache"]))
-                views[root + "compressor.state_cache"] = (32, 1024, "torch.float32")
-    descriptors, aliases = {}, {"shared": [], "index": []}
-    for name, dimensions in views.items():
-        planes = dimensions if isinstance(dimensions, list) else [dimensions]
-        items = []
-        for plane_id, (rows, width, dtype) in enumerate(planes):
-            size = torch.empty((), dtype=getattr(torch, dtype.split(".")[-1])).element_size()
-            key = "index" if name.endswith("indexer.k_cache") and rows == 128 else "shared"
-            offset = (65536 + (8192 if plane_id else 0)) if name.endswith("indexer.k_cache") and rows == 64 else 0
-            if key == "index" and plane_id:
-                offset = 16384
-            items.append(dict(storage_key=key, dtype=dtype, shape=[2, rows, 1, width],
-                stride=[131072 // size, width, width, 1], storage_offset_bytes=offset, storage_bytes=262144))
-            if name not in aliases[key]:
-                aliases[key].append(name)
-        descriptors[name] = items if isinstance(dimensions, list) else items[0]
-    raw = {key: dict(storage_key=key, dtype="torch.int8", shape=[262144], stride=[1],
-                    storage_offset_bytes=0, storage_bytes=262144) for key in aliases}
-    layout = dict(raw=raw, views=descriptors, aliases=aliases)
-    template = dict(layout=layout, groups=groups, hash_constants={})
-    cache = dict(cache_ABI=[deepcopy(template) for _ in range(16)], engram_contracts={1: {}, 14: {}})
-    topology = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
-    model = dict(text_config=dict(vocab_size=4096))
-    provider = object.__new__(NetworkCacheProvider)
-    provider.topology, provider.capacity = topology, 16
-    checked, consumed = 0, []
-    with TemporaryDirectory(prefix="a3-prefill-prepare-") as temporary:
-        root = Path(temporary)
-        checkpoint = root / "checkpoint"
-        checkpoint.mkdir()
-        write_json(checkpoint / "config.json", model)
-        config = dict(topology=topology, model_config=model)
-        chunks = prepare_token_chunks(list(range(2048)), checkpoint=checkpoint, cache=cache,
-                                      config=config, output=root / "prepared")
-        previous = None
-        for epoch, packet in enumerate(chunks):
-            actual = packet["inputs"]["input_contract"]
-            request = actual["DP_engines"][0]["requests"][0]
-            if actual["predecessor_input_sha256"] != previous or request["history_tokens"] != consumed:
-                raise RuntimeError("Automatic chunks lost the immediate input lineage or history")
-            consumed.extend(request["token_ids"])
-            previous = packet["contract"]["input_contract_sha256"]
-            if epoch not in (0, 7, 8, 31, 32, 63, 64, 127):
-                continue
-            payloads = packet["cache"]["cache_ABI"]
-            provider.layouts = [{"fresh": payload["layout"]} for payload in payloads]
-            for rank, payload in enumerate(payloads):
-                _check_layout(payload["layout"])
-                for layer in range(40):
-                    record = provider._record("fresh", layer, rank, payload, actual, [16, 0, 0, 0])
-                    role = resolve_layer_role(layer)
-                    if role["mode"] != "swa":
-                        blocks = payload["layout"]["views"][f"model.layers.{layer}.self_attn.swa_cache"]["shape"][0]
-                        geometry = network_cache_geometry(payload["layout"], role, blocks)
-                        source_root = f"model.layers.{role['kv_source']}.self_attn."
-                        for name, plane in (("long_kv_cache", "long"), ("indexer.k_cache", "codes")):
-                            owned_cache_pages(record, source_root + name, geometry[plane])
-                    checked += 1
-            payload = payloads[0]
-            for source in packet["metadata_sources"]:
-                if file_sha(source["path"]) != source["sha256"]:
-                    raise RuntimeError("Prepared rank metadata identity changed")
-            own = payload["metadata"]["model.layers.0.self_attn.swa_cache"]["global_metadata"]
-            slots = own["slot_mapping"].tolist()
-            table = own["block_table"][0].tolist()
-            expected = [[table[position // 128], position % 128] for position in range(epoch * 16, epoch * 16 + 16)]
-            if slots != expected:
-                raise RuntimeError("A chunk crossed a page boundary with the wrong physical slots")
-            regions = json.loads(Path(packet["contract"]["state_regions"]["path"]).read_text())
-            intervals = regions["ranks"]["0"]["layers"][0]["raw_readonly_untouched_complement"]["shared"]
-            for page, row in slots:
-                offset = page * 131072 + row * 1024
-                if any(begin <= offset < end for begin, end in intervals):
-                    raise RuntimeError("Writable SWA bytes were marked readonly")
-            if not any(begin == 0 and end >= 131072 for begin, end in intervals):
-                raise RuntimeError("Reserved page zero lost exact untouched protection")
-        if consumed != list(range(2048)) or epoch != 127:
-            raise RuntimeError("Automatic chunks skipped or duplicated prompt tokens")
-        record = provider._record("fresh", 24, 0, packet["cache"]["cache_ABI"][0], actual, [16, 0, 0, 0])
-        candidates = torch.full((16, 1, 2048), -1, dtype=torch.int32)
-        candidates[:, 0, :256] = torch.arange(256, dtype=torch.int32)
-        validate_live_refresh_candidates(record, {"candidates": candidates}, 20)
-        candidates[:, 0, 64] = -1
-        try:
-            validate_live_refresh_candidates(record, {"candidates": candidates}, 20)
-        except ValueError:
-            pass
-        else:
-            raise RuntimeError("Layer24 accepted a candidate pool missing a visible historical block")
-        if cache["cache_ABI"][0]["layout"] != layout:
-            raise RuntimeError("Reserving automatic pages mutated the caller's cache template")
-        layouts, allocations, reserved = reserve_cache_layouts(cache["cache_ABI"], 2048)
-        for begin in (0, 1, 7, 15, 31, 127, 128, 511, 512, 1023, 1024, 2047):
-            current = list(range(begin, min(2048, begin + 7)))
-            payload = build_chunk_metadata(template, layouts[12], allocations[12], tokens=current,
-                context=begin, tp_rank=0, active=True, reserved=reserved)
-            root_name = "model.layers.2.self_attn."
-            compressed = payload["metadata"][root_name + "long_kv_cache"]["global_metadata"]
-            table = compressed["block_table"][0].tolist()
-            expected = [[table[pos // 128], pos % 128 // 2] if pos % 2 else [-1, -1] for pos in current]
-            if compressed["slot_mapping"].tolist() != expected:
-                raise RuntimeError("An odd chunk boundary published an incomplete compression pair")
-            if compressed["cache_seq_lens"].tolist() != [(begin + len(current)) // 2]:
-                raise RuntimeError("C2 completed history length changed at an odd chunk boundary")
-            ring = payload["metadata"][root_name + "compressor.state_cache"]["global_metadata"]
-            if ring["c2_source_positions"].tolist() != [pos - 1 if pos % 2 else 0 for pos in current]:
-                raise RuntimeError("C2 RoPE positions lost the preceding token at an odd chunk boundary")
-            regions = build_state_regions([payload] * 16, "boundary-input")
-            if begin:
-                own = payload["metadata"]["model.layers.0.self_attn.swa_cache"]["global_metadata"]
-                previous_page = int(own["block_table"][0, (begin - 1) // 128])
-                offset = previous_page * 131072 + ((begin - 1) % 128) * 1024
-                untouched = regions["ranks"]["0"]["layers"][0]["raw_readonly_untouched_complement"]["shared"]
-                if not any(left <= offset and offset + 1024 <= right for left, right in untouched):
-                    raise RuntimeError("Preparing a chunk allowed an earlier SWA history row to change")
-        chunks = list(prepare_token_chunks(list(range(129)), checkpoint=checkpoint, cache=cache,
-            config=config, output=root / "odd-chunks", chunk_size=15, dp_rank=3))
-        if len(chunks) != 9 or chunks[-1]["inputs"]["input_contract"]["DP_engines"][3]["active"] != 9:
-            raise RuntimeError("Automatic Prefill lost the partial final chunk")
-        for packet in chunks:
-            for rank, payload in enumerate(packet["cache"]["cache_ABI"]):
-                provider.layouts = [{"fresh": row["layout"]} for row in packet["cache"]["cache_ABI"]]
-                active = packet["inputs"]["input_contract"]["DP_engines"][3]["active"]
-                provider._record("fresh", 2, rank, payload, packet["inputs"]["input_contract"], [0, 0, 0, active])
-        for invalid in ([], [True], [-1], [4096], list(range(2049))):
-            try:
-                tokenize_prompt(invalid, checkpoint, 4096)
-            except ValueError:
-                continue
-            raise RuntimeError("Invalid automatic input was accepted")
-    return dict(tokens=2048, chunks=128, layer_rank_coordinates=checked, odd_boundaries="checked", final_tail="checked",
-                layer24_candidates="checked",
-                NPU_numerics="not_run")
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--validate-host", action="store_true", required=True)
-    parser.parse_args()
-    print(json.dumps(validate_host(), sort_keys=True))

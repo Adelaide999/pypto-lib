@@ -148,7 +148,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     from .moe import DISPATCH_MAP_PAD as MAP_PAD, validate_received_routes, validate_returned_routes
     from .prefill_compressed_runtime import run_compressed_attention
     from .prefill_consumer_runtime import run_consumer_attention
-    from .cache import LayerObservations, invalidate_live_versions, publish_live_versions
+    from .cache import invalidate_live_versions, publish_live_versions
     from .cache import resolve_layer_role, validate_live_state
     from .runtime_config import ExpertParallelConfig
     from .swa_scheduler import from_controls
@@ -213,8 +213,6 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
 
     local_experts, head_width, output_width = 384 // world, 32768 // tp, 8192 // tp
     local_groups = 8 // tp
-    capture_nodes = runtime.get("capture_nodes", False)
-    capture_state = runtime.get("capture_state", False)
     states = [{} for _ in range(world)]
     for rank in range(world):
         for case in batch["cases"]:
@@ -258,20 +256,6 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 physical,
             ]
             execute("collapse_norm", rank, case, arguments, outputs, ("hc_pre", "attention_norm"))
-            nodes = {} if capture_nodes else LayerObservations(False)
-            if capture_nodes:
-                nodes.update(
-                    {
-                        "hc_pre0.collapsed": collapsed[:physical].clone(),
-                        "hc_pre0.post": post[:physical].clone(),
-                        "hc_pre0.comb": comb[:physical].clone(),
-                        "hc_pre0.next_pre": pre[:physical].clone(),
-                        "attention_norm": normed[:physical].clone(),
-                    }
-                )
-            if engram is not None:
-                if capture_nodes:
-                    nodes.update(engram["nodes"])
             states[rank][case] = dict(
                 original=original,
                 physical=physical,
@@ -284,26 +268,16 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 pre=pre,
                 post=post,
                 comb=comb,
-                nodes=nodes,
                 role=role,
                 live=cache_state[rank][case],
             )
-            state = states[rank][case]
-            live = state["live"]
-            if role["mode"] != "swa":
-                state["raw_cache_before"] = (
-                    {name: value.clone() for name, value in live["raw"].items()} if capture_state else None
-                )
-                state["shared_state_before"] = (
-                    {name: value.clone() for name, value in live["shared"].items()} if capture_state else None
-                )
             norm_packets[rank][case] = normed
     gathered = exchange("attention-input-gather", norm_packets, "all_gather", "tp")
     head_packets = [{} for _ in range(world)]
     for case, originals in batch["cases"].items():
         for rank, original in enumerate(originals):
             state = states[rank][case]
-            physical, total, nodes = state["physical"], state["total"], state["nodes"]
+            physical, total = state["physical"], state["total"]
             full_norm = zeros(capacity, 5120)
             execute(
                 "sp_unpack",
@@ -454,18 +428,6 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                     ("head_pack", [inverse, packet, query_rows], {"packet": packet}, "output_projection"),
                 ],
             )
-            if capture_nodes:
-                nodes.update(
-                    q_norm=latent[:query_rows].clone(),
-                    query_latent=latent[:query_rows].clone(),
-                    query_rope=query[:query_rows].reshape(query_rows, 64, 512).clone(),
-                    attention_context=context[:query_rows].reshape(query_rows, 64, 512).clone(),
-                )
-                nodes.update(
-                    wkv=kv_raw[:total].clone(),
-                    kv_norm=kv_norm[:total].clone(),
-                    attention_context_inverse_rope=inverse[:query_rows].reshape(query_rows, 64, 512).clone(),
-                )
             state.update(cache=cache, per_rank=per_rank, positions=positions)
             head_packets[rank][case] = packet
     exchanged = exchange("attention-head-exchange", head_packets, "all_to_all", "tp")
@@ -473,7 +435,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     for case in batch["cases"]:
         for rank in range(world):
             state, tp_rank = states[rank][case], rank % tp
-            total, physical, nodes = state["total"], state["physical"], state["nodes"]
+            total, physical = state["total"], state["physical"]
             heads, woa, wob = (
                 zeros(capacity, head_width),
                 zeros(capacity, output_width),
@@ -501,13 +463,6 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                     ("reduce_pack", [wob, packed, physical, total], {"packed": packed}, "output_projection"),
                 ],
             )
-            if capture_nodes:
-                nodes.update(
-                    attention_heads_after_exchange=heads[:total].reshape(total, 64 // tp, 512).clone(),
-                    wo_a=woa[:total].clone(),
-                    wo_b=wob[:total].clone(),
-                    attention_output=wob[:total].clone(),
-                )
             reduction[rank][case] = packed
     scattered = exchange("attention-output-scatter", reduction, "reduce_scatter", "tp")
     dispatch_packets = [{} for _ in range(world)]
@@ -516,7 +471,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
         routing_rows = max(original["SP_physical_rows"] for original in batch["cases"][case])
         for rank in range(world):
             state = states[rank][case]
-            physical, nodes = state["physical"], state["nodes"]
+            physical = state["physical"]
             changed = zeros(capacity, 4, 5120)
             pre, post = zeros(capacity, 4, dtype=torch.float32), zeros(capacity, 4, dtype=torch.float32)
             comb, collapsed = zeros(capacity, 4, 4, dtype=torch.float32), zeros(capacity, 5120)
@@ -604,22 +559,6 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                     ("dispatch_pack", args_pack, packet, "dispatch_pack"),
                 ],
             )
-            if capture_nodes:
-                nodes.update(
-                    {
-                        "hc_post0": changed[:physical].clone(),
-                        "hc_pre1.collapsed": collapsed[:physical].clone(),
-                        "hc_pre1.post": post[:physical].clone(),
-                        "hc_pre1.comb": comb[:physical].clone(),
-                        "hc_pre1.next_pre": pre[:physical].clone(),
-                        "ffn_norm_bf16": normed[:physical].clone(),
-                        "ffn_router_input_fp32": router_input[:physical].clone(),
-                        "logits": logits[:physical].clone(),
-                        "route_ids": ids[:routing_rows].clone(),
-                        "route_weights": weights[:routing_rows].clone(),
-                        "shared": shared[:physical].clone(),
-                    }
-                )
             state.update(
                 changed=changed,
                 ffn_pre=pre,
@@ -695,11 +634,6 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 "dispatch_pack",
             )
             returns[rank][case] = dict(routes=packet["routes"], counts=packet["counts"], hidden=sent)
-            if capture_nodes:
-                state.update(
-                    received_routes=recv_routes[:total].clone(), received_hidden=recv_hidden[:total].clone()
-                )
-                state["nodes"]["local_expert_counts"] = counts.to(torch.int32)
     returned = exchange("expert-return", returns, "all_to_all", "ep", packets=True)
     final_hidden, final_pre = [{} for _ in range(world)], [{} for _ in range(world)]
     for rank in range(world):
@@ -745,480 +679,13 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             )
             output_flat = output.reshape(capacity, 20480)
             execute("mask_output", rank, case, [output_flat, valid, physical], {"hidden": output}, "hc_post")
-            routed_node = routed[: state["routing_rows"]].clone() if capture_nodes else None
-            if capture_nodes:
-                state["nodes"].update(
-                    routed_native=routed_node,
-                    moe_output=combined[:physical].clone(),
-                    hc_post1=output[:physical].clone(),
-                )
             state.update(padded_hidden=output)
-            if capture_nodes:
-                state["returned_routes"] = returned_routes[: state["valid"] * 6].clone()
             final_hidden[rank][case] = output
             final_pre[rank][case] = state["ffn_pre"]
     for rank in range(world):
         for case in batch["cases"]:
-            states[rank][case]["nodes"] = dict(states[rank][case]["nodes"])
             publish_live_versions(role, cache_state[rank][case], epoch, token_map_id)
     return {"hidden": final_hidden, "pre_mix": final_pre, "states": states}
-
-
-def run_prefill_layer(args, layer_id=0):
-    """Execute one physical layer with CP/SP attention, Engram and multi-rank EP MoE."""
-    from .moe_transport import CANNMemory
-    from .cache import fixture_live_state, resolve_layer_role
-    from .weights import prepare_product_operands
-    from .runtime_config import ExpertParallelConfig
-    from .runtime_utils import Executable, communicate, file_sha, loaded_source_files, write_json
-    from .weights import CheckpointOperands
-
-    contract = torch.load(args.inputs, map_location="cpu", weights_only=True)
-    boundary_layer = contract.get("physical_layer_id", contract.get("layer", layer_id))
-    if layer_id not in (0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25) or boundary_layer != layer_id:
-        raise ValueError("Require the requested physical layer input boundary")
-    if layer_id == 14:
-        if contract.get("own_cache_sources") != dict(kv=14, index=14, hash_slot=1) or contract.get(
-            "product_chain"
-        ):
-            raise ValueError("Physical14 requires its own caches and independent slot1 input boundary")
-    if layer_id in (15, 19):
-        if contract.get("source_physical_layer_id") != 14 or contract.get("product_chain"):
-            raise ValueError("Require an independent physical consumer with explicit readonly source14")
-    if layer_id == 21 and (contract.get("source_physical_layer_id") != 20 or contract.get("product_chain")):
-        raise ValueError("Physical21 requires its own layer and explicit readonly source20")
-    if layer_id == 25 and (
-        contract.get("source_physical_layer_id") != 20
-        or contract.get("incoming_source_physical_layer_id") != 24
-        or contract.get("index_source_physical_layer_id") != 24
-        or contract.get("candidate_source_physical_layer_id") != 20
-        or contract.get("product_chain")
-    ):
-        raise ValueError("Physical25 requires readonly KV/candidates20 and incoming/selection24")
-    if layer_id == 20 and (
-        contract.get("own_cache_sources") != dict(kv=20, index=20, candidate=20)
-        or contract.get("product_chain")
-    ):
-        raise ValueError("Physical20 requires its own ratio1 KV/index/candidate state")
-    if layer_id == 24:
-        from .prefill_indexer_runtime import validate_refresh_candidates
-
-        if contract.get("product_chain") or contract.get("candidate_source_physical_layer_id") != 20:
-            raise ValueError("Physical24 refresh requires an independent readonly20 candidate boundary")
-        validate_refresh_candidates(contract)
-    prefix = f"layers.{layer_id}"
-    topology = contract["topology"]
-    layout = ExpertParallelConfig(topology["dp"], topology["tp"], topology["ep"], 384)
-    tp, world = layout.tp, layout.ep
-    if any(topology[name] != 1 for name in ("pp", "pcp", "dcp")):
-        raise ValueError("Require PP1/PCP1/DCP1")
-    if args.tp != tp or not 2 <= world <= 16:
-        raise ValueError("Require matching TP1/2/4 and a real local multi-rank EP topology")
-    if any(len(records) != world for records in contract["cases"].values()):
-        raise ValueError("Every case must cover the actual complete world")
-    if not contract["enable_expert_parallel"] or not all(contract["required_modes"].values()):
-        raise ValueError("Every native target mode must remain enabled")
-    cache_pages = {2: 12, 3: 16, 14: 12, 15: 16, 19: 16, 20: 12, 21: 16, 24: 16, 25: 16}.get(layer_id, 3)
-    if contract["global_experts"] != 384 or contract["top_k"] != 6 or contract["cache_pages"] != cache_pages:
-        raise ValueError("Original expert, top-k and cache geometry is required")
-    ownership = validate_prefill_ownership(layout, contract["ownership"])
-    from .runtime_config import configure_devices
-
-    assigned = configure_devices(args.devices, world=world)
-    if (
-        len(assigned) != world
-        or len(set(assigned)) != world
-        or any(not device.isdecimal() for device in assigned)
-    ):
-        raise ValueError("Require the complete distinct queue-assigned device set for this topology")
-    torch.set_num_threads(4)
-    args.output = args.output.resolve()
-    args.output.mkdir(parents=True, exist_ok=True)
-    captures, build = args.output / "captures", args.output / "compiled"
-    captures.mkdir()
-    build.mkdir()
-    runtime = {
-        "topology": topology,
-        "assigned_devices": assigned,
-        "logical_rank_mapping": list(range(world)),
-        "enable_expert_parallel": True,
-        "required_modes": contract["required_modes"],
-        "groups": {
-            "ep": [list(range(world))],
-            "tp": [list(range(r, r + tp)) for r in range(0, world, tp)],
-            "dp": [list(range(r, world, tp)) for r in range(tp)],
-        },
-        "source_root": str(Path(__file__).resolve().parents[2]),
-        "source_files": {},
-        "command": [sys.executable, *sys.argv],
-        "inputs_sha256": file_sha(args.inputs),
-        "checkpoint_config_sha256": file_sha(Path(contract["checkpoint"]) / "config.json"),
-        "complete_layer_status": "not_run",
-        "physical_layer_id": layer_id,
-    }
-    runtime_path = args.output / "runtime_config.json"
-    write_json(runtime_path, runtime)
-    reports = [
-        {
-            "rank": rank,
-            "ownership": ownership[rank],
-            "kernels": [],
-            "communication": [],
-            "consumed_tensors": {},
-            "command": runtime["command"],
-        }
-        for rank in range(world)
-    ]
-    memory = CANNMemory()
-
-    def exchange(stage, values, collective, group, *, packets=False):
-        transport = (
-            values
-            if packets
-            else [{case: {"value": value} for case, value in rank_values.items()} for rank_values in values]
-        )
-        results, receipts = communicate(
-            stage, transport, args.output, runtime_path, collective=collective, group=group
-        )
-        for rank, receipt in enumerate(receipts):
-            reports[rank]["communication"].append(receipt)
-        if packets:
-            return results
-        return [{case: packet["value"] for case, packet in rank_values.items()} for rank_values in results]
-
-    # Actual product group prechecks precede all model computation.
-    precheck = [{"rank": torch.tensor([[rank]], dtype=torch.int32)} for rank in range(world)]
-    for group in ("ep", "tp", "dp"):
-        observed = exchange("startup-" + group, precheck, "all_gather", group)
-        for rank in range(world):
-            ranks = next(ranks for ranks in runtime["groups"][group] if rank in ranks)
-            if observed[rank]["rank"].flatten().tolist() != ranks:
-                raise RuntimeError("Product HCCL group precheck failed: " + group)
-    capacity = contract["capacity"]
-    model_config = contract["model_config"]
-    config = dict(model_config["text_config"], image_sentinel_base_id=model_config["image_token_id"])
-    max_tokens = max(
-        sum(original["SP_valid_rows"] for original in originals) for originals in contract["cases"].values()
-    )
-    expert_capacity = (max_tokens + 15) // 16 * 16
-    requests, table_pages = 1, 2
-    if layer_id in (2, 14, 20):
-        from .prefill_compressed_runtime import compressed_geometry
-
-        cache_pages, requests, table_pages = compressed_geometry(contract)
-    if layer_id in (3, 15, 19, 21, 24, 25):
-        from .prefill_compressed_runtime import compressed_geometry
-
-        cache_pages, requests, table_pages = compressed_geometry(contract)
-    functions = make_prefill_layer_entries(
-        capacity,
-        config,
-        expert_capacity,
-        layer_id,
-        cache_pages,
-        requests,
-        table_pages,
-        ep=world,
-        cache_layout=next(iter(contract["cases"].values()))[0].get("cache_layout"),
-        tp=tp,
-    )
-    entries = {name: Executable(function, build / name) for name, function in functions.items()}
-
-    def execute(name, rank, case, arguments, outputs, responsibility=None):
-        roles = name if responsibility is None else responsibility
-        path = captures / f"rank-{rank}-{case}-{name}-{len(reports[rank]['kernels'])}.pt"
-        entries[name].execute(arguments, outputs, rank, roles, path, reports[rank], memory)
-
-    def zeros(*shape, dtype=torch.bfloat16):
-        return torch.zeros(shape, dtype=dtype)
-
-    def pad(value):
-        target = zeros(capacity, *value.shape[1:], dtype=value.dtype)
-        target[: len(value)].copy_(value)
-        return target
-
-    readers = [CheckpointOperands(contract["checkpoint"]) for _ in range(world)]
-    shared_reader = CheckpointOperands(contract["checkpoint"])
-    try:
-        with memory.interval(0, "load", "shared_checkpoint"):
-            raw = {
-                name: shared_reader.load(name)
-                for name in shared_reader.index
-                if name.startswith(prefix + ".")
-                and ".ffn.experts." not in name
-                and ".engram.embed." not in name
-            }
-            operands = prepare_product_operands(raw, layer_id)
-        for rank, reader in enumerate(readers):
-            reader.consumed.update(shared_reader.consumed)
-            with memory.interval(rank, "load", "owned_checkpoint"):
-                for expert, _slot in layout.ownership(rank):
-                    for stem in ("w1", "w2", "w3"):
-                        for suffix in ("weight", "weight_scale", "weight_offset"):
-                            reader.load(f"{prefix}.ffn.experts.{expert}.{stem}.{suffix}")
-            memory.sample(rank, "checkpoint/load/after")
-        role = resolve_layer_role(layer_id)
-        epoch, token_map_id = "independent-fixture", runtime["inputs_sha256"]
-        batch = {"cases": contract["cases"], "epoch": epoch, "token_map_id": token_map_id}
-        live = fixture_live_state(contract, role, epoch, token_map_id)
-        hidden = [
-            {case: pad(records[rank]["hidden"]) for case, records in contract["cases"].items()}
-            for rank in range(world)
-        ]
-        pre = [
-            {case: pad(records[rank]["pre_mix"]) for case, records in contract["cases"].items()}
-            for rank in range(world)
-        ]
-
-        def expert_weights(rank, expert):
-            name = prefix + ".ffn.shared_experts" if expert is None else f"{prefix}.ffn.experts.{expert}"
-            return readers[rank].expert(name)
-
-        def engram(current_role, current_batch, current_hidden, current_live, *, exchange):
-            from .prefill_engram_runtime import run_prefill_engram
-
-            hash_caches = [
-                {case: state["hash_cache"] for case, state in records.items()} for records in current_live
-            ]
-            return run_prefill_engram(
-                contract,
-                raw,
-                args.output,
-                reports,
-                memory,
-                exchange,
-                layer_id,
-                role=current_role,
-                local_hidden=current_hidden,
-                live_hash_caches=hash_caches,
-            )
-
-        core_runtime = dict(
-            topology=topology,
-            ownership=ownership,
-            enable_expert_parallel=True,
-            required_modes=contract["required_modes"],
-            capacity=capacity,
-            expert_capacity=expert_capacity,
-            cache_blocks=cache_pages,
-            requests=requests,
-            table_pages=table_pages,
-            memory=memory,
-            execute=execute,
-            exchange=exchange,
-            epoch=epoch,
-            token_map_id=token_map_id,
-            output_sentinel=contract["output_sentinel"],
-            capture_nodes=True,
-            capture_state=True,
-            engram=engram,
-        )
-        computed = run_prefill_layer_inmemory(
-            role,
-            batch,
-            hidden,
-            pre,
-            live,
-            {"raw": raw, "operands": operands, "expert": expert_weights},
-            core_runtime,
-        )
-        states = computed["states"]
-        final_hidden = [
-            {case: value.reshape(capacity, 20480) for case, value in records.items()}
-            for records in computed["hidden"]
-        ]
-        final_pre = computed["pre_mix"]
-        full_hidden = exchange("final-hidden-gather", final_hidden, "all_gather", "tp")
-        full_pre = exchange("final-hc-gather", final_pre, "all_gather", "tp")
-        for rank in range(world):
-            for case, state in states[rank].items():
-                physical, total, original = state["physical"], state["total"], state["original"]
-                hidden, pre = zeros(capacity, 20480), zeros(capacity, 4, dtype=torch.float32)
-                execute(
-                    "final_unpack",
-                    rank,
-                    case,
-                    [full_hidden[rank][case], hidden, physical, total],
-                    {"hidden": hidden},
-                    "hc_post",
-                )
-                execute(
-                    "pre_unpack",
-                    rank,
-                    case,
-                    [full_pre[rank][case], pre, physical, total],
-                    {"pre": pre},
-                    "hc_pre",
-                )
-                padded_pre = torch.full((capacity, 4), contract["output_sentinel"], dtype=torch.float32)
-                padded_pre[:physical].copy_(state["ffn_pre"][:physical])
-                result = dict(
-                    output_hidden=hidden[:total].reshape(total, 4, 5120).clone(),
-                    next_pre=pre[:total].clone(),
-                    local_output_hidden=state["padded_hidden"][:physical].clone(),
-                    local_next_pre=state["ffn_pre"][:physical].clone(),
-                    padded_hidden=state["padded_hidden"],
-                    padded_next_pre=padded_pre,
-                    cache_after=state["cache"],
-                    nodes=state["nodes"],
-                    received_routes=state["received_routes"],
-                    received_hidden=state["received_hidden"],
-                    returned_routes=state["returned_routes"],
-                    metadata=original["metadata"],
-                    cp_token_range=original["cp_token_range"],
-                    cache_mutable_slots=original.get("cache_mutable_slots", []),
-                )
-                if layer_id in (2, 3, 14, 15, 19, 20, 21, 24, 25):
-                    result["cache_after"] = state["cache"].clone()
-                    result.update(
-                        {
-                            name: state[name]
-                            for name in (
-                                "raw_cache_before",
-                                "raw_cache_after",
-                                "shared_state_before",
-                                "shared_state_after",
-                            )
-                        }
-                    )
-                    result.update(
-                        {name: original[name] for name in ("active_by_dp", "cache_layout", "cache_metadata")}
-                    )
-                if state["engram"] is not None:
-                    result.update(
-                        hash_cache_before=state["engram"]["hash_cache_before"],
-                        hash_cache_after=state["engram"]["hash_cache_after"],
-                    )
-                readonly = dict(
-                    hidden=state["readonly_hidden"][:physical],
-                    pre_mix=state["incoming"][:physical],
-                    input_ids=state["token_ids"][:physical],
-                    positions=state["positions"][:total],
-                    full_input_ids=original["full_input_ids"],
-                )
-                for key, value in readonly.items():
-                    if not torch.equal(value, original[key]):
-                        raise RuntimeError("Model compute modified readonly " + key)
-                    result["readonly_" + key] = value.clone()
-                torch.save(result, args.output / f"rank-{rank}-{case}.pt")
-        runtime["complete_layer_status"] = "executed_short_gate"
-    finally:
-        for rank, report in enumerate(reports):
-            report["consumed_tensors"] = readers[rank].consumed
-            transport = [receipt["memory"] for receipt in report["communication"]]
-            intervals = [item for item in memory.intervals if item["rank"] == rank]
-            intervals += [item for receipt in transport for item in receipt.get("intervals", [])]
-            report["memory"] = {
-                "scope": "Stage samples; qualified peaks are computed by the frozen observer",
-                "samples": [item for item in memory.samples if item["rank"] == rank],
-                "transport": transport,
-                "intervals": intervals,
-            }
-            write_json(args.output / f"rank-{rank}-report.json", report)
-        loaded_source_files(runtime)
-        write_json(runtime_path, runtime)
-
-
-def compile_prefill_layer(args, layer_id=0):
-    """Compile the complete physical-layer entries through Golden without a device."""
-    from golden import normalize_config
-
-    from .engram import make_prefill_engram_entries
-    from .runtime_utils import file_sha, loaded_source_files, write_json
-
-    contract = torch.load(args.inputs, map_location="cpu", weights_only=True)
-    boundary_layer = contract.get("physical_layer_id", contract.get("layer", layer_id))
-    if boundary_layer != layer_id:
-        raise ValueError("Compile the same physical boundary as the product")
-    config = dict(contract["model_config"]["text_config"])
-    image_id = contract["model_config"]["image_token_id"]
-    config.update(image_sentinel_base_id=image_id, image_token_id=image_id)
-    config["image_pad_token_id"] = contract["model_config"].get("image_pad_token_id", image_id + 1)
-    capacity = contract["capacity"]
-    originals = [original for records in contract["cases"].values() for original in records]
-    max_tokens = max(
-        sum(original["SP_valid_rows"] for original in records) for records in contract["cases"].values()
-    )
-    expert_capacity = (max_tokens + 15) // 16 * 16
-    cache_pages, requests, table_pages = contract["cache_pages"], 1, 2
-    if layer_id in (2, 3, 14, 15, 19, 20, 21, 24, 25):
-        from .prefill_compressed_runtime import compressed_geometry
-
-        cache_pages, requests, table_pages = compressed_geometry(contract)
-    entries = make_prefill_layer_entries(
-        capacity,
-        config,
-        expert_capacity,
-        layer_id,
-        cache_pages,
-        requests,
-        table_pages,
-        ep=contract["topology"]["ep"],
-        cache_layout=originals[0].get("cache_layout"),
-        tp=args.tp,
-    )
-    if layer_id in (1, 14):
-        from .prefill_engram_runtime import engram_owner
-
-        engram_owner(contract, layer_id)
-        cache_rows = originals[0]["hash_cache"].numel()
-        max_blocks = max(original["metadata"]["block_table"].shape[1] for original in originals)
-        engram_args = (
-            capacity,
-            contract["hash_constants"],
-            config,
-            contract["engram_shards"],
-            cache_rows,
-            max_blocks,
-        )
-        entries.update(make_prefill_engram_entries(*engram_args, tp=args.tp))
-    args.output.mkdir(parents=True, exist_ok=False)
-    report = {
-        "physical_layer_id": layer_id,
-        "device_execution": "not_run",
-        "entries": {},
-        "source_root": str(Path(__file__).resolve().parents[2]),
-        "source_files": {},
-        "inputs_sha256": file_sha(args.inputs),
-    }
-    try:
-        for name, function in entries.items():
-            directory = args.output / name
-            config = normalize_config({"platform": "a2a3", "save_kernels_dir": str(directory)})
-            function.compile(config=config)
-            artifacts = {
-                str(path): file_sha(path)
-                for path in sorted(directory.rglob("*"))
-                if path.is_file() and path.suffix in (".pto", ".cpp", ".so")
-            }
-            if not any(path.endswith(".pto") for path in artifacts):
-                raise RuntimeError("No retained PTO for " + name)
-            report["entries"][name] = {"compilation": "passed", "artifacts": artifacts}
-            print({"stage": "compile_only", "entry": name, "status": "passed"}, flush=True)
-    finally:
-        loaded_source_files(report)
-        write_json(args.output / "compilation.json", report)
-
-
-def main():
-    """Select and execute a complete physical-layer boundary or compile its entries."""
-    import argparse
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-p", "--platform", choices=("a2a3",), default="a2a3")
-    parser.add_argument(
-        "--layer-id", type=int, choices=(0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25), required=True
-    )
-    parser.add_argument("--tp", type=int, choices=(1, 2, 4), required=True)
-    parser.add_argument("--devices", type=lambda value: value.split(","), required=True)
-    parser.add_argument("--inputs", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args()
-    if args.compile_only:
-        compile_prefill_layer(args, layer_id=args.layer_id)
-    else:
-        run_prefill_layer(args, layer_id=args.layer_id)
 
 
 # Each binding names one external tensor or scalar, shared by all uses in a region.
@@ -1466,7 +933,3 @@ def region_arguments(name, operations):
         outputs.update({child + "." + key: value for key, value in observed.items()})
         roles.extend([role] if isinstance(role, str) else role)
     return [values[binding] for binding in region_bindings(steps)], outputs, tuple(roles)
-
-
-if __name__ == "__main__":
-    main()

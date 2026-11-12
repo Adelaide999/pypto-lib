@@ -182,38 +182,6 @@ def resolve_layer_role(layer_id, role=None):
     return dict(expected)
 
 
-def fixture_live_state(contract, role, epoch, token_map_id):
-    """Initialize once from an independent fixture; never use this adapter in a chain."""
-    world = contract["topology"]["ep"]
-    live = [{} for _ in range(world)]
-    for case, records in contract["cases"].items():
-        for rank, original in enumerate(records):
-            state = {"versions": {}}
-            if role["mode"] == "swa":
-                state["cache"] = original["cache"].clone()
-            else:
-                state["raw"] = {key: value.clone() for key, value in original["raw_cache_before"].items()}
-                state["layout"] = original["cache_layout"]
-                state["shared"] = {}
-                for name, encoded in original["shared_state_initial"].items():
-                    dtype = getattr(torch, encoded["dtype"].split(".")[-1])
-                    value = torch.full(encoded["shape"], encoded["fill"], dtype=dtype)
-                    value[: len(encoded["prefix"])].copy_(encoded["prefix"])
-                    state["shared"][name] = value
-                for name, owner in (
-                    ("kv", role["kv_source"]),
-                    ("index", role["index_source"]),
-                    ("candidate", role["candidate_source"]),
-                ):
-                    if owner is not None:
-                        state["versions"][name] = (owner, epoch, token_map_id)
-            if role["engram_slot"] is not None:
-                state["hash_cache"] = original["hash_cache"].clone()
-                state["hash_owner"] = role["physical_layer"]
-            live[rank][case] = state
-    return live
-
-
 def validate_live_state(role, original, live, epoch, token_map_id):
     """Reject stale selections and missing actual arenas before any layer mutation."""
     if role["engram_slot"] is not None:
@@ -279,22 +247,6 @@ def invalidate_live_versions(role, live):
     ):
         if writes:
             live["versions"].pop(name, None)
-
-
-class LayerObservations(dict):
-    """Retain optional diagnostic tensors without retaining every layer in a network."""
-
-    def __init__(self, enabled):
-        super().__init__()
-        self.enabled = enabled
-
-    def __setitem__(self, key, value):
-        if self.enabled:
-            super().__setitem__(key, value)
-
-    def update(self, *args, **kwargs):
-        if self.enabled:
-            super().update(*args, **kwargs)
 
 
 DTYPES = {

@@ -16,7 +16,7 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
                            capacity, cache_blocks, requests, table_pages, layer_id=3, *,
                            q_input=None, latent=None, cosine=None, sine=None):
     """Publish computed own KV and read the supplied source selection and physical caches."""
-    original, total, nodes = state["original"], state["total"], state["nodes"]
+    original, total = state["original"], state["total"]
     start, end, _per_rank, _padded = original["cp_token_range"]
     query_rows = max(0, min(end, total) - min(start, total))
     if query_rows != original["actual_local_query_rows"]:
@@ -141,7 +141,5 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
                 dict(context=context), ("swa", "compressed_attention"))
     if role["ratio"] == 1 and network is None:
         execute("consumer_cache_store", rank, case, [dense, raw_cache], {"raw": raw_cache}, "physical_cache_store")
-    nodes["consumer.selected_indices"] = selected[:query_rows].clone()
-    nodes["consumer.own_swa_publication"] = dict(slots=slots.clone(), values=state["kv_rope"][:total].clone())
     state.update(raw_cache_after=raw, shared_state_after=shared)
     return context, views[own_name] if network is not None else cache

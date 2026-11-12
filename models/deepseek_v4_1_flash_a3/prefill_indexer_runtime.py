@@ -12,16 +12,6 @@ import torch
 from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY
 
 
-def validate_refresh_candidates(contract):
-    """Require the bounded route where candidate blocks cover every visible source key."""
-    if contract["physical_layer_id"] != 24 or contract["source_physical_layer_id"] != 20:
-        raise ValueError("Require original physical24 refresh of source20")
-    for originals in contract["cases"].values():
-        for original in originals:
-            candidates = original["shared_state_initial"]["candidates"]["prefix"]
-            validate_live_refresh_candidates(original, {"candidates": candidates}, 20)
-
-
 def validate_live_refresh_candidates(original, shared, source_id):
     """Preserve the short full-coverage guard against the actual live candidate buffer."""
     starts = original["metadata"]["query_start_loc"].tolist()

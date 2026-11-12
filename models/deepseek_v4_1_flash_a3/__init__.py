@@ -34,7 +34,6 @@ _EXPORTS = {
     "make_routed_expert_w8a8": ("moe", "make_routed_expert_w8a8"),
     "make_shared_expert_w8a8": ("moe", "make_shared_expert_w8a8"),
     "make_prefill_layer_entries": ("prefill_layer", "make_prefill_layer_entries"),
-    "run_prefill_layer": ("prefill_layer", "run_prefill_layer"),
     "make_physical_compressed_entries": ("prefill_c2a", "make_physical_compressed_entries"),
     "make_prefill_engram_entries": ("engram", "make_prefill_engram_entries"),
     "engram_reference": ("engram", "engram_reference"),

@@ -1,33 +1,18 @@
-# DeepSeek V4.1 Flash A3 Prefill and Decode
+# DeepSeek V4.1 Flash A3
 
-This directory contains the actual A3 product implementation exported from
-commit `ebf19ad0ae7d668b4f7f2b04b526c9dcff2785a9`, including PyPTO kernels,
-complete-layer composition, full 40-layer Prefill wiring, cache ownership,
-Engram, and CANN/HCCL transport. The independently developed Decode kernels
-are consolidated into this same A3 package; the duplicate A2 directory is removed.
+A3 Eco-Tech W8A8 operators, the complete 40-layer Prefill composition and
+persistent runtime, plus bounded Decode operators. The package has 56 Python
+modules organized by computation responsibility.
 
-See the [model documentation](../../docs/models/deepseek_v4_1_flash_a3/index.md)
-for entry points, dependencies, topology, and the limits of the evidence.
-See [Decode](../../docs/models/deepseek_v4_1_flash_a3/decode.md) for its separate acceptance contract.
-The original source directory was named `deepseek_v4_1_flash_a2`; that historic
-path in `source_manifest.json` records provenance rather than the target hardware.
+- `prefill_fwd.prefill_fwd`: embedding, all 40 layers and vocabulary head.
+- `prefill_fwd.compile_prefill`: reusable compilation from request/cache geometry.
+- `prefill_layer.py`: generic layer composition and L2 compute regions.
+- `decode_fwd.py`: bounded single-step SWA; the full EP16 driver remains unimplemented.
 
-`prefill_fwd.prefill_fwd` executes embedding, the complete 40-layer backbone
-and the final head from explicit request/cache metadata and checkpoint weights.
-`prefill_fwd.compile_prefill` prepares all stage artifacts for reuse in the
-same process without allocating the full cache buffers or running NPU work.
-The existing host communication and weight streaming boundaries remain;
-the Prefill interface does not claim a single device L2 graph.
-`decode_fwd.py` provides the bounded SWA step. Fixed EP2 Decode drivers have
-been removed; a full 40-layer EP16 Decode driver remains unimplemented.
+Historical regression runners, replay/capture paths and task admission tooling
+are removed. Operator files retain Torch goldens and standard validation
+entries. Arithmetic, rounding and cache semantics are preserved.
 
-Run the device-free package checks from the repository root:
-
-```bash
-python -B -m models.deepseek_v4_1_flash_a3.validate
-```
-
-The original A3 task admitted 11 independent complete layers at an earlier
-source identity. Full-network accuracy and a fresh relocated-package NPU run
-are not claimed. Weights, private fixtures, generated compiler artifacts,
-and device allocations are not included.
+See the [model documentation](../../docs/models/deepseek_v4_1_flash_a3/index.md),
+[Decode scope](../../docs/models/deepseek_v4_1_flash_a3/decode.md) and
+[module owners](MODULE_ALIGNMENT.md) for configuration, usage and current limits.

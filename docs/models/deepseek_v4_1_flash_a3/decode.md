@@ -1,92 +1,42 @@
 # DeepSeek V4.1 Flash A3 Decode
 
-Decode and Prefill reside in `models.deepseek_v4_1_flash_a3`. The old fixed
-EP2 product path, two-device compile drivers and complete-layer wrappers
-have been removed. Their source and historical results remain in Git at
-`2704263`; they are not current entry points or EP16 acceptance evidence.
+Decode and Prefill share the A3 package and small computation primitives.
+The bounded SWA Decode entry is implemented; a complete 40-layer EP16 Decode
+network is not implemented. Old EP2 drivers, state replay, task acceptance
+gates and independent reference-capture scripts are removed.
 
-## Entries and operator ownership
+## Owners
 
-| Responsibility | Maintained owner |
+| Responsibility | Module |
 | --- | --- |
-| Bounded single-step SWA Decode and state replay | `decode_fwd.py`, `decode_replay.py` |
+| Bounded single-step SWA forward and local golden | `decode_fwd.py` |
 | Local attention and mHC composition | `decode_swa.py` |
-| Routing, dispatch primitives and shared-expert variants | `moe.py` |
-| Routed expert kernels | `expert_routed.py` |
-| Compression, Indexer and Engram computation | `compressor.py`, `indexer.py`, `engram.py` |
-| Quantization, linear, normalization, RoPE and cache computation | `quant.py`, `gemm.py`, `rmsnorm.py`, `rope.py`, `qkv_proj_rope.py`, `o_proj.py`, `swa.py` |
-| Checkpoint and EP16 MoE weight layouts | `weights.py` |
-| HOST contracts and dependency scan | `decode_acceptance.py`, `decode_contract.py`, `decode_gate.py` |
-
-The retained numerical kernels preserve their arithmetic, rounding and cache
-semantics. The bounded SWA forward contains attention computation; it is not
-an EP16 MoE, a complete layer or a 40-layer Decode network. `decode_swa.py`
-composes local attention with mHC and does not import distributed MoE.
-
-## EP16 contract and current limits
+| Routing, dispatch and shared-expert variants | `moe.py` |
+| Routed expert computation | `expert_routed.py` |
+| Compression, Indexer and Engram | `compressor.py`, `indexer.py`, `engram.py` |
+| Linear, quantization, Norm, RoPE and cache operations | Shared child operators |
+| Checkpoint loading and EP16 MoE layout | `weights.py` |
 
 The declared topology matrix is DP16/TP1/EP16, DP8/TP2/EP16 and
-DP4/TP4/EP16. A Decode configuration with EP2 is rejected. Declaring one of
-these EP16 configurations does not shard the bounded SWA kernel or provide
-a distributed network driver.
+DP4/TP4/EP16. EP2 is rejected. These declarations do not turn the local
+SWA step into a distributed MoE or a complete network.
 
-`weights.load_decode_rank_weights(checkpoint, layer, rank)` loads the router,
-shared expert and one contiguous 24-expert MoE shard for an EP16 owner.
-Ranks 0 through 15 cover all 384 experts exactly once. This preserves the
-existing per-expert packing, scale handling and offset checks; it does not
-bind TP-sharded attention weights, source/cache lifetimes or a network plan.
-`weights.abi_summary()` describes that host layout without loading weights.
+`weights.load_decode_rank_weights(checkpoint, layer, rank)` loads router,
+shared-expert operands and a contiguous 24-expert shard. Ranks 0..15 cover
+all 384 experts once. Per-expert packing, scale handling and offset checks
+are preserved. This loader does not bind TP attention weights or source/cache
+ownership into a network plan.
 
-The following requirements remain unimplemented or unverified:
-
-- Complete-network EP16 Decode dispatch, communication and output reduction.
-- Per-layer TP attention, cache ownership and Prefill-to-Decode handoff.
-- DecodeState binding and request/position/finished/epoch transitions.
-- Same-input NPU versus independent vLLM-Ascend reference captures.
-- Device memory peaks, resident model coverage and performance.
-
-`decode_gate.py` reports `ready_for_submission=false`, no product command and
-no formal network entry point while the EP16 driver is unavailable. It does
-not substitute a bounded operator run for the requested topology.
-
-## Source and acceptance evidence
-
-`decode_source_manifest.json` and `source_manifest.json` retain original
-export identities, including retired files. `package_refactor_map.json`
-records retired definitions separately from current owners. The original
-four-commit history is recorded in `decode_cherry_pick_receipt.json`.
-
-Historical two-card layer and MoE replays remain evidence for their exact
-old source, inputs and topology. They do not establish current EP16
-correctness. Every current formal layer and topology gate remains `not_run`.
-Floating comparisons use `rtol=0.05, atol=0.05`; discrete control, indices,
-readonly state, inactive rows and untouched cache regions remain exact.
-
-`decode_contract.py` still requires identical checkpoint, request, history
-cache and independent reference captures. C2A/C1A reference assets must
-include compressed KV, index and candidate state, and Engram layers must
-identify the captured rows. A contract scan or a CPU golden is not an NPU
-acceptance result.
-
-## Checks
-
-The following HOST reports initialize no devices:
-
-```bash
-python -m models.deepseek_v4_1_flash_a3.decode_acceptance --json
-python -m models.deepseek_v4_1_flash_a3.decode_gate --topology main --json
-```
-
-The dependency scan rejects vLLM, vLLM-Ascend and Torch-NPU imports in the
-product closure. Independent reference capture remains in
-`decode_reference.py`; it is not part of product computation.
-
-The bounded SWA entry can be compiled with the existing
-[Golden Harness](../../run-and-validate/golden-harness.md):
+The bounded entry retains its own Torch golden and standard
+[Golden Harness](../../run-and-validate/golden-harness.md) command:
 
 ```bash
 python -m models.deepseek_v4_1_flash_a3.decode_fwd -p a2a3 --sim --compile-only
-python -m models.deepseek_v4_1_flash_a3.decode_replay --steps 1 -p a2a3 --sim --compile-only
 ```
 
-These are bounded operator checks, not EP16 or full-network acceptance.
+This compiles an operator case; it is not a full-network accuracy result.
+Remaining work includes the EP16 driver and collectives, per-layer weight and
+cache binding, request/position/finished/epoch transitions, Prefill state
+handoff, and device accuracy/memory/performance verification. Continuous
+generation currently uses the complete Prefill feedback path described in
+the [model documentation](index.md).

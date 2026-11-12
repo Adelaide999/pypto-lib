@@ -11,7 +11,6 @@
 import argparse
 import json
 import math
-import os
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +21,6 @@ from torch.utils._python_dispatch import _disable_current_modes
 from .prefill_fwd import prefill_fwd
 from .prefill_prepare import build_chunk_metadata, reserve_cache_layouts
 from .runtime_utils import file_sha, write_json
-from .state import build_state_regions
 
 
 TOPOLOGY = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
@@ -77,17 +75,14 @@ class FeedbackInputs:
                     tokens=current, context=len(history), tp_rank=rank % 4, active=rank // 4 == 0,
                     reserved=self.reserved)
                 payloads.append(payload)
-            regions = build_state_regions(payloads, identity)
         for rank, payload in enumerate(payloads):
             path = directory / f"rank-{rank}-metadata.pt"
             torch.save(payload, path)
             sources.append(dict(rank=rank, path=str(path), sha256=file_sha(path)))
-        region_path = directory / "state-regions.json"
-        write_json(region_path, regions)
         contract = dict(topology=TOPOLOGY, checkpoint=str(self.checkpoint), model_config=self.model,
             required_modes=self.base["required_modes"], capacity=16, scheduler_capacity=8192,
             fresh_shared_initialization={"topk_indices": -1}, input_contract_path=str(input_path),
-            input_contract_sha256=identity, state_regions=dict(path=str(region_path), sha256=file_sha(region_path)))
+            input_contract_sha256=identity)
         cache = dict(cache_ABI=payloads, engram_contracts=self.engram,
             cache_ABI_sources=[dict(rank=row["rank"], payload_sha256=row["sha256"], report_sha256=row["sha256"])
                                for row in sources])
@@ -121,30 +116,26 @@ def load_prompt(path, checkpoint):
 
 
 def main():
-    """Run one actual public-leased greedy generation or a bounded metadata readiness check."""
+    """Run greedy generation on explicitly assigned devices and persistent network caches."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--assets", type=Path, required=True)
     parser.add_argument("--prompt", type=Path, required=True)
-    parser.add_argument("--source-identity", type=Path, required=True)
-    parser.add_argument("--submission", type=Path)
+    parser.add_argument("--devices", type=lambda value: [int(item) for item in value.split(",")], required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--result", type=Path, required=True)
-    parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     args.result.mkdir(parents=True, exist_ok=True)
     prompt, tokenizer = load_prompt(args.prompt, args.checkpoint)
-    identity = json.loads(args.source_identity.read_text())
     report = dict(at=datetime.now(timezone.utc).isoformat(), status="preparing", prompt=prompt["prompt"],
-        source=identity, checkpoint=str(args.checkpoint), tokenizer=prompt["assets"],
+        checkpoint=str(args.checkpoint), tokenizer=prompt["assets"],
         rendered_prompt=prompt["rendered_prompt"], input_token_ids=prompt["input_token_ids"],
-        eos_token_id=prompt["eos_token_id"], topology=TOPOLOGY, diagnostics=False,
+        eos_token_id=prompt["eos_token_id"], topology=TOPOLOGY,
         initial_max_new_tokens=128, maximum_new_tokens=256, active_token_limit=128,
         generated_token_ids=[], raw_decoded_answer="", steps=[], eos=False, truncated=False,
         complete_answer_observed=False, accuracy="not_run", exit_code=None, device_computation="PyPTO only",
-        algorithm="Persistent-cache sequential Prefill feedback; one complete 40-layer forward per new token",
-        optional_intermediate_precision_captures_hash_gates=False)
+        algorithm="Persistent-cache sequential Prefill feedback; one complete 40-layer forward per new token")
     start = monotonic()
     generated, steps = report["generated_token_ids"], report["steps"]
 
@@ -154,7 +145,7 @@ def main():
         atomic_json(args.result / "generation-result.json", report)
         atomic_json(args.result / "status.json", dict(
             at=report["updated_at"], stage=report.get("stage"), epoch=report.get("epoch"), layer=report.get("layer"),
-            task_id=report.get("task_id"), lease=report.get("lease"), actual_devices=report.get("actual_devices"),
+            actual_devices=report.get("actual_devices"),
             status=report["status"], generated_tokens=len(generated), generated_token_ids=list(generated),
             eos=report["eos"], truncated=report["truncated"], complete_answer_observed=report["complete_answer_observed"],
             elapsed_seconds=report["elapsed_seconds"], result=str(args.result / "generation-result.json")))
@@ -166,30 +157,10 @@ def main():
         builder = FeedbackInputs(args.checkpoint, args.assets, args.output / "prepared", prompt, 256)
         history, current = [], list(prompt["input_token_ids"])
         chunk = builder.chunk(0, current, history, None)
-        if args.check_only:
-            from .prefill_fwd import prepare_network_provider
+        from .runtime_config import configure_devices
 
-            provider = prepare_network_provider(dict(chunk["inputs"], **chunk["cache"]), chunk["contract"],
-                                                "generation-readiness", geometry_only=True)
-            geometry = provider.runtime_geometry()
-            if geometry["table_pages"] != 3 or provider.history.cache_rows != geometry["cache_blocks"] * 128:
-                raise ValueError("Reserved context/history geometry differs")
-            if [row["SP_valid_rows"] for row in provider.batch_for_layer(0)["cases"]["fresh"]] != [2] * 4 + [0] * 12:
-                raise ValueError("Original chat input is not mapped to its actual active TP rows")
-            publish(dict(status="host_interfaces_ready", stage="readiness_complete", geometry=geometry,
-                execution="not_run", compilation="not_run", reserved_context_tokens=builder.reservation, exit_code=0))
-            return
-        if args.submission is None:
-            raise ValueError("Actual generation requires its real public submission receipt")
-        submission = json.loads(args.submission.read_text())
-        job = Path(os.environ["DS41_JOB_ROOT"])
-        lease_path = job / "lease.json"
-        lease = json.loads(lease_path.read_text())
-        devices = [int(value) for value in os.environ["TASK_DEVICE"].split(",")]
-        if lease["assigned_devices"] != devices or len(devices) != 16:
-            raise ValueError("Actual device mapping differs from the leased public group")
-        report.update(task_id=submission["task_id"], lease=str(lease_path), lease_at_start=lease,
-                      actual_devices=devices, logical_rank_mapping=list(range(16)), status="executing")
+        devices = configure_devices(args.devices, world=TOPOLOGY["ep"])
+        report.update(actual_devices=devices, logical_rank_mapping=list(range(16)), status="executing")
 
         from .engram_host import HostEngram
 
@@ -249,7 +220,7 @@ def main():
             chunk["inputs"]["engram_lookup"] = host.lookup(chunk["inputs"], cache=chunk["cache"], config=chunk["contract"])
             result = prefill_fwd(chunk["inputs"], weights=args.checkpoint, cache=chunk["cache"],
                 config=chunk["contract"], devices=devices, output=args.output / "network",
-                continuation=feedback(), diagnostics=False, progress=publish)
+                continuation=feedback(), progress=publish)
         finally:
             host.close()
         report["compilation"] = result["compilation"]
@@ -264,4 +235,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

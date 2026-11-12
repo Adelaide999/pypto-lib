@@ -23,7 +23,6 @@ import torch
 from .cache import resolve_layer_role
 from .gemm import prepare_ecotech_dynamic_weight
 from .runtime_config import ExpertParallelConfig
-from .runtime_utils import tensor_sha
 from .utils import pack_nz
 
 
@@ -240,14 +239,13 @@ load_decoder_layer_weights = load_attention_weights
 class CheckpointOperands:
     """Read original sharded safetensors and record each consumed operand."""
 
-    def __init__(self, root, *, diagnostics=True):
+    def __init__(self, root):
         import json
 
         self.root = Path(root).resolve()
         index = self.root / "quant_model_weights.safetensors.index.json"
         self.index = json.loads(index.read_text())["weight_map"]
         self.consumed = {}
-        self.diagnostics = diagnostics
         self.read_seconds, self.read_calls = 0.0, 0
 
     def load(self, name):
@@ -264,8 +262,6 @@ class CheckpointOperands:
             "dtype": str(value.dtype),
             "selected_rows": None,
         }
-        if self.diagnostics:
-            self.consumed[name]["sha256"] = tensor_sha(value)
         self.read_seconds += perf_counter() - begin
         self.read_calls += 1
         return value
@@ -1035,7 +1031,7 @@ class ResidentCheckpointOperands(CheckpointOperands):
     """Cache model boundary weights while streaming expert source tensors once."""
 
     def __init__(self, root):
-        super().__init__(root, diagnostics=False)
+        super().__init__(root)
         self.boundaries = {}
 
     def load(self, name):

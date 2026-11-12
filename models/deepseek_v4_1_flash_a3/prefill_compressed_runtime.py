@@ -9,7 +9,6 @@
 """Schedule physical compressed Prefill with aliased raw caches and shared index state."""
 
 import torch
-from .runtime_utils import tensor_sha
 
 
 DTYPES = {str(dtype): dtype for dtype in (torch.int8, torch.float16, torch.float32, torch.bfloat16)}
@@ -71,7 +70,7 @@ def run_compressed_attention(
         raise ValueError("Require the original physical producer role")
     prefix = f"model.layers.{layer_id}.self_attn."
     ratio = role["ratio"]
-    original, total, nodes = state["original"], state["total"], state["nodes"]
+    original, total = state["original"], state["total"]
     start, end, _per_rank, _padded = original["cp_token_range"]
     query_rows = max(0, min(end, total) - min(start, total))
     metadata = original["cache_metadata"]["actual_metadata"]
@@ -356,7 +355,6 @@ def run_compressed_attention(
         )
 
     after = live["shared"]
-    before = state["shared_state_before"]
     execute(
         "shared_index_publish",
         rank,
@@ -386,49 +384,4 @@ def run_compressed_attention(
             dict(candidates=after["candidates"], lengths=after["candidate_lengths"]),
             "candidate_publication",
         )
-    if not hasattr(nodes, "enabled") or nodes.enabled:
-        for name, value in after.items():
-            count = query_rows if ratio == 1 or name in ("topk_indices", "topk_lengths") else 0
-            nodes["indexer.shared." + name] = value[:count].clone()
-            if before is not None:
-                nodes["indexer.untouched." + name] = dict(
-                    start=count,
-                    before_sha256=tensor_sha(before[name][count:]),
-                    after_sha256=tensor_sha(value[count:]),
-                )
-        nodes.update(
-            {
-                "compressor.wkv": kv[:total].clone(),
-                "compressor.norm": normalized[:total].clone(),
-                "indexer.wk": wk[:total].clone(),
-                "indexer.k_norm": k_norm[:total].clone(),
-                "indexer.key_before_dynamic_quant": key[:total].clone(),
-                "indexer.dynamic_quant_key_and_scale": (
-                    payload[:total].clone(),
-                    quant_scale[:total, 0].clone(),
-                ),
-            }
-        )
-
-        if ratio == 1:
-            nodes.update(
-                {
-                    "compressor.projected_bf16": kv[:total].clone(),
-                    "indexer.key_rope_cos": source_cos[:total]
-                    .unsqueeze(-1)
-                    .expand(total, 32, 2)
-                    .reshape(total, 1, 1, 64)
-                    .clone(),
-                    "indexer.key_rope_sin": source_sin[:total]
-                    .unsqueeze(-1)
-                    .expand(total, 32, 2)
-                    .reshape(total, 1, 1, 64)
-                    .clone(),
-                }
-            )
-        else:
-            nodes.update(
-                {"compressor.wgate": gate[:total].clone(), "compressor.pooled_bf16": pooled[:total].clone()}
-            )
-    state.update(raw_cache_after=raw, shared_state_after=after)
     return context, views[prefix + "swa_cache"] if network is not None else cache

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Iterator, Sequence
 import numpy as np
 import torch
+from .runtime_utils import file_sha
 
 
 def lookup_columns(codes, scales, rows):
@@ -808,3 +809,45 @@ class SharedEngramArray:
         if self.path is not None:
             self.path.unlink(missing_ok=True)
             self.path = None
+
+
+def load_rotation(checkpoint, hidden_size):
+    """Load and validate repeated block32 checkpoint rotation by byte identity."""
+    from safetensors import safe_open
+
+    path = Path(checkpoint) / "optional/quarot.safetensors"
+    if not path.is_file():
+        raise FileNotFoundError("The physical A3 Engram requires its checkpoint rotation")
+    with safe_open(path, framework="pt", device="cpu") as source:
+        rotation = source.get_tensor("global_rotation")
+    if tuple(rotation.shape) != (hidden_size, hidden_size):
+        raise ValueError("Checkpoint rotation has a different full hidden dimension")
+    block = rotation[:32, :32].contiguous()
+    zero = torch.zeros_like(block)
+    for row in range(0, hidden_size, 32):
+        for col in range(0, hidden_size, 32):
+            expected = block if row == col else zero
+            if not torch.equal(rotation[row : row + 32, col : col + 32], expected):
+                raise ValueError("Checkpoint rotation is not repeated block32")
+    return block.float(), {"path": str(path), "sha256": file_sha(path)}
+
+def engram_owner(contract, layer_id, role=None):
+    """Resolve the physical checkpoint prefix and original hash slot."""
+    layer_ids = tuple(contract["hash_constants"]["layer_ids"])
+    if role is None:
+        if (
+            layer_id not in (1, 14)
+            or contract.get("physical_layer_id") != layer_id
+            or layer_id not in layer_ids
+        ):
+            raise ValueError("Require the actual physical Engram owner in the original hash layout")
+    else:
+        from .cache import resolve_layer_role
+
+        role = resolve_layer_role(layer_id, role)
+        if role["engram_slot"] is None or layer_id not in layer_ids:
+            raise ValueError("Require the original Engram owner role")
+    slot = layer_ids.index(layer_id)
+    if contract.get("engram_slot", slot) != slot or (role is not None and role["engram_slot"] != slot):
+        raise ValueError("Engram slot differs from the original physical-layer hash layout")
+    return f"layers.{layer_id}.engram", slot

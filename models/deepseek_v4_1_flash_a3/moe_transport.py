@@ -8,10 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Transport contiguous PyPTO route buckets through CANN memory and HCCL bytes."""
 
-import argparse
 import ctypes
-import json
-import os
 import sys
 import time
 from contextlib import contextmanager
@@ -21,8 +18,6 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
 import torch
-from .runtime_config import configure_devices
-from .runtime_utils import file_sha
 
 
 def _check(status, operation):
@@ -40,8 +35,8 @@ def _bind(library, name, argument_types):
 class CANNMemory:
     """Allocate/copy CANN memory and retain raw device-memory samples."""
 
-    def __init__(self, *, diagnostics=None):
-        self.diagnostics = os.environ.get("DS41_DIAGNOSTICS") != "0" if diagnostics is None else diagnostics
+    def __init__(self, *, diagnostics=False):
+        self.diagnostics = diagnostics
         self.library = ctypes.CDLL("libascendcl.so", mode=ctypes.RTLD_GLOBAL)
         pointer, size, integer = ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int
         _bind(self.library, "aclInit", [ctypes.c_char_p])
@@ -101,7 +96,7 @@ class HCCLBytes:
         _check(function(root), "HcclGetRootInfo")
         return root.raw
 
-    def __init__(self, memory, rank, world, directory, group_ranks=None, *, root_info=None):
+    def __init__(self, memory, rank, world, group_ranks=None, *, root_info):
         self.memory, self.rank, self.world = memory, rank, world
         self.group_ranks = list(range(world)) if group_ranks is None else group_ranks
         local_rank = self.group_ranks.index(rank)
@@ -118,28 +113,9 @@ class HCCLBytes:
         _check(memory.library.aclrtCreateStream(ctypes.byref(self.stream)), "aclrtCreateStream")
         try:
             root = ctypes.create_string_buffer(4108)
-            path = None if directory is None else directory / ("hccl-root-" + "-".join(map(str, self.group_ranks)) + ".bin")
-            if root_info is not None:
-                if len(root_info) != ctypes.sizeof(root):
-                    raise ValueError("Invalid in-memory HCCL root information size")
-                ctypes.memmove(root, root_info, len(root_info))
-            elif path is None:
-                raise ValueError("HCCL bootstrap requires explicit root bytes or a rendezvous directory")
-            elif local_rank == 0:
-                _check(self.library.HcclGetRootInfo(root), "HcclGetRootInfo")
-                temporary = path.with_suffix(".tmp")
-                temporary.write_bytes(root.raw)
-                temporary.replace(path)
-            else:
-                deadline = time.monotonic() + 180
-                while not path.exists():
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("Timed out waiting for the HCCL root communicator")
-                    time.sleep(0.02)
-                data = path.read_bytes()
-                if len(data) != ctypes.sizeof(root):
-                    raise ValueError("Invalid HCCL root information size")
-                ctypes.memmove(root, data, len(data))
+            if len(root_info) != ctypes.sizeof(root):
+                raise ValueError("Invalid in-memory HCCL root information size")
+            ctypes.memmove(root, root_info, len(root_info))
             arguments = [world, root, local_rank, ctypes.byref(self.comm)]
             _check(self.library.HcclCommInitRootInfo(*arguments), "HcclCommInitRootInfo")
         except BaseException:
@@ -210,60 +186,3 @@ class HCCLBytes:
             if self.stream.value:
                 _check(self.memory.library.aclrtDestroyStream(self.stream), "aclrtDestroyStream")
                 self.stream = ctypes.c_void_p()
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--directory", type=Path, required=True)
-    parser.add_argument("--runtime-config", type=Path, required=True)
-    parser.add_argument("--rank", type=int, required=True)
-    args = parser.parse_args()
-    runtime = json.loads(args.runtime_config.read_text())
-    world, rank = runtime["topology"]["ep"], args.rank
-    if not 0 <= rank < world:
-        raise ValueError("HCCL rank is outside the explicit runtime device mapping")
-    assigned = configure_devices(runtime["assigned_devices"], world=world)
-    os.environ["HCCL_EXEC_TIMEOUT"] = "180"
-    settings = runtime.get("transport", {"collective": "all_to_all", "group": "ep", "stage": args.directory.name})
-    collective = settings["collective"]
-    group_ranks = next((group for group in runtime.get("groups", {}).get(settings["group"], [])
-                        if rank in group), list(range(world)))
-    memory = CANNMemory()
-    memory.sample(rank, "transport/load/before")
-    with memory.interval(rank, "communication", "communicator_init"):
-        transport = HCCLBytes(memory, rank, len(group_ranks), args.directory, group_ranks)
-    path = args.directory / f"rank-{rank}-inputs.pt"
-    values = torch.load(path, map_location="cpu", weights_only=True)
-    outputs = {}
-    try:
-        for case, packet in values.items():
-            outputs[case] = {}
-            for name, value in packet.items():
-                outputs[case][name] = transport.exchange(value, case + "/" + name, collective)
-            print({"rank": rank, "case": case, "transport": "HcclAlltoAll/UINT8"}, flush=True)
-    finally:
-        transport.close()
-    output_path = args.directory / f"rank-{rank}-outputs.pt"
-    torch.save(outputs, output_path)
-    libraries = {}
-    for line in Path("/proc/self/maps").read_text().splitlines():
-        path_string = line.split()[-1]
-        if path_string.startswith("/") and ".so" in path_string and Path(path_string).is_file():
-            if any(part in path_string.lower() for part in ("libhccl", "libascendcl", "libruntime")):
-                libraries[path_string] = file_sha(path_string)
-    report = {"rank": rank, "assigned_device": assigned[rank], "backend": "CANN/HCCL byte transport",
-              "collective": collective, "group_ranks": group_ranks, "stage": settings["stage"],
-              "artifacts": {str(path): file_sha(path), str(output_path): file_sha(output_path)},
-              "command": [sys.executable, *sys.argv], "source_sha256": file_sha(__file__),
-              "inputs_sha256": file_sha(path), "outputs_sha256": file_sha(output_path),
-              "libraries": libraries, "transfers": transport.transfers,
-              "memory": {"scope": "CANN whole-device HBM samples at transport stage boundaries; not a peak",
-                         "samples": memory.samples, "intervals": memory.intervals,
-                         "transport_buffer_peak_bytes": transport.buffers_peak,
-                         "buffer_scope": "Only the two explicit transport buffers; excludes runtime and communicator"}}
-    receipt_path = args.directory / f"rank-{rank}-report.json"
-    receipt_path.write_text(json.dumps(report, indent=2) + "\n")
-
-
-if __name__ == "__main__":
-    main()

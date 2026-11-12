@@ -238,7 +238,7 @@ class ResidentNetworkRuntime:
 
     def load_rotation(self, checkpoint, hidden_size):
         """Retain the validated checkpoint rotation for both slots and subsequent tokens."""
-        from .prefill_engram_runtime import load_rotation
+        from .engram_host import load_rotation
 
         key = str(checkpoint), hidden_size
         if key not in self.rotations:
@@ -284,7 +284,7 @@ class ResidentNetworkRuntime:
                 root_info = HCCLBytes.root_info(memory)
 
                 def connect(rank):
-                    channel = HCCLBytes(memory, rank, len(ranks), None, ranks, root_info=root_info)
+                    channel = HCCLBytes(memory, rank, len(ranks), ranks, root_info=root_info)
                     self._stack.callback(channel.close)
                     return rank, channel
 

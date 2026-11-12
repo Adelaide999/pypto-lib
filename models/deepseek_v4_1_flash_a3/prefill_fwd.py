@@ -9,7 +9,6 @@
 """Whole-network Prefill, reusable stage compilation and runtime orchestration."""
 
 import argparse
-import gc
 import json
 import sys
 from collections.abc import Mapping
@@ -25,8 +24,6 @@ if __package__ in (None, ""):
     __package__ = "models.deepseek_v4_1_flash_a3"
 import torch
 from pypto import ir
-from pypto.backend import BackendType
-from pypto.runtime import ExecutionMode, RunConfig
 from .cache import attach_network_cache_geometry, network_cache_geometry, resolve_layer_role
 from .engram import make_prefill_engram_entries
 from .input_pack import make_input_entries
@@ -34,10 +31,8 @@ from .lm_head import make_output_entries
 from .prefill_layer import REGIONS, execute_region, make_network_l2_entries, make_prefill_layer_entries, run_prefill_layer_inmemory
 from .prefill_network_engram import prepare_network_engram, validate_host_lookup
 from .prefill_network_input import run_input_boundary
-from .runtime_config import ExpertParallelConfig
-from .runtime_utils import Executable, communicate, file_sha, loaded_source_files, tensor_sha, write_json
-from .state import NetworkCacheProvider, NetworkStatePreservation, begin_product_observation, end_product_observation, product_engram_observation
-from .weights import CheckpointOperands, prepare_product_operands
+from .runtime_utils import Executable, file_sha, loaded_source_files, tensor_sha, write_json
+from .state import NetworkCacheProvider
 
 
 def compile_prefill(inputs, *, cache, config, output, weights=None):
@@ -98,7 +93,6 @@ def prefill_fwd(
     output,
     compiled=None,
     continuation=None,
-    diagnostics=False,
     progress=None,
     engram_lookup=None,
 ):
@@ -118,7 +112,6 @@ def prefill_fwd(
     The forward performs only device projection/gating on these ready rows.
     Ordinary execution preloads all compute weights and retains workers,
     caches and communication groups until the complete stream ends.
-    Diagnostics retain the streaming checkpoint path for independent capture.
     """
     from .runtime_config import configure_devices
 
@@ -158,7 +151,6 @@ def prefill_fwd(
             output=output,
             compiled=compiled,
             continuation=continuation,
-            diagnostics=diagnostics,
             progress=progress,
         )
     finally:
@@ -406,75 +398,6 @@ class PrefillProgram:
         )
 
 
-class NetworkWeights:
-    """Retain one actual layer's non-expert host weights and load only real owned experts on demand."""
-
-    def __init__(self, checkpoint, topology, model_config):
-        self.reader = CheckpointOperands(checkpoint)
-        self.layout = ExpertParallelConfig(topology["dp"], topology["tp"], topology["ep"], 384)
-        self.model_config = model_config
-        self.current_layer, self.current = None, None
-        self.layer_receipts = {}
-        self.load_seconds, self.load_calls = 0.0, 0
-
-    def for_layer(self, layer_id):
-        role = resolve_layer_role(layer_id)
-        if self.current_layer != layer_id:
-            begin = perf_counter()
-            self.release_current()
-            prefix = f"layers.{layer_id}."
-            selected = [
-                name
-                for name in self.reader.index
-                if name.startswith(prefix) and ".ffn.experts." not in name and ".engram.embed." not in name
-            ]
-            if not selected:
-                raise ValueError("Missing original physical-layer checkpoint operands")
-            raw = {name: self.reader.load(name) for name in selected}
-            operands = prepare_product_operands(raw, layer_id, role=role)
-            self.current_layer = layer_id
-            self.current = dict(raw=raw, operands=operands, expert=self.expert)
-            self.layer_receipts[layer_id] = dict(
-                original_names=selected,
-                loaded_non_expert_bytes=sum(value.numel() * value.element_size() for value in raw.values()),
-                prepared_bytes=sum(value.numel() * value.element_size() for value in operands.values()),
-                policy="One current layer on host; real expert payloads loaded for owned active experts",
-                HBM_residency="Not established by host byte counts; measure actual execution",
-            )
-            self.load_seconds += perf_counter() - begin
-            self.load_calls += 1
-        return self.current
-
-    def raw_for_layer(self, layer_id):
-        return self.for_layer(layer_id)["raw"]
-
-    def projection_for_layer(self, layer_id):
-        return self.raw_for_layer(layer_id)[f"layers.{layer_id}.engram.wkv.weight"].T.contiguous()
-
-    def head_for_rank(self, rank):
-        head = self.reader.load("head.weight")
-        count = head.shape[0] // self.layout.tp
-        return head.narrow(0, rank % self.layout.tp * count, count).T.contiguous()
-
-    def expert(self, rank, expert):
-        if self.current_layer is None or not 0 <= rank < self.layout.ep:
-            raise ValueError("An actual current layer and allocated expert rank are required")
-        if expert is not None and self.layout.owner(expert) != rank:
-            raise ValueError("Routed expert request does not belong to this real EP rank")
-        prefix = f"layers.{self.current_layer}.ffn."
-        prefix += "shared_experts" if expert is None else f"experts.{expert}"
-        begin = perf_counter()
-        result = self.reader.expert(prefix)
-        self.load_seconds += perf_counter() - begin
-        self.load_calls += 1
-        return result
-
-    def release_current(self):
-        self.current = None
-        self.current_layer = None
-        gc.collect()
-
-
 def network_parameter_abi(compiled):
     """Validate the complete saved signature and returned assembly write slots without loading runtime."""
     from pypto import ir
@@ -603,96 +526,28 @@ def network_parameter_abi(compiled):
     )
 
 
-def network_argument_protection(arguments, outputs, abi):
-    """Protect true In tensors; audit-output names and selection grant no write permission."""
-    params, directions = abi["params"], abi["effective_directions"]
-    if len(arguments) != len(params) or len(directions) != len(params):
-        raise ValueError("Require all actual JIT parameters including Out/InOut")
-
-    def extent(value):
-        if value.layout != torch.strided or any(stride < 0 for stride in value.stride()):
-            raise ValueError("Unsupported tensor layout for exact readonly alias protection")
-        if not value.numel():
-            return None
-        first = value.data_ptr()
-        span = sum((size - 1) * stride for size, stride in zip(value.shape, value.stride())) + 1
-        return str(value.device), first, first + span * value.element_size()
-
-    def overlap(left, right):
-        return (
-            left is not None
-            and right is not None
-            and left[0] == right[0]
-            and max(left[1], right[1]) < min(left[2], right[2])
-        )
-
-    readonly, writable = [], []
-    for index, (param, value, direction) in enumerate(zip(params, arguments, directions)):
-        if param["direction"] not in {"In", "Out", "InOut"} or direction not in {"In", "Out", "InOut"}:
-            raise ValueError("Unknown JIT parameter direction")
-        if param["shape"] is None:
-            if isinstance(value, torch.Tensor) or direction != "In":
-                raise ValueError("Unexpected scalar argument or writable scalar ABI")
-            continue
-        if not isinstance(value, torch.Tensor):
-            raise ValueError("The network wrapper requires actual host tensor arguments")
-        record = dict(
-            index=index,
-            name=param["name"],
-            direction=direction,
-            logical_direction=param["direction"],
-            lowered_direction=abi["lowered_params"][index]["direction"],
-            extent=extent(value),
-        )
-        (readonly if direction == "In" else writable).append(record)
-    for source in readonly:
-        for target in writable:
-            if overlap(source["extent"], target["extent"]):
-                raise ValueError(
-                    "Readonly/writable JIT parameters overlap: " + source["name"] + "/" + target["name"]
-                )
-    for name, value in outputs.items():
-        if not isinstance(value, torch.Tensor):
-            raise ValueError("Network audit outputs must be tensors")
-        output_extent = extent(value)
-        if output_extent is not None and not any(
-            target["extent"] is not None
-            and output_extent[0] == target["extent"][0]
-            and target["extent"][1] <= output_extent[1] <= output_extent[2] <= target["extent"][2]
-            for target in writable
-        ):
-            raise ValueError("Audit output does not belong to a writable JIT parameter: " + name)
-    return [(item["index"], tensor_sha(arguments[item["index"]])) for item in readonly], writable
-
-
 class NetworkExecutor:
-    """Compile exact existing per-layer entries and record invocations without retaining all tensor captures."""
+    """Dispatch shared compiled stages through persistent device workers and HCCL groups."""
 
     def __init__(
         self,
-        output,
-        config,
         topology,
         provider,
         ownership,
         memory,
-        runtime_path,
         reports,
         program,
         namespace="chunk0",
-        diagnostics=True,
         resident=None,
     ):
-        self.output, self.config, self.topology = Path(output), config, topology
+        self.topology = topology
         self.provider, self.ownership, self.memory = provider, ownership, memory
-        self.runtime_path, self.reports = runtime_path, reports
+        self.reports = reports
         self.namespace = namespace
-        self.diagnostics = diagnostics
         self.program = program
         self.resident = resident
         self.current_layer, self.current_entries = None, None
         self.compiled = {}
-        self.entry_abis = {}
         self.resident_abis = {}
         # The public ChipWorker retains registrations until close (64 slots).
         # IO entries use only CPU boundaries; give them independent workers and
@@ -729,12 +584,7 @@ class NetworkExecutor:
         transport = (
             values if packets else [{case: {"value": value} for case, value in row.items()} for row in values]
         )
-        if self.resident is None:
-            result, receipts = communicate(
-                stage, transport, self.output, self.runtime_path, collective=collective, group=group
-            )
-        else:
-            result, receipts = self.resident.exchange(stage, transport, collective, group)
+        result, receipts = self.resident.exchange(stage, transport, collective, group)
         for rank, receipt in enumerate(receipts):
             self.reports[rank]["communication"].append(receipt)
         if packets:
@@ -765,66 +615,12 @@ class NetworkExecutor:
         batch = self.provider.batch_for_layer(layer_id)
         if self.current_layer != layer_id:
             self.current_entries = None
-            directory = self.output / f"{self.namespace}-layer{layer_id}"
-            directory.mkdir(exist_ok=False)
             self.current_entries = self.program.entries_for_stage(f"layer{layer_id}")
-            self.entry_abis = {
-                name: network_parameter_abi(entry.compiled) for name, entry in self.current_entries.items()
-            }
-            for name, entry in self.current_entries.items():
-                abi = self.entry_abis[name]
-                entry.artifacts[abi["path"]] = abi["sha256"]
             self.compiled[layer_id] = {name: entry.artifacts for name, entry in self.current_entries.items()}
             self.current_layer = layer_id
 
         def execute(name, rank, case, arguments, outputs, responsibility=None):
-            entry = self.current_entries[name]
-            config = RunConfig(
-                arch=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD, device_id=rank
-            )
-            if not self.diagnostics:
-                self.execute_entry(entry, rank, arguments)
-                return
-            abi = self.entry_abis[name]
-            readonly, writable = network_argument_protection(arguments, outputs, abi)
-            roles = name if responsibility is None else responsibility
-            config = RunConfig(
-                arch=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD, device_id=rank
-            )
-            self.memory.sample(rank, f"L{layer_id}/{name}/before")
-            with self.memory.interval(rank, "execute", f"L{layer_id}/{name}"):
-                entry.compiled(*arguments, config=config)
-            self.memory.sample(rank, f"L{layer_id}/{name}/after")
-            if any(tensor_sha(arguments[index]) != digest for index, digest in readonly):
-                raise RuntimeError("Network entry modified a readonly argument: " + name)
-            self.reports[rank]["kernels"].append(
-                dict(
-                    layer=layer_id,
-                    name=name,
-                    case=case,
-                    responsibility=roles,
-                    artifacts=entry.artifacts,
-                    argument_shapes=[
-                        list(value.shape) if isinstance(value, torch.Tensor) else value for value in arguments
-                    ],
-                    jit_parameter_abi=dict(
-                        path=abi["path"],
-                        sha256=abi["sha256"],
-                        schema=abi["schema"],
-                        directions=[item["direction"] for item in abi["params"]],
-                        lowered_directions=[item["direction"] for item in abi["lowered_params"]],
-                        effective_directions=abi["effective_directions"],
-                        return_aliases=abi["return_aliases"],
-                        num_return_types=abi["num_return_types"],
-                        writable_arguments=[item["index"] for item in writable],
-                        writable_proofs=abi["writable_proofs"],
-                        live_program_aliases_checked=abi["live_program_aliases_checked"],
-                    ),
-                    readonly_exact=True,
-                    readonly_arguments=len(readonly),
-                    status="executed_not_independently_compared",
-                )
-            )
+            self.execute_entry(self.current_entries[name], rank, arguments)
 
         return dict(
             topology=self.topology,
@@ -843,42 +639,7 @@ class NetworkExecutor:
             token_map_id=batch["token_map_id"],
             output_sentinel=-37.0,
             stage_namespace=f"{self.namespace}-layer{layer_id}",
-            capture_nodes=False,
-            capture_state=False,
         )
-
-
-def load_product_backbone_input(paths, *, input_contract, provider, capacity, expected_files):
-    """Load only admitted actual product input-component outputs, then preserve their original local SP mapping."""
-    world = input_contract["topology"]["ep"]
-    if len(paths) != world or set(expected_files) != {str(path) for path in paths}:
-        raise ValueError("Every original rank needs an exact admitted product input output")
-    hidden, premix = [], []
-    for rank, path in enumerate(paths):
-        if file_sha(path) != expected_files[str(path)]:
-            raise ValueError("An admitted product backbone input changed")
-        original = torch.load(path, map_location="cpu", weights_only=True)
-        record = provider.batch_for_layer(0)["cases"]["fresh"][rank]
-        physical, valid = record["SP_physical_rows"], record["SP_valid_rows"]
-        if original["SP_physical_rows"] != physical or original["SP_valid_rows"] != valid:
-            raise ValueError("Input component and actual network metadata disagree on CP/SP rows")
-        if original["DP_rank"] != rank // input_contract["topology"]["tp"]:
-            raise ValueError("Actual product input belongs to another DP request engine")
-        actual_hidden, actual_pre = original["hidden"], original["pre_mix"]
-        if (
-            actual_hidden.dtype != torch.bfloat16
-            or tuple(actual_hidden.shape) != (physical, 4, 5120)
-            or actual_pre.dtype != torch.float32
-            or tuple(actual_pre.shape) != (physical, 4)
-        ):
-            raise ValueError("Actual initial HC product boundary has a different tensor ABI")
-        padded_hidden = torch.zeros((capacity, 4, 5120), dtype=torch.bfloat16)
-        padded_pre = torch.zeros((capacity, 4), dtype=torch.float32)
-        padded_hidden[:physical].copy_(actual_hidden)
-        padded_pre[:physical].copy_(actual_pre)
-        hidden.append(dict(fresh=padded_hidden))
-        premix.append(dict(fresh=padded_pre))
-    return hidden, premix
 
 
 def embed_network_input(input_contract, weights, executor, config, output):
@@ -888,26 +649,7 @@ def embed_network_input(input_contract, weights, executor, config, output):
     entries = executor.program.entries_for_stage("embedding")
 
     def execute(name, rank, arguments, outputs):
-        if not executor.diagnostics:
-            executor.execute_entry(entries[name], rank, arguments)
-            return
-        readonly = [
-            (index, tensor_sha(value))
-            for index, value in enumerate(arguments)
-            if isinstance(value, torch.Tensor) and all(value is not out for out in outputs.values())
-        ]
-        capture = directory / f"rank-{rank}-{name}.pt"
-        entries[name].execute(
-            arguments,
-            outputs,
-            rank,
-            "network_input/" + name,
-            capture,
-            executor.reports[rank],
-            executor.memory,
-        )
-        if any(tensor_sha(arguments[index]) != digest for index, digest in readonly):
-            raise RuntimeError("Embedding changed a readonly token or weight operand")
+        executor.execute_entry(entries[name], rank, arguments)
 
     def exchange(stage, packets):
         return executor.exchange(executor.namespace + "-" + stage, packets, "all_gather", "tp", packets=True)
@@ -962,24 +704,9 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
         or tuple(head.shape) != (config["vocab_size"], 5120)
     ):
         raise ValueError("Actual complete output norm/head checkpoint ABI differs")
-    output_report = dict(kernels=[])
 
     def execute(name, rank, case, arguments, outputs, responsibility=None):
-        if not executor.diagnostics:
-            executor.execute_entry(entries[name], rank, arguments)
-            return
-        mutable = {value.untyped_storage().data_ptr() for value in outputs.values()}
-        before = [
-            (index, tensor_sha(value))
-            for index, value in enumerate(arguments)
-            if isinstance(value, torch.Tensor) and value.untyped_storage().data_ptr() not in mutable
-        ]
-        capture = directory / f"rank-{rank}-{case}-{name}.pt"
-        entries[name].execute(
-            arguments, outputs, rank, "network_output/" + name, capture, output_report, executor.memory
-        )
-        if any(tensor_sha(arguments[index]) != digest for index, digest in before):
-            raise RuntimeError("Output boundary changed an actual readonly layer39 tensor or weight")
+        executor.execute_entry(entries[name], rank, arguments)
 
     packets = [{} for _ in range(world)]
     for case, records in batch["cases"].items():
@@ -1059,7 +786,6 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
         dict(
             outcome="executed_actual_layer39_output_boundary_not_compared",
             files=files,
-            kernels=output_report["kernels"],
             native_reference="not_run",
             full40_accuracy="not_run",
         ),
@@ -1067,8 +793,8 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
     return dict(files=files, logits=actual_logits)
 
 
-def _network_owner_snapshot(provider, *, diagnostics=True):
-    """Bind persistent allocation identities, with optional diagnostic byte hashes."""
+def _network_owner_snapshot(provider):
+    """Bind persistent allocation identities across continuous request chunks."""
     result = {"provider": id(provider), "history": id(provider.history), "arrays": {}}
     for family, values in (
         ("raw", provider.arenas),
@@ -1086,8 +812,6 @@ def _network_owner_snapshot(provider, *, diagnostics=True):
                         shape=list(value.shape),
                         dtype=str(value.dtype),
                     )
-                    if diagnostics:
-                        record["sha256"] = tensor_sha(value)
                     result["arrays"][key] = record
     return result
 
@@ -1141,7 +865,6 @@ def run_network_runtime(
     checkpoint=None,
     continuation=None,
     compiled=None,
-    diagnostics=True,
     progress=None,
 ):
     """Execute a fresh chunk and a lazy stream of continuations with shared live state.
@@ -1185,27 +908,22 @@ def run_network_runtime(
     program.compile(provider, contract["model_config"], topology, inputs["engram_contracts"])
     provider = prepare_network_provider(inputs, contract, output.name)
     with ExitStack() as stack:
-        resident = None
-        if diagnostics:
-            weights = NetworkWeights(contract["checkpoint"], topology, contract["model_config"])
-            stack.callback(weights.release_current)
-        else:
-            from .prefill_resident import ResidentNetworkRuntime
-            from .weights import ResidentNetworkWeights
+        from .prefill_resident import ResidentNetworkRuntime
+        from .weights import ResidentNetworkWeights
 
-            resident = stack.enter_context(ResidentNetworkRuntime(assigned, topology))
-            weights = ResidentNetworkWeights(
-                contract["checkpoint"], topology, contract["model_config"], resident
-            )
-            stack.callback(weights.close)
-            weights.preload(progress)
-            for family, values in (("raw", provider.arenas), ("shared", provider.shared)):
-                for rank, cases in enumerate(values):
-                    for case, tensors in cases.items():
-                        items = tensors.items() if isinstance(tensors, dict) else (("history", tensors),)
-                        for name, value in items:
-                            resident.pin(value, [rank], readonly=False, name=f"{family}/{rank}/{case}/{name}")
-        memory = CANNMemory(diagnostics=diagnostics)
+        resident = stack.enter_context(ResidentNetworkRuntime(assigned, topology))
+        weights = ResidentNetworkWeights(
+            contract["checkpoint"], topology, contract["model_config"], resident
+        )
+        stack.callback(weights.close)
+        weights.preload(progress)
+        for family, values in (("raw", provider.arenas), ("shared", provider.shared)):
+            for rank, cases in enumerate(values):
+                for case, tensors in cases.items():
+                    items = tensors.items() if isinstance(tensors, dict) else (("history", tensors),)
+                    for name, value in items:
+                        resident.pin(value, [rank], readonly=False, name=f"{family}/{rank}/{case}/{name}")
+        memory = CANNMemory(diagnostics=False)
         ownership = [weights.layout.ownership(rank) for rank in range(16)]
         first = _run_network_chunk(
             inputs,
@@ -1219,7 +937,6 @@ def run_network_runtime(
             engram_contracts=inputs["engram_contracts"],
             program=program,
             epoch=0,
-            diagnostics=diagnostics,
             progress=progress,
             resident=resident,
         )
@@ -1280,7 +997,7 @@ def run_network_runtime(
             if "engram_lookup" not in following:
                 raise ValueError("Each continuation requires fresh host-prepared Engram rows")
             following = dict(following, cache_ABI=metadata)
-            before = _network_owner_snapshot(provider, diagnostics=diagnostics)
+            before = _network_owner_snapshot(provider)
             provider.begin_chunk(
                 epoch=epoch,
                 token_map_id=next_contract["input_contract_sha256"],
@@ -1288,9 +1005,9 @@ def run_network_runtime(
                 metadata_by_case={"fresh": metadata},
                 metadata_sources_by_case={"fresh": receipts},
             )
-            after = _network_owner_snapshot(provider, diagnostics=diagnostics)
+            after = _network_owner_snapshot(provider)
             if before != after:
-                raise RuntimeError("Chunk admission changed persistent raw/shared/history owners or bytes")
+                raise RuntimeError("Chunk admission changed persistent raw/shared/history allocation identities")
             validate_host_lookup(
                 following["engram_lookup"], inputs["engram_contracts"][1], provider.hash_batch()
             )
@@ -1303,9 +1020,9 @@ def run_network_runtime(
                     before=before,
                     after=after,
                     allocation_identity_exact=True,
-                    bytes_compared=diagnostics,
+                    bytes_compared=False,
                     previous_complete_output=True,
-                    scope="Persistent allocation identities; optional own-byte diagnostic comparison",
+                    scope="Persistent allocation identities across request chunks",
                 ),
             )
             result = _run_network_chunk(
@@ -1320,7 +1037,6 @@ def run_network_runtime(
                 engram_contracts=inputs["engram_contracts"],
                 program=program,
                 epoch=epoch,
-                diagnostics=diagnostics,
                 progress=progress,
                 resident=resident,
             )
@@ -1344,7 +1060,6 @@ def _run_network_chunk(
     engram_contracts,
     program,
     epoch,
-    diagnostics=True,
     progress=None,
     resident=None,
 ):
@@ -1357,16 +1072,6 @@ def _run_network_chunk(
     namespace = f"chunk{epoch}"
     if progress is not None:
         progress(dict(stage="executing_embedding", epoch=epoch))
-    state_guard = (
-        NetworkStatePreservation(
-            provider,
-            contract["state_regions"]["path"],
-            contract["state_regions"]["sha256"],
-            contract["input_contract_sha256"],
-        )
-        if diagnostics
-        else None
-    )
     runtime_path = output / "runtime_config.json"
     runtime = dict(
         topology=topology,
@@ -1383,59 +1088,26 @@ def _run_network_chunk(
         epoch=epoch,
         namespace=namespace,
         input_contract_sha256=contract["input_contract_sha256"],
-        state_regions_sha256=contract["state_regions"]["sha256"],
-        diagnostics=diagnostics,
-        optional_intermediate_numerical_gate=False if not diagnostics else "external_collector",
-        optional_tensor_hashes=diagnostics,
-        optional_state_snapshots=diagnostics,
-        optional_boundary_captures=diagnostics,
-        detailed_memory_sampling=diagnostics,
         fresh_shared_initialization=contract["fresh_shared_initialization"],
         fresh_initialization_applied=epoch == 0,
     )
     loaded_source_files(runtime)
     write_json(runtime_path, runtime)
-    if diagnostics:
-        for rank in range(16):
-            torch.save(
-                dict(
-                    raw=provider.arenas[rank],
-                    shared=provider.shared[rank],
-                    hash_history=provider.history.caches[rank],
-                    layout=provider.layouts[rank],
-                    metadata=inputs["cache_ABI"][rank]["metadata"],
-                    groups=inputs["cache_ABI"][rank]["groups"],
-                ),
-                output / f"rank-{rank}-initial-state.pt",
-            )
-    reports = [dict(rank=rank, kernels=[], communication=[]) for rank in range(16)]
+    reports = [dict(rank=rank, communication=[]) for rank in range(16)]
     executor = NetworkExecutor(
-        output,
-        text,
         topology,
         provider,
         ownership,
         memory,
-        runtime_path,
         reports,
         program,
         namespace,
-        diagnostics=diagnostics,
         resident=resident,
     )
     executor.precheck()
-    if "product_input_paths" in inputs:
-        hidden, premix = load_product_backbone_input(
-            inputs["product_input_paths"],
-            input_contract=inputs["input_contract"],
-            provider=provider,
-            capacity=16,
-            expected_files=inputs["product_input_files"],
-        )
-    else:
-        hidden, premix = embed_network_input(
-            inputs["input_contract"], weights, executor, text, output / "embedding"
-        )
+    hidden, premix = embed_network_input(
+        inputs["input_contract"], weights, executor, text, output / "embedding"
+    )
     hash_batch = provider.hash_batch()
     common_engram = engram_contracts[1]
     if progress is not None:
@@ -1450,15 +1122,6 @@ def _run_network_chunk(
             or item["hash_constants"]["pad_id"] != captured_constants["pad_id"]
         ):
             raise ValueError("TP4 Engram contract differs from the original slot/pad layout")
-
-    def observe_engram(layer, rank, case, observation):
-        directory = output / "engram-discrete"
-        directory.mkdir(exist_ok=True)
-        path = directory / f"rank-{rank}-{case}-layer{layer}-discrete.pt"
-        if path.exists():
-            raise ValueError("Repeated product Engram boundary observation")
-        torch.save(product_engram_observation(layer, rank, case, observation), path)
-
     eng_runtime = dict(
         topology=topology,
         assigned_devices=assigned,
@@ -1468,16 +1131,11 @@ def _run_network_chunk(
         reports=reports,
         memory=memory,
         exchange=executor.exchange,
-        capture_nodes=False,
-        capture_state=diagnostics,
-        diagnostics=diagnostics,
-        observe_discrete=observe_engram if diagnostics else None,
         entries_for_stage=program.entries_for_stage,
         execute_entry=executor.execute_entry,
         projection_for_layer=weights.projection_for_layer,
     )
-    if resident is not None:
-        eng_runtime["load_rotation"] = resident.load_rotation
+    eng_runtime["load_rotation"] = resident.load_rotation
     prepared_engram = prepare_network_engram(
         common_engram,
         hash_batch,
@@ -1489,18 +1147,10 @@ def _run_network_chunk(
     )
     for layer in (1, 14):
         prepared_engram.attach(layer, provider.state_handles_for_layer(layer))
-
-    discrete_pending = {}
-
     def runtime_for_layer(layer):
         if progress is not None:
             progress(dict(stage="executing_layer", epoch=epoch, layer=layer))
         actual = executor.for_layer(layer)
-        if diagnostics:
-            state_guard.begin_layer(layer)
-            if layer in discrete_pending:
-                raise ValueError("Repeated product layer observation begin")
-            discrete_pending[layer] = begin_product_observation(provider, layer)
         actual["required_modes"] = contract["required_modes"]
         actual["engram"] = prepared_engram.apply
         return actual
@@ -1508,66 +1158,11 @@ def _run_network_chunk(
     completed_layers = []
 
     def observe_layer(layer, result):
-        if diagnostics:
-            state_guard.finish_layer(layer, output / f"{namespace}-layer{layer}" / "state-preservation.json")
         provider.observe_layer(layer, result)
         completed_layers.append(layer)
         if progress is not None:
             progress(dict(stage="layer_complete", epoch=epoch, layer=layer))
-        directory = output / f"{namespace}-layer{layer}"
-        if not diagnostics:
-            print(dict(stage="full40_layer_complete", layer=layer, diagnostics=False), flush=True)
-            write_json(
-                directory / "terminal.json",
-                dict(layer=layer, diagnostics=False, status="executed_not_compared"),
-            )
-            if layer == 39:
-                for rank in range(16):
-                    torch.save(
-                        dict(hidden=result["hidden"][rank], pre_mix=result["pre_mix"][rank]),
-                        output / f"rank-{rank}-actual-layer39-boundary.pt",
-                    )
-            weights.release_current()
-            return
-        discrete = end_product_observation(provider, layer, result, discrete_pending.pop(layer))
-        for rank in range(16):
-            memory.sample(rank, f"L{layer}/complete")
-        write_json(
-            directory / "terminal.json",
-            dict(
-                layer=layer,
-                status="executed_not_independently_compared",
-                actual_state_owners=provider.versions,
-                actual_local_shapes=[
-                    {case: list(value.shape) for case, value in row.items()} for row in result["hidden"]
-                ],
-                current_host_weight_accounting=weights.layer_receipts.get(layer),
-                next_layer_input="actual_local_product_output",
-            ),
-        )
-        for rank in range(16):
-            boundaries = {}
-            for case, value in result["hidden"][rank].items():
-                record = provider.batch_for_layer(layer)["cases"][case][rank]
-                physical = record["SP_physical_rows"]
-                boundaries[case] = dict(
-                    layer=layer,
-                    hidden=value[:physical].clone(),
-                    pre_mix=result["pre_mix"][rank][case][:physical].clone(),
-                    padded_hidden=value,
-                    padded_pre_mix=result["pre_mix"][rank][case],
-                    SP_physical_rows=physical,
-                    SP_valid_rows=record["SP_valid_rows"],
-                    cp_token_range=record["cp_token_range"],
-                )
-            torch.save(boundaries, directory / f"rank-{rank}-boundary.pt")
-            torch.save(discrete[rank], directory / f"rank-{rank}-discrete.pt")
-        if layer == 39:
-            for rank in range(16):
-                torch.save(
-                    dict(hidden=result["hidden"][rank], pre_mix=result["pre_mix"][rank]),
-                    output / f"rank-{rank}-actual-layer39-boundary.pt",
-                )
+        print(dict(stage="full40_layer_complete", layer=layer), flush=True)
         weights.release_current()
 
     try:
@@ -1591,17 +1186,6 @@ def _run_network_chunk(
             executor=executor,
             output=output / "actual-layer39-output",
         )
-        if diagnostics:
-            for rank in range(16):
-                torch.save(
-                    dict(
-                        raw=provider.arenas[rank],
-                        shared=provider.shared[rank],
-                        versions=provider.versions[rank],
-                        hash_history=provider.history.caches[rank],
-                    ),
-                    output / f"rank-{rank}-final-state.pt",
-                )
         loaded_source_files(runtime)
         runtime.update(
             status="executed_full40_not_compared",
@@ -1610,8 +1194,7 @@ def _run_network_chunk(
             final_output_files=output_result["files"],
             formal_accuracy="not_run",
         )
-        if resident is not None:
-            runtime["resident_runtime"] = resident.summary()
+        runtime["resident_runtime"] = resident.summary()
         write_json(runtime_path, runtime)
         write_json(
             output / "execution.json",
