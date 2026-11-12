@@ -47,8 +47,7 @@ def make_bf16_linear(capacity: int, width: int, output_width: int):
         output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(((active + 15) // 16) * blocks,
-                             name_hint="dsv41_a2a3_bf16_linear"):
+        for block in pl.spmd(((active + 15) // 16) * blocks, name_hint="dsv41_a2a3_bf16_linear"):
             t0 = (block // blocks) * 16
             n0 = (block % blocks) * n_tile
             rows = pl.min(16, active - t0)
@@ -58,7 +57,7 @@ def make_bf16_linear(capacity: int, width: int, output_width: int):
                 lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), 16, 256)
                 rhs = pl.slice(weight, [256, n_tile], [k0, n0])
                 acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
-            output[t0:t0 + 16, n0:n0 + n_tile] = pl.set_validshape(
+            output[t0 : t0 + 16, n0 : n0 + n_tile] = pl.set_validshape(
                 pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
             )
         return output
@@ -81,8 +80,7 @@ def make_fp32_linear(capacity: int, width: int, output_width: int):
         output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(((active + 15) // 16) * blocks,
-                             name_hint="dsv41_a2a3_fp32_linear"):
+        for block in pl.spmd(((active + 15) // 16) * blocks, name_hint="dsv41_a2a3_fp32_linear"):
             t0 = (block // blocks) * 16
             n0 = (block % blocks) * n_tile
             rows = pl.min(16, active - t0)
@@ -94,7 +92,7 @@ def make_fp32_linear(capacity: int, width: int, output_width: int):
                 lhs = pl.cast(lhs, pl.FP32, mode="rint")
                 rhs = pl.cast(rhs, pl.FP32, mode="rint")
                 acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
-            output[t0:t0 + 16, n0:n0 + n_tile] = pl.set_validshape(
+            output[t0 : t0 + 16, n0 : n0 + n_tile] = pl.set_validshape(
                 pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
             )
         return output
@@ -137,8 +135,7 @@ def make_rope_kernel(capacity: int, heads: int, head_dim: int, rope_dim: int):
     return kernel
 
 
-def make_grouped_wo_a(capacity: int, heads: int, head_dim: int,
-                      groups: int, rank: int):
+def make_grouped_wo_a(capacity: int, heads: int, head_dim: int, groups: int, rank: int):
     """Apply grouped BF16 Wo-A while retaining only one GEMM tile on core."""
 
     width = heads * head_dim
@@ -155,8 +152,9 @@ def make_grouped_wo_a(capacity: int, heads: int, head_dim: int,
         grouped: pl.InOut[pl.Tensor[[capacity, groups * rank], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(((active + 15) // 16) * groups * group_blocks,
-                             name_hint="dsv41_a2a3_grouped_wo_a"):
+        for block in pl.spmd(
+            ((active + 15) // 16) * groups * group_blocks, name_hint="dsv41_a2a3_grouped_wo_a"
+        ):
             token = (block // (groups * group_blocks)) * 16
             group = (block % (groups * group_blocks)) // group_blocks
             n0 = (block % group_blocks) * 64
@@ -164,14 +162,16 @@ def make_grouped_wo_a(capacity: int, heads: int, head_dim: int,
             acc = pl.create_tensor([16, 64], dtype=pl.FP32)
             for k0 in pl.pipeline(0, group_input, 256, stage=2):
                 source = pl.slice(
-                    rotated, [16, 256], [token, group * group_input + k0],
+                    rotated,
+                    [16, 256],
+                    [token, group * group_input + k0],
                     valid_shape=[rows, 256],
                 )
                 source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 16, 256)
-                weight = wo_a[group:group + 1, k0:k0 + 256, n0:n0 + 64]
+                weight = wo_a[group : group + 1, k0 : k0 + 256, n0 : n0 + 64]
                 weight = pl.reshape(weight, [256, 64])
                 acc = pl.matmul_acc(acc, source, weight, init_cond=(k0 == 0))
-            grouped[token:token + 16, group * rank + n0:group * rank + n0 + 64] = pl.set_validshape(
+            grouped[token : token + 16, group * rank + n0 : group * rank + n0 + 64] = pl.set_validshape(
                 pl.cast(acc, pl.BF16, mode="rint"), rows, 64
             )
         return grouped
@@ -192,8 +192,7 @@ def make_swiglu(capacity: int, intermediate: int, clamp_limit: float = 10.0):
         active: pl.Scalar[pl.INT32],
     ):
         tiles = intermediate // 256
-        for block in pl.spmd(((active + 7) // 8) * tiles,
-                             name_hint="dsv41_a2a3_swiglu_v2"):
+        for block in pl.spmd(((active + 7) // 8) * tiles, name_hint="dsv41_a2a3_swiglu_v2"):
             token = (block // tiles) * 8
             column = (block % tiles) * 256
             rows = pl.min(8, active - token)
@@ -209,7 +208,7 @@ def make_swiglu(capacity: int, intermediate: int, clamp_limit: float = 10.0):
             silu = pl.mul(gate, pl.cast(sigmoid_bf16, pl.FP32))
             silu_bf16 = pl.cast(silu, pl.BF16, mode="rint")
             activated = pl.mul(pl.cast(silu_bf16, pl.FP32), up)
-            output[token:token + 8, column:column + 256] = pl.set_validshape(
+            output[token : token + 8, column : column + 256] = pl.set_validshape(
                 pl.cast(activated, pl.BF16, mode="rint"), rows, 256
             )
         return output
@@ -218,7 +217,7 @@ def make_swiglu(capacity: int, intermediate: int, clamp_limit: float = 10.0):
 
 
 def make_index_quantize(capacity: int, heads: int, head_dim: int = 128):
-    from .decode_index_cache import make_index_cache_quantize
+    from .indexer import make_decode_index_cache_quantize as make_index_cache_quantize
 
     quantize = make_index_cache_quantize(capacity, heads, head_dim)
 

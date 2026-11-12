@@ -37,11 +37,11 @@ unchanged. The distinct implementations are intentional: `linear_primitives`
 owns blocked INT8 quantization/packing/dequantization, while `gemm` owns direct
 and BF16/FP32 linear entries. `rmsnorm.make_blocked_rmsnorm` and
 `norm_rope.make_adjacent_rope` keep the former blocked semantics separately
-from the existing norm/RoPE contracts. `output_proj`, `activation`, `index_cache`
+from the existing norm/RoPE contracts. `output_proj`, `activation`, `indexer`
 and `swa_attention` own the remaining staged computations. Pure direct-linear
 forwarding now resolves directly to `gemm.make_int8_linear_direct`.
 
-The active layer-2 kernels now belong to `compressor_projection.py`; grouped
+The active compression kernels now belong to `compressor.py`; grouped
 TP output belongs to `qkv_proj_rope.py`. Generic layer selection remains in
 `prefill_layer.py`. Unused historical fixed-layer implementations and pure
 wrappers have been removed after checking retained callers.

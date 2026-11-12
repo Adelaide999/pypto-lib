@@ -17,7 +17,7 @@ from time import perf_counter
 from pypto import ir
 
 from .prefill_embedding import make_input_entries
-from .prefill_engram import make_prefill_engram_entries
+from .engram import make_prefill_engram_entries
 from .prefill_layer import make_prefill_layer_entries
 from .prefill_layer_state import resolve_layer_role
 from .prefill_l2 import REGIONS, make_network_l2_entries
@@ -47,17 +47,33 @@ def make_network_layer_entries(provider, config, topology, layer_id, definitions
     role = resolve_layer_role(layer_id)
     planes = {} if role["mode"] == "swa" else network_cache_geometry(layout, role, geometry["cache_blocks"])
     # Physical ownership is checked above and by the runtime; only byte geometry enters child IR.
-    semantic_role = {name: value for name, value in role.items()
-                     if name not in ("physical_layer", "kv_source", "index_source", "candidate_source", "engram_slot")}
-    plane_types = {name: {key: value for key, value in plane.items() if key != "storage_key"}
-                   for name, plane in planes.items()}
-    key = json.dumps([geometry, expert_capacity, config, topology, semantic_role, plane_types], sort_keys=True)
+    semantic_role = {
+        name: value
+        for name, value in role.items()
+        if name not in ("physical_layer", "kv_source", "index_source", "candidate_source", "engram_slot")
+    }
+    plane_types = {
+        name: {key: value for key, value in plane.items() if key != "storage_key"}
+        for name, plane in planes.items()
+    }
+    key = json.dumps(
+        [geometry, expert_capacity, config, topology, semantic_role, plane_types], sort_keys=True
+    )
     if definitions_cache is not None and key in definitions_cache:
         return definitions_cache[key], geometry, expert_capacity
     entries = make_prefill_layer_entries(
-        geometry["capacity"], config, expert_capacity, layer_id,
-        geometry["cache_blocks"], geometry["requests"], geometry["table_pages"],
-        ep=topology["ep"], tp=topology["tp"], cache_layout=layout, role=role, network_cache=True,
+        geometry["capacity"],
+        config,
+        expert_capacity,
+        layer_id,
+        geometry["cache_blocks"],
+        geometry["requests"],
+        geometry["table_pages"],
+        ep=topology["ep"],
+        tp=topology["tp"],
+        cache_layout=layout,
+        role=role,
+        network_cache=True,
     )
     definitions = make_network_l2_entries(entries, geometry["capacity"])
     if definitions_cache is not None:
@@ -67,18 +83,33 @@ def make_network_layer_entries(provider, config, topology, layer_id, definitions
 
 def _compile_signature(provider, model_config, topology, engram_contracts):
     """Freeze all compile-time geometry and constants, excluding token values and live cache bytes."""
+
     def encode(value):
         if hasattr(value, "dtype") and hasattr(value, "shape"):
             return dict(shape=list(value.shape), dtype=str(value.dtype), sha256=tensor_sha(value))
         raise TypeError("Unsupported compile-time configuration value: " + type(value).__name__)
 
     batch = provider.hash_batch()
-    max_blocks = max(1, max(record["metadata"]["block_table"].shape[1]
-                           for records in batch["cases"].values() for record in records))
-    signature = dict(geometry=provider.runtime_geometry(), layouts=provider.layouts,
-        model=model_config, topology=topology, history_rows=provider.history.cache_rows, max_blocks=max_blocks,
-        engram={layer: {name: contract[name] for name in ("model_config", "hash_constants", "engram_shards")}
-                for layer, contract in engram_contracts.items()})
+    max_blocks = max(
+        1,
+        max(
+            record["metadata"]["block_table"].shape[1]
+            for records in batch["cases"].values()
+            for record in records
+        ),
+    )
+    signature = dict(
+        geometry=provider.runtime_geometry(),
+        layouts=provider.layouts,
+        model=model_config,
+        topology=topology,
+        history_rows=provider.history.cache_rows,
+        max_blocks=max_blocks,
+        engram={
+            layer: {name: contract[name] for name in ("model_config", "hash_constants", "engram_shards")}
+            for layer, contract in engram_contracts.items()
+        },
+    )
     return sha256(json.dumps(signature, sort_keys=True, default=encode).encode()).hexdigest()
 
 
@@ -117,7 +148,9 @@ class PrefillProgram:
             match = next((item for item in bucket if ir.structural_equal(item["ir"], program)), None)
             if stage in self.stages:
                 if match is None or match["entry"] is not self.stages[stage][name]:
-                    raise ValueError("The compiled stage geometry or computation changed: " + stage + "/" + name)
+                    raise ValueError(
+                        "The compiled stage geometry or computation changed: " + stage + "/" + name
+                    )
             elif match is None:
                 if self.ready:
                     raise ValueError("The compiled network does not cover stage: " + stage + "/" + name)
@@ -128,7 +161,9 @@ class PrefillProgram:
                 self.compile_seconds += seconds
                 match = dict(ir=program, entry=entry)
                 self._buckets.setdefault(key, []).append(match)
-                self.records.append(dict(first_stage=stage, name=name, seconds=seconds, artifacts=entry.artifacts))
+                self.records.append(
+                    dict(first_stage=stage, name=name, seconds=seconds, artifacts=entry.artifacts)
+                )
             entries[name] = match["entry"]
         self.stages[stage] = entries
         return entries
@@ -150,25 +185,57 @@ class PrefillProgram:
         text = dict(model_config["text_config"], image_sentinel_base_id=model_config["image_token_id"])
         geometry = provider.runtime_geometry()
         try:
-            self.bind("embedding", make_network_l2_entries(
-                make_input_entries(geometry["capacity"], text, topology["tp"]), geometry["capacity"], "embedding"))
+            self.bind(
+                "embedding",
+                make_network_l2_entries(
+                    make_input_entries(geometry["capacity"], text, topology["tp"]),
+                    geometry["capacity"],
+                    "embedding",
+                ),
+            )
             for layer in range(40):
-                definitions, _, _ = make_network_layer_entries(provider, text, topology, layer, self._layer_definitions)
+                definitions, _, _ = make_network_layer_entries(
+                    provider, text, topology, layer, self._layer_definitions
+                )
                 self.bind(f"layer{layer}", definitions)
             batch = provider.hash_batch()
-            max_blocks = max(1, max(record["metadata"]["block_table"].shape[1]
-                                    for records in batch["cases"].values() for record in records))
+            max_blocks = max(
+                1,
+                max(
+                    record["metadata"]["block_table"].shape[1]
+                    for records in batch["cases"].values()
+                    for record in records
+                ),
+            )
             for layer in (1, 14):
                 contract = engram_contracts[layer]
-                config = dict(contract["model_config"]["text_config"], image_token_id=model_config["image_token_id"])
-                config["image_pad_token_id"] = model_config.get("image_pad_token_id", config["image_token_id"] + 1)
-                definitions = make_prefill_engram_entries(
-                    geometry["capacity"], contract["hash_constants"], config, contract["engram_shards"],
-                    provider.history.cache_rows, max_blocks, topology["tp"],
+                config = dict(
+                    contract["model_config"]["text_config"], image_token_id=model_config["image_token_id"]
                 )
-                self.bind(f"engram{layer}", {name: definitions[name] for name in ("engram_projection", "engram_gate")})
-            self.bind("output", make_network_l2_entries(
-                make_output_entries(geometry["capacity"], text, topology["tp"]), geometry["capacity"], "output"))
+                config["image_pad_token_id"] = model_config.get(
+                    "image_pad_token_id", config["image_token_id"] + 1
+                )
+                definitions = make_prefill_engram_entries(
+                    geometry["capacity"],
+                    contract["hash_constants"],
+                    config,
+                    contract["engram_shards"],
+                    provider.history.cache_rows,
+                    max_blocks,
+                    topology["tp"],
+                )
+                self.bind(
+                    f"engram{layer}",
+                    {name: definitions[name] for name in ("engram_projection", "engram_gate")},
+                )
+            self.bind(
+                "output",
+                make_network_l2_entries(
+                    make_output_entries(geometry["capacity"], text, topology["tp"]),
+                    geometry["capacity"],
+                    "output",
+                ),
+            )
             self._signature = signature
             self.ready = True
         finally:
@@ -178,13 +245,22 @@ class PrefillProgram:
 
     def summary(self):
         """Report actual compiler work separately from device execution and accuracy."""
-        return dict(complete=self.ready, layers=[layer for layer in range(40) if f"layer{layer}" in self.stages],
-                    execution_model="host_hccl_with_l2_compute_regions", single_l2=False,
-                    l2_regions={name: [child for child, _ in steps] for name, steps in REGIONS.items()},
-                    stages={stage: list(entries) for stage, entries in self.stages.items()},
-                    unique_entries=len(self.records), stage_bindings=sum(map(len, self.stages.values())),
-                    layer_definition_specializations=len(self._layer_definitions),
-                    specialized_functions=len(self._specializations),
-                    compile_seconds=self.compile_seconds, compile_phase="pypto_ir_pto_cpp_generation",
-                    device_binary_build_and_weight_loading="not_measured_here", prepare_seconds=getattr(self, "prepare_seconds", None),
-                    entries=self.records, device_execution="not_run", numerical_acceptance="not_run")
+        return dict(
+            complete=self.ready,
+            layers=[layer for layer in range(40) if f"layer{layer}" in self.stages],
+            execution_model="host_hccl_with_l2_compute_regions",
+            single_l2=False,
+            l2_regions={name: [child for child, _ in steps] for name, steps in REGIONS.items()},
+            stages={stage: list(entries) for stage, entries in self.stages.items()},
+            unique_entries=len(self.records),
+            stage_bindings=sum(map(len, self.stages.values())),
+            layer_definition_specializations=len(self._layer_definitions),
+            specialized_functions=len(self._specializations),
+            compile_seconds=self.compile_seconds,
+            compile_phase="pypto_ir_pto_cpp_generation",
+            device_binary_build_and_weight_loading="not_measured_here",
+            prepare_seconds=getattr(self, "prepare_seconds", None),
+            entries=self.records,
+            device_execution="not_run",
+            numerical_acceptance="not_run",
+        )

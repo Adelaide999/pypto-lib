@@ -13,9 +13,13 @@ from __future__ import annotations
 import torch
 import pypto.language as pl
 
-from .decode_gemm import make_fp32_dequantize, make_int8_gemm, make_pack_weight
+from .gemm import make_fp32_dequantize, make_int8_gemm, make_pack_weight
 from .decode_norm_rope import rope_reference
-from .decode_quant import int8_matmul, make_dynamic_int8_quantize, quantize_per_token_int8
+from .quant import (
+    int8_matmul,
+    make_decode_dynamic_int8_quantize as make_dynamic_int8_quantize,
+    quantize_per_token_int8,
+)
 from .decode_projection import make_bf16_linear
 
 
@@ -35,14 +39,18 @@ def output_projection_reference(
     groups, group_input, rank = wo_a.shape
     rotated = rope_reference(attention, cosine, -sine, heads, head_dim, rope_dim)
     chunks = rotated.reshape(rotated.shape[0], groups, group_input)
-    grouped = torch.einsum("tgi,gir->tgr", chunks.float(), wo_a.float()).reshape(
-        rotated.shape[0], groups * rank
-    ).to(torch.bfloat16)
+    grouped = (
+        torch.einsum("tgi,gir->tgr", chunks.float(), wo_a.float())
+        .reshape(rotated.shape[0], groups * rank)
+        .to(torch.bfloat16)
+    )
     payload, token_scale = quantize_per_token_int8(grouped)
     # Prepared A2/A3 assets use canonical ``[K, N]`` layout; the reference
     # helper consumes output-major ``[N, K]`` weights.
     accumulator = int8_matmul(payload, wo_b.transpose(0, 1).contiguous())
-    output = (accumulator.float() * token_scale.float() * wo_b_scale.float().reshape(1, -1)).to(torch.bfloat16)
+    output = (accumulator.float() * token_scale.float() * wo_b_scale.float().reshape(1, -1)).to(
+        torch.bfloat16
+    )
     return {"rotated": rotated, "grouped": grouped, "output": output}
 
 
@@ -113,7 +121,7 @@ def make_output_projection_bf16(
                 pl.store(output_zero, [token, 0], output)
         inverse_sine = pl.create_tensor([capacity, rope_dim // 2], dtype=pl.FP32)
         for block in pl.spmd(active, name_hint="dsv41_a2a3_bf16_inverse_sine"):
-            inverse_sine[block:block + 1, :] = pl.mul(sine[block:block + 1, :], -1.0)
+            inverse_sine[block : block + 1, :] = pl.mul(sine[block : block + 1, :], -1.0)
         rotate(attention, cosine, inverse_sine, rotated, active)
         n_tile = 128
         k_tile = 256
@@ -127,16 +135,20 @@ def make_output_projection_bf16(
             acc = pl.create_tensor([16, n_tile], dtype=pl.FP32)
             for k0 in pl.pipeline(0, group_input, k_tile, stage=2):
                 source_tile = pl.slice(
-                    rotated, [16, k_tile], [token0, group * group_input + k0],
+                    rotated,
+                    [16, k_tile],
+                    [token0, group * group_input + k0],
                     valid_shape=[rows, k_tile],
                 )
-                source_tile = pl.set_validshape(pl.fillpad(source_tile, pad_value=pl.PadValue.zero), 16, k_tile)
+                source_tile = pl.set_validshape(
+                    pl.fillpad(source_tile, pad_value=pl.PadValue.zero), 16, k_tile
+                )
                 weight_tile = pl.reshape(
-                    wo_a[group:group + 1, k0:k0 + k_tile, group_column:group_column + n_tile],
+                    wo_a[group : group + 1, k0 : k0 + k_tile, group_column : group_column + n_tile],
                     [k_tile, n_tile],
                 )
                 acc = pl.matmul_acc(acc, source_tile, weight_tile, init_cond=(k0 == 0))
-            grouped[token0:token0 + 16, column:column + n_tile] = pl.set_validshape(
+            grouped[token0 : token0 + 16, column : column + n_tile] = pl.set_validshape(
                 pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
             )
         project_b(grouped, wo_b, output, active)
@@ -176,16 +188,18 @@ def make_output_projection(capacity: int, heads: int, head_dim: int, rope_dim: i
         rotated = pl.create_tensor([capacity, width], dtype=pl.BF16)
         inverse_sine = pl.create_tensor([capacity, pairs], dtype=pl.FP32)
         for block in pl.spmd(active, name_hint="dsv41_a2a3_inverse_sine"):
-            inverse_sine[block:block + 1, :] = pl.mul(sine[block:block + 1, :], -1.0)
+            inverse_sine[block : block + 1, :] = pl.mul(sine[block : block + 1, :], -1.0)
         rotate(attention, cosine, inverse_sine, rotated, active)
         grouped = pl.create_tensor([capacity, groups * rank], dtype=pl.BF16)
         for block in pl.spmd(active * groups, name_hint="dsv41_a2a3_wo_a"):
             token = block // groups
             group = block % groups
-            source = rotated[token:token + 1, group * group_input:(group + 1) * group_input]
-            weights = wo_a[group:group + 1, :, :]
+            source = rotated[token : token + 1, group * group_input : (group + 1) * group_input]
+            weights = wo_a[group : group + 1, :, :]
             projected = pl.matmul(source, pl.reshape(weights, [group_input, rank]), out_dtype=pl.FP32)
-            grouped[token:token + 1, group * rank:(group + 1) * rank] = pl.cast(projected, pl.BF16, mode="rint")
+            grouped[token : token + 1, group * rank : (group + 1) * rank] = pl.cast(
+                projected, pl.BF16, mode="rint"
+            )
         payload = pl.create_tensor([capacity, groups * rank], dtype=pl.INT8)
         token_scale = pl.create_tensor([capacity, 1], dtype=pl.FP32)
         quantize(grouped, payload, token_scale, active)

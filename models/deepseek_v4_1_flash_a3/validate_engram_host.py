@@ -36,10 +36,14 @@ def reject(call):
 def fixture(root, *, tp=2, dp=2):
     from safetensors.torch import save_file
 
-    constants = dict(layer_ids=[1, 14], pad_id=2, token_map=torch.arange(64, dtype=torch.int32),
+    constants = dict(
+        layer_ids=[1, 14],
+        pad_id=2,
+        token_map=torch.arange(64, dtype=torch.int32),
         multipliers=torch.tensor([[3, 5, 7, 11], [13, 17, 19, 23]], dtype=torch.int64),
         primes=torch.full((2, 24), 5, dtype=torch.int64),
-        offsets=torch.arange(24, dtype=torch.int64).repeat(2, 1) * 5)
+        offsets=torch.arange(24, dtype=torch.int64).repeat(2, 1) * 5,
+    )
     topology = dict(dp=dp, tp=tp, ep=dp * tp, pp=1, pcp=1, dcp=1)
     model = dict(image_token_id=61, image_pad_token_id=62, text_config={})
     tensors, contracts, weights = {}, {}, {}
@@ -52,32 +56,61 @@ def fixture(root, *, tp=2, dp=2):
         shards = []
         for rank in range(tp):
             begin, end = rank * 120 // tp, (rank + 1) * 120 // tp
-            hashes = {kind: sha256(value[begin:end].contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
-                      for kind, value in (("codes", codes), ("scales", scales))}
-            shards.append(dict(head_range=[rank * 24 // tp, (rank + 1) * 24 // tp], row_range=[begin, end],
-                               DP_sharing_ranks=list(range(rank, dp * tp, tp)), host_payload_sha256=hashes))
-        contracts[layer] = dict(checkpoint=str(root), topology=topology, model_config=model,
-            physical_layer_id=layer, hash_constants=constants, engram_shards=shards,
-            engram_storage_contract=dict(dtype="INT8", scale_dtype="FP32", group_size=32,
-                cpu_offload=True, dp_shared_memory=True, global_columns=24), capacity=16)
+            hashes = {
+                kind: sha256(value[begin:end].contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
+                for kind, value in (("codes", codes), ("scales", scales))
+            }
+            shards.append(
+                dict(
+                    head_range=[rank * 24 // tp, (rank + 1) * 24 // tp],
+                    row_range=[begin, end],
+                    DP_sharing_ranks=list(range(rank, dp * tp, tp)),
+                    host_payload_sha256=hashes,
+                )
+            )
+        contracts[layer] = dict(
+            checkpoint=str(root),
+            topology=topology,
+            model_config=model,
+            physical_layer_id=layer,
+            hash_constants=constants,
+            engram_shards=shards,
+            engram_storage_contract=dict(
+                dtype="INT8",
+                scale_dtype="FP32",
+                group_size=32,
+                cpu_offload=True,
+                dp_shared_memory=True,
+                global_columns=24,
+            ),
+            capacity=16,
+        )
     save_file(tensors, root / "weights.safetensors")
-    (root / "quant_model_weights.safetensors.index.json").write_text(json.dumps(
-        dict(weight_map={name: "weights.safetensors" for name in tensors})))
+    (root / "quant_model_weights.safetensors.index.json").write_text(
+        json.dumps(dict(weight_map={name: "weights.safetensors" for name in tensors}))
+    )
     return contracts, weights
 
 
 def request(tokens, history=(), slot=0):
-    return dict(request_slot=slot, token_ids=list(tokens), history_tokens=list(history),
+    return dict(
+        request_slot=slot,
+        token_ids=list(tokens),
+        history_tokens=list(history),
         position_ids=list(range(len(history), len(history) + len(tokens))),
-        live_token_mask=[1] * len(tokens), initial_context_length=len(history))
+        live_token_mask=[1] * len(tokens),
+        initial_context_length=len(history),
+    )
 
 
 def chunk(root, contracts, requests, epoch):
     topology = contracts[1]["topology"]
     count = sum(len(row["token_ids"]) for row in requests)
     tp = topology["tp"]
-    engines = [dict(dp_rank=dp, active=count if dp == 0 else 0, requests=requests if dp == 0 else [])
-               for dp in range(topology["dp"])]
+    engines = [
+        dict(dp_rank=dp, active=count if dp == 0 else 0, requests=requests if dp == 0 else [])
+        for dp in range(topology["dp"])
+    ]
     inputs = dict(input_contract=dict(topology=topology, epoch=epoch, DP_engines=engines))
     payloads = []
     for rank in range(topology["ep"]):
@@ -88,13 +121,26 @@ def chunk(root, contracts, requests, epoch):
             starts.append(starts[-1] + len(row["token_ids"]))
         physical = (count + tp - 1) // tp if rank < tp else 0
         begin = rank % tp * physical
-        metadata = dict(query_start_loc=torch.tensor(starts, dtype=torch.int32),
+        metadata = dict(
+            query_start_loc=torch.tensor(starts, dtype=torch.int32),
             slot_mapping=torch.arange(len(positions), dtype=torch.int64),
-            block_table=torch.zeros((len(rows), 1), dtype=torch.int32))
-        payloads.append(dict(positions=torch.tensor(positions, dtype=torch.int64),
-            query_start_loc=metadata["query_start_loc"], metadata={"model.layers.1.self_attn.swa_cache": dict(
-                cp_token_range=[begin, begin + physical, physical, physical * tp], global_metadata=metadata)}))
-    config = dict(topology=topology, capacity=16, checkpoint=str(root), input_contract_sha256=f"chunk-{epoch}")
+            block_table=torch.zeros((len(rows), 1), dtype=torch.int32),
+        )
+        payloads.append(
+            dict(
+                positions=torch.tensor(positions, dtype=torch.int64),
+                query_start_loc=metadata["query_start_loc"],
+                metadata={
+                    "model.layers.1.self_attn.swa_cache": dict(
+                        cp_token_range=[begin, begin + physical, physical, physical * tp],
+                        global_metadata=metadata,
+                    )
+                },
+            )
+        )
+    config = dict(
+        topology=topology, capacity=16, checkpoint=str(root), input_contract_sha256=f"chunk-{epoch}"
+    )
     return inputs, dict(cache_ABI=payloads), config
 
 
@@ -110,7 +156,10 @@ def validate_host():
             next_rows = host.lookup(second[0], cache=second[1], config=second[2])
             full = host.lookup(whole[0], cache=whole[1], config=whole[2])
             left, right = next_rows["cases"]["fresh"][0], full["cases"]["fresh"][0]
-            require(torch.equal(left["hashes"][:2], right["hashes"][3:5]), "Chunked request history changed hashes")
+            require(
+                torch.equal(left["hashes"][:2], right["hashes"][3:5]),
+                "Chunked request history changed hashes",
+            )
             for layer, slot in ((1, 0), (14, 1)):
                 codes, scales = weights[layer]
                 expected = torch.zeros((5, 6144), dtype=torch.bfloat16)
@@ -119,17 +168,33 @@ def validate_host():
                         row = int(right["hashes"][token, slot, head])
                         for group in range(8):
                             begin = group * 32
-                            expected[token, head * 256 + begin:head * 256 + begin + 32] = (
-                                codes[row, begin:begin + 32].float() * scales[row, group]).to(torch.bfloat16)
-                require(torch.equal(right["full"][layer][:5], expected), "CPU group32 decoding changed real row values")
-                require(torch.equal(left["full"][layer][:2], expected[3:5]), "Chunked lookup changed selected entries")
-                require(torch.equal(right["local"][layer][:3], expected[:3]), "TP lane0 changed the SP partition")
+                            expected[token, head * 256 + begin : head * 256 + begin + 32] = (
+                                codes[row, begin : begin + 32].float() * scales[row, group]
+                            ).to(torch.bfloat16)
+                require(
+                    torch.equal(right["full"][layer][:5], expected),
+                    "CPU group32 decoding changed real row values",
+                )
+                require(
+                    torch.equal(left["full"][layer][:2], expected[3:5]),
+                    "Chunked lookup changed selected entries",
+                )
+                require(
+                    torch.equal(right["local"][layer][:3], expected[:3]), "TP lane0 changed the SP partition"
+                )
                 lane1 = full["cases"]["fresh"][1]
-                require(torch.equal(lane1["local"][layer][:2], expected[3:5]), "TP lane1 changed the SP partition")
+                require(
+                    torch.equal(lane1["local"][layer][:2], expected[3:5]), "TP lane1 changed the SP partition"
+                )
                 require(not torch.any(lane1["local"][layer][2:]), "Padded rows were not zero")
             require(prefix["cases"]["fresh"][0]["mask"][:3].tolist() == [1, 0, 1], "Image mask changed")
-            require(all(not torch.any(row["mask"]) and not torch.any(row["local"][1])
-                        for row in full["cases"]["fresh"][2:]), "Empty DP replicas were not preserved")
+            require(
+                all(
+                    not torch.any(row["mask"]) and not torch.any(row["local"][1])
+                    for row in full["cases"]["fresh"][2:]
+                ),
+                "Empty DP replicas were not preserved",
+            )
             codes = host._table(1, 1, "codes")
             scales = host._table(1, 1, "scales")
             invalid = lookup_columns(codes, scales, torch.tensor([[-1, 59, 120]], dtype=torch.int32))
@@ -145,8 +210,13 @@ def validate_host():
                 single = chunk(root, contracts, [req], 4 + index)
                 one = host.lookup(single[0], cache=single[1], config=single[2])
                 begin, end = ((0, 2), (2, 3))[index]
-                require(torch.equal(multi["cases"]["fresh"][0]["hashes"][begin:end],
-                    one["cases"]["fresh"][0]["hashes"][:end - begin]), "Request boundary leaked another request's history")
+                require(
+                    torch.equal(
+                        multi["cases"]["fresh"][0]["hashes"][begin:end],
+                        one["cases"]["fresh"][0]["hashes"][: end - begin],
+                    ),
+                    "Request boundary leaked another request's history",
+                )
             original_cache = first[1]
         require(not any(path.exists() for path in paths), "Host storage teardown leaked mappings")
         require(torch.equal(right["full"][1], copied), "Prepared rows alias closed table mappings")
@@ -159,29 +229,68 @@ def validate_host():
         for rank, row in enumerate(records):
             total = len(row["full_input_ids"])
             physical = row["cp_token_range"][2]
-            batch_rows.append(dict(full_input_ids=row["full_input_ids"], positions=row["positions"],
-                cp_token_range=row["cp_token_range"], SP_physical_rows=physical,
-                SP_valid_rows=min(physical, max(0, total - row["cp_token_range"][0])),
-                metadata=dict(slot_mapping=torch.arange(total, dtype=torch.int64))))
-        batch = dict(epoch=2, token_map_id="chunk-2", engram_metadata_owner_layer=1, cases=dict(fresh=batch_rows))
-        bindings = [dict(fresh=dict(owner_layer=1, block_size=128, bound=True,
-                                    kv_binding_id=f"rank-{rank}-L1", kv_blocks=1)) for rank in range(4)]
+            batch_rows.append(
+                dict(
+                    full_input_ids=row["full_input_ids"],
+                    positions=row["positions"],
+                    cp_token_range=row["cp_token_range"],
+                    SP_physical_rows=physical,
+                    SP_valid_rows=min(physical, max(0, total - row["cp_token_range"][0])),
+                    metadata=dict(slot_mapping=torch.arange(total, dtype=torch.int64)),
+                )
+            )
+        batch = dict(
+            epoch=2, token_map_id="chunk-2", engram_metadata_owner_layer=1, cases=dict(fresh=batch_rows)
+        )
+        bindings = [
+            dict(
+                fresh=dict(
+                    owner_layer=1, block_size=128, bound=True, kv_binding_id=f"rank-{rank}-L1", kv_blocks=1
+                )
+            )
+            for rank in range(4)
+        ]
         history = network.NetworkEngramHistory(bindings)
-        runtime = dict(topology=contracts[1]["topology"], capacity=16, output=root / "forward",
-            entries_for_stage=lambda stage: {}, reports=[{} for _ in range(4)], diagnostics=False,
-            capture_state=True, load_rotation=lambda *args: (torch.eye(32), {}))
+        runtime = dict(
+            topology=contracts[1]["topology"],
+            capacity=16,
+            output=root / "forward",
+            entries_for_stage=lambda stage: {},
+            reports=[{} for _ in range(4)],
+            diagnostics=False,
+            capture_state=True,
+            load_rotation=lambda *args: (torch.eye(32), {}),
+        )
         with patch.object(network, "Executable", side_effect=AssertionError("Unexpected compilation")):
-            prepared = network.prepare_network_engram(contracts[1], batch, history, contracts,
-                lambda layer: None, runtime, lookup=full)
-            require(history.caches[0]["fresh"][:5].tolist() == [7, -1, 9, 10, 11], "Forward history publication changed")
+            prepared = network.prepare_network_engram(
+                contracts[1], batch, history, contracts, lambda layer: None, runtime, lookup=full
+            )
+            require(
+                history.caches[0]["fresh"][:5].tolist() == [7, -1, 9, 10, 11],
+                "Forward history publication changed",
+            )
             require(not torch.any(history.caches[2]["fresh"]), "Empty DP mutated history")
-            require(prepared.states[1][0]["fresh"]["local"] is records[0]["local"][1],
-                    "Forward did not consume caller-prepared rows")
-            reject(lambda: network.prepare_network_engram(contracts[1], batch, history, contracts,
-                lambda layer: None, runtime, lookup=full))
+            require(
+                prepared.states[1][0]["fresh"]["local"] is records[0]["local"][1],
+                "Forward did not consume caller-prepared rows",
+            )
+            reject(
+                lambda: network.prepare_network_engram(
+                    contracts[1], batch, history, contracts, lambda layer: None, runtime, lookup=full
+                )
+            )
             changed = dict(full, epoch=3)
-            reject(lambda: network.prepare_network_engram(contracts[1], batch,
-                network.NetworkEngramHistory(bindings), contracts, lambda layer: None, runtime, lookup=changed))
+            reject(
+                lambda: network.prepare_network_engram(
+                    contracts[1],
+                    batch,
+                    network.NetworkEngramHistory(bindings),
+                    contracts,
+                    lambda layer: None,
+                    runtime,
+                    lookup=changed,
+                )
+            )
             changed = deepcopy(full)
             changed["cases"]["fresh"][0]["local"][1] = changed["cases"]["fresh"][0]["local"][1].float()
             reject(lambda: network.validate_host_lookup(changed, contracts[1], batch))
@@ -197,16 +306,21 @@ def validate_host():
                 require(torch.equal(row["local"][1][0], row["full"][1][rank]), "TP4 changed row ownership")
             else:
                 require(not torch.any(row["local"][1]), "TP4 padding or empty DP rows were not zero")
-        return dict(lookup="CPU INT8/FP32 group32 to BF16; exact row oracle", slots=2,
-            requests="chunked history, separate requests and image masking", ranks="TP2/DP2 and TP4/DP4",
-            forward="ready-row admission and history publication", device_execution="not_run")
+        return dict(
+            lookup="CPU INT8/FP32 group32 to BF16; exact row oracle",
+            slots=2,
+            requests="chunked history, separate requests and image masking",
+            ranks="TP2/DP2 and TP4/DP4",
+            forward="ready-row admission and history publication",
+            device_execution="not_run",
+        )
 
 
 def validate_device(device, *, compile_only=False):
     """Run ready CPU rows through the existing projection and gate kernels."""
     from golden import ScalarSpec, TensorSpec, run
 
-    from .prefill_engram import prefill_engram_gate_golden_cases
+    from .engram import prefill_engram_gate_golden_cases
     from .qkv_proj_rope import golden_bf16_projection, golden_prefix_compare, make_bf16_projection_staged
 
     with TemporaryDirectory(prefix="ds41-host-device-") as temporary:
@@ -218,29 +332,49 @@ def validate_device(device, *, compile_only=False):
         source = ready["cases"]["fresh"][0]["local"][1]
         generator = torch.Generator().manual_seed(41)
         weight = torch.empty((6144, 25600), dtype=torch.bfloat16).uniform_(-0.002, 0.002, generator=generator)
-        specs = [TensorSpec("source", [16, 6144], torch.bfloat16, init_value=source),
-                 TensorSpec("weight", [6144, 25600], torch.bfloat16, init_value=weight),
-                 TensorSpec("output", [16, 25600], torch.bfloat16, init_value=-12.5),
-                 ScalarSpec("num_tokens", torch.int32, 2, compile_runtime=True)]
-        result = run(make_bf16_projection_staged(6144, 25600, capacity=16), specs,
-            golden_fn=golden_bf16_projection, compare_fn={"output": golden_prefix_compare(2)},
-            config=dict(backend_type="a2a3", execution_mode=False, device_id=device), compile_only=compile_only)
+        specs = [
+            TensorSpec("source", [16, 6144], torch.bfloat16, init_value=source),
+            TensorSpec("weight", [6144, 25600], torch.bfloat16, init_value=weight),
+            TensorSpec("output", [16, 25600], torch.bfloat16, init_value=-12.5),
+            ScalarSpec("num_tokens", torch.int32, 2, compile_runtime=True),
+        ]
+        result = run(
+            make_bf16_projection_staged(6144, 25600, capacity=16),
+            specs,
+            golden_fn=golden_bf16_projection,
+            compare_fn={"output": golden_prefix_compare(2)},
+            config=dict(backend_type="a2a3", execution_mode=False, device_id=device),
+            compile_only=compile_only,
+        )
         require(result.passed, f"Host-row projection: {result.error}")
         gate = next(case for case in prefill_engram_gate_golden_cases() if case["name"].endswith("-7"))
         gate.pop("name")
-        result = run(**gate, config=dict(backend_type="a2a3", execution_mode=False, device_id=device), compile_only=compile_only)
+        result = run(
+            **gate,
+            config=dict(backend_type="a2a3", execution_mode=False, device_id=device),
+            compile_only=compile_only,
+        )
         require(result.passed, f"Engram gate: {result.error}")
-    return dict(device_execution="not_run" if compile_only else "PASS", compilation="PASS", device=device,
-                projection="host-selected BF16 rows, full 6144x25600 weight",
-                gate="existing original-basis gate; active and masked rows", full_network="not_run")
+    return dict(
+        device_execution="not_run" if compile_only else "PASS",
+        compilation="PASS",
+        device=device,
+        projection="host-selected BF16 rows, full 6144x25600 weight",
+        gate="existing original-basis gate; active and masked rows",
+        full_network="not_run",
+    )
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", type=int, help="Run projection/gate on an allocated device after CPU validation")
-    parser.add_argument("--compile-only", action="store_true", help="Compile projection/gate without device execution")
+    parser.add_argument(
+        "--device", type=int, help="Run projection/gate on an allocated device after CPU validation"
+    )
+    parser.add_argument(
+        "--compile-only", action="store_true", help="Compile projection/gate without device execution"
+    )
     arguments = parser.parse_args()
     print(json.dumps(validate_host()))
     if arguments.device is not None or arguments.compile_only:

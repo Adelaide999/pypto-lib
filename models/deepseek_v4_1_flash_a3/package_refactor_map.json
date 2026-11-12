@@ -27,9 +27,9 @@
   "module_map": {
     "a2/attention": "decode_attention",
     "a2/attention_block": "decode_attention_block",
-    "a2/c1c2": "decode_c1c2",
-    "a2/candidate_pool": "decode_candidate_pool",
-    "a2/compressor_core": "compressor_core",
+    "a2/c1c2": "compressor",
+    "a2/candidate_pool": "indexer",
+    "a2/compressor_core": "compressor",
     "a2/config": "config",
     "a2/decode_acceptance": "decode_acceptance",
     "a2/decode_asset_contract": "decode_asset_contract",
@@ -48,17 +48,17 @@
     "a2/decode_reference": "decode_reference",
     "a2/decode_replay": "decode_replay",
     "a2/decode_shape_contract": "decode_shape_contract",
-    "a2/decode_weight_abi": "decode_weight_abi",
-    "a2/decode_weights": "decode_weights",
+    "a2/decode_weight_abi": "weights",
+    "a2/decode_weights": "weights",
     "a2/engram": "engram",
     "a2/gemm": "decode_gemm",
-    "a2/hc": "decode_hc",
-    "a2/index_cache": "decode_index_cache",
+    "a2/hc": "hc",
+    "a2/index_cache": "indexer",
     "a2/indexer": "decode_indexer_projection",
-    "a2/indexer_prepare": "indexer_prepare",
-    "a2/indexer_query": "decode_indexer_query",
-    "a2/indexer_select": "decode_indexer_select",
-    "a2/layer2_c1c2": "decode_compressor_c2",
+    "a2/indexer_prepare": "indexer",
+    "a2/indexer_query": "indexer",
+    "a2/indexer_select": "indexer",
+    "a2/layer2_c1c2": "compressor",
     "a2/moe": "moe",
     "a2/moe_dispatch": "moe",
     "a2/moe_routed": "decode_expert_routed",
@@ -66,14 +66,14 @@
     "a2/moe_shared": "moe",
     "a2/norm_rope": "decode_norm_rope",
     "a2/operator_config": "operator_config",
-    "a2/ops": "decode_primitives",
+    "a2/ops": "linear_primitives",
     "a2/output_proj": "decode_output_proj",
     "a2/qkv": "decode_qkv",
     "a2/qkv_proj_rope": "decode_qkv_proj_rope",
     "a2/qkv_w8a8": "decode_qkv_w8a8",
-    "a2/quant": "decode_quant",
-    "a2/ratio1_prefill": "decode_compressor_c1",
-    "a2/rmsnorm": "decode_rmsnorm",
+    "a2/quant": "quant",
+    "a2/ratio1_prefill": "compressor",
+    "a2/rmsnorm": "rmsnorm",
     "a2/runtime_config": "decode_config",
     "a2/sparse_attention": "decode_sparse_attention",
     "a2/staged": "decode_projection",
@@ -86,16 +86,16 @@
     "a3/audit_source": "audit_source",
     "a3/audit_task": "audit_task",
     "a3/bf16_linear_native": "bf16_linear_native",
-    "a3/candidate_pool": "candidate_pool",
+    "a3/candidate_pool": "indexer",
     "a3/compressor": "compressor",
-    "a3/compressor_core": "compressor_core",
+    "a3/compressor_core": "compressor",
     "a3/config": "config",
     "a3/ecotech_linear": "ecotech_linear",
     "a3/ecotech_linear_tail": "ecotech_linear_tail",
     "a3/ecotech_shared": "moe",
     "a3/engram": "engram",
-    "a3/engram_ecotech": "engram_ecotech",
-    "a3/engram_ecotech_observed": "engram_ecotech_observed",
+    "a3/engram_ecotech": "engram",
+    "a3/engram_ecotech_observed": "engram",
     "a3/engram_hash": "engram_hash",
     "a3/engram_host": "engram_host",
     "a3/engram_offload": "engram_offload",
@@ -104,9 +104,9 @@
     "a3/generate": "generate",
     "a3/hc": "hc",
     "a3/hc_pre_runtime": "hc_pre_runtime",
-    "a3/index_cache": "index_cache",
-    "a3/indexer_prepare": "indexer_prepare",
-    "a3/indexer_query": "indexer_query",
+    "a3/index_cache": "indexer",
+    "a3/indexer_prepare": "indexer",
+    "a3/indexer_query": "indexer",
     "a3/indexer_select": "indexer_select",
     "a3/linear_primitives": "linear_primitives",
     "a3/moe": "moe",
@@ -123,19 +123,19 @@
     "a3/o_proj": "o_proj",
     "a3/operator_config": "operator_config",
     "a3/output_proj": "output_proj",
-    "a3/prefill_c2_pool": "prefill_c2_pool",
+    "a3/prefill_c2_pool": "compressor",
     "a3/prefill_cache_layout": "prefill_cache_layout",
-    "a3/prefill_cache_publish": "prefill_cache_publish",
+    "a3/prefill_cache_publish": "compressor",
     "a3/prefill_compressed_runtime": "prefill_compressed_runtime",
     "a3/prefill_consumer": "prefill_compressed_reuse",
     "a3/prefill_consumer_runtime": "prefill_consumer_runtime",
     "a3/prefill_cp": "prefill_cp",
     "a3/prefill_embedding": "prefill_embedding",
-    "a3/prefill_engram": "prefill_engram",
+    "a3/prefill_engram": "engram",
     "a3/prefill_engram_runtime": "prefill_engram_runtime",
     "a3/prefill_full2": "prefill_c2a",
-    "a3/prefill_full2_observed": "prefill_c2a_observed",
-    "a3/prefill_full2_readback": "prefill_c2a_readback",
+    "a3/prefill_full2_observed": "prefill_c2a",
+    "a3/prefill_full2_readback": "prefill_c2a",
     "a3/prefill_full2_readback_runtime": "prefill_full2_readback_runtime",
     "a3/prefill_fwd": "prefill_fwd",
     "a3/prefill_hc_full2_runtime": "prefill_hc_full2_runtime",
@@ -143,7 +143,7 @@
     "a3/prefill_indexer_runtime": "prefill_indexer_runtime",
     "a3/prefill_l2": "prefill_l2",
     "a3/prefill_layer": "prefill_layer",
-    "a3/prefill_layer2_c1c2": "compressor_projection",
+    "a3/prefill_layer2_c1c2": "compressor",
     "a3/prefill_layer_state": "prefill_layer_state",
     "a3/prefill_moe_ep": "prefill_moe",
     "a3/prefill_network_cache": "prefill_network_cache",
@@ -154,12 +154,12 @@
     "a3/prefill_network_runtime": "prefill_network_runtime",
     "a3/prefill_network_shared_observer": "prefill_network_shared_observer",
     "a3/prefill_network_state": "prefill_network_state",
-    "a3/prefill_norm": "prefill_norm",
+    "a3/prefill_norm": "rmsnorm",
     "a3/prefill_output": "prefill_output",
     "a3/prefill_prepare": "prefill_prepare",
     "a3/prefill_program": "prefill_program",
     "a3/prefill_qli_full2_runtime": "prefill_qli_full2_runtime",
-    "a3/prefill_ratio1": "prefill_c1a",
+    "a3/prefill_ratio1": "compressor",
     "a3/prefill_resident": "prefill_resident",
     "a3/prefill_resident_weights": "prefill_resident_weights",
     "a3/prefill_sparse_consumer": "prefill_sparse_attention",
@@ -171,7 +171,7 @@
     "a3/qli_boundary": "qli_boundary",
     "a3/qli_runtime": "qli_runtime",
     "a3/quant": "quant",
-    "a3/raw_checkpoint": "raw_checkpoint",
+    "a3/raw_checkpoint": "weights",
     "a3/rmsnorm": "rmsnorm",
     "a3/runtime_config": "runtime_config",
     "a3/runtime_utils": "runtime_utils",
@@ -387,7 +387,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/c1c2.py",
       "definition": "make_compressed_cache_publish",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c1c2.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "make_compressed_cache_publish",
       "source_ast_sha256": "9e6ffc1e313de95170e2a1fc46974fde958cc1c0d0e9ada9a5035062f9d7d070",
       "relocated_ast_sha256": "9e6ffc1e313de95170e2a1fc46974fde958cc1c0d0e9ada9a5035062f9d7d070"
@@ -395,23 +395,23 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/c1c2.py",
       "definition": "make_indexer_cache_publish",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_c1c2.py",
-      "destination_definition": "make_indexer_cache_publish",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
+      "destination_definition": "make_decode_indexer_cache_publish",
       "source_ast_sha256": "bb32265d7c9c82143e1293212d6c345a27115df85d9091667766d1d6a0f7eeb6",
-      "relocated_ast_sha256": "bb32265d7c9c82143e1293212d6c345a27115df85d9091667766d1d6a0f7eeb6"
+      "relocated_ast_sha256": "4c6dbe4d7757f9e4ae32bcda8323e91b0cd1ccdccbad75a4f430cefee52d180c"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/candidate_pool.py",
       "definition": "make_candidate_block_pool",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_candidate_pool.py",
-      "destination_definition": "make_candidate_block_pool",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
+      "destination_definition": "make_decode_candidate_block_pool",
       "source_ast_sha256": "f8f84641676b1adcbe5a5774de3010ea95233cb7a406cf0e044f54aed14d6142",
-      "relocated_ast_sha256": "f8f84641676b1adcbe5a5774de3010ea95233cb7a406cf0e044f54aed14d6142"
+      "relocated_ast_sha256": "c2a92bd0056b458c1fe8825ef084032da97ca0a82fd95613b35800dc22ed6121"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/compressor_core.py",
       "definition": "compressor_pool",
-      "destination": "models/deepseek_v4_1_flash_a3/compressor_core.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "compressor_pool",
       "source_ast_sha256": "098f166947b9cd1bbb93541ebf4249c0a7e8b2d9427c862c50d386e21cc80c79",
       "relocated_ast_sha256": "098f166947b9cd1bbb93541ebf4249c0a7e8b2d9427c862c50d386e21cc80c79"
@@ -419,7 +419,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/compressor_core.py",
       "definition": "compressor_state_write",
-      "destination": "models/deepseek_v4_1_flash_a3/compressor_core.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "compressor_state_write",
       "source_ast_sha256": "da4bfcf634f89390c8997aedd65edd2923a876a58fd683be81774cc3ae07546c",
       "relocated_ast_sha256": "da4bfcf634f89390c8997aedd65edd2923a876a58fd683be81774cc3ae07546c"
@@ -427,7 +427,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/compressor_core.py",
       "definition": "compressor_ratio2",
-      "destination": "models/deepseek_v4_1_flash_a3/compressor_core.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "compressor_ratio2",
       "source_ast_sha256": "8cc25aa1ef685de8988b24fda6c8bff083967653adee25572779a23b3147b839",
       "relocated_ast_sha256": "8cc25aa1ef685de8988b24fda6c8bff083967653adee25572779a23b3147b839"
@@ -1107,7 +1107,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
       "definition": "_name",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_weight_abi.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "_name",
       "source_ast_sha256": "9bc06c317bec8478a129a26075bdd0f94ee2e72f9aed76e09237dd1ce3752d80",
       "relocated_ast_sha256": "9bc06c317bec8478a129a26075bdd0f94ee2e72f9aed76e09237dd1ce3752d80"
@@ -1115,7 +1115,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
       "definition": "_expert_name",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_weight_abi.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "_expert_name",
       "source_ast_sha256": "2f964f03915fe30f0d82be9d4d7ddc15666255ef592c59d32adee2fee87b26f1",
       "relocated_ast_sha256": "2f964f03915fe30f0d82be9d4d7ddc15666255ef592c59d32adee2fee87b26f1"
@@ -1123,7 +1123,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
       "definition": "_require",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_weight_abi.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "_require",
       "source_ast_sha256": "66b5968516cfd4c54ee0a9681aed26fcd607aa61380aa17deaf77376dc2c2193",
       "relocated_ast_sha256": "66b5968516cfd4c54ee0a9681aed26fcd607aa61380aa17deaf77376dc2c2193"
@@ -1131,7 +1131,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
       "definition": "_require_zero_offset",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_weight_abi.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "_require_zero_offset",
       "source_ast_sha256": "74697a29185b28ef6d2fb8ac011179cbb3a665b91ff04352424b035ebbfc6830",
       "relocated_ast_sha256": "74697a29185b28ef6d2fb8ac011179cbb3a665b91ff04352424b035ebbfc6830"
@@ -1139,7 +1139,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
       "definition": "_scale",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_weight_abi.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "_scale",
       "source_ast_sha256": "a3c0435560ff9698b42b4fd3de354475959362f34fd423bac189da78d48da15a",
       "relocated_ast_sha256": "a3c0435560ff9698b42b4fd3de354475959362f34fd423bac189da78d48da15a"
@@ -1147,7 +1147,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
       "definition": "_pad_w2",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_weight_abi.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "_pad_w2",
       "source_ast_sha256": "71d40208f006348b601d3eabd195727ab5957649ff700b4132d15a57e0406eec",
       "relocated_ast_sha256": "71d40208f006348b601d3eabd195727ab5957649ff700b4132d15a57e0406eec"
@@ -1155,7 +1155,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
       "definition": "pack_routed_expert",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_weight_abi.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "pack_routed_expert",
       "source_ast_sha256": "986e1fc718a9d078ae216dffc0ceb242a7d7f95888a28183bfebb1893bff464d",
       "relocated_ast_sha256": "986e1fc718a9d078ae216dffc0ceb242a7d7f95888a28183bfebb1893bff464d"
@@ -1163,15 +1163,15 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
       "definition": "iter_routed_experts",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_weight_abi.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "iter_routed_experts",
       "source_ast_sha256": "7cdf4515ebbeec65d46793fc4005a033793b2acfcf889f5bc4930ac881142113",
-      "relocated_ast_sha256": "7cdf4515ebbeec65d46793fc4005a033793b2acfcf889f5bc4930ac881142113"
+      "relocated_ast_sha256": "ef85c7e13afe13ad325aab7d33298d9c01149cb3da7267c49f0c53932848c0e3"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
       "definition": "load_routed_shard",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_weight_abi.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "load_routed_shard",
       "source_ast_sha256": "0308fe1f3bc4de5ca40ff929dc6bec454378ad908d614ff9d38695375090611d",
       "relocated_ast_sha256": "0308fe1f3bc4de5ca40ff929dc6bec454378ad908d614ff9d38695375090611d"
@@ -1179,7 +1179,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
       "definition": "load_router",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_weight_abi.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "load_router",
       "source_ast_sha256": "29db0c473aa1a8996b14842e6a6128347989be18a93eb128cdde0e327803c68f",
       "relocated_ast_sha256": "29db0c473aa1a8996b14842e6a6128347989be18a93eb128cdde0e327803c68f"
@@ -1187,7 +1187,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
       "definition": "load_shared_expert",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_weight_abi.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "load_shared_expert",
       "source_ast_sha256": "bc02f53dbb714235fd3d3fb06045406b77ff6c276fa0349df0666587000ca504",
       "relocated_ast_sha256": "bc02f53dbb714235fd3d3fb06045406b77ff6c276fa0349df0666587000ca504"
@@ -1195,7 +1195,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
       "definition": "load_ep2_rank_weights",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_weight_abi.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "load_ep2_rank_weights",
       "source_ast_sha256": "4dab3b6c86306053d72fa96073a322e39842cf9e69dc6e37b917c7e62e633107",
       "relocated_ast_sha256": "4dab3b6c86306053d72fa96073a322e39842cf9e69dc6e37b917c7e62e633107"
@@ -1203,7 +1203,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weight_abi.py",
       "definition": "abi_summary",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_weight_abi.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "abi_summary",
       "source_ast_sha256": "027c1cbff41cb7e7403846d12987678e424a8f5ddd6993f1a1cf56ba7a324ea4",
       "relocated_ast_sha256": "027c1cbff41cb7e7403846d12987678e424a8f5ddd6993f1a1cf56ba7a324ea4"
@@ -1211,7 +1211,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/decode_weights.py",
       "definition": "DecodeSafetensorsCheckpoint",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_weights.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "DecodeSafetensorsCheckpoint",
       "source_ast_sha256": "ec5f5e0924f331d8dee9ecda898b75a125526d6d3110ec9167c0536d334ff422",
       "relocated_ast_sha256": "ec5f5e0924f331d8dee9ecda898b75a125526d6d3110ec9167c0536d334ff422"
@@ -1251,7 +1251,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/gemm.py",
       "definition": "make_pack_weight",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_gemm.py",
+      "destination": "models/deepseek_v4_1_flash_a3/gemm.py",
       "destination_definition": "make_pack_weight",
       "source_ast_sha256": "14522539e7db91a5312cbd9dca2774b98ff543a84a3a09a3e4a0c791eb4722ff",
       "relocated_ast_sha256": "14522539e7db91a5312cbd9dca2774b98ff543a84a3a09a3e4a0c791eb4722ff"
@@ -1259,7 +1259,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/gemm.py",
       "definition": "make_int8_gemm",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_gemm.py",
+      "destination": "models/deepseek_v4_1_flash_a3/gemm.py",
       "destination_definition": "make_int8_gemm",
       "source_ast_sha256": "4075c1915576c9080e996b63ae598e9b37c8eebe6a2810e1c87093edfb195813",
       "relocated_ast_sha256": "4075c1915576c9080e996b63ae598e9b37c8eebe6a2810e1c87093edfb195813"
@@ -1267,7 +1267,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/gemm.py",
       "definition": "make_fp32_dequantize",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_gemm.py",
+      "destination": "models/deepseek_v4_1_flash_a3/gemm.py",
       "destination_definition": "make_fp32_dequantize",
       "source_ast_sha256": "2d960bf117536bf4e1c22ce5dec62c9df94db0dd762f8722b5409b563c78ae49",
       "relocated_ast_sha256": "2d960bf117536bf4e1c22ce5dec62c9df94db0dd762f8722b5409b563c78ae49"
@@ -1278,44 +1278,44 @@
       "destination": "models/deepseek_v4_1_flash_a3/decode_gemm.py",
       "destination_definition": "make_int8_linear_direct",
       "source_ast_sha256": "dfddbab819bb6614efd2f87811d2bf3d91af667622c59b616cbee35a7af1cddb",
-      "relocated_ast_sha256": "9a1f64f49c362767ae446a61e6e7bd11f2fa833b662d9317578a01727822550d"
+      "relocated_ast_sha256": "4569d339886b4d25c88ef405fe9117b5e7288d2fe997c79eafe8aff3d2772ed4"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/hc.py",
       "definition": "make_hc_pre_inline",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_hc.py",
-      "destination_definition": "make_hc_pre_inline",
+      "destination": "models/deepseek_v4_1_flash_a3/hc.py",
+      "destination_definition": "make_decode_hc_pre_inline",
       "source_ast_sha256": "34791a0b234c2786ac04664af2a5ff19d75e35ba4ca3608383e404411496ec22",
-      "relocated_ast_sha256": "34791a0b234c2786ac04664af2a5ff19d75e35ba4ca3608383e404411496ec22"
+      "relocated_ast_sha256": "477e7b45783727745ce85f6c61da6001c3b71a617bb3d090aee2ebc965a511c1"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/hc.py",
       "definition": "make_hc_post_inline",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_hc.py",
-      "destination_definition": "make_hc_post_inline",
+      "destination": "models/deepseek_v4_1_flash_a3/hc.py",
+      "destination_definition": "make_decode_hc_post_inline",
       "source_ast_sha256": "55a98e5f5dcd535fba722faa2c7617ea2132293ab5c665413d2058539d35342a",
-      "relocated_ast_sha256": "55a98e5f5dcd535fba722faa2c7617ea2132293ab5c665413d2058539d35342a"
+      "relocated_ast_sha256": "e8aced1b526ecc8e7cc85e4b8ec79bc2328be2b889f3ed2ee7e2dbad3ae692bd"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/hc.py",
       "definition": "make_hc",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_hc.py",
-      "destination_definition": "make_hc",
+      "destination": "models/deepseek_v4_1_flash_a3/hc.py",
+      "destination_definition": "make_decode_hc",
       "source_ast_sha256": "decb25cefe19cc05efe758a5ae0f53d01062c794810b2cda936de162767379ad",
-      "relocated_ast_sha256": "decb25cefe19cc05efe758a5ae0f53d01062c794810b2cda936de162767379ad"
+      "relocated_ast_sha256": "efd9edc4f80474e70fa37044e2ba9191cef235ae5eb044074cfc0b8ae1454828"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/index_cache.py",
       "definition": "quantize_index_cache",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_index_cache.py",
-      "destination_definition": "quantize_index_cache",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
+      "destination_definition": "decode_quantize_index_cache",
       "source_ast_sha256": "7071a709421cbbda3224a6a6e48a0c94c7b970be8f07f5689bf6271a06ed6ba0",
-      "relocated_ast_sha256": "7071a709421cbbda3224a6a6e48a0c94c7b970be8f07f5689bf6271a06ed6ba0"
+      "relocated_ast_sha256": "b12a6fd4539ceb75e182c01c60132b7b5ccc02eab53dd935c8d5c2199e5a1107"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/index_cache.py",
       "definition": "dequantize_index_cache",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_index_cache.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "dequantize_index_cache",
       "source_ast_sha256": "31777d957748ea7cbe01b0d60e97f9716766d8d90a9ce91ea0b28b743424e14d",
       "relocated_ast_sha256": "31777d957748ea7cbe01b0d60e97f9716766d8d90a9ce91ea0b28b743424e14d"
@@ -1323,10 +1323,10 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/index_cache.py",
       "definition": "make_index_cache_quantize",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_index_cache.py",
-      "destination_definition": "make_index_cache_quantize",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
+      "destination_definition": "make_decode_index_cache_quantize",
       "source_ast_sha256": "24134c7bc0cc7681122be3503a567fba9d3fa2acb63045abaf6ec0dc2f73a3ad",
-      "relocated_ast_sha256": "24134c7bc0cc7681122be3503a567fba9d3fa2acb63045abaf6ec0dc2f73a3ad"
+      "relocated_ast_sha256": "f49dada5a597a251f20674dcb91a6a0b3dafe49e34a301a72cccfba645e3bb35"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/indexer.py",
@@ -1363,7 +1363,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/indexer_prepare.py",
       "definition": "prepare_indexer_indices_reference",
-      "destination": "models/deepseek_v4_1_flash_a3/indexer_prepare.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "prepare_indexer_indices_reference",
       "source_ast_sha256": "3ad358c8977b4f38870d75d88f3f9287a7b9b2287721697f60f49bd13c69b7d4",
       "relocated_ast_sha256": "3ad358c8977b4f38870d75d88f3f9287a7b9b2287721697f60f49bd13c69b7d4"
@@ -1371,7 +1371,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/indexer_prepare.py",
       "definition": "make_indexer_prepare",
-      "destination": "models/deepseek_v4_1_flash_a3/indexer_prepare.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "make_indexer_prepare",
       "source_ast_sha256": "2ac1e80aae675db3a8a47b2d0b19d3f2c2ac1b8dea21880d09ef7815df62d0cc",
       "relocated_ast_sha256": "2ac1e80aae675db3a8a47b2d0b19d3f2c2ac1b8dea21880d09ef7815df62d0cc"
@@ -1379,47 +1379,47 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/indexer_query.py",
       "definition": "quantize_indexer_query_reference",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_indexer_query.py",
-      "destination_definition": "quantize_indexer_query_reference",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
+      "destination_definition": "decode_quantize_indexer_query_reference",
       "source_ast_sha256": "f62ba670a8b6623af013b302b8f02727b4ce1e87e325050468614e81d282624e",
-      "relocated_ast_sha256": "f62ba670a8b6623af013b302b8f02727b4ce1e87e325050468614e81d282624e"
+      "relocated_ast_sha256": "4e88c61e09b8434e4462a88b65f98633b83a5ad7a67b0df26ead7e86945f4a3a"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/indexer_query.py",
       "definition": "_make_indexer_query_quantize_inline",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_indexer_query.py",
-      "destination_definition": "_make_indexer_query_quantize_inline",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
+      "destination_definition": "_decode_make_indexer_query_quantize_inline",
       "source_ast_sha256": "d4b33f9ff9edee977c7e0a77a2aed3153e020a0d145d8eb636712d1c9d5670bb",
-      "relocated_ast_sha256": "d4b33f9ff9edee977c7e0a77a2aed3153e020a0d145d8eb636712d1c9d5670bb"
+      "relocated_ast_sha256": "9643711cd5f6e8431fc3e942690c71fd4eb4c26e000f2e8a919eba03c7305889"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/indexer_query.py",
       "definition": "make_indexer_query_quantize",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_indexer_query.py",
-      "destination_definition": "make_indexer_query_quantize",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
+      "destination_definition": "make_decode_indexer_query_quantize",
       "source_ast_sha256": "b5766e3822670f3060f367efa1249320d3ffa6a835a35e4deb44737b9d2e1427",
-      "relocated_ast_sha256": "b5766e3822670f3060f367efa1249320d3ffa6a835a35e4deb44737b9d2e1427"
+      "relocated_ast_sha256": "58bfb990dfdcff9809f851f1f55f68d41debdee30ca096809af86fe9f24e66f4"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/indexer_query.py",
       "definition": "make_l3_indexer_query",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_indexer_query.py",
-      "destination_definition": "make_l3_indexer_query",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
+      "destination_definition": "make_decode_l3_indexer_query",
       "source_ast_sha256": "387d1f6526ee95646542295ee4032df5c0744377fbe764cf6a0732e1e516687d",
-      "relocated_ast_sha256": "387d1f6526ee95646542295ee4032df5c0744377fbe764cf6a0732e1e516687d"
+      "relocated_ast_sha256": "fee99c12143eeda5797902bfa7513a6e804e8119d9dab7eeaef8b41539963c0c"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/indexer_query.py",
       "definition": "indexer_query_reference",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_indexer_query.py",
-      "destination_definition": "indexer_query_reference",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
+      "destination_definition": "decode_indexer_query_reference",
       "source_ast_sha256": "d09c77460cc7b70a2dd405db25030d9c3f0ee9450d120b79b66653aa30e50083",
-      "relocated_ast_sha256": "d09c77460cc7b70a2dd405db25030d9c3f0ee9450d120b79b66653aa30e50083"
+      "relocated_ast_sha256": "dd3c69d0b0400e5c074b80876b49302c91b68f2c9535fbd6acdca3b972eb1828"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/indexer_select.py",
       "definition": "indexer_select_reference",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_indexer_select.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "indexer_select_reference",
       "source_ast_sha256": "e592080fd1270208e913a343c56a94b87c30c539ef8fdbd5968a8d31d444128d",
       "relocated_ast_sha256": "e592080fd1270208e913a343c56a94b87c30c539ef8fdbd5968a8d31d444128d"
@@ -1427,7 +1427,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/indexer_select.py",
       "definition": "make_indexer_select",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_indexer_select.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "make_indexer_select",
       "source_ast_sha256": "86a0ac099521c9f88bbfffe2c6e098435d50a42817280a1b59559e018dc0e2a7",
       "relocated_ast_sha256": "86a0ac099521c9f88bbfffe2c6e098435d50a42817280a1b59559e018dc0e2a7"
@@ -1435,7 +1435,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/indexer_select.py",
       "definition": "make_indexer_select_restricted",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_indexer_select.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "make_indexer_select_restricted",
       "source_ast_sha256": "4167771f04b054d3ee96bad2751990e3f28f4bb05dad28dd7a5f8cca34106daf",
       "relocated_ast_sha256": "4167771f04b054d3ee96bad2751990e3f28f4bb05dad28dd7a5f8cca34106daf"
@@ -1443,7 +1443,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/layer2_c1c2.py",
       "definition": "make_fp32_projection",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_compressor_c2.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "make_fp32_projection",
       "source_ast_sha256": "9512bd9dc422aebcfc2ba4708b145633d186bd4803d9ef6432ad9e199bb10f9e",
       "relocated_ast_sha256": "9512bd9dc422aebcfc2ba4708b145633d186bd4803d9ef6432ad9e199bb10f9e"
@@ -1451,34 +1451,34 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/layer2_c1c2.py",
       "definition": "make_indexer_cache_publish_128",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_compressor_c2.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "make_indexer_cache_publish_128",
       "source_ast_sha256": "a2041775651e9184be29cac1e5798850c419baaea44fe975f5445eaabcb23417",
-      "relocated_ast_sha256": "a2041775651e9184be29cac1e5798850c419baaea44fe975f5445eaabcb23417"
+      "relocated_ast_sha256": "d049ea1a699cc86e0a6de337905a24e3d2bb751466d5f5ef56513b365b5dced4"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/layer2_c1c2.py",
       "definition": "make_c2_index_publish_projected_inline",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_compressor_c2.py",
-      "destination_definition": "make_c2_index_publish_projected_inline",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
+      "destination_definition": "make_decode_c2_index_publish_projected_inline",
       "source_ast_sha256": "8932c5a57acb35d5babbd4c416ab8cfb451d3a83807f5fdf5cbde4c71db0bbf7",
-      "relocated_ast_sha256": "8932c5a57acb35d5babbd4c416ab8cfb451d3a83807f5fdf5cbde4c71db0bbf7"
+      "relocated_ast_sha256": "49b340653a661867db896f7e4b0d00370f4550772c4eb6f62df5dfaf739284f5"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/layer2_c1c2.py",
       "definition": "make_c2_index_publish_inline",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_compressor_c2.py",
-      "destination_definition": "make_c2_index_publish_inline",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
+      "destination_definition": "make_decode_c2_index_publish_inline",
       "source_ast_sha256": "aedeec35708bd02ce01e30a16433f14ceec46c4790cc43e4fd21890723b73bc6",
-      "relocated_ast_sha256": "aedeec35708bd02ce01e30a16433f14ceec46c4790cc43e4fd21890723b73bc6"
+      "relocated_ast_sha256": "48adb87746ff1e3ef17aa1b2829491a17f8b8a6bf6af98395446dd2d95d643d1"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/layer2_c1c2.py",
       "definition": "make_layer2_c1c2",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_compressor_c2.py",
-      "destination_definition": "make_layer2_c1c2",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
+      "destination_definition": "make_decode_layer2_c1c2",
       "source_ast_sha256": "08b5e54215e0eca9d9b0afe46982b0c63fce15c1eb5feb2141cd0bcd583dbfb9",
-      "relocated_ast_sha256": "08b5e54215e0eca9d9b0afe46982b0c63fce15c1eb5feb2141cd0bcd583dbfb9"
+      "relocated_ast_sha256": "6bfbf600314d88c66862a5bab6c539e377fcd161cf7a1be3ef840fa00f9af423"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/moe.py",
@@ -1691,23 +1691,23 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/ops.py",
       "definition": "make_cast_tile",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_primitives.py",
-      "destination_definition": "make_cast_tile",
+      "destination": "models/deepseek_v4_1_flash_a3/linear_primitives.py",
+      "destination_definition": "make_decode_cast_tile",
       "source_ast_sha256": "cefb41c1dbd470d1e6fa75272297749a6be023c08c2fe5c007c3443aca0e1e06",
-      "relocated_ast_sha256": "cefb41c1dbd470d1e6fa75272297749a6be023c08c2fe5c007c3443aca0e1e06"
+      "relocated_ast_sha256": "c326f7cfeebae5cb7856ceef4a04cbf87fe881fb4c751abbfefd7895698256f2"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/ops.py",
       "definition": "make_quantize",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_primitives.py",
-      "destination_definition": "make_quantize",
+      "destination": "models/deepseek_v4_1_flash_a3/linear_primitives.py",
+      "destination_definition": "make_decode_quantize",
       "source_ast_sha256": "b97e0ffebbbdba79e1520c63ca180601c2e406266d2c59aa1356be3a1400d094",
-      "relocated_ast_sha256": "b97e0ffebbbdba79e1520c63ca180601c2e406266d2c59aa1356be3a1400d094"
+      "relocated_ast_sha256": "15305d6391cfb7fefc6c1aeba3f854494a5379735f842ee1600ee2a4b65aa300"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/ops.py",
       "definition": "make_pack_weight",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_primitives.py",
+      "destination": "models/deepseek_v4_1_flash_a3/linear_primitives.py",
       "destination_definition": "make_pack_weight",
       "source_ast_sha256": "5d45a700a63ce6a1b30b1e75a8e4227e50de16d1a0ea6b554f9744a42a4cc50d",
       "relocated_ast_sha256": "5d45a700a63ce6a1b30b1e75a8e4227e50de16d1a0ea6b554f9744a42a4cc50d"
@@ -1715,7 +1715,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/ops.py",
       "definition": "make_dot",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_primitives.py",
+      "destination": "models/deepseek_v4_1_flash_a3/linear_primitives.py",
       "destination_definition": "make_dot",
       "source_ast_sha256": "9e0cc122495c3c3c0e2ea26fd3289ac2467611dc0a47242ec25db7e48101e29f",
       "relocated_ast_sha256": "9e0cc122495c3c3c0e2ea26fd3289ac2467611dc0a47242ec25db7e48101e29f"
@@ -1723,26 +1723,26 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/ops.py",
       "definition": "make_dequantize",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_primitives.py",
-      "destination_definition": "make_dequantize",
+      "destination": "models/deepseek_v4_1_flash_a3/linear_primitives.py",
+      "destination_definition": "make_decode_dequantize",
       "source_ast_sha256": "532ee170d83c036825a73ea5b99950b98a74728da473d6bb9e3ca500bb55a3f1",
-      "relocated_ast_sha256": "532ee170d83c036825a73ea5b99950b98a74728da473d6bb9e3ca500bb55a3f1"
+      "relocated_ast_sha256": "8ebd4b28858e36f6749e05a02d2ccf5aff2bd452311a81e6c58c20e6f26c7bdb"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/ops.py",
       "definition": "make_norm",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_primitives.py",
-      "destination_definition": "make_norm",
+      "destination": "models/deepseek_v4_1_flash_a3/linear_primitives.py",
+      "destination_definition": "make_decode_norm",
       "source_ast_sha256": "eb0e41263dfbabcdc361485fbd93d3d77dc11fa1e92600a64cc5384b36c95183",
-      "relocated_ast_sha256": "eb0e41263dfbabcdc361485fbd93d3d77dc11fa1e92600a64cc5384b36c95183"
+      "relocated_ast_sha256": "cbea1267e575f790624194464881b00629643efa42a5eb8953e9767085ef18cb"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/ops.py",
       "definition": "make_rope",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_primitives.py",
-      "destination_definition": "make_rope",
+      "destination": "models/deepseek_v4_1_flash_a3/linear_primitives.py",
+      "destination_definition": "make_decode_rope",
       "source_ast_sha256": "e8a8086e271272386b0f122487c583f29c9fb71042d9eaf2b1f67b6085a66c17",
-      "relocated_ast_sha256": "e8a8086e271272386b0f122487c583f29c9fb71042d9eaf2b1f67b6085a66c17"
+      "relocated_ast_sha256": "ade21431ac07a68a5ea22f05a4eb7b511054493328da37a78f099603b2def4de"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/output_proj.py",
@@ -1859,7 +1859,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/quant.py",
       "definition": "_round_symmetric_int8",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_quant.py",
+      "destination": "models/deepseek_v4_1_flash_a3/quant.py",
       "destination_definition": "_round_symmetric_int8",
       "source_ast_sha256": "5e448fb002aedf922e0fe68d72cca75e71693e314ceef22bd5b03412142d4cf7",
       "relocated_ast_sha256": "5e448fb002aedf922e0fe68d72cca75e71693e314ceef22bd5b03412142d4cf7"
@@ -1867,7 +1867,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/quant.py",
       "definition": "quantize_per_token_int8",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_quant.py",
+      "destination": "models/deepseek_v4_1_flash_a3/quant.py",
       "destination_definition": "quantize_per_token_int8",
       "source_ast_sha256": "930e07bc4759de5dae1dbf2a304ad7974b0bac9ad9d92a3f7b1427b037750ac9",
       "relocated_ast_sha256": "930e07bc4759de5dae1dbf2a304ad7974b0bac9ad9d92a3f7b1427b037750ac9"
@@ -1875,7 +1875,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/quant.py",
       "definition": "quantize_per_channel_int8",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_quant.py",
+      "destination": "models/deepseek_v4_1_flash_a3/quant.py",
       "destination_definition": "quantize_per_channel_int8",
       "source_ast_sha256": "a044eb399be98ff94bd6e4f3c4cee8c1f7476b8019278d0b19f826dcb33ca222",
       "relocated_ast_sha256": "a044eb399be98ff94bd6e4f3c4cee8c1f7476b8019278d0b19f826dcb33ca222"
@@ -1883,7 +1883,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/quant.py",
       "definition": "int8_matmul",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_quant.py",
+      "destination": "models/deepseek_v4_1_flash_a3/quant.py",
       "destination_definition": "int8_matmul",
       "source_ast_sha256": "32f7e1d2d3c587470cc1bb0d534af21c8f77471bf919e628565d65d12b82fc33",
       "relocated_ast_sha256": "32f7e1d2d3c587470cc1bb0d534af21c8f77471bf919e628565d65d12b82fc33"
@@ -1891,7 +1891,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/quant.py",
       "definition": "dequantize_int32",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_quant.py",
+      "destination": "models/deepseek_v4_1_flash_a3/quant.py",
       "destination_definition": "dequantize_int32",
       "source_ast_sha256": "bf56e3ef7e01ef4f3b38fb7c242ee6adb48a0bfd3e1eb9bfb810511c7e367d64",
       "relocated_ast_sha256": "bf56e3ef7e01ef4f3b38fb7c242ee6adb48a0bfd3e1eb9bfb810511c7e367d64"
@@ -1899,7 +1899,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/quant.py",
       "definition": "w8a8_linear",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_quant.py",
+      "destination": "models/deepseek_v4_1_flash_a3/quant.py",
       "destination_definition": "w8a8_linear",
       "source_ast_sha256": "cd59114f237e8c1fd0540ab09d61b02a8acd0391bfb587c92b7ceba1d756f22c",
       "relocated_ast_sha256": "cd59114f237e8c1fd0540ab09d61b02a8acd0391bfb587c92b7ceba1d756f22c"
@@ -1907,55 +1907,55 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/quant.py",
       "definition": "make_dynamic_int8_quantize",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_quant.py",
-      "destination_definition": "make_dynamic_int8_quantize",
+      "destination": "models/deepseek_v4_1_flash_a3/quant.py",
+      "destination_definition": "make_decode_dynamic_int8_quantize",
       "source_ast_sha256": "c3e5933b722c1c2f875f05445caf3e4436c09215f3593802a3524d89cc7a1b9c",
-      "relocated_ast_sha256": "c3e5933b722c1c2f875f05445caf3e4436c09215f3593802a3524d89cc7a1b9c"
+      "relocated_ast_sha256": "7cdae374af6751091290637f27c1804c5f2d35959ddd1d6bbf6447c1b35c910f"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/ratio1_prefill.py",
       "definition": "make_ratio1_compress_publish",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_compressor_c1.py",
-      "destination_definition": "make_ratio1_compress_publish",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
+      "destination_definition": "make_decode_ratio1_compress_publish",
       "source_ast_sha256": "1ebee158c5af25192e65fb4c534ebda1d6107e30d45589c47c62cd04842f0110",
-      "relocated_ast_sha256": "1ebee158c5af25192e65fb4c534ebda1d6107e30d45589c47c62cd04842f0110"
+      "relocated_ast_sha256": "0065412f77b6558ecb1661a78e26a0f50b3ea314fd1ec1fb25f13848c0b8072c"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/rmsnorm.py",
       "definition": "rms_norm_tiled",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_rmsnorm.py",
+      "destination": "models/deepseek_v4_1_flash_a3/rmsnorm.py",
       "destination_definition": "rms_norm_tiled",
       "source_ast_sha256": "0c98d8860e2f66891aa193c5adcbc2215d3b890870ba36e72ed53be24defbbb6",
-      "relocated_ast_sha256": "0c98d8860e2f66891aa193c5adcbc2215d3b890870ba36e72ed53be24defbbb6"
+      "relocated_ast_sha256": "f052bf28e70d4b36ae8748b31f1e6158de06ac6903e9374cc7da0a79b2ab5c50"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/rmsnorm.py",
       "definition": "rms_norm_tiled_with_fp32",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_rmsnorm.py",
+      "destination": "models/deepseek_v4_1_flash_a3/rmsnorm.py",
       "destination_definition": "rms_norm_tiled_with_fp32",
       "source_ast_sha256": "c8270e4e7aa3533c7ddeae533f5a472debf772b20386833acfc962f815a6d177",
-      "relocated_ast_sha256": "c8270e4e7aa3533c7ddeae533f5a472debf772b20386833acfc962f815a6d177"
+      "relocated_ast_sha256": "cffc26efb170ffc3305346442a8a79dfa9e0448dba62332f680c05e5842b4bdb"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/rmsnorm.py",
       "definition": "rms_norm_tiled_from_fp32",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_rmsnorm.py",
+      "destination": "models/deepseek_v4_1_flash_a3/rmsnorm.py",
       "destination_definition": "rms_norm_tiled_from_fp32",
       "source_ast_sha256": "d62dea9853b13373f747893a1fd9816f016efb554c0c91145b88dc971a4dbf67",
-      "relocated_ast_sha256": "d62dea9853b13373f747893a1fd9816f016efb554c0c91145b88dc971a4dbf67"
+      "relocated_ast_sha256": "847d80522965a88db32beb8aa03d9da4233cdd482050b971506c83c20e16fc87"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/rmsnorm.py",
       "definition": "rms_norm",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_rmsnorm.py",
-      "destination_definition": "rms_norm",
+      "destination": "models/deepseek_v4_1_flash_a3/rmsnorm.py",
+      "destination_definition": "decode_rms_norm",
       "source_ast_sha256": "9bb036084649c4aa3b08f2bf1e03db0b57515f18fce04fe3cb6c542ee9a7a031",
-      "relocated_ast_sha256": "9bb036084649c4aa3b08f2bf1e03db0b57515f18fce04fe3cb6c542ee9a7a031"
+      "relocated_ast_sha256": "359e92153334e9d5c53cf78b5ce7117b88e8eaa92e755e5f057bf5eb10400b2e"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/rmsnorm.py",
       "definition": "golden_rms_norm",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_rmsnorm.py",
+      "destination": "models/deepseek_v4_1_flash_a3/rmsnorm.py",
       "destination_definition": "golden_rms_norm",
       "source_ast_sha256": "579c7aeb5ef88ec8f790daef6f677d5516d88523b4e01501e3a79c2b35e9f6d8",
       "relocated_ast_sha256": "579c7aeb5ef88ec8f790daef6f677d5516d88523b4e01501e3a79c2b35e9f6d8"
@@ -1963,10 +1963,10 @@
     {
       "source": "models/deepseek_v4_1_flash_a2/rmsnorm.py",
       "definition": "make_prefill_norm",
-      "destination": "models/deepseek_v4_1_flash_a3/decode_rmsnorm.py",
-      "destination_definition": "make_prefill_norm",
+      "destination": "models/deepseek_v4_1_flash_a3/rmsnorm.py",
+      "destination_definition": "make_decode_norm",
       "source_ast_sha256": "d3dc81d008592c6c2164e392e1cfdab7726f4a6c6fce0e663bf0b308470b9ea8",
-      "relocated_ast_sha256": "d3dc81d008592c6c2164e392e1cfdab7726f4a6c6fce0e663bf0b308470b9ea8"
+      "relocated_ast_sha256": "ecfe4f94b78994f1e6b470803e458e08afe880696eba645fec2693bf420bee4e"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/runtime_config.py",
@@ -2094,7 +2094,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/decode_projection.py",
       "destination_definition": "make_index_quantize",
       "source_ast_sha256": "f05cc4054d9512c494ce875fe89b306d18b10b5bface72f395dcdfc3ed153ad2",
-      "relocated_ast_sha256": "0d21dc5140f374cc096f7f74adc178163c12777557bc682d1d7268cbf84e3834"
+      "relocated_ast_sha256": "cc6874705d385b2913f9c3ada8b0140150a91fdf67c49c05208eb8a0395f4fed"
     },
     {
       "source": "models/deepseek_v4_1_flash_a2/staged.py",
@@ -2275,7 +2275,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/candidate_pool.py",
       "definition": "make_candidate_block_pool",
-      "destination": "models/deepseek_v4_1_flash_a3/candidate_pool.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "make_candidate_block_pool",
       "source_ast_sha256": "7b1daab5e4bb7978ad414cad94d3d5e9e50a4e276c80f231be3fb8bdc9f05249",
       "relocated_ast_sha256": "7b1daab5e4bb7978ad414cad94d3d5e9e50a4e276c80f231be3fb8bdc9f05249"
@@ -2283,7 +2283,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/candidate_pool.py",
       "definition": "make_candidate_pool_publish",
-      "destination": "models/deepseek_v4_1_flash_a3/candidate_pool.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "make_candidate_pool_publish",
       "source_ast_sha256": "7b18e76c55554eae63d4b24a3823efedc9dc16c4c839955997c59d5b1694f30c",
       "relocated_ast_sha256": "7b18e76c55554eae63d4b24a3823efedc9dc16c4c839955997c59d5b1694f30c"
@@ -2291,7 +2291,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/candidate_pool.py",
       "definition": "golden_candidate_block_pool",
-      "destination": "models/deepseek_v4_1_flash_a3/candidate_pool.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "golden_candidate_block_pool",
       "source_ast_sha256": "64cd5ca11264af3567d2317b03578c461a48e67b4ed59493771e5c5874b959cc",
       "relocated_ast_sha256": "64cd5ca11264af3567d2317b03578c461a48e67b4ed59493771e5c5874b959cc"
@@ -2299,7 +2299,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/candidate_pool.py",
       "definition": "golden_candidate_pool_publish",
-      "destination": "models/deepseek_v4_1_flash_a3/candidate_pool.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "golden_candidate_pool_publish",
       "source_ast_sha256": "2eaea4b138623d133fd1d37cd56c24895a2b49cce356cf857adba98f2134a389",
       "relocated_ast_sha256": "2eaea4b138623d133fd1d37cd56c24895a2b49cce356cf857adba98f2134a389"
@@ -2307,7 +2307,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/candidate_pool.py",
       "definition": "validate",
-      "destination": "models/deepseek_v4_1_flash_a3/candidate_pool.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "validate",
       "source_ast_sha256": "ffe30c03ce4411a6d545792c84c608a178851f68cb6e9355a7810b52ac6bd308",
       "relocated_ast_sha256": "ffe30c03ce4411a6d545792c84c608a178851f68cb6e9355a7810b52ac6bd308"
@@ -2323,7 +2323,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/compressor_core.py",
       "definition": "compressor_pool",
-      "destination": "models/deepseek_v4_1_flash_a3/compressor_core.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "compressor_pool",
       "source_ast_sha256": "098f166947b9cd1bbb93541ebf4249c0a7e8b2d9427c862c50d386e21cc80c79",
       "relocated_ast_sha256": "098f166947b9cd1bbb93541ebf4249c0a7e8b2d9427c862c50d386e21cc80c79"
@@ -2331,7 +2331,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/compressor_core.py",
       "definition": "compressor_state_write",
-      "destination": "models/deepseek_v4_1_flash_a3/compressor_core.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "compressor_state_write",
       "source_ast_sha256": "da4bfcf634f89390c8997aedd65edd2923a876a58fd683be81774cc3ae07546c",
       "relocated_ast_sha256": "da4bfcf634f89390c8997aedd65edd2923a876a58fd683be81774cc3ae07546c"
@@ -2339,7 +2339,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/compressor_core.py",
       "definition": "compressor_ratio2",
-      "destination": "models/deepseek_v4_1_flash_a3/compressor_core.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "compressor_ratio2",
       "source_ast_sha256": "8cc25aa1ef685de8988b24fda6c8bff083967653adee25572779a23b3147b839",
       "relocated_ast_sha256": "8cc25aa1ef685de8988b24fda6c8bff083967653adee25572779a23b3147b839"
@@ -2507,39 +2507,39 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
       "definition": "make_resident_int8_lookup",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "make_resident_int8_lookup",
       "source_ast_sha256": "c897c05e357bd132d1300bb58321ca689eebb5791ac3746cb51ed670505ea69a",
-      "relocated_ast_sha256": "c897c05e357bd132d1300bb58321ca689eebb5791ac3746cb51ed670505ea69a"
+      "relocated_ast_sha256": "9a180f576cc949a6cd3494aeb388e05d47e418cf8f68022be818afaf3fe1a33e"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
       "definition": "make_original_basis_hidden",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "make_original_basis_hidden",
       "source_ast_sha256": "a3719989a166c56b4e4b77057a60231e1510ad37e7d588b383a24b6c6a6ea463",
-      "relocated_ast_sha256": "a3719989a166c56b4e4b77057a60231e1510ad37e7d588b383a24b6c6a6ea463"
+      "relocated_ast_sha256": "b1fac739c49cb372b15e7c4ee558b52b0ce88812901d32e8eb3a9590c24458c3"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
       "definition": "make_original_basis_gate",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "make_original_basis_gate",
       "source_ast_sha256": "135d3c3e7b188f78a06a355e35d827d2d8215805a7728d7abe9e5c7fd7a55ef0",
-      "relocated_ast_sha256": "135d3c3e7b188f78a06a355e35d827d2d8215805a7728d7abe9e5c7fd7a55ef0"
+      "relocated_ast_sha256": "7984a517d4f3ba0bf7fa5c4665c91fa453f67c144a0a2bf620d22a062c65593d"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
       "definition": "make_engram_ecotech",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "make_engram_ecotech",
       "source_ast_sha256": "bd3145e7a99da666caf1884542909fa4b65fb027431df00438a44954737bd871",
-      "relocated_ast_sha256": "bd3145e7a99da666caf1884542909fa4b65fb027431df00438a44954737bd871"
+      "relocated_ast_sha256": "93793e6367568741e2387d62f2f13f5b76e748afcc487dffa59b6f8cdaed3672"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
       "definition": "reference_int8_rows",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "reference_int8_rows",
       "source_ast_sha256": "f5b67115981cc1ab098e09d6cb5e7945f93a0a4ea19d927eb9f9d22495517caa",
       "relocated_ast_sha256": "f5b67115981cc1ab098e09d6cb5e7945f93a0a4ea19d927eb9f9d22495517caa"
@@ -2547,7 +2547,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
       "definition": "golden_int8_lookup",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "golden_int8_lookup",
       "source_ast_sha256": "652b0936496a4c607a0eab20cba6e2e0e67385a1018afadf43693c891789770e",
       "relocated_ast_sha256": "652b0936496a4c607a0eab20cba6e2e0e67385a1018afadf43693c891789770e"
@@ -2555,31 +2555,31 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
       "definition": "golden_original_basis_hidden",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "golden_original_basis_hidden",
       "source_ast_sha256": "4106b117a03c471db658c6df04581f77b80eb7b66a164f4c379fcfb638e989ea",
-      "relocated_ast_sha256": "4106b117a03c471db658c6df04581f77b80eb7b66a164f4c379fcfb638e989ea"
+      "relocated_ast_sha256": "32e5802ae8ab8aea2a00ddea9a1b76d84fb035471d7659de9ac52e65a1eaf4b8"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
       "definition": "golden_original_basis_gate",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "golden_original_basis_gate",
       "source_ast_sha256": "35afa6e7855c37c3bd860bf9562afce11cfa991bca1c36f7b23bff436a35f697",
-      "relocated_ast_sha256": "35afa6e7855c37c3bd860bf9562afce11cfa991bca1c36f7b23bff436a35f697"
+      "relocated_ast_sha256": "716d04fb56a6db3c9236d947b0210041bd0e75a8ad25ba9686e06df1f9480ced"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
       "definition": "golden_engram_ecotech",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "golden_engram_ecotech",
       "source_ast_sha256": "59491f6a90b6231398916c7887df66aa2087e2e7441d2893a2ad38bc3bf6a796",
-      "relocated_ast_sha256": "59491f6a90b6231398916c7887df66aa2087e2e7441d2893a2ad38bc3bf6a796"
+      "relocated_ast_sha256": "a92cf932f605a501f2c9c3b46459aefda4ab74e67656862767c3140bae8ce27d"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
       "definition": "golden_masked_gate_compare",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "golden_masked_gate_compare",
       "source_ast_sha256": "16613ea9bc9dc9b7668f6a9779e3094309d2a7052e5dbd08160916cb9909acf8",
       "relocated_ast_sha256": "16613ea9bc9dc9b7668f6a9779e3094309d2a7052e5dbd08160916cb9909acf8"
@@ -2587,15 +2587,15 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
       "definition": "engram_int8_golden_cases",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "engram_int8_golden_cases",
       "source_ast_sha256": "1827aa4b6fade6377abfdb1ac753216aecc0d7548890d2ccf4e9882f5c570197",
-      "relocated_ast_sha256": "1827aa4b6fade6377abfdb1ac753216aecc0d7548890d2ccf4e9882f5c570197"
+      "relocated_ast_sha256": "0076dff0d4090659c687be2278369d3de6fc1d45b28b3afe5efe9abb9c2d1c22"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
       "definition": "validate_engram_int8",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "validate_engram_int8",
       "source_ast_sha256": "e447e06f27669428b267de296d21c5679b4cbbc7d3a8654113862a0ec5b59a2f",
       "relocated_ast_sha256": "e447e06f27669428b267de296d21c5679b4cbbc7d3a8654113862a0ec5b59a2f"
@@ -2603,23 +2603,23 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech_observed.py",
       "definition": "make_engram_ecotech_observed",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech_observed.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "make_engram_ecotech_observed",
       "source_ast_sha256": "7409b1a54e44b17dcec1a791dc40f42d9519e4c108641bb76abc739764616fa4",
-      "relocated_ast_sha256": "7409b1a54e44b17dcec1a791dc40f42d9519e4c108641bb76abc739764616fa4"
+      "relocated_ast_sha256": "3c58f36bdbf41a8cd909c9f21f405a44c051d1ebc3eea62be27f9c84f87c0e28"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech_observed.py",
       "definition": "engram_observed_golden_cases",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech_observed.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "engram_observed_golden_cases",
       "source_ast_sha256": "111739b2d867141ab77b211f8352fbff38df36e93e96c7763308083de9f4765e",
-      "relocated_ast_sha256": "111739b2d867141ab77b211f8352fbff38df36e93e96c7763308083de9f4765e"
+      "relocated_ast_sha256": "1dcde52d3370c742ba1e7ea781cae3a2cd15726367008979c8a18410aa1c3787"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/engram_ecotech_observed.py",
       "definition": "validate_engram_observed",
-      "destination": "models/deepseek_v4_1_flash_a3/engram_ecotech_observed.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "validate_engram_observed",
       "source_ast_sha256": "cd31451d756fb29de8b50327151aefcc55d0a03eee72bda31cbc31a2bfde4e6e",
       "relocated_ast_sha256": "cd31451d756fb29de8b50327151aefcc55d0a03eee72bda31cbc31a2bfde4e6e"
@@ -2915,7 +2915,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/index_cache.py",
       "definition": "quantize_index_cache",
-      "destination": "models/deepseek_v4_1_flash_a3/index_cache.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "quantize_index_cache",
       "source_ast_sha256": "7071a709421cbbda3224a6a6e48a0c94c7b970be8f07f5689bf6271a06ed6ba0",
       "relocated_ast_sha256": "7071a709421cbbda3224a6a6e48a0c94c7b970be8f07f5689bf6271a06ed6ba0"
@@ -2923,7 +2923,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/index_cache.py",
       "definition": "dequantize_index_cache",
-      "destination": "models/deepseek_v4_1_flash_a3/index_cache.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "dequantize_index_cache",
       "source_ast_sha256": "31777d957748ea7cbe01b0d60e97f9716766d8d90a9ce91ea0b28b743424e14d",
       "relocated_ast_sha256": "31777d957748ea7cbe01b0d60e97f9716766d8d90a9ce91ea0b28b743424e14d"
@@ -2931,7 +2931,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/index_cache.py",
       "definition": "make_index_cache_quantize",
-      "destination": "models/deepseek_v4_1_flash_a3/index_cache.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "make_index_cache_quantize",
       "source_ast_sha256": "24134c7bc0cc7681122be3503a567fba9d3fa2acb63045abaf6ec0dc2f73a3ad",
       "relocated_ast_sha256": "24134c7bc0cc7681122be3503a567fba9d3fa2acb63045abaf6ec0dc2f73a3ad"
@@ -2939,7 +2939,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/index_cache.py",
       "definition": "make_index_quantize",
-      "destination": "models/deepseek_v4_1_flash_a3/index_cache.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "make_index_quantize",
       "source_ast_sha256": "b8a103b2148e168830b69d29efb13d22ae4d480f0012d57e60cb2ed3788f56b7",
       "relocated_ast_sha256": "b8a103b2148e168830b69d29efb13d22ae4d480f0012d57e60cb2ed3788f56b7"
@@ -2947,7 +2947,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/indexer_prepare.py",
       "definition": "prepare_indexer_indices_reference",
-      "destination": "models/deepseek_v4_1_flash_a3/indexer_prepare.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "prepare_indexer_indices_reference",
       "source_ast_sha256": "3ad358c8977b4f38870d75d88f3f9287a7b9b2287721697f60f49bd13c69b7d4",
       "relocated_ast_sha256": "3ad358c8977b4f38870d75d88f3f9287a7b9b2287721697f60f49bd13c69b7d4"
@@ -2955,7 +2955,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/indexer_prepare.py",
       "definition": "make_indexer_prepare",
-      "destination": "models/deepseek_v4_1_flash_a3/indexer_prepare.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "make_indexer_prepare",
       "source_ast_sha256": "2ac1e80aae675db3a8a47b2d0b19d3f2c2ac1b8dea21880d09ef7815df62d0cc",
       "relocated_ast_sha256": "2ac1e80aae675db3a8a47b2d0b19d3f2c2ac1b8dea21880d09ef7815df62d0cc"
@@ -2963,7 +2963,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/indexer_query.py",
       "definition": "quantize_indexer_query_reference",
-      "destination": "models/deepseek_v4_1_flash_a3/indexer_query.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "quantize_indexer_query_reference",
       "source_ast_sha256": "f62ba670a8b6623af013b302b8f02727b4ce1e87e325050468614e81d282624e",
       "relocated_ast_sha256": "f62ba670a8b6623af013b302b8f02727b4ce1e87e325050468614e81d282624e"
@@ -2971,7 +2971,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/indexer_query.py",
       "definition": "_make_indexer_query_quantize_inline",
-      "destination": "models/deepseek_v4_1_flash_a3/indexer_query.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "_make_indexer_query_quantize_inline",
       "source_ast_sha256": "d4b33f9ff9edee977c7e0a77a2aed3153e020a0d145d8eb636712d1c9d5670bb",
       "relocated_ast_sha256": "d4b33f9ff9edee977c7e0a77a2aed3153e020a0d145d8eb636712d1c9d5670bb"
@@ -2979,7 +2979,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/indexer_query.py",
       "definition": "make_indexer_query_quantize",
-      "destination": "models/deepseek_v4_1_flash_a3/indexer_query.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "make_indexer_query_quantize",
       "source_ast_sha256": "b5766e3822670f3060f367efa1249320d3ffa6a835a35e4deb44737b9d2e1427",
       "relocated_ast_sha256": "b5766e3822670f3060f367efa1249320d3ffa6a835a35e4deb44737b9d2e1427"
@@ -2987,7 +2987,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/indexer_query.py",
       "definition": "make_l3_indexer_query",
-      "destination": "models/deepseek_v4_1_flash_a3/indexer_query.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "make_l3_indexer_query",
       "source_ast_sha256": "387d1f6526ee95646542295ee4032df5c0744377fbe764cf6a0732e1e516687d",
       "relocated_ast_sha256": "387d1f6526ee95646542295ee4032df5c0744377fbe764cf6a0732e1e516687d"
@@ -2995,7 +2995,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/indexer_query.py",
       "definition": "indexer_query_reference",
-      "destination": "models/deepseek_v4_1_flash_a3/indexer_query.py",
+      "destination": "models/deepseek_v4_1_flash_a3/indexer.py",
       "destination_definition": "indexer_query_reference",
       "source_ast_sha256": "d09c77460cc7b70a2dd405db25030d9c3f0ee9450d120b79b66653aa30e50083",
       "relocated_ast_sha256": "d09c77460cc7b70a2dd405db25030d9c3f0ee9450d120b79b66653aa30e50083"
@@ -3595,7 +3595,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_c2_pool.py",
       "definition": "pool_prefill",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2_pool.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "pool_prefill",
       "source_ast_sha256": "39877f92938b6d95313942a12e21a96f83b857a5499c9c8933482b69d257c1b7",
       "relocated_ast_sha256": "39877f92938b6d95313942a12e21a96f83b857a5499c9c8933482b69d257c1b7"
@@ -3603,7 +3603,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_c2_pool.py",
       "definition": "compressor_ratio2_prefill",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2_pool.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "compressor_ratio2_prefill",
       "source_ast_sha256": "74efc5ffb3055e8bada21c29196444073f1eab1b4f05fca7f07ff138bcee5959",
       "relocated_ast_sha256": "74efc5ffb3055e8bada21c29196444073f1eab1b4f05fca7f07ff138bcee5959"
@@ -3611,7 +3611,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_c2_pool.py",
       "definition": "make_c2_pool_observed",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2_pool.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "make_c2_pool_observed",
       "source_ast_sha256": "b9ade14fdbb7f293015d3cd41d7e4963b94db9221191b8b5024cde664ef12e4d",
       "relocated_ast_sha256": "b9ade14fdbb7f293015d3cd41d7e4963b94db9221191b8b5024cde664ef12e4d"
@@ -3651,7 +3651,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_cache_publish.py",
       "definition": "make_compressed_cache_publish",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_cache_publish.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "make_compressed_cache_publish",
       "source_ast_sha256": "9e6ffc1e313de95170e2a1fc46974fde958cc1c0d0e9ada9a5035062f9d7d070",
       "relocated_ast_sha256": "9e6ffc1e313de95170e2a1fc46974fde958cc1c0d0e9ada9a5035062f9d7d070"
@@ -3659,7 +3659,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_cache_publish.py",
       "definition": "make_indexer_cache_publish",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_cache_publish.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "make_indexer_cache_publish",
       "source_ast_sha256": "bb32265d7c9c82143e1293212d6c345a27115df85d9091667766d1d6a0f7eeb6",
       "relocated_ast_sha256": "bb32265d7c9c82143e1293212d6c345a27115df85d9091667766d1d6a0f7eeb6"
@@ -3667,7 +3667,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_cache_publish.py",
       "definition": "make_index_cache_publish_observed",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_cache_publish.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "make_index_cache_publish_observed",
       "source_ast_sha256": "7090754173c3eaad24ee96fd47173d714b8d056b6e34af2a704a136b7fbbd076",
       "relocated_ast_sha256": "7090754173c3eaad24ee96fd47173d714b8d056b6e34af2a704a136b7fbbd076"
@@ -3694,7 +3694,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/prefill_compressed_runtime.py",
       "destination_definition": "run_compressed_attention",
       "source_ast_sha256": "51663180986eb0ee202eb66b249b964e1802afcf2059b5da459facf46d2857ae",
-      "relocated_ast_sha256": "51663180986eb0ee202eb66b249b964e1802afcf2059b5da459facf46d2857ae"
+      "relocated_ast_sha256": "1ce4e6fe996ffb1726bb7b2cf85f67f6586bb13c813e9c639771d60816e2349a"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_consumer.py",
@@ -3859,39 +3859,39 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
       "definition": "make_prefill_engram_hash",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "make_prefill_engram_hash",
       "source_ast_sha256": "a9126adf217af9778672dcf21e37a063d3dacce1e23430aac5469fd83ea557af",
-      "relocated_ast_sha256": "a9126adf217af9778672dcf21e37a063d3dacce1e23430aac5469fd83ea557af"
+      "relocated_ast_sha256": "cd28259d856fe8fc3d29c59162bb35e3e19b799c1c015298516fb82a43888aa8"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
       "definition": "make_prefill_engram_layout",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "make_prefill_engram_layout",
       "source_ast_sha256": "790bc9c4d0198060707d66bc0bb2c54e680c051395bddc024bcec3b987885a26",
-      "relocated_ast_sha256": "790bc9c4d0198060707d66bc0bb2c54e680c051395bddc024bcec3b987885a26"
+      "relocated_ast_sha256": "886e06b2df605cc56575e3b05839096afcff527102c315b5e99347450f6b9b4e"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
       "definition": "make_prefill_engram_gate",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "make_prefill_engram_gate",
       "source_ast_sha256": "6323ae94248951e544e411c2d7986054057b199461ef9340e978f5bb4cf2ca53",
-      "relocated_ast_sha256": "6323ae94248951e544e411c2d7986054057b199461ef9340e978f5bb4cf2ca53"
+      "relocated_ast_sha256": "32b977f47480a2c27e0a20ffcdbf284b68d9b5d01a94853cf5b95edbe777dedf"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
       "definition": "make_prefill_engram_entries",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "make_prefill_engram_entries",
       "source_ast_sha256": "19d3f4798bd3300ba8cd80b45624b867108d82e76a45c85bf366625f7e63d611",
-      "relocated_ast_sha256": "19d3f4798bd3300ba8cd80b45624b867108d82e76a45c85bf366625f7e63d611"
+      "relocated_ast_sha256": "d6f4e5573592efdd6b0b4e5483e63c6bf59f9df0a45c8ad8f2af4b1ab4f08e69"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
       "definition": "golden_prefill_engram_hash",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "golden_prefill_engram_hash",
       "source_ast_sha256": "987ea5c0625c89c01fa689c5903342182ce9b1afd014a15ac4f66cecc7dee94a",
       "relocated_ast_sha256": "987ea5c0625c89c01fa689c5903342182ce9b1afd014a15ac4f66cecc7dee94a"
@@ -3899,47 +3899,47 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
       "definition": "golden_prefill_engram_layout",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "golden_prefill_engram_layout",
       "source_ast_sha256": "641ec097fe78cab92f564f04f34b823c0c51c8862094d64c655552e5222d11cd",
-      "relocated_ast_sha256": "641ec097fe78cab92f564f04f34b823c0c51c8862094d64c655552e5222d11cd"
+      "relocated_ast_sha256": "4ed3f4f1aff7fa274136e8dd14773d1c2a5d1c7bb30ea2b39101d29e77b67bdb"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
       "definition": "golden_prefill_engram_gate",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "golden_prefill_engram_gate",
       "source_ast_sha256": "940b57209f503d3a61581efb5c414f722d3b05f798f0a8403d51d926f26d8d59",
-      "relocated_ast_sha256": "940b57209f503d3a61581efb5c414f722d3b05f798f0a8403d51d926f26d8d59"
+      "relocated_ast_sha256": "aca0c8694b465c29a72070934204119db7840a37aefa76bb8adab1e0890b27c8"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
       "definition": "prefill_engram_hash_golden_cases",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "prefill_engram_hash_golden_cases",
       "source_ast_sha256": "771a77d90f85fb55df91399f6a2dc2c874e216e71c276ce849664ca46d677707",
-      "relocated_ast_sha256": "771a77d90f85fb55df91399f6a2dc2c874e216e71c276ce849664ca46d677707"
+      "relocated_ast_sha256": "773907b0337db2d82df6c8f5a8f5e8d564ce27fe25dc29ced0893b8739f96fc6"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
       "definition": "prefill_engram_layout_golden_cases",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "prefill_engram_layout_golden_cases",
       "source_ast_sha256": "da72ec0108021c45a95c67319579c009d568c81cffd2896f90006a4ec47fe239",
-      "relocated_ast_sha256": "da72ec0108021c45a95c67319579c009d568c81cffd2896f90006a4ec47fe239"
+      "relocated_ast_sha256": "7592f659d342f1781d2446d14890f9320491a101f8751bc9367fded3b92a37b8"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
       "definition": "prefill_engram_gate_golden_cases",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "prefill_engram_gate_golden_cases",
       "source_ast_sha256": "6ae93906dc1fb6b04e0a43fb627e299a02a342d7ac2569c8e18099eabcea8cca",
-      "relocated_ast_sha256": "6ae93906dc1fb6b04e0a43fb627e299a02a342d7ac2569c8e18099eabcea8cca"
+      "relocated_ast_sha256": "9bc84b4970d5d2f2dd9746adc4e743b2adb0f43bc1397d2502488cda8017af07"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
       "definition": "validate_prefill_engram",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_engram.py",
+      "destination": "models/deepseek_v4_1_flash_a3/engram.py",
       "destination_definition": "validate_prefill_engram",
       "source_ast_sha256": "b2e7fc7efe094c6490b486de25dbfe0bd6b61bc9a07492174455361445aab5ae",
       "relocated_ast_sha256": "b2e7fc7efe094c6490b486de25dbfe0bd6b61bc9a07492174455361445aab5ae"
@@ -3982,12 +3982,12 @@
       "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a.py",
       "destination_definition": "make_physical_compressed_entries",
       "source_ast_sha256": "6096889829f1b97672374cfd3b55c4f5a0dcef71fddd2369532d8014b615a574",
-      "relocated_ast_sha256": "d4753d83ccdcd3fac9b911a2f1ba1ae88560c8c0467eb71059c22ebb6b53a229"
+      "relocated_ast_sha256": "bbd7e173060c80de5ac7024d322a00f6ea2f89042cef8dae1330d3d18309ffa2"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_full2_observed.py",
       "definition": "make_wk_input_observed_inline",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a_observed.py",
+      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a.py",
       "destination_definition": "make_wk_input_observed_inline",
       "source_ast_sha256": "34e94092a9c0e47820e455265f3a108c701bf8ab6ff03ee4570e3ca323a8746d",
       "relocated_ast_sha256": "34e94092a9c0e47820e455265f3a108c701bf8ab6ff03ee4570e3ca323a8746d"
@@ -3995,7 +3995,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_full2_observed.py",
       "definition": "make_indexer_cache_publish_128_observed",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a_observed.py",
+      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a.py",
       "destination_definition": "make_indexer_cache_publish_128_observed",
       "source_ast_sha256": "72a7fed06a7a2416a43bc02a6df33ad30609f1c2d35e8a19fc1575a33493690a",
       "relocated_ast_sha256": "72a7fed06a7a2416a43bc02a6df33ad30609f1c2d35e8a19fc1575a33493690a"
@@ -4003,7 +4003,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_full2_observed.py",
       "definition": "make_c2_index_publish_projected_observed_inline",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a_observed.py",
+      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a.py",
       "destination_definition": "make_c2_index_publish_projected_observed_inline",
       "source_ast_sha256": "2a980c37f0a2b2f95b38f256f986f04622a6fb2374b57bad5e55c5ef1a9807a1",
       "relocated_ast_sha256": "2a980c37f0a2b2f95b38f256f986f04622a6fb2374b57bad5e55c5ef1a9807a1"
@@ -4011,7 +4011,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_full2_observed.py",
       "definition": "make_indexer_projection_observed",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a_observed.py",
+      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a.py",
       "destination_definition": "make_indexer_projection_observed",
       "source_ast_sha256": "4716a365d147e7cb580995e459ca9ee8247fa11f9040eef3b38ca59d5a41e918",
       "relocated_ast_sha256": "4716a365d147e7cb580995e459ca9ee8247fa11f9040eef3b38ca59d5a41e918"
@@ -4019,7 +4019,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_full2_observed.py",
       "definition": "make_indexer_query_quantize_observed",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a_observed.py",
+      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a.py",
       "destination_definition": "make_indexer_query_quantize_observed",
       "source_ast_sha256": "ceb898601521ea5af8a302bed1b5d839aee48926ce5f2a92fb9467f4a83c455d",
       "relocated_ast_sha256": "ceb898601521ea5af8a302bed1b5d839aee48926ce5f2a92fb9467f4a83c455d"
@@ -4027,7 +4027,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_full2_observed.py",
       "definition": "make_c2_program",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a_observed.py",
+      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a.py",
       "destination_definition": "make_c2_program",
       "source_ast_sha256": "a804c10b57729c50e0bfa97f3a3be4dfc1be4dbe44e5d0677e25dbec5795840d",
       "relocated_ast_sha256": "a804c10b57729c50e0bfa97f3a3be4dfc1be4dbe44e5d0677e25dbec5795840d"
@@ -4035,7 +4035,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_full2_readback.py",
       "definition": "make_readback_entries",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a_readback.py",
+      "destination": "models/deepseek_v4_1_flash_a3/prefill_c2a.py",
       "destination_definition": "make_readback_entries",
       "source_ast_sha256": "72a9405ac458cafe71dd3326a78d41ff7ddbc8a6df2641d68a5604168166862b",
       "relocated_ast_sha256": "72a9405ac458cafe71dd3326a78d41ff7ddbc8a6df2641d68a5604168166862b"
@@ -4326,7 +4326,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/prefill_layer.py",
       "destination_definition": "make_prefill_layer_entries",
       "source_ast_sha256": "264224957d6cffbd242b855a21b553c57aa6eaa32b2d4213660dc5c69cbf5d50",
-      "relocated_ast_sha256": "f36da53f57767bf8135e2d53c1116ce16c19de64c0bb2384778a2f6038bb8233"
+      "relocated_ast_sha256": "11412d5fc5891e669e7147e9842951429621eb3311b973b2cf7ff49422f5a38f"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_layer.py",
@@ -4358,7 +4358,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/prefill_layer.py",
       "destination_definition": "compile_prefill_layer",
       "source_ast_sha256": "8d14edefac101fc4438445bf68c1b8557646e6757357f172e511e88e516322b0",
-      "relocated_ast_sha256": "8d14edefac101fc4438445bf68c1b8557646e6757357f172e511e88e516322b0"
+      "relocated_ast_sha256": "38760d1bfe0b7eb6a6f577b0b46dd5cb330008bc4db0fbf3cfeaca418dc173db"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_layer.py",
@@ -4371,7 +4371,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_layer2_c1c2.py",
       "definition": "make_fp32_projection",
-      "destination": "models/deepseek_v4_1_flash_a3/compressor_projection.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "make_fp32_projection",
       "source_ast_sha256": "9512bd9dc422aebcfc2ba4708b145633d186bd4803d9ef6432ad9e199bb10f9e",
       "relocated_ast_sha256": "9512bd9dc422aebcfc2ba4708b145633d186bd4803d9ef6432ad9e199bb10f9e"
@@ -4379,7 +4379,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_layer2_c1c2.py",
       "definition": "make_indexer_cache_publish_128",
-      "destination": "models/deepseek_v4_1_flash_a3/compressor_projection.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "make_indexer_cache_publish_128",
       "source_ast_sha256": "d049ea1a699cc86e0a6de337905a24e3d2bb751466d5f5ef56513b365b5dced4",
       "relocated_ast_sha256": "d049ea1a699cc86e0a6de337905a24e3d2bb751466d5f5ef56513b365b5dced4"
@@ -4387,34 +4387,34 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_layer2_c1c2.py",
       "definition": "make_c2_index_publish_projected_inline",
-      "destination": "models/deepseek_v4_1_flash_a3/compressor_projection.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "make_c2_index_publish_projected_inline",
       "source_ast_sha256": "6884faa3ede6ca093fe3fe8d8c090c4ba88c2ef6ea2217d52bec79fb55f31b8f",
-      "relocated_ast_sha256": "6884faa3ede6ca093fe3fe8d8c090c4ba88c2ef6ea2217d52bec79fb55f31b8f"
+      "relocated_ast_sha256": "938a2510d9115b75b6e80b8f480317d7978f5967d1562d436dbf114168024ef5"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_layer2_c1c2.py",
       "definition": "make_c2_index_publish_inline",
-      "destination": "models/deepseek_v4_1_flash_a3/compressor_projection.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "make_c2_index_publish_inline",
       "source_ast_sha256": "8fccc2661a4af846effd5550bbd7c9fdc22f2bd8a5d45933041a0fa8c775acb2",
-      "relocated_ast_sha256": "8fccc2661a4af846effd5550bbd7c9fdc22f2bd8a5d45933041a0fa8c775acb2"
+      "relocated_ast_sha256": "c9ce9db416131d5f3eb77997d30eff6182b1b11173255957d4e648debe7cb937"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_layer2_c1c2.py",
       "definition": "make_layer2_c1c2",
-      "destination": "models/deepseek_v4_1_flash_a3/compressor_projection.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "make_layer2_c1c2",
       "source_ast_sha256": "d049deeffc6393607c9e9f98607bd202c1c64fc14d73597381d91d37c5374765",
-      "relocated_ast_sha256": "d049deeffc6393607c9e9f98607bd202c1c64fc14d73597381d91d37c5374765"
+      "relocated_ast_sha256": "7eba492f103636af78b23686916460af472e25f59808a1a82557cf08be76480b"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_layer2_c1c2.py",
       "definition": "make_c2_projection",
-      "destination": "models/deepseek_v4_1_flash_a3/compressor_projection.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "make_c2_projection",
       "source_ast_sha256": "af015cbd87a75e4370a0dea336627e931e9739a523d7b1fe949db54f07483427",
-      "relocated_ast_sha256": "af015cbd87a75e4370a0dea336627e931e9739a523d7b1fe949db54f07483427"
+      "relocated_ast_sha256": "6c11d5c70b29f6f17646b1896f86632731e370f77007e064fa8829c416f4d7a0"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_layer_state.py",
@@ -4867,18 +4867,18 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_norm.py",
       "definition": "make_prefill_norm",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_norm.py",
+      "destination": "models/deepseek_v4_1_flash_a3/rmsnorm.py",
       "destination_definition": "make_prefill_norm",
       "source_ast_sha256": "5c1474931eb6251a8d79f81be81c9a58beaa89f4cdf41d88d35ebe2e12699495",
-      "relocated_ast_sha256": "5c1474931eb6251a8d79f81be81c9a58beaa89f4cdf41d88d35ebe2e12699495"
+      "relocated_ast_sha256": "388914026e05a008f10747f19e612f798f8286137abbe67cde55de32629b9823"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_norm.py",
       "definition": "make_prefill_norm_cast",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_norm.py",
+      "destination": "models/deepseek_v4_1_flash_a3/rmsnorm.py",
       "destination_definition": "make_prefill_norm_cast",
       "source_ast_sha256": "f0f9a5630be5dda24251fe1b392fbe6b502cf11832ba076388081d27b49c9f41",
-      "relocated_ast_sha256": "f0f9a5630be5dda24251fe1b392fbe6b502cf11832ba076388081d27b49c9f41"
+      "relocated_ast_sha256": "bbf9d08acf9f23990ac2a707f8255600252b7e05d7179ce26ac0bc2d0f340596"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_output.py",
@@ -4995,7 +4995,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/prefill_ratio1.py",
       "definition": "make_ratio1_compress_publish",
-      "destination": "models/deepseek_v4_1_flash_a3/prefill_c1a.py",
+      "destination": "models/deepseek_v4_1_flash_a3/compressor.py",
       "destination_definition": "make_ratio1_compress_publish",
       "source_ast_sha256": "a4451df8c8e3930b6b5c2b269c50aeaf10843c41fb1d22cd019a7c01cc102715",
       "relocated_ast_sha256": "a4451df8c8e3930b6b5c2b269c50aeaf10843c41fb1d22cd019a7c01cc102715"
@@ -5299,7 +5299,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/raw_checkpoint.py",
       "definition": "_shape",
-      "destination": "models/deepseek_v4_1_flash_a3/raw_checkpoint.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "_shape",
       "source_ast_sha256": "3a0e058714afc0daf86c7ce87b6045e35486db0f9c203cb49e82364077a16a73",
       "relocated_ast_sha256": "3a0e058714afc0daf86c7ce87b6045e35486db0f9c203cb49e82364077a16a73"
@@ -5307,7 +5307,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/raw_checkpoint.py",
       "definition": "RawCheckpoint",
-      "destination": "models/deepseek_v4_1_flash_a3/raw_checkpoint.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "RawCheckpoint",
       "source_ast_sha256": "5de22e0bb8679334296d0c279037d3abd51bd3e8a13debe3aaafa7fdb05cc1df",
       "relocated_ast_sha256": "5de22e0bb8679334296d0c279037d3abd51bd3e8a13debe3aaafa7fdb05cc1df"
@@ -5315,7 +5315,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/raw_checkpoint.py",
       "definition": "flatten_scale",
-      "destination": "models/deepseek_v4_1_flash_a3/raw_checkpoint.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "flatten_scale",
       "source_ast_sha256": "f20af1a43317efe181691abe35518ffc0e2948c383fef624f2180e840b7113d9",
       "relocated_ast_sha256": "f20af1a43317efe181691abe35518ffc0e2948c383fef624f2180e840b7113d9"
@@ -5323,7 +5323,7 @@
     {
       "source": "models/deepseek_v4_1_flash_a3/raw_checkpoint.py",
       "definition": "load_attention_weights",
-      "destination": "models/deepseek_v4_1_flash_a3/raw_checkpoint.py",
+      "destination": "models/deepseek_v4_1_flash_a3/weights.py",
       "destination_definition": "load_attention_weights",
       "source_ast_sha256": "3324f5e7c7b6c25842a8f4da2864d23f5dad6953aadd3181e5f00cb859e87445",
       "relocated_ast_sha256": "3324f5e7c7b6c25842a8f4da2864d23f5dad6953aadd3181e5f00cb859e87445"
@@ -5870,7 +5870,7 @@
       "destination": "models/deepseek_v4_1_flash_a3/validate_engram_host.py",
       "destination_definition": "validate_device",
       "source_ast_sha256": "413f0f92af9c3342868f17e271486b9f5ad79c0904393db3f602a1ce428cb362",
-      "relocated_ast_sha256": "413f0f92af9c3342868f17e271486b9f5ad79c0904393db3f602a1ce428cb362"
+      "relocated_ast_sha256": "e5766e2a6fd044f362b4ba009801f158e185783bbd2abf8651a9f66355ddd8bf"
     },
     {
       "source": "models/deepseek_v4_1_flash_a3/validate_resident.py",
@@ -6012,20 +6012,20 @@
   "removed_forwarding_modules": {
     "a2/decode_indexer": {
       "make_candidate_block_pool": [
-        "decode_candidate_pool",
-        "make_candidate_block_pool"
+        "indexer",
+        "make_decode_candidate_block_pool"
       ],
       "dequantize_index_cache": [
-        "decode_index_cache",
+        "indexer",
         "dequantize_index_cache"
       ],
       "make_index_cache_quantize": [
-        "decode_index_cache",
-        "make_index_cache_quantize"
+        "indexer",
+        "make_decode_index_cache_quantize"
       ],
       "quantize_index_cache": [
-        "decode_index_cache",
-        "quantize_index_cache"
+        "indexer",
+        "decode_quantize_index_cache"
       ],
       "INDEX_HEADS": [
         "decode_indexer_projection",
@@ -6068,35 +6068,35 @@
         "make_sparse_controls"
       ],
       "make_indexer_prepare": [
-        "indexer_prepare",
+        "indexer",
         "make_indexer_prepare"
       ],
       "prepare_indexer_indices_reference": [
-        "indexer_prepare",
+        "indexer",
         "prepare_indexer_indices_reference"
       ],
       "indexer_query_reference": [
-        "decode_indexer_query",
-        "indexer_query_reference"
+        "indexer",
+        "decode_indexer_query_reference"
       ],
       "make_l3_indexer_query": [
-        "decode_indexer_query",
-        "make_l3_indexer_query"
+        "indexer",
+        "make_decode_l3_indexer_query"
       ],
       "quantize_indexer_query_reference": [
-        "decode_indexer_query",
-        "quantize_indexer_query_reference"
+        "indexer",
+        "decode_quantize_indexer_query_reference"
       ],
       "indexer_select_reference": [
-        "decode_indexer_select",
+        "indexer",
         "indexer_select_reference"
       ],
       "make_indexer_select": [
-        "decode_indexer_select",
+        "indexer",
         "make_indexer_select"
       ],
       "make_indexer_select_restricted": [
-        "decode_indexer_select",
+        "indexer",
         "make_indexer_select_restricted"
       ]
     }
@@ -6110,5 +6110,1385 @@
       "audit_source provenance and global-binding checks"
     ],
     "comparison": "AST equality after scope-aware binding relocation; imports and provenance paths normalized"
+  },
+  "operator_consolidation": {
+    "base_commit": "c8297f4d1f747c82a93528f5e35a81e4327789c1",
+    "reference_structure_commit": "e1c3522fa2670e13efaab80def5c04e7cfab024a",
+    "kind": "Scope-aware binding relocation and dependency-equivalent definition reuse; arithmetic unchanged",
+    "python_modules_before": 151,
+    "python_modules_after": 123,
+    "module_map": {
+      "candidate_pool": "indexer",
+      "compressor_core": "compressor",
+      "compressor_projection": "compressor",
+      "decode_c1c2": "compressor",
+      "decode_candidate_pool": "indexer",
+      "decode_compressor_c1": "compressor",
+      "decode_compressor_c2": "compressor",
+      "decode_hc": "hc",
+      "decode_indexer_query": "indexer",
+      "decode_indexer_select": "indexer",
+      "decode_index_cache": "indexer",
+      "decode_primitives": "linear_primitives",
+      "decode_quant": "quant",
+      "decode_rmsnorm": "rmsnorm",
+      "decode_weights": "weights",
+      "decode_weight_abi": "weights",
+      "engram_ecotech": "engram",
+      "engram_ecotech_observed": "engram",
+      "indexer_prepare": "indexer",
+      "indexer_query": "indexer",
+      "index_cache": "indexer",
+      "prefill_c1a": "compressor",
+      "prefill_c2a_observed": "prefill_c2a",
+      "prefill_c2a_readback": "prefill_c2a",
+      "prefill_c2_pool": "compressor",
+      "prefill_cache_publish": "compressor",
+      "prefill_engram": "engram",
+      "prefill_norm": "rmsnorm",
+      "raw_checkpoint": "weights"
+    },
+    "shared_definitions": [
+      {
+        "source": "decode_quant.py",
+        "definition": "_round_symmetric_int8",
+        "destination": "quant.py",
+        "destination_definition": "_round_symmetric_int8"
+      },
+      {
+        "source": "decode_quant.py",
+        "definition": "dequantize_int32",
+        "destination": "quant.py",
+        "destination_definition": "dequantize_int32"
+      },
+      {
+        "source": "decode_quant.py",
+        "definition": "int8_matmul",
+        "destination": "quant.py",
+        "destination_definition": "int8_matmul"
+      },
+      {
+        "source": "decode_quant.py",
+        "definition": "quantize_per_channel_int8",
+        "destination": "quant.py",
+        "destination_definition": "quantize_per_channel_int8"
+      },
+      {
+        "source": "decode_quant.py",
+        "definition": "quantize_per_token_int8",
+        "destination": "quant.py",
+        "destination_definition": "quantize_per_token_int8"
+      },
+      {
+        "source": "decode_quant.py",
+        "definition": "w8a8_linear",
+        "destination": "quant.py",
+        "destination_definition": "w8a8_linear"
+      },
+      {
+        "source": "decode_primitives.py",
+        "definition": "make_dot",
+        "destination": "linear_primitives.py",
+        "destination_definition": "make_dot"
+      },
+      {
+        "source": "decode_primitives.py",
+        "definition": "make_pack_weight",
+        "destination": "linear_primitives.py",
+        "destination_definition": "make_pack_weight"
+      },
+      {
+        "source": "decode_c1c2.py",
+        "definition": "make_compressed_cache_publish",
+        "destination": "prefill_cache_publish.py",
+        "destination_definition": "make_compressed_cache_publish"
+      },
+      {
+        "source": "decode_compressor_c2.py",
+        "definition": "make_fp32_projection",
+        "destination": "compressor_projection.py",
+        "destination_definition": "make_fp32_projection"
+      },
+      {
+        "source": "decode_compressor_c2.py",
+        "definition": "make_indexer_cache_publish_128",
+        "destination": "compressor_projection.py",
+        "destination_definition": "make_indexer_cache_publish_128"
+      },
+      {
+        "source": "decode_index_cache.py",
+        "definition": "dequantize_index_cache",
+        "destination": "index_cache.py",
+        "destination_definition": "dequantize_index_cache"
+      },
+      {
+        "source": "decode_rmsnorm.py",
+        "definition": "golden_rms_norm",
+        "destination": "rmsnorm.py",
+        "destination_definition": "golden_rms_norm"
+      },
+      {
+        "source": "decode_gemm.py",
+        "definition": "make_fp32_dequantize",
+        "destination": "gemm.py",
+        "destination_definition": "make_fp32_dequantize"
+      },
+      {
+        "source": "decode_gemm.py",
+        "definition": "make_int8_gemm",
+        "destination": "gemm.py",
+        "destination_definition": "make_int8_gemm"
+      },
+      {
+        "source": "decode_gemm.py",
+        "definition": "make_pack_weight",
+        "destination": "gemm.py",
+        "destination_definition": "make_pack_weight"
+      }
+    ],
+    "definitions": [
+      {
+        "source": "candidate_pool.py",
+        "definition": "make_candidate_block_pool",
+        "destination": "indexer.py",
+        "destination_definition": "make_candidate_block_pool",
+        "source_ast_sha256": "7b1daab5e4bb7978ad414cad94d3d5e9e50a4e276c80f231be3fb8bdc9f05249",
+        "relocated_ast_sha256": "7b1daab5e4bb7978ad414cad94d3d5e9e50a4e276c80f231be3fb8bdc9f05249",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "candidate_pool.py",
+        "definition": "make_candidate_pool_publish",
+        "destination": "indexer.py",
+        "destination_definition": "make_candidate_pool_publish",
+        "source_ast_sha256": "7b18e76c55554eae63d4b24a3823efedc9dc16c4c839955997c59d5b1694f30c",
+        "relocated_ast_sha256": "7b18e76c55554eae63d4b24a3823efedc9dc16c4c839955997c59d5b1694f30c",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "candidate_pool.py",
+        "definition": "golden_candidate_block_pool",
+        "destination": "indexer.py",
+        "destination_definition": "golden_candidate_block_pool",
+        "source_ast_sha256": "64cd5ca11264af3567d2317b03578c461a48e67b4ed59493771e5c5874b959cc",
+        "relocated_ast_sha256": "64cd5ca11264af3567d2317b03578c461a48e67b4ed59493771e5c5874b959cc",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "candidate_pool.py",
+        "definition": "golden_candidate_pool_publish",
+        "destination": "indexer.py",
+        "destination_definition": "golden_candidate_pool_publish",
+        "source_ast_sha256": "2eaea4b138623d133fd1d37cd56c24895a2b49cce356cf857adba98f2134a389",
+        "relocated_ast_sha256": "2eaea4b138623d133fd1d37cd56c24895a2b49cce356cf857adba98f2134a389",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "candidate_pool.py",
+        "definition": "validate",
+        "destination": "indexer.py",
+        "destination_definition": "validate",
+        "source_ast_sha256": "ffe30c03ce4411a6d545792c84c608a178851f68cb6e9355a7810b52ac6bd308",
+        "relocated_ast_sha256": "ffe30c03ce4411a6d545792c84c608a178851f68cb6e9355a7810b52ac6bd308",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "compressor_core.py",
+        "definition": "compressor_pool",
+        "destination": "compressor.py",
+        "destination_definition": "compressor_pool",
+        "source_ast_sha256": "098f166947b9cd1bbb93541ebf4249c0a7e8b2d9427c862c50d386e21cc80c79",
+        "relocated_ast_sha256": "098f166947b9cd1bbb93541ebf4249c0a7e8b2d9427c862c50d386e21cc80c79",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "compressor_core.py",
+        "definition": "compressor_state_write",
+        "destination": "compressor.py",
+        "destination_definition": "compressor_state_write",
+        "source_ast_sha256": "da4bfcf634f89390c8997aedd65edd2923a876a58fd683be81774cc3ae07546c",
+        "relocated_ast_sha256": "da4bfcf634f89390c8997aedd65edd2923a876a58fd683be81774cc3ae07546c",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "compressor_core.py",
+        "definition": "compressor_ratio2",
+        "destination": "compressor.py",
+        "destination_definition": "compressor_ratio2",
+        "source_ast_sha256": "8cc25aa1ef685de8988b24fda6c8bff083967653adee25572779a23b3147b839",
+        "relocated_ast_sha256": "8cc25aa1ef685de8988b24fda6c8bff083967653adee25572779a23b3147b839",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "compressor_projection.py",
+        "definition": "make_fp32_projection",
+        "destination": "compressor.py",
+        "destination_definition": "make_fp32_projection",
+        "source_ast_sha256": "9512bd9dc422aebcfc2ba4708b145633d186bd4803d9ef6432ad9e199bb10f9e",
+        "relocated_ast_sha256": "9512bd9dc422aebcfc2ba4708b145633d186bd4803d9ef6432ad9e199bb10f9e",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "compressor_projection.py",
+        "definition": "make_indexer_cache_publish_128",
+        "destination": "compressor.py",
+        "destination_definition": "make_indexer_cache_publish_128",
+        "source_ast_sha256": "d049ea1a699cc86e0a6de337905a24e3d2bb751466d5f5ef56513b365b5dced4",
+        "relocated_ast_sha256": "d049ea1a699cc86e0a6de337905a24e3d2bb751466d5f5ef56513b365b5dced4",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "compressor_projection.py",
+        "definition": "make_c2_index_publish_projected_inline",
+        "destination": "compressor.py",
+        "destination_definition": "make_c2_index_publish_projected_inline",
+        "source_ast_sha256": "6884faa3ede6ca093fe3fe8d8c090c4ba88c2ef6ea2217d52bec79fb55f31b8f",
+        "relocated_ast_sha256": "938a2510d9115b75b6e80b8f480317d7978f5967d1562d436dbf114168024ef5",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "compressor_projection.py",
+        "definition": "make_c2_index_publish_inline",
+        "destination": "compressor.py",
+        "destination_definition": "make_c2_index_publish_inline",
+        "source_ast_sha256": "8fccc2661a4af846effd5550bbd7c9fdc22f2bd8a5d45933041a0fa8c775acb2",
+        "relocated_ast_sha256": "c9ce9db416131d5f3eb77997d30eff6182b1b11173255957d4e648debe7cb937",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "compressor_projection.py",
+        "definition": "make_layer2_c1c2",
+        "destination": "compressor.py",
+        "destination_definition": "make_layer2_c1c2",
+        "source_ast_sha256": "d049deeffc6393607c9e9f98607bd202c1c64fc14d73597381d91d37c5374765",
+        "relocated_ast_sha256": "7eba492f103636af78b23686916460af472e25f59808a1a82557cf08be76480b",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "compressor_projection.py",
+        "definition": "make_c2_projection",
+        "destination": "compressor.py",
+        "destination_definition": "make_c2_projection",
+        "source_ast_sha256": "af015cbd87a75e4370a0dea336627e931e9739a523d7b1fe949db54f07483427",
+        "relocated_ast_sha256": "6c11d5c70b29f6f17646b1896f86632731e370f77007e064fa8829c416f4d7a0",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_c1c2.py",
+        "definition": "make_compressed_cache_publish",
+        "destination": "compressor.py",
+        "destination_definition": "make_compressed_cache_publish",
+        "source_ast_sha256": "9e6ffc1e313de95170e2a1fc46974fde958cc1c0d0e9ada9a5035062f9d7d070",
+        "relocated_ast_sha256": "9e6ffc1e313de95170e2a1fc46974fde958cc1c0d0e9ada9a5035062f9d7d070",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_c1c2.py",
+        "definition": "make_indexer_cache_publish",
+        "destination": "compressor.py",
+        "destination_definition": "make_decode_indexer_cache_publish",
+        "source_ast_sha256": "bb32265d7c9c82143e1293212d6c345a27115df85d9091667766d1d6a0f7eeb6",
+        "relocated_ast_sha256": "4c6dbe4d7757f9e4ae32bcda8323e91b0cd1ccdccbad75a4f430cefee52d180c",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_candidate_pool.py",
+        "definition": "make_candidate_block_pool",
+        "destination": "indexer.py",
+        "destination_definition": "make_decode_candidate_block_pool",
+        "source_ast_sha256": "f8f84641676b1adcbe5a5774de3010ea95233cb7a406cf0e044f54aed14d6142",
+        "relocated_ast_sha256": "c2a92bd0056b458c1fe8825ef084032da97ca0a82fd95613b35800dc22ed6121",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_compressor_c1.py",
+        "definition": "make_ratio1_compress_publish",
+        "destination": "compressor.py",
+        "destination_definition": "make_decode_ratio1_compress_publish",
+        "source_ast_sha256": "1ebee158c5af25192e65fb4c534ebda1d6107e30d45589c47c62cd04842f0110",
+        "relocated_ast_sha256": "0065412f77b6558ecb1661a78e26a0f50b3ea314fd1ec1fb25f13848c0b8072c",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_compressor_c2.py",
+        "definition": "make_fp32_projection",
+        "destination": "compressor.py",
+        "destination_definition": "make_fp32_projection",
+        "source_ast_sha256": "9512bd9dc422aebcfc2ba4708b145633d186bd4803d9ef6432ad9e199bb10f9e",
+        "relocated_ast_sha256": "9512bd9dc422aebcfc2ba4708b145633d186bd4803d9ef6432ad9e199bb10f9e",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_compressor_c2.py",
+        "definition": "make_indexer_cache_publish_128",
+        "destination": "compressor.py",
+        "destination_definition": "make_indexer_cache_publish_128",
+        "source_ast_sha256": "a2041775651e9184be29cac1e5798850c419baaea44fe975f5445eaabcb23417",
+        "relocated_ast_sha256": "d049ea1a699cc86e0a6de337905a24e3d2bb751466d5f5ef56513b365b5dced4",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_compressor_c2.py",
+        "definition": "make_c2_index_publish_projected_inline",
+        "destination": "compressor.py",
+        "destination_definition": "make_decode_c2_index_publish_projected_inline",
+        "source_ast_sha256": "8932c5a57acb35d5babbd4c416ab8cfb451d3a83807f5fdf5cbde4c71db0bbf7",
+        "relocated_ast_sha256": "49b340653a661867db896f7e4b0d00370f4550772c4eb6f62df5dfaf739284f5",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_compressor_c2.py",
+        "definition": "make_c2_index_publish_inline",
+        "destination": "compressor.py",
+        "destination_definition": "make_decode_c2_index_publish_inline",
+        "source_ast_sha256": "aedeec35708bd02ce01e30a16433f14ceec46c4790cc43e4fd21890723b73bc6",
+        "relocated_ast_sha256": "48adb87746ff1e3ef17aa1b2829491a17f8b8a6bf6af98395446dd2d95d643d1",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_compressor_c2.py",
+        "definition": "make_layer2_c1c2",
+        "destination": "compressor.py",
+        "destination_definition": "make_decode_layer2_c1c2",
+        "source_ast_sha256": "08b5e54215e0eca9d9b0afe46982b0c63fce15c1eb5feb2141cd0bcd583dbfb9",
+        "relocated_ast_sha256": "6bfbf600314d88c66862a5bab6c539e377fcd161cf7a1be3ef840fa00f9af423",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_gemm.py",
+        "definition": "make_pack_weight",
+        "destination": "gemm.py",
+        "destination_definition": "make_pack_weight",
+        "source_ast_sha256": "14522539e7db91a5312cbd9dca2774b98ff543a84a3a09a3e4a0c791eb4722ff",
+        "relocated_ast_sha256": "14522539e7db91a5312cbd9dca2774b98ff543a84a3a09a3e4a0c791eb4722ff",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_gemm.py",
+        "definition": "make_int8_gemm",
+        "destination": "gemm.py",
+        "destination_definition": "make_int8_gemm",
+        "source_ast_sha256": "4075c1915576c9080e996b63ae598e9b37c8eebe6a2810e1c87093edfb195813",
+        "relocated_ast_sha256": "4075c1915576c9080e996b63ae598e9b37c8eebe6a2810e1c87093edfb195813",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_gemm.py",
+        "definition": "make_fp32_dequantize",
+        "destination": "gemm.py",
+        "destination_definition": "make_fp32_dequantize",
+        "source_ast_sha256": "2d960bf117536bf4e1c22ce5dec62c9df94db0dd762f8722b5409b563c78ae49",
+        "relocated_ast_sha256": "2d960bf117536bf4e1c22ce5dec62c9df94db0dd762f8722b5409b563c78ae49",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_gemm.py",
+        "definition": "make_int8_linear_direct",
+        "destination": "decode_gemm.py",
+        "destination_definition": "make_int8_linear_direct",
+        "source_ast_sha256": "9a1f64f49c362767ae446a61e6e7bd11f2fa833b662d9317578a01727822550d",
+        "relocated_ast_sha256": "4569d339886b4d25c88ef405fe9117b5e7288d2fe997c79eafe8aff3d2772ed4",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_hc.py",
+        "definition": "make_hc_pre_inline",
+        "destination": "hc.py",
+        "destination_definition": "make_decode_hc_pre_inline",
+        "source_ast_sha256": "34791a0b234c2786ac04664af2a5ff19d75e35ba4ca3608383e404411496ec22",
+        "relocated_ast_sha256": "477e7b45783727745ce85f6c61da6001c3b71a617bb3d090aee2ebc965a511c1",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_hc.py",
+        "definition": "make_hc_post_inline",
+        "destination": "hc.py",
+        "destination_definition": "make_decode_hc_post_inline",
+        "source_ast_sha256": "55a98e5f5dcd535fba722faa2c7617ea2132293ab5c665413d2058539d35342a",
+        "relocated_ast_sha256": "e8aced1b526ecc8e7cc85e4b8ec79bc2328be2b889f3ed2ee7e2dbad3ae692bd",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_hc.py",
+        "definition": "make_hc",
+        "destination": "hc.py",
+        "destination_definition": "make_decode_hc",
+        "source_ast_sha256": "decb25cefe19cc05efe758a5ae0f53d01062c794810b2cda936de162767379ad",
+        "relocated_ast_sha256": "efd9edc4f80474e70fa37044e2ba9191cef235ae5eb044074cfc0b8ae1454828",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_indexer_query.py",
+        "definition": "quantize_indexer_query_reference",
+        "destination": "indexer.py",
+        "destination_definition": "decode_quantize_indexer_query_reference",
+        "source_ast_sha256": "f62ba670a8b6623af013b302b8f02727b4ce1e87e325050468614e81d282624e",
+        "relocated_ast_sha256": "4e88c61e09b8434e4462a88b65f98633b83a5ad7a67b0df26ead7e86945f4a3a",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_indexer_query.py",
+        "definition": "_make_indexer_query_quantize_inline",
+        "destination": "indexer.py",
+        "destination_definition": "_decode_make_indexer_query_quantize_inline",
+        "source_ast_sha256": "d4b33f9ff9edee977c7e0a77a2aed3153e020a0d145d8eb636712d1c9d5670bb",
+        "relocated_ast_sha256": "9643711cd5f6e8431fc3e942690c71fd4eb4c26e000f2e8a919eba03c7305889",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_indexer_query.py",
+        "definition": "make_indexer_query_quantize",
+        "destination": "indexer.py",
+        "destination_definition": "make_decode_indexer_query_quantize",
+        "source_ast_sha256": "b5766e3822670f3060f367efa1249320d3ffa6a835a35e4deb44737b9d2e1427",
+        "relocated_ast_sha256": "58bfb990dfdcff9809f851f1f55f68d41debdee30ca096809af86fe9f24e66f4",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_indexer_query.py",
+        "definition": "make_l3_indexer_query",
+        "destination": "indexer.py",
+        "destination_definition": "make_decode_l3_indexer_query",
+        "source_ast_sha256": "387d1f6526ee95646542295ee4032df5c0744377fbe764cf6a0732e1e516687d",
+        "relocated_ast_sha256": "fee99c12143eeda5797902bfa7513a6e804e8119d9dab7eeaef8b41539963c0c",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_indexer_query.py",
+        "definition": "indexer_query_reference",
+        "destination": "indexer.py",
+        "destination_definition": "decode_indexer_query_reference",
+        "source_ast_sha256": "d09c77460cc7b70a2dd405db25030d9c3f0ee9450d120b79b66653aa30e50083",
+        "relocated_ast_sha256": "dd3c69d0b0400e5c074b80876b49302c91b68f2c9535fbd6acdca3b972eb1828",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_indexer_select.py",
+        "definition": "indexer_select_reference",
+        "destination": "indexer.py",
+        "destination_definition": "indexer_select_reference",
+        "source_ast_sha256": "e592080fd1270208e913a343c56a94b87c30c539ef8fdbd5968a8d31d444128d",
+        "relocated_ast_sha256": "e592080fd1270208e913a343c56a94b87c30c539ef8fdbd5968a8d31d444128d",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_indexer_select.py",
+        "definition": "make_indexer_select",
+        "destination": "indexer.py",
+        "destination_definition": "make_indexer_select",
+        "source_ast_sha256": "86a0ac099521c9f88bbfffe2c6e098435d50a42817280a1b59559e018dc0e2a7",
+        "relocated_ast_sha256": "86a0ac099521c9f88bbfffe2c6e098435d50a42817280a1b59559e018dc0e2a7",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_indexer_select.py",
+        "definition": "make_indexer_select_restricted",
+        "destination": "indexer.py",
+        "destination_definition": "make_indexer_select_restricted",
+        "source_ast_sha256": "4167771f04b054d3ee96bad2751990e3f28f4bb05dad28dd7a5f8cca34106daf",
+        "relocated_ast_sha256": "4167771f04b054d3ee96bad2751990e3f28f4bb05dad28dd7a5f8cca34106daf",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_index_cache.py",
+        "definition": "quantize_index_cache",
+        "destination": "indexer.py",
+        "destination_definition": "decode_quantize_index_cache",
+        "source_ast_sha256": "7071a709421cbbda3224a6a6e48a0c94c7b970be8f07f5689bf6271a06ed6ba0",
+        "relocated_ast_sha256": "b12a6fd4539ceb75e182c01c60132b7b5ccc02eab53dd935c8d5c2199e5a1107",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_index_cache.py",
+        "definition": "dequantize_index_cache",
+        "destination": "indexer.py",
+        "destination_definition": "dequantize_index_cache",
+        "source_ast_sha256": "31777d957748ea7cbe01b0d60e97f9716766d8d90a9ce91ea0b28b743424e14d",
+        "relocated_ast_sha256": "31777d957748ea7cbe01b0d60e97f9716766d8d90a9ce91ea0b28b743424e14d",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_index_cache.py",
+        "definition": "make_index_cache_quantize",
+        "destination": "indexer.py",
+        "destination_definition": "make_decode_index_cache_quantize",
+        "source_ast_sha256": "24134c7bc0cc7681122be3503a567fba9d3fa2acb63045abaf6ec0dc2f73a3ad",
+        "relocated_ast_sha256": "f49dada5a597a251f20674dcb91a6a0b3dafe49e34a301a72cccfba645e3bb35",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_primitives.py",
+        "definition": "make_cast_tile",
+        "destination": "linear_primitives.py",
+        "destination_definition": "make_decode_cast_tile",
+        "source_ast_sha256": "cefb41c1dbd470d1e6fa75272297749a6be023c08c2fe5c007c3443aca0e1e06",
+        "relocated_ast_sha256": "c326f7cfeebae5cb7856ceef4a04cbf87fe881fb4c751abbfefd7895698256f2",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_primitives.py",
+        "definition": "make_quantize",
+        "destination": "linear_primitives.py",
+        "destination_definition": "make_decode_quantize",
+        "source_ast_sha256": "b97e0ffebbbdba79e1520c63ca180601c2e406266d2c59aa1356be3a1400d094",
+        "relocated_ast_sha256": "15305d6391cfb7fefc6c1aeba3f854494a5379735f842ee1600ee2a4b65aa300",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_primitives.py",
+        "definition": "make_pack_weight",
+        "destination": "linear_primitives.py",
+        "destination_definition": "make_pack_weight",
+        "source_ast_sha256": "5d45a700a63ce6a1b30b1e75a8e4227e50de16d1a0ea6b554f9744a42a4cc50d",
+        "relocated_ast_sha256": "5d45a700a63ce6a1b30b1e75a8e4227e50de16d1a0ea6b554f9744a42a4cc50d",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_primitives.py",
+        "definition": "make_dot",
+        "destination": "linear_primitives.py",
+        "destination_definition": "make_dot",
+        "source_ast_sha256": "9e0cc122495c3c3c0e2ea26fd3289ac2467611dc0a47242ec25db7e48101e29f",
+        "relocated_ast_sha256": "9e0cc122495c3c3c0e2ea26fd3289ac2467611dc0a47242ec25db7e48101e29f",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_primitives.py",
+        "definition": "make_dequantize",
+        "destination": "linear_primitives.py",
+        "destination_definition": "make_decode_dequantize",
+        "source_ast_sha256": "532ee170d83c036825a73ea5b99950b98a74728da473d6bb9e3ca500bb55a3f1",
+        "relocated_ast_sha256": "8ebd4b28858e36f6749e05a02d2ccf5aff2bd452311a81e6c58c20e6f26c7bdb",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_primitives.py",
+        "definition": "make_norm",
+        "destination": "linear_primitives.py",
+        "destination_definition": "make_decode_norm",
+        "source_ast_sha256": "eb0e41263dfbabcdc361485fbd93d3d77dc11fa1e92600a64cc5384b36c95183",
+        "relocated_ast_sha256": "cbea1267e575f790624194464881b00629643efa42a5eb8953e9767085ef18cb",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_primitives.py",
+        "definition": "make_rope",
+        "destination": "linear_primitives.py",
+        "destination_definition": "make_decode_rope",
+        "source_ast_sha256": "e8a8086e271272386b0f122487c583f29c9fb71042d9eaf2b1f67b6085a66c17",
+        "relocated_ast_sha256": "ade21431ac07a68a5ea22f05a4eb7b511054493328da37a78f099603b2def4de",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_projection.py",
+        "definition": "make_index_quantize",
+        "destination": "decode_projection.py",
+        "destination_definition": "make_index_quantize",
+        "source_ast_sha256": "0d21dc5140f374cc096f7f74adc178163c12777557bc682d1d7268cbf84e3834",
+        "relocated_ast_sha256": "cc6874705d385b2913f9c3ada8b0140150a91fdf67c49c05208eb8a0395f4fed",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_quant.py",
+        "definition": "_round_symmetric_int8",
+        "destination": "quant.py",
+        "destination_definition": "_round_symmetric_int8",
+        "source_ast_sha256": "5e448fb002aedf922e0fe68d72cca75e71693e314ceef22bd5b03412142d4cf7",
+        "relocated_ast_sha256": "5e448fb002aedf922e0fe68d72cca75e71693e314ceef22bd5b03412142d4cf7",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_quant.py",
+        "definition": "quantize_per_token_int8",
+        "destination": "quant.py",
+        "destination_definition": "quantize_per_token_int8",
+        "source_ast_sha256": "930e07bc4759de5dae1dbf2a304ad7974b0bac9ad9d92a3f7b1427b037750ac9",
+        "relocated_ast_sha256": "930e07bc4759de5dae1dbf2a304ad7974b0bac9ad9d92a3f7b1427b037750ac9",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_quant.py",
+        "definition": "quantize_per_channel_int8",
+        "destination": "quant.py",
+        "destination_definition": "quantize_per_channel_int8",
+        "source_ast_sha256": "a044eb399be98ff94bd6e4f3c4cee8c1f7476b8019278d0b19f826dcb33ca222",
+        "relocated_ast_sha256": "a044eb399be98ff94bd6e4f3c4cee8c1f7476b8019278d0b19f826dcb33ca222",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_quant.py",
+        "definition": "int8_matmul",
+        "destination": "quant.py",
+        "destination_definition": "int8_matmul",
+        "source_ast_sha256": "32f7e1d2d3c587470cc1bb0d534af21c8f77471bf919e628565d65d12b82fc33",
+        "relocated_ast_sha256": "32f7e1d2d3c587470cc1bb0d534af21c8f77471bf919e628565d65d12b82fc33",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_quant.py",
+        "definition": "dequantize_int32",
+        "destination": "quant.py",
+        "destination_definition": "dequantize_int32",
+        "source_ast_sha256": "bf56e3ef7e01ef4f3b38fb7c242ee6adb48a0bfd3e1eb9bfb810511c7e367d64",
+        "relocated_ast_sha256": "bf56e3ef7e01ef4f3b38fb7c242ee6adb48a0bfd3e1eb9bfb810511c7e367d64",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_quant.py",
+        "definition": "w8a8_linear",
+        "destination": "quant.py",
+        "destination_definition": "w8a8_linear",
+        "source_ast_sha256": "cd59114f237e8c1fd0540ab09d61b02a8acd0391bfb587c92b7ceba1d756f22c",
+        "relocated_ast_sha256": "cd59114f237e8c1fd0540ab09d61b02a8acd0391bfb587c92b7ceba1d756f22c",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_quant.py",
+        "definition": "make_dynamic_int8_quantize",
+        "destination": "quant.py",
+        "destination_definition": "make_decode_dynamic_int8_quantize",
+        "source_ast_sha256": "c3e5933b722c1c2f875f05445caf3e4436c09215f3593802a3524d89cc7a1b9c",
+        "relocated_ast_sha256": "7cdae374af6751091290637f27c1804c5f2d35959ddd1d6bbf6447c1b35c910f",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_rmsnorm.py",
+        "definition": "rms_norm_tiled",
+        "destination": "rmsnorm.py",
+        "destination_definition": "rms_norm_tiled",
+        "source_ast_sha256": "0c98d8860e2f66891aa193c5adcbc2215d3b890870ba36e72ed53be24defbbb6",
+        "relocated_ast_sha256": "f052bf28e70d4b36ae8748b31f1e6158de06ac6903e9374cc7da0a79b2ab5c50",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_rmsnorm.py",
+        "definition": "rms_norm_tiled_with_fp32",
+        "destination": "rmsnorm.py",
+        "destination_definition": "rms_norm_tiled_with_fp32",
+        "source_ast_sha256": "c8270e4e7aa3533c7ddeae533f5a472debf772b20386833acfc962f815a6d177",
+        "relocated_ast_sha256": "cffc26efb170ffc3305346442a8a79dfa9e0448dba62332f680c05e5842b4bdb",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_rmsnorm.py",
+        "definition": "rms_norm_tiled_from_fp32",
+        "destination": "rmsnorm.py",
+        "destination_definition": "rms_norm_tiled_from_fp32",
+        "source_ast_sha256": "d62dea9853b13373f747893a1fd9816f016efb554c0c91145b88dc971a4dbf67",
+        "relocated_ast_sha256": "847d80522965a88db32beb8aa03d9da4233cdd482050b971506c83c20e16fc87",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_rmsnorm.py",
+        "definition": "rms_norm",
+        "destination": "rmsnorm.py",
+        "destination_definition": "decode_rms_norm",
+        "source_ast_sha256": "9bb036084649c4aa3b08f2bf1e03db0b57515f18fce04fe3cb6c542ee9a7a031",
+        "relocated_ast_sha256": "359e92153334e9d5c53cf78b5ce7117b88e8eaa92e755e5f057bf5eb10400b2e",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_rmsnorm.py",
+        "definition": "golden_rms_norm",
+        "destination": "rmsnorm.py",
+        "destination_definition": "golden_rms_norm",
+        "source_ast_sha256": "579c7aeb5ef88ec8f790daef6f677d5516d88523b4e01501e3a79c2b35e9f6d8",
+        "relocated_ast_sha256": "579c7aeb5ef88ec8f790daef6f677d5516d88523b4e01501e3a79c2b35e9f6d8",
+        "shared_identical_definition": true
+      },
+      {
+        "source": "decode_rmsnorm.py",
+        "definition": "make_prefill_norm",
+        "destination": "rmsnorm.py",
+        "destination_definition": "make_decode_norm",
+        "source_ast_sha256": "d3dc81d008592c6c2164e392e1cfdab7726f4a6c6fce0e663bf0b308470b9ea8",
+        "relocated_ast_sha256": "ecfe4f94b78994f1e6b470803e458e08afe880696eba645fec2693bf420bee4e",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_weights.py",
+        "definition": "DecodeSafetensorsCheckpoint",
+        "destination": "weights.py",
+        "destination_definition": "DecodeSafetensorsCheckpoint",
+        "source_ast_sha256": "ec5f5e0924f331d8dee9ecda898b75a125526d6d3110ec9167c0536d334ff422",
+        "relocated_ast_sha256": "ec5f5e0924f331d8dee9ecda898b75a125526d6d3110ec9167c0536d334ff422",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_weight_abi.py",
+        "definition": "_name",
+        "destination": "weights.py",
+        "destination_definition": "_name",
+        "source_ast_sha256": "9bc06c317bec8478a129a26075bdd0f94ee2e72f9aed76e09237dd1ce3752d80",
+        "relocated_ast_sha256": "9bc06c317bec8478a129a26075bdd0f94ee2e72f9aed76e09237dd1ce3752d80",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_weight_abi.py",
+        "definition": "_expert_name",
+        "destination": "weights.py",
+        "destination_definition": "_expert_name",
+        "source_ast_sha256": "2f964f03915fe30f0d82be9d4d7ddc15666255ef592c59d32adee2fee87b26f1",
+        "relocated_ast_sha256": "2f964f03915fe30f0d82be9d4d7ddc15666255ef592c59d32adee2fee87b26f1",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_weight_abi.py",
+        "definition": "_require",
+        "destination": "weights.py",
+        "destination_definition": "_require",
+        "source_ast_sha256": "66b5968516cfd4c54ee0a9681aed26fcd607aa61380aa17deaf77376dc2c2193",
+        "relocated_ast_sha256": "66b5968516cfd4c54ee0a9681aed26fcd607aa61380aa17deaf77376dc2c2193",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_weight_abi.py",
+        "definition": "_require_zero_offset",
+        "destination": "weights.py",
+        "destination_definition": "_require_zero_offset",
+        "source_ast_sha256": "74697a29185b28ef6d2fb8ac011179cbb3a665b91ff04352424b035ebbfc6830",
+        "relocated_ast_sha256": "74697a29185b28ef6d2fb8ac011179cbb3a665b91ff04352424b035ebbfc6830",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_weight_abi.py",
+        "definition": "_scale",
+        "destination": "weights.py",
+        "destination_definition": "_scale",
+        "source_ast_sha256": "a3c0435560ff9698b42b4fd3de354475959362f34fd423bac189da78d48da15a",
+        "relocated_ast_sha256": "a3c0435560ff9698b42b4fd3de354475959362f34fd423bac189da78d48da15a",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_weight_abi.py",
+        "definition": "_pad_w2",
+        "destination": "weights.py",
+        "destination_definition": "_pad_w2",
+        "source_ast_sha256": "71d40208f006348b601d3eabd195727ab5957649ff700b4132d15a57e0406eec",
+        "relocated_ast_sha256": "71d40208f006348b601d3eabd195727ab5957649ff700b4132d15a57e0406eec",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_weight_abi.py",
+        "definition": "pack_routed_expert",
+        "destination": "weights.py",
+        "destination_definition": "pack_routed_expert",
+        "source_ast_sha256": "986e1fc718a9d078ae216dffc0ceb242a7d7f95888a28183bfebb1893bff464d",
+        "relocated_ast_sha256": "986e1fc718a9d078ae216dffc0ceb242a7d7f95888a28183bfebb1893bff464d",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_weight_abi.py",
+        "definition": "iter_routed_experts",
+        "destination": "weights.py",
+        "destination_definition": "iter_routed_experts",
+        "source_ast_sha256": "7cdf4515ebbeec65d46793fc4005a033793b2acfcf889f5bc4930ac881142113",
+        "relocated_ast_sha256": "ef85c7e13afe13ad325aab7d33298d9c01149cb3da7267c49f0c53932848c0e3",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_weight_abi.py",
+        "definition": "load_routed_shard",
+        "destination": "weights.py",
+        "destination_definition": "load_routed_shard",
+        "source_ast_sha256": "0308fe1f3bc4de5ca40ff929dc6bec454378ad908d614ff9d38695375090611d",
+        "relocated_ast_sha256": "0308fe1f3bc4de5ca40ff929dc6bec454378ad908d614ff9d38695375090611d",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_weight_abi.py",
+        "definition": "load_router",
+        "destination": "weights.py",
+        "destination_definition": "load_router",
+        "source_ast_sha256": "29db0c473aa1a8996b14842e6a6128347989be18a93eb128cdde0e327803c68f",
+        "relocated_ast_sha256": "29db0c473aa1a8996b14842e6a6128347989be18a93eb128cdde0e327803c68f",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_weight_abi.py",
+        "definition": "load_shared_expert",
+        "destination": "weights.py",
+        "destination_definition": "load_shared_expert",
+        "source_ast_sha256": "bc02f53dbb714235fd3d3fb06045406b77ff6c276fa0349df0666587000ca504",
+        "relocated_ast_sha256": "bc02f53dbb714235fd3d3fb06045406b77ff6c276fa0349df0666587000ca504",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_weight_abi.py",
+        "definition": "load_ep2_rank_weights",
+        "destination": "weights.py",
+        "destination_definition": "load_ep2_rank_weights",
+        "source_ast_sha256": "4dab3b6c86306053d72fa96073a322e39842cf9e69dc6e37b917c7e62e633107",
+        "relocated_ast_sha256": "4dab3b6c86306053d72fa96073a322e39842cf9e69dc6e37b917c7e62e633107",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "decode_weight_abi.py",
+        "definition": "abi_summary",
+        "destination": "weights.py",
+        "destination_definition": "abi_summary",
+        "source_ast_sha256": "027c1cbff41cb7e7403846d12987678e424a8f5ddd6993f1a1cf56ba7a324ea4",
+        "relocated_ast_sha256": "027c1cbff41cb7e7403846d12987678e424a8f5ddd6993f1a1cf56ba7a324ea4",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech.py",
+        "definition": "make_resident_int8_lookup",
+        "destination": "engram.py",
+        "destination_definition": "make_resident_int8_lookup",
+        "source_ast_sha256": "c897c05e357bd132d1300bb58321ca689eebb5791ac3746cb51ed670505ea69a",
+        "relocated_ast_sha256": "9a180f576cc949a6cd3494aeb388e05d47e418cf8f68022be818afaf3fe1a33e",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech.py",
+        "definition": "make_original_basis_hidden",
+        "destination": "engram.py",
+        "destination_definition": "make_original_basis_hidden",
+        "source_ast_sha256": "a3719989a166c56b4e4b77057a60231e1510ad37e7d588b383a24b6c6a6ea463",
+        "relocated_ast_sha256": "b1fac739c49cb372b15e7c4ee558b52b0ce88812901d32e8eb3a9590c24458c3",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech.py",
+        "definition": "make_original_basis_gate",
+        "destination": "engram.py",
+        "destination_definition": "make_original_basis_gate",
+        "source_ast_sha256": "135d3c3e7b188f78a06a355e35d827d2d8215805a7728d7abe9e5c7fd7a55ef0",
+        "relocated_ast_sha256": "7984a517d4f3ba0bf7fa5c4665c91fa453f67c144a0a2bf620d22a062c65593d",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech.py",
+        "definition": "make_engram_ecotech",
+        "destination": "engram.py",
+        "destination_definition": "make_engram_ecotech",
+        "source_ast_sha256": "bd3145e7a99da666caf1884542909fa4b65fb027431df00438a44954737bd871",
+        "relocated_ast_sha256": "93793e6367568741e2387d62f2f13f5b76e748afcc487dffa59b6f8cdaed3672",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech.py",
+        "definition": "reference_int8_rows",
+        "destination": "engram.py",
+        "destination_definition": "reference_int8_rows",
+        "source_ast_sha256": "f5b67115981cc1ab098e09d6cb5e7945f93a0a4ea19d927eb9f9d22495517caa",
+        "relocated_ast_sha256": "f5b67115981cc1ab098e09d6cb5e7945f93a0a4ea19d927eb9f9d22495517caa",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech.py",
+        "definition": "golden_int8_lookup",
+        "destination": "engram.py",
+        "destination_definition": "golden_int8_lookup",
+        "source_ast_sha256": "652b0936496a4c607a0eab20cba6e2e0e67385a1018afadf43693c891789770e",
+        "relocated_ast_sha256": "652b0936496a4c607a0eab20cba6e2e0e67385a1018afadf43693c891789770e",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech.py",
+        "definition": "golden_original_basis_hidden",
+        "destination": "engram.py",
+        "destination_definition": "golden_original_basis_hidden",
+        "source_ast_sha256": "4106b117a03c471db658c6df04581f77b80eb7b66a164f4c379fcfb638e989ea",
+        "relocated_ast_sha256": "32e5802ae8ab8aea2a00ddea9a1b76d84fb035471d7659de9ac52e65a1eaf4b8",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech.py",
+        "definition": "golden_original_basis_gate",
+        "destination": "engram.py",
+        "destination_definition": "golden_original_basis_gate",
+        "source_ast_sha256": "35afa6e7855c37c3bd860bf9562afce11cfa991bca1c36f7b23bff436a35f697",
+        "relocated_ast_sha256": "716d04fb56a6db3c9236d947b0210041bd0e75a8ad25ba9686e06df1f9480ced",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech.py",
+        "definition": "golden_engram_ecotech",
+        "destination": "engram.py",
+        "destination_definition": "golden_engram_ecotech",
+        "source_ast_sha256": "59491f6a90b6231398916c7887df66aa2087e2e7441d2893a2ad38bc3bf6a796",
+        "relocated_ast_sha256": "a92cf932f605a501f2c9c3b46459aefda4ab74e67656862767c3140bae8ce27d",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech.py",
+        "definition": "golden_masked_gate_compare",
+        "destination": "engram.py",
+        "destination_definition": "golden_masked_gate_compare",
+        "source_ast_sha256": "16613ea9bc9dc9b7668f6a9779e3094309d2a7052e5dbd08160916cb9909acf8",
+        "relocated_ast_sha256": "16613ea9bc9dc9b7668f6a9779e3094309d2a7052e5dbd08160916cb9909acf8",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech.py",
+        "definition": "engram_int8_golden_cases",
+        "destination": "engram.py",
+        "destination_definition": "engram_int8_golden_cases",
+        "source_ast_sha256": "1827aa4b6fade6377abfdb1ac753216aecc0d7548890d2ccf4e9882f5c570197",
+        "relocated_ast_sha256": "0076dff0d4090659c687be2278369d3de6fc1d45b28b3afe5efe9abb9c2d1c22",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech.py",
+        "definition": "validate_engram_int8",
+        "destination": "engram.py",
+        "destination_definition": "validate_engram_int8",
+        "source_ast_sha256": "e447e06f27669428b267de296d21c5679b4cbbc7d3a8654113862a0ec5b59a2f",
+        "relocated_ast_sha256": "e447e06f27669428b267de296d21c5679b4cbbc7d3a8654113862a0ec5b59a2f",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech_observed.py",
+        "definition": "make_engram_ecotech_observed",
+        "destination": "engram.py",
+        "destination_definition": "make_engram_ecotech_observed",
+        "source_ast_sha256": "7409b1a54e44b17dcec1a791dc40f42d9519e4c108641bb76abc739764616fa4",
+        "relocated_ast_sha256": "3c58f36bdbf41a8cd909c9f21f405a44c051d1ebc3eea62be27f9c84f87c0e28",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech_observed.py",
+        "definition": "engram_observed_golden_cases",
+        "destination": "engram.py",
+        "destination_definition": "engram_observed_golden_cases",
+        "source_ast_sha256": "111739b2d867141ab77b211f8352fbff38df36e93e96c7763308083de9f4765e",
+        "relocated_ast_sha256": "1dcde52d3370c742ba1e7ea781cae3a2cd15726367008979c8a18410aa1c3787",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "engram_ecotech_observed.py",
+        "definition": "validate_engram_observed",
+        "destination": "engram.py",
+        "destination_definition": "validate_engram_observed",
+        "source_ast_sha256": "cd31451d756fb29de8b50327151aefcc55d0a03eee72bda31cbc31a2bfde4e6e",
+        "relocated_ast_sha256": "cd31451d756fb29de8b50327151aefcc55d0a03eee72bda31cbc31a2bfde4e6e",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "indexer_prepare.py",
+        "definition": "prepare_indexer_indices_reference",
+        "destination": "indexer.py",
+        "destination_definition": "prepare_indexer_indices_reference",
+        "source_ast_sha256": "3ad358c8977b4f38870d75d88f3f9287a7b9b2287721697f60f49bd13c69b7d4",
+        "relocated_ast_sha256": "3ad358c8977b4f38870d75d88f3f9287a7b9b2287721697f60f49bd13c69b7d4",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "indexer_prepare.py",
+        "definition": "make_indexer_prepare",
+        "destination": "indexer.py",
+        "destination_definition": "make_indexer_prepare",
+        "source_ast_sha256": "2ac1e80aae675db3a8a47b2d0b19d3f2c2ac1b8dea21880d09ef7815df62d0cc",
+        "relocated_ast_sha256": "2ac1e80aae675db3a8a47b2d0b19d3f2c2ac1b8dea21880d09ef7815df62d0cc",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "indexer_query.py",
+        "definition": "quantize_indexer_query_reference",
+        "destination": "indexer.py",
+        "destination_definition": "quantize_indexer_query_reference",
+        "source_ast_sha256": "f62ba670a8b6623af013b302b8f02727b4ce1e87e325050468614e81d282624e",
+        "relocated_ast_sha256": "f62ba670a8b6623af013b302b8f02727b4ce1e87e325050468614e81d282624e",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "indexer_query.py",
+        "definition": "_make_indexer_query_quantize_inline",
+        "destination": "indexer.py",
+        "destination_definition": "_make_indexer_query_quantize_inline",
+        "source_ast_sha256": "d4b33f9ff9edee977c7e0a77a2aed3153e020a0d145d8eb636712d1c9d5670bb",
+        "relocated_ast_sha256": "d4b33f9ff9edee977c7e0a77a2aed3153e020a0d145d8eb636712d1c9d5670bb",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "indexer_query.py",
+        "definition": "make_indexer_query_quantize",
+        "destination": "indexer.py",
+        "destination_definition": "make_indexer_query_quantize",
+        "source_ast_sha256": "b5766e3822670f3060f367efa1249320d3ffa6a835a35e4deb44737b9d2e1427",
+        "relocated_ast_sha256": "b5766e3822670f3060f367efa1249320d3ffa6a835a35e4deb44737b9d2e1427",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "indexer_query.py",
+        "definition": "make_l3_indexer_query",
+        "destination": "indexer.py",
+        "destination_definition": "make_l3_indexer_query",
+        "source_ast_sha256": "387d1f6526ee95646542295ee4032df5c0744377fbe764cf6a0732e1e516687d",
+        "relocated_ast_sha256": "387d1f6526ee95646542295ee4032df5c0744377fbe764cf6a0732e1e516687d",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "indexer_query.py",
+        "definition": "indexer_query_reference",
+        "destination": "indexer.py",
+        "destination_definition": "indexer_query_reference",
+        "source_ast_sha256": "d09c77460cc7b70a2dd405db25030d9c3f0ee9450d120b79b66653aa30e50083",
+        "relocated_ast_sha256": "d09c77460cc7b70a2dd405db25030d9c3f0ee9450d120b79b66653aa30e50083",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "index_cache.py",
+        "definition": "quantize_index_cache",
+        "destination": "indexer.py",
+        "destination_definition": "quantize_index_cache",
+        "source_ast_sha256": "7071a709421cbbda3224a6a6e48a0c94c7b970be8f07f5689bf6271a06ed6ba0",
+        "relocated_ast_sha256": "7071a709421cbbda3224a6a6e48a0c94c7b970be8f07f5689bf6271a06ed6ba0",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "index_cache.py",
+        "definition": "dequantize_index_cache",
+        "destination": "indexer.py",
+        "destination_definition": "dequantize_index_cache",
+        "source_ast_sha256": "31777d957748ea7cbe01b0d60e97f9716766d8d90a9ce91ea0b28b743424e14d",
+        "relocated_ast_sha256": "31777d957748ea7cbe01b0d60e97f9716766d8d90a9ce91ea0b28b743424e14d",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "index_cache.py",
+        "definition": "make_index_cache_quantize",
+        "destination": "indexer.py",
+        "destination_definition": "make_index_cache_quantize",
+        "source_ast_sha256": "24134c7bc0cc7681122be3503a567fba9d3fa2acb63045abaf6ec0dc2f73a3ad",
+        "relocated_ast_sha256": "24134c7bc0cc7681122be3503a567fba9d3fa2acb63045abaf6ec0dc2f73a3ad",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "index_cache.py",
+        "definition": "make_index_quantize",
+        "destination": "indexer.py",
+        "destination_definition": "make_index_quantize",
+        "source_ast_sha256": "b8a103b2148e168830b69d29efb13d22ae4d480f0012d57e60cb2ed3788f56b7",
+        "relocated_ast_sha256": "b8a103b2148e168830b69d29efb13d22ae4d480f0012d57e60cb2ed3788f56b7",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_c1a.py",
+        "definition": "make_ratio1_compress_publish",
+        "destination": "compressor.py",
+        "destination_definition": "make_ratio1_compress_publish",
+        "source_ast_sha256": "a4451df8c8e3930b6b5c2b269c50aeaf10843c41fb1d22cd019a7c01cc102715",
+        "relocated_ast_sha256": "a4451df8c8e3930b6b5c2b269c50aeaf10843c41fb1d22cd019a7c01cc102715",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_c2a.py",
+        "definition": "make_physical_compressed_entries",
+        "destination": "prefill_c2a.py",
+        "destination_definition": "make_physical_compressed_entries",
+        "source_ast_sha256": "d4753d83ccdcd3fac9b911a2f1ba1ae88560c8c0467eb71059c22ebb6b53a229",
+        "relocated_ast_sha256": "bbd7e173060c80de5ac7024d322a00f6ea2f89042cef8dae1330d3d18309ffa2",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_c2a_observed.py",
+        "definition": "make_wk_input_observed_inline",
+        "destination": "prefill_c2a.py",
+        "destination_definition": "make_wk_input_observed_inline",
+        "source_ast_sha256": "34e94092a9c0e47820e455265f3a108c701bf8ab6ff03ee4570e3ca323a8746d",
+        "relocated_ast_sha256": "34e94092a9c0e47820e455265f3a108c701bf8ab6ff03ee4570e3ca323a8746d",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_c2a_observed.py",
+        "definition": "make_indexer_cache_publish_128_observed",
+        "destination": "prefill_c2a.py",
+        "destination_definition": "make_indexer_cache_publish_128_observed",
+        "source_ast_sha256": "72a7fed06a7a2416a43bc02a6df33ad30609f1c2d35e8a19fc1575a33493690a",
+        "relocated_ast_sha256": "72a7fed06a7a2416a43bc02a6df33ad30609f1c2d35e8a19fc1575a33493690a",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_c2a_observed.py",
+        "definition": "make_c2_index_publish_projected_observed_inline",
+        "destination": "prefill_c2a.py",
+        "destination_definition": "make_c2_index_publish_projected_observed_inline",
+        "source_ast_sha256": "2a980c37f0a2b2f95b38f256f986f04622a6fb2374b57bad5e55c5ef1a9807a1",
+        "relocated_ast_sha256": "2a980c37f0a2b2f95b38f256f986f04622a6fb2374b57bad5e55c5ef1a9807a1",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_c2a_observed.py",
+        "definition": "make_indexer_projection_observed",
+        "destination": "prefill_c2a.py",
+        "destination_definition": "make_indexer_projection_observed",
+        "source_ast_sha256": "4716a365d147e7cb580995e459ca9ee8247fa11f9040eef3b38ca59d5a41e918",
+        "relocated_ast_sha256": "4716a365d147e7cb580995e459ca9ee8247fa11f9040eef3b38ca59d5a41e918",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_c2a_observed.py",
+        "definition": "make_indexer_query_quantize_observed",
+        "destination": "prefill_c2a.py",
+        "destination_definition": "make_indexer_query_quantize_observed",
+        "source_ast_sha256": "ceb898601521ea5af8a302bed1b5d839aee48926ce5f2a92fb9467f4a83c455d",
+        "relocated_ast_sha256": "ceb898601521ea5af8a302bed1b5d839aee48926ce5f2a92fb9467f4a83c455d",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_c2a_observed.py",
+        "definition": "make_c2_program",
+        "destination": "prefill_c2a.py",
+        "destination_definition": "make_c2_program",
+        "source_ast_sha256": "a804c10b57729c50e0bfa97f3a3be4dfc1be4dbe44e5d0677e25dbec5795840d",
+        "relocated_ast_sha256": "a804c10b57729c50e0bfa97f3a3be4dfc1be4dbe44e5d0677e25dbec5795840d",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_c2a_readback.py",
+        "definition": "make_readback_entries",
+        "destination": "prefill_c2a.py",
+        "destination_definition": "make_readback_entries",
+        "source_ast_sha256": "72a9405ac458cafe71dd3326a78d41ff7ddbc8a6df2641d68a5604168166862b",
+        "relocated_ast_sha256": "72a9405ac458cafe71dd3326a78d41ff7ddbc8a6df2641d68a5604168166862b",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_c2_pool.py",
+        "definition": "pool_prefill",
+        "destination": "compressor.py",
+        "destination_definition": "pool_prefill",
+        "source_ast_sha256": "39877f92938b6d95313942a12e21a96f83b857a5499c9c8933482b69d257c1b7",
+        "relocated_ast_sha256": "39877f92938b6d95313942a12e21a96f83b857a5499c9c8933482b69d257c1b7",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_c2_pool.py",
+        "definition": "compressor_ratio2_prefill",
+        "destination": "compressor.py",
+        "destination_definition": "compressor_ratio2_prefill",
+        "source_ast_sha256": "74efc5ffb3055e8bada21c29196444073f1eab1b4f05fca7f07ff138bcee5959",
+        "relocated_ast_sha256": "74efc5ffb3055e8bada21c29196444073f1eab1b4f05fca7f07ff138bcee5959",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_c2_pool.py",
+        "definition": "make_c2_pool_observed",
+        "destination": "compressor.py",
+        "destination_definition": "make_c2_pool_observed",
+        "source_ast_sha256": "b9ade14fdbb7f293015d3cd41d7e4963b94db9221191b8b5024cde664ef12e4d",
+        "relocated_ast_sha256": "b9ade14fdbb7f293015d3cd41d7e4963b94db9221191b8b5024cde664ef12e4d",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_cache_publish.py",
+        "definition": "make_compressed_cache_publish",
+        "destination": "compressor.py",
+        "destination_definition": "make_compressed_cache_publish",
+        "source_ast_sha256": "9e6ffc1e313de95170e2a1fc46974fde958cc1c0d0e9ada9a5035062f9d7d070",
+        "relocated_ast_sha256": "9e6ffc1e313de95170e2a1fc46974fde958cc1c0d0e9ada9a5035062f9d7d070",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_cache_publish.py",
+        "definition": "make_indexer_cache_publish",
+        "destination": "compressor.py",
+        "destination_definition": "make_indexer_cache_publish",
+        "source_ast_sha256": "bb32265d7c9c82143e1293212d6c345a27115df85d9091667766d1d6a0f7eeb6",
+        "relocated_ast_sha256": "bb32265d7c9c82143e1293212d6c345a27115df85d9091667766d1d6a0f7eeb6",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_cache_publish.py",
+        "definition": "make_index_cache_publish_observed",
+        "destination": "compressor.py",
+        "destination_definition": "make_index_cache_publish_observed",
+        "source_ast_sha256": "7090754173c3eaad24ee96fd47173d714b8d056b6e34af2a704a136b7fbbd076",
+        "relocated_ast_sha256": "7090754173c3eaad24ee96fd47173d714b8d056b6e34af2a704a136b7fbbd076",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_compressed_runtime.py",
+        "definition": "run_compressed_attention",
+        "destination": "prefill_compressed_runtime.py",
+        "destination_definition": "run_compressed_attention",
+        "source_ast_sha256": "51663180986eb0ee202eb66b249b964e1802afcf2059b5da459facf46d2857ae",
+        "relocated_ast_sha256": "1ce4e6fe996ffb1726bb7b2cf85f67f6586bb13c813e9c639771d60816e2349a",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_engram.py",
+        "definition": "make_prefill_engram_hash",
+        "destination": "engram.py",
+        "destination_definition": "make_prefill_engram_hash",
+        "source_ast_sha256": "a9126adf217af9778672dcf21e37a063d3dacce1e23430aac5469fd83ea557af",
+        "relocated_ast_sha256": "cd28259d856fe8fc3d29c59162bb35e3e19b799c1c015298516fb82a43888aa8",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_engram.py",
+        "definition": "make_prefill_engram_layout",
+        "destination": "engram.py",
+        "destination_definition": "make_prefill_engram_layout",
+        "source_ast_sha256": "790bc9c4d0198060707d66bc0bb2c54e680c051395bddc024bcec3b987885a26",
+        "relocated_ast_sha256": "886e06b2df605cc56575e3b05839096afcff527102c315b5e99347450f6b9b4e",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_engram.py",
+        "definition": "make_prefill_engram_gate",
+        "destination": "engram.py",
+        "destination_definition": "make_prefill_engram_gate",
+        "source_ast_sha256": "6323ae94248951e544e411c2d7986054057b199461ef9340e978f5bb4cf2ca53",
+        "relocated_ast_sha256": "32b977f47480a2c27e0a20ffcdbf284b68d9b5d01a94853cf5b95edbe777dedf",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_engram.py",
+        "definition": "make_prefill_engram_entries",
+        "destination": "engram.py",
+        "destination_definition": "make_prefill_engram_entries",
+        "source_ast_sha256": "19d3f4798bd3300ba8cd80b45624b867108d82e76a45c85bf366625f7e63d611",
+        "relocated_ast_sha256": "d6f4e5573592efdd6b0b4e5483e63c6bf59f9df0a45c8ad8f2af4b1ab4f08e69",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_engram.py",
+        "definition": "golden_prefill_engram_hash",
+        "destination": "engram.py",
+        "destination_definition": "golden_prefill_engram_hash",
+        "source_ast_sha256": "987ea5c0625c89c01fa689c5903342182ce9b1afd014a15ac4f66cecc7dee94a",
+        "relocated_ast_sha256": "987ea5c0625c89c01fa689c5903342182ce9b1afd014a15ac4f66cecc7dee94a",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_engram.py",
+        "definition": "golden_prefill_engram_layout",
+        "destination": "engram.py",
+        "destination_definition": "golden_prefill_engram_layout",
+        "source_ast_sha256": "641ec097fe78cab92f564f04f34b823c0c51c8862094d64c655552e5222d11cd",
+        "relocated_ast_sha256": "4ed3f4f1aff7fa274136e8dd14773d1c2a5d1c7bb30ea2b39101d29e77b67bdb",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_engram.py",
+        "definition": "golden_prefill_engram_gate",
+        "destination": "engram.py",
+        "destination_definition": "golden_prefill_engram_gate",
+        "source_ast_sha256": "940b57209f503d3a61581efb5c414f722d3b05f798f0a8403d51d926f26d8d59",
+        "relocated_ast_sha256": "aca0c8694b465c29a72070934204119db7840a37aefa76bb8adab1e0890b27c8",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_engram.py",
+        "definition": "prefill_engram_hash_golden_cases",
+        "destination": "engram.py",
+        "destination_definition": "prefill_engram_hash_golden_cases",
+        "source_ast_sha256": "771a77d90f85fb55df91399f6a2dc2c874e216e71c276ce849664ca46d677707",
+        "relocated_ast_sha256": "773907b0337db2d82df6c8f5a8f5e8d564ce27fe25dc29ced0893b8739f96fc6",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_engram.py",
+        "definition": "prefill_engram_layout_golden_cases",
+        "destination": "engram.py",
+        "destination_definition": "prefill_engram_layout_golden_cases",
+        "source_ast_sha256": "da72ec0108021c45a95c67319579c009d568c81cffd2896f90006a4ec47fe239",
+        "relocated_ast_sha256": "7592f659d342f1781d2446d14890f9320491a101f8751bc9367fded3b92a37b8",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_engram.py",
+        "definition": "prefill_engram_gate_golden_cases",
+        "destination": "engram.py",
+        "destination_definition": "prefill_engram_gate_golden_cases",
+        "source_ast_sha256": "6ae93906dc1fb6b04e0a43fb627e299a02a342d7ac2569c8e18099eabcea8cca",
+        "relocated_ast_sha256": "9bc84b4970d5d2f2dd9746adc4e743b2adb0f43bc1397d2502488cda8017af07",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_engram.py",
+        "definition": "validate_prefill_engram",
+        "destination": "engram.py",
+        "destination_definition": "validate_prefill_engram",
+        "source_ast_sha256": "b2e7fc7efe094c6490b486de25dbfe0bd6b61bc9a07492174455361445aab5ae",
+        "relocated_ast_sha256": "b2e7fc7efe094c6490b486de25dbfe0bd6b61bc9a07492174455361445aab5ae",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_layer.py",
+        "definition": "make_prefill_layer_entries",
+        "destination": "prefill_layer.py",
+        "destination_definition": "make_prefill_layer_entries",
+        "source_ast_sha256": "f36da53f57767bf8135e2d53c1116ce16c19de64c0bb2384778a2f6038bb8233",
+        "relocated_ast_sha256": "11412d5fc5891e669e7147e9842951429621eb3311b973b2cf7ff49422f5a38f",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_layer.py",
+        "definition": "compile_prefill_layer",
+        "destination": "prefill_layer.py",
+        "destination_definition": "compile_prefill_layer",
+        "source_ast_sha256": "8d14edefac101fc4438445bf68c1b8557646e6757357f172e511e88e516322b0",
+        "relocated_ast_sha256": "38760d1bfe0b7eb6a6f577b0b46dd5cb330008bc4db0fbf3cfeaca418dc173db",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_norm.py",
+        "definition": "make_prefill_norm",
+        "destination": "rmsnorm.py",
+        "destination_definition": "make_prefill_norm",
+        "source_ast_sha256": "5c1474931eb6251a8d79f81be81c9a58beaa89f4cdf41d88d35ebe2e12699495",
+        "relocated_ast_sha256": "388914026e05a008f10747f19e612f798f8286137abbe67cde55de32629b9823",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "prefill_norm.py",
+        "definition": "make_prefill_norm_cast",
+        "destination": "rmsnorm.py",
+        "destination_definition": "make_prefill_norm_cast",
+        "source_ast_sha256": "f0f9a5630be5dda24251fe1b392fbe6b502cf11832ba076388081d27b49c9f41",
+        "relocated_ast_sha256": "bbf9d08acf9f23990ac2a707f8255600252b7e05d7179ce26ac0bc2d0f340596",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "raw_checkpoint.py",
+        "definition": "_shape",
+        "destination": "weights.py",
+        "destination_definition": "_shape",
+        "source_ast_sha256": "3a0e058714afc0daf86c7ce87b6045e35486db0f9c203cb49e82364077a16a73",
+        "relocated_ast_sha256": "3a0e058714afc0daf86c7ce87b6045e35486db0f9c203cb49e82364077a16a73",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "raw_checkpoint.py",
+        "definition": "RawCheckpoint",
+        "destination": "weights.py",
+        "destination_definition": "RawCheckpoint",
+        "source_ast_sha256": "5de22e0bb8679334296d0c279037d3abd51bd3e8a13debe3aaafa7fdb05cc1df",
+        "relocated_ast_sha256": "5de22e0bb8679334296d0c279037d3abd51bd3e8a13debe3aaafa7fdb05cc1df",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "raw_checkpoint.py",
+        "definition": "flatten_scale",
+        "destination": "weights.py",
+        "destination_definition": "flatten_scale",
+        "source_ast_sha256": "f20af1a43317efe181691abe35518ffc0e2948c383fef624f2180e840b7113d9",
+        "relocated_ast_sha256": "f20af1a43317efe181691abe35518ffc0e2948c383fef624f2180e840b7113d9",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "raw_checkpoint.py",
+        "definition": "load_attention_weights",
+        "destination": "weights.py",
+        "destination_definition": "load_attention_weights",
+        "source_ast_sha256": "3324f5e7c7b6c25842a8f4da2864d23f5dad6953aadd3181e5f00cb859e87445",
+        "relocated_ast_sha256": "3324f5e7c7b6c25842a8f4da2864d23f5dad6953aadd3181e5f00cb859e87445",
+        "shared_identical_definition": false
+      },
+      {
+        "source": "validate_engram_host.py",
+        "definition": "validate_device",
+        "destination": "validate_engram_host.py",
+        "destination_definition": "validate_device",
+        "source_ast_sha256": "413f0f92af9c3342868f17e271486b9f5ad79c0904393db3f602a1ce428cb362",
+        "relocated_ast_sha256": "e5766e2a6fd044f362b4ba009801f158e185783bbd2abf8651a9f66355ddd8bf",
+        "shared_identical_definition": false
+      }
+    ]
   }
 }

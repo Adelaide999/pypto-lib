@@ -35,8 +35,11 @@ from .decode_moe import (
     TOPK,
     decode_ep2_rank,
 )
-from .decode_hc import make_hc_post_inline, make_hc_pre_inline
-from .decode_rmsnorm import NORM_T_TILE, rms_norm_tiled_with_fp32
+from .hc import (
+    make_decode_hc_post_inline as make_hc_post_inline,
+    make_decode_hc_pre_inline as make_hc_pre_inline,
+)
+from .rmsnorm import NORM_T_TILE, rms_norm_tiled_with_fp32
 
 
 CONFIG = asdict(FLASH)
@@ -180,7 +183,8 @@ def decode_layer_ep2_rank(
         ffn_next_pre,
         ffn_post,
         ffn_comb,
-        ffn_collapsed, ffn_collapsed_fp32,
+        ffn_collapsed,
+        ffn_collapsed_fp32,
         active,
     )
     ffn_router_normed = pl.create_tensor([T, HIDDEN], dtype=pl.FP32)
@@ -188,9 +192,7 @@ def decode_layer_ep2_rank(
         # The fused reference normalizes the BF16 HC collapse and exposes its
         # FP32 result to the router.  Keep the BF16 store boundary before both
         # outputs so expert input and router input share the same source.
-        rms_norm_tiled_with_fp32(
-            ffn_collapsed, ffn_norm_weight, ffn_normed, ffn_router_normed, block, active
-        )
+        rms_norm_tiled_with_fp32(ffn_collapsed, ffn_norm_weight, ffn_normed, ffn_router_normed, block, active)
 
     EP2_RANK(
         ffn_normed,

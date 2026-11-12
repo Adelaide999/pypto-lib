@@ -6,9 +6,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Torch goldens and PyPTO entry points for A2/A3 W8A8 quantization."""
+"""Shared W8A8 goldens and phase-specific device quantization."""
 
 from __future__ import annotations
+
 
 import torch
 import pypto.language as pl
@@ -17,6 +18,96 @@ from .operator_config import CONTRACT
 
 INT8_AMAX_EPS = CONTRACT.int8_amax_epsilon
 K_TILE = 256
+
+
+def make_dynamic_int8_quantize(capacity: int, width: int):
+    """Build a PyPTO kernel for BF16 to INT8 per-token quantization.
+
+    The scale uses the vLLM/A2/A3 contract directly: one FP32 dequantization
+    scale per token, stored as ``[T, 1]``.
+    """
+
+    if capacity % 8 or width % K_TILE:
+        raise ValueError("capacity must be divisible by 8 and width by 256")
+
+    @pl.jit.inline
+    def quantize(
+        value: pl.Tensor[[capacity, width], pl.BF16],
+        payload: pl.Tensor[[capacity, width], pl.INT8],
+        scales: pl.Tensor[[capacity, 1], pl.FP32],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for block in pl.spmd(capacity // 8, name_hint="dsv41_a2a3_dynamic_quant"):
+            t0 = block * 8
+            maximum = pl.full([1, 8], dtype=pl.FP32, value=INT8_AMAX_EPS)
+            for k0 in pl.range(0, width, K_TILE):
+                source = pl.slice(value, [8, K_TILE], [t0, k0])
+                maximum = pl.maximum(
+                    maximum, pl.reshape(pl.row_max(pl.abs(pl.cast(source, pl.FP32))), [1, 8])
+                )
+            inverse = pl.reshape(pl.div(pl.full([1, 8], dtype=pl.FP32, value=127.0), maximum), [8, 1])
+            scale = pl.reshape(pl.div(maximum, 127.0), [8, 1])
+            scales[t0 : t0 + 8, 0:1] = scale
+            for k0 in pl.range(0, width, K_TILE):
+                source_fp32 = pl.cast(pl.slice(value, [8, K_TILE], [t0, k0]), pl.FP32)
+                normalized = pl.row_expand_mul(source_fp32, inverse)
+                bounded = pl.minimum(pl.maximum(normalized, -127.0), 127.0)
+                rounded = pl.cast(bounded, pl.INT32, mode="rint")
+                payload[t0 : t0 + 8, k0 : k0 + K_TILE] = pl.cast(rounded, pl.INT8, mode="trunc")
+        return payload, scales
+
+    return quantize
+
+
+DECODE_INT8_AMAX_EPS = CONTRACT.int8_amax_epsilon
+
+
+def make_decode_dynamic_int8_quantize(capacity: int, width: int, *, cann_dispatch: bool = False):
+    """Build a PyPTO kernel for BF16 to INT8 per-token quantization.
+
+    The scale uses the vLLM/A2/A3 contract directly: one FP32 dequantization
+    scale per token, stored as ``[T, 1]``.  CANN's fused EP2 dispatch path
+    uses FP16 truncation before its rounded INT8 store; other paths retain
+    the existing INT32 staging sequence.
+    """
+
+    if capacity % 8 or width % K_TILE:
+        raise ValueError("capacity must be divisible by 8 and width by 256")
+
+    @pl.jit.inline
+    def quantize(
+        value: pl.Tensor[[capacity, width], pl.BF16],
+        payload: pl.Tensor[[capacity, width], pl.INT8],
+        scales: pl.Tensor[[capacity, 1], pl.FP32],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for block in pl.spmd(capacity // 8, name_hint="dsv41_a2a3_dynamic_quant"):
+            t0 = block * 8
+            maximum = pl.full([1, 8], dtype=pl.FP32, value=DECODE_INT8_AMAX_EPS)
+            for k0 in pl.range(0, width, K_TILE):
+                source = pl.slice(value, [8, K_TILE], [t0, k0])
+                maximum = pl.maximum(
+                    maximum, pl.reshape(pl.row_max(pl.abs(pl.cast(source, pl.FP32))), [1, 8])
+                )
+            inverse = pl.reshape(pl.div(pl.full([1, 8], dtype=pl.FP32, value=127.0), maximum), [8, 1])
+            scale = pl.reshape(pl.div(maximum, 127.0), [8, 1])
+            scales[t0 : t0 + 8, 0:1] = scale
+            for k0 in pl.range(0, width, K_TILE):
+                source_fp32 = pl.cast(pl.slice(value, [8, K_TILE], [t0, k0]), pl.FP32)
+                normalized = pl.row_expand_mul(source_fp32, inverse)
+                bounded = pl.minimum(pl.maximum(normalized, -127.0), 127.0)
+                if cann_dispatch:
+                    payload[t0 : t0 + 8, k0 : k0 + K_TILE] = pl.cast(
+                        pl.cast(bounded, target_type=pl.FP16, mode="trunc"),
+                        target_type=pl.INT8,
+                        mode="round",
+                    )
+                else:
+                    rounded = pl.cast(bounded, pl.INT32, mode="rint")
+                    payload[t0 : t0 + 8, k0 : k0 + K_TILE] = pl.cast(rounded, pl.INT8, mode="trunc")
+        return payload, scales
+
+    return quantize
 
 
 def _round_symmetric_int8(value: torch.Tensor) -> torch.Tensor:
@@ -61,8 +152,7 @@ def int8_matmul(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"K mismatch: activation={value.shape[-1]}, weight={weight.shape[-1]}")
     if value.shape[-1] % CONTRACT.int8_k_alignment:
         raise ValueError(
-            f"A2/A3 INT8 GEMM requires K aligned to {CONTRACT.int8_k_alignment}, "
-            f"got {value.shape[-1]}"
+            f"A2/A3 INT8 GEMM requires K aligned to {CONTRACT.int8_k_alignment}, got {value.shape[-1]}"
         )
     return torch.matmul(value.to(torch.int32), weight.to(torch.int32).transpose(-2, -1))
 
@@ -96,52 +186,3 @@ def w8a8_linear(
     if bias is not None:
         result = (result.float() + bias.float()).to(out_dtype)
     return result
-
-
-def make_dynamic_int8_quantize(capacity: int, width: int):
-    """Build a PyPTO kernel for BF16 to INT8 per-token quantization.
-
-    The scale uses the vLLM/A2/A3 contract directly: one FP32 dequantization
-    scale per token, stored as ``[T, 1]``.
-    """
-
-    if capacity % 8 or width % K_TILE:
-        raise ValueError("capacity must be divisible by 8 and width by 256")
-
-    @pl.jit.inline
-    def quantize(
-        value: pl.Tensor[[capacity, width], pl.BF16],
-        payload: pl.Tensor[[capacity, width], pl.INT8],
-        scales: pl.Tensor[[capacity, 1], pl.FP32],
-        active: pl.Scalar[pl.INT32],
-    ):
-        for block in pl.spmd(capacity // 8, name_hint="dsv41_a2a3_dynamic_quant"):
-            t0 = block * 8
-            maximum = pl.full([1, 8], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            for k0 in pl.range(0, width, K_TILE):
-                source = pl.slice(value, [8, K_TILE], [t0, k0])
-                maximum = pl.maximum(maximum, pl.reshape(pl.row_max(pl.abs(pl.cast(source, pl.FP32))), [1, 8]))
-            inverse = pl.reshape(
-                pl.div(pl.full([1, 8], dtype=pl.FP32, value=127.0), maximum), [8, 1]
-            )
-            scale = pl.reshape(pl.div(maximum, 127.0), [8, 1])
-            scales[t0:t0 + 8, 0:1] = scale
-            for k0 in pl.range(0, width, K_TILE):
-                source_fp32 = pl.cast(pl.slice(value, [8, K_TILE], [t0, k0]), pl.FP32)
-                normalized = pl.row_expand_mul(source_fp32, inverse)
-                bounded = pl.minimum(pl.maximum(normalized, -127.0), 127.0)
-                rounded = pl.cast(bounded, pl.INT32, mode="rint")
-                payload[t0:t0 + 8, k0:k0 + K_TILE] = pl.cast(rounded, pl.INT8, mode="trunc")
-        return payload, scales
-
-    return quantize
-
-
-__all__ = [
-    "dequantize_int32",
-    "int8_matmul",
-    "make_dynamic_int8_quantize",
-    "quantize_per_channel_int8",
-    "quantize_per_token_int8",
-    "w8a8_linear",
-]

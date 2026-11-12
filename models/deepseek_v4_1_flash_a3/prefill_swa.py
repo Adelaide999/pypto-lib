@@ -15,16 +15,25 @@ from .ecotech_linear import make_ecotech_dynamic_linear, prepare_ecotech_dynamic
 from .hc import make_hc_pre_inline
 from .rmsnorm import make_blocked_rmsnorm as make_norm
 from .norm_rope import make_adjacent_rope as make_rope
-from .prefill_norm import make_prefill_norm
+from .rmsnorm import make_prefill_norm
 from .swa import make_swa_inline, make_swa_leaves, make_swa_read
 
 
 # model config
 GEOMETRY = dict(
-    hidden_size=5120, num_attention_heads=64, num_key_value_heads=1,
-    head_dim=512, qk_rope_head_dim=64, q_lora_rank=1280, o_lora_rank=1024,
-    o_groups=8, sliding_window=128, rms_norm_eps=1e-20, hc_mult=4,
-    hc_sinkhorn_iters=20, hc_eps=1e-6,
+    hidden_size=5120,
+    num_attention_heads=64,
+    num_key_value_heads=1,
+    head_dim=512,
+    qk_rope_head_dim=64,
+    q_lora_rank=1280,
+    o_lora_rank=1024,
+    o_groups=8,
+    sliding_window=128,
+    rms_norm_eps=1e-20,
+    hc_mult=4,
+    hc_sinkhorn_iters=20,
+    hc_eps=1e-6,
 )
 
 
@@ -38,7 +47,9 @@ def prepare_product_operands(raw, layer_id=0, *, role=None):
     for projection in ("wq_a", "wq_b", "wkv"):
         prefix = f"{layer}.attn.{projection}."
         weight, scale = prepare_ecotech_dynamic_weight(
-            raw[prefix + "weight"], raw[prefix + "weight_scale"], raw[prefix + "weight_offset"],
+            raw[prefix + "weight"],
+            raw[prefix + "weight_scale"],
+            raw[prefix + "weight_offset"],
         )
         prepared[projection] = weight
         prepared[projection + "_scale"] = scale
@@ -51,9 +62,13 @@ def prepare_product_operands(raw, layer_id=0, *, role=None):
     prepared["wo_a_grouped_prefill"] = wo_a.reshape(8, 1024, 4096).contiguous()
     prepared["wo_b"] = wo_b.T.contiguous()
     names = dict(
-        attn_norm=f"{layer}.attn_norm.weight", q_norm=f"{layer}.attn.q_norm.weight",
-        kv_norm=f"{layer}.attn.kv_norm.weight", sink=f"{layer}.attn.attn_sink",
-        hc_function=f"{layer}.hc_attn_fn", hc_scale=f"{layer}.hc_attn_scale", hc_base=f"{layer}.hc_attn_base",
+        attn_norm=f"{layer}.attn_norm.weight",
+        q_norm=f"{layer}.attn.q_norm.weight",
+        kv_norm=f"{layer}.attn.kv_norm.weight",
+        sink=f"{layer}.attn.attn_sink",
+        hc_function=f"{layer}.hc_attn_fn",
+        hc_scale=f"{layer}.hc_attn_scale",
+        hc_base=f"{layer}.hc_attn_base",
     )
     for target, source in names.items():
         prepared[target] = raw[source].contiguous()
@@ -68,13 +83,18 @@ def prepare_product_operands(raw, layer_id=0, *, role=None):
         prepared["index_norm"] = raw[indexer + ".k_norm.weight"].contiguous()
         prepared["index_weights"] = raw[indexer + ".weights_proj.weight"].T.contiguous()
         prepared["index_wqb"], prepared["index_wqb_scale"] = prepare_ecotech_dynamic_weight(
-            raw[indexer + ".wq_b.weight"], raw[indexer + ".wq_b.weight_scale"], raw[indexer + ".wq_b.weight_offset"],
+            raw[indexer + ".wq_b.weight"],
+            raw[indexer + ".wq_b.weight_scale"],
+            raw[indexer + ".wq_b.weight_offset"],
         )
     if role["mode"] == "reindex":
         indexer = f"{layer}.attn.indexer"
         prepared["index_weights"] = raw[indexer + ".weights_proj.weight"].T.contiguous()
         prepared["index_wqb"], prepared["index_wqb_scale"] = prepare_ecotech_dynamic_weight(
-            raw[indexer + ".wq_b.weight"], raw[indexer + ".wq_b.weight_scale"], raw[indexer + ".wq_b.weight_offset"])
+            raw[indexer + ".wq_b.weight"],
+            raw[indexer + ".wq_b.weight_scale"],
+            raw[indexer + ".wq_b.weight_offset"],
+        )
     if any(value.device.type != "cpu" for value in prepared.values()):
         raise ValueError("Operand preparation requires CPU tensors")
     return prepared

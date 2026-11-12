@@ -12,7 +12,7 @@ import pypto.language as pl
 
 from .hc import make_hc_collapse_inline
 from .prefill_cp import make_sp_gather_unpack
-from .prefill_norm import make_prefill_norm
+from .rmsnorm import make_prefill_norm
 from .rmsnorm import D, EPS
 from .gemm import make_bf16_linear
 
@@ -53,8 +53,8 @@ def make_output_vocab_unpack(capacity, vocabulary, tp):
             peer = column // local_width
             source = peer * capacity + token
             local_column = column % local_width
-            value = packet[source:source + 1, local_column:local_column + 64]
-            output[token:token + 1, column:column + 64] = value
+            value = packet[source : source + 1, local_column : local_column + 64]
+            output[token : token + 1, column : column + 64] = value
         return output
 
     return vocab_unpack

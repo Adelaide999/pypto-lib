@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 
 from .engram_hash import update_slot_history
-from .prefill_engram import make_prefill_engram_entries
+from .engram import make_prefill_engram_entries
 from .prefill_engram_runtime import engram_owner, load_rotation
 from .prefill_layer_state import resolve_layer_role
 from .runtime_utils import Executable
@@ -30,14 +30,28 @@ class NetworkEngramHistory:
         rows = set()
         for rank, records in enumerate(bindings):
             for case, binding in records.items():
-                if (binding["owner_layer"] != 1 or binding["block_size"] != 128
-                        or not binding["bound"] or not binding["kv_binding_id"] or binding["kv_blocks"] <= 0):
-                    raise ValueError("Network V1 history requires the bound physical1 SWA identity and 128-row pages")
+                if (
+                    binding["owner_layer"] != 1
+                    or binding["block_size"] != 128
+                    or not binding["bound"]
+                    or not binding["kv_binding_id"]
+                    or binding["kv_blocks"] <= 0
+                ):
+                    raise ValueError(
+                        "Network V1 history requires the bound physical1 SWA identity and 128-row pages"
+                    )
                 count = binding["kv_blocks"] * binding["block_size"]
                 device = "meta" if geometry_only else "cpu"
-                cache = (torch.zeros(count, dtype=torch.int32, device=device) if initial_caches is None
-                         else initial_caches[rank][case])
-                if cache.dtype != torch.int32 or cache.device.type != device or tuple(cache.shape) != (count,):
+                cache = (
+                    torch.zeros(count, dtype=torch.int32, device=device)
+                    if initial_caches is None
+                    else initial_caches[rank][case]
+                )
+                if (
+                    cache.dtype != torch.int32
+                    or cache.device.type != device
+                    or tuple(cache.shape) != (count,)
+                ):
                     raise ValueError("Network history must retain the exact first-SWA INT32 slot extent")
                 self.caches[rank][case] = cache
                 rows.add(count)
@@ -82,8 +96,11 @@ class PreparedNetworkEngram:
         runtime, capacity = self.runtime, self.runtime["capacity"]
         raw = self.raw_for_layer(layer_id)
         prefix = context["prefix"]
-        projection = (runtime["projection_for_layer"](layer_id) if "projection_for_layer" in runtime
-                      else raw[prefix + ".wkv.weight"].T.contiguous())
+        projection = (
+            runtime["projection_for_layer"](layer_id)
+            if "projection_for_layer" in runtime
+            else raw[prefix + ".wkv.weight"].T.contiguous()
+        )
         if projection.dtype != torch.bfloat16 or tuple(projection.shape) != (6144, 25600):
             raise ValueError("Require the actual complete BF16 Engram projection")
         result = [{} for _ in self.history.caches]
@@ -95,35 +112,67 @@ class PreparedNetworkEngram:
                 for name in ("full_input_ids", "positions", "input_ids"):
                     if not torch.equal(original[name], source[name]):
                         raise ValueError("Prepared Engram token coordinates differ: " + name)
-                if (original["SP_physical_rows"] != source["SP_physical_rows"]
-                        or original["SP_valid_rows"] != source["SP_valid_rows"]
-                        or tuple(original["cp_token_range"]) != tuple(source["cp_token_range"])):
+                if (
+                    original["SP_physical_rows"] != source["SP_physical_rows"]
+                    or original["SP_valid_rows"] != source["SP_valid_rows"]
+                    or tuple(original["cp_token_range"]) != tuple(source["cp_token_range"])
+                ):
                     raise ValueError("Prepared Engram SP/CP token mapping differs")
                 physical = original["SP_physical_rows"]
                 hidden_input = local_hidden[rank][case]
                 if hidden_input.dtype != torch.bfloat16 or tuple(hidden_input.shape) != (capacity, 4, 5120):
                     raise ValueError("Engram gate requires this layer's local padded product hidden")
                 projected = torch.zeros((capacity, 25600), dtype=torch.bfloat16)
-                context["execute"]("engram_projection", rank, case,
-                    [prepared["local"], projection, projected, physical], {"projected": projected}, "engram_projection")
+                context["execute"](
+                    "engram_projection",
+                    rank,
+                    case,
+                    [prepared["local"], projection, projected, physical],
+                    {"projected": projected},
+                    "engram_projection",
+                )
                 restored = torch.zeros((capacity, 4, 5120), dtype=torch.float32)
                 probability = torch.zeros((capacity, 4), dtype=torch.float32)
                 hidden = torch.zeros((capacity, 4, 5120), dtype=torch.bfloat16)
-                arguments = [hidden_input, projected, raw[prefix + ".q_weight"], raw[prefix + ".k_weight"],
-                             context["rotation"], prepared["local_mask"], restored, probability, hidden, physical]
-                context["execute"]("engram_gate", rank, case, arguments,
-                    dict(original=restored, probability=probability, hidden=hidden), "engram_gate")
+                arguments = [
+                    hidden_input,
+                    projected,
+                    raw[prefix + ".q_weight"],
+                    raw[prefix + ".k_weight"],
+                    context["rotation"],
+                    prepared["local_mask"],
+                    restored,
+                    probability,
+                    hidden,
+                    physical,
+                ]
+                context["execute"](
+                    "engram_gate",
+                    rank,
+                    case,
+                    arguments,
+                    dict(original=restored, probability=probability, hidden=hidden),
+                    "engram_gate",
+                )
                 nodes = {}
                 if runtime.get("capture_nodes", False):
                     total = len(source["full_input_ids"])
-                    nodes = dict(engram_hash_ids=prepared["hashes"][:total].clone(),
+                    nodes = dict(
+                        engram_hash_ids=prepared["hashes"][:total].clone(),
                         engram_token_mask=prepared["mask"][:total].to(torch.bool),
                         engram_lookup_full=prepared["full"][:total].clone(),
                         engram_lookup_local=prepared["local"][:physical].clone(),
-                        engram_projection=projected[:physical].clone(), engram_hidden_after=hidden[:physical].clone())
-                result[rank][case] = dict(hidden=hidden, nodes=nodes,
-                    hash_cache_before=prepared["hash_cache_before"], hash_cache_after=prepared["hash_cache_after"],
-                    network_history_owner=1, network_hash_slot=role["engram_slot"])
+                        engram_projection=projected[:physical].clone(),
+                        engram_hidden_after=hidden[:physical].clone(),
+                    )
+                result[rank][case] = dict(
+                    hidden=hidden,
+                    nodes=nodes,
+                    hash_cache_before=prepared["hash_cache_before"],
+                    hash_cache_after=prepared["hash_cache_after"],
+                    network_history_owner=1,
+                    network_hash_slot=role["engram_slot"],
+                )
         self.applied.add(layer_id)
         return result
 
@@ -151,9 +200,12 @@ def validate_host_lookup(lookup, contract, batch):
     identity = batch["epoch"], batch["token_map_id"]
     if (lookup["epoch"], lookup["token_map_id"]) != identity:
         raise ValueError("Host Engram rows identify a different chunk")
-    if (lookup["topology"] != topology or lookup["capacity"] != capacity
-            or Path(lookup["checkpoint"]).resolve() != Path(contract["checkpoint"]).resolve()
-            or set(lookup["cases"]) != set(batch["cases"])):
+    if (
+        lookup["topology"] != topology
+        or lookup["capacity"] != capacity
+        or Path(lookup["checkpoint"]).resolve() != Path(contract["checkpoint"]).resolve()
+        or set(lookup["cases"]) != set(batch["cases"])
+    ):
         raise ValueError("Host Engram rows do not match the forward ABI")
     _check_constants(contract["hash_constants"], lookup["hash_constants"])
     for case, records in batch["cases"].items():
@@ -169,10 +221,18 @@ def validate_host_lookup(lookup, contract, batch):
             for layer in (1, 14):
                 for name in ("full", "local"):
                     value = ready[name][layer]
-                    if (value.device.type != "cpu" or value.dtype != torch.bfloat16
-                            or tuple(value.shape) != (capacity, 6144) or not value.is_contiguous()):
+                    if (
+                        value.device.type != "cpu"
+                        or value.dtype != torch.bfloat16
+                        or tuple(value.shape) != (capacity, 6144)
+                        or not value.is_contiguous()
+                    ):
                         raise ValueError("Forward requires ready contiguous BF16 Engram rows")
-            for name, shape in (("hashes", (capacity, 2, 24)), ("mask", (capacity,)), ("local_mask", (capacity,))):
+            for name, shape in (
+                ("hashes", (capacity, 2, 24)),
+                ("mask", (capacity,)),
+                ("local_mask", (capacity,)),
+            ):
                 value = ready[name]
                 if value.device.type != "cpu" or value.dtype != torch.int32 or tuple(value.shape) != shape:
                     raise ValueError("Host Engram control ABI changed: " + name)
@@ -201,13 +261,25 @@ def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_la
         if "entries_for_stage" in runtime:
             entries = runtime["entries_for_stage"](f"engram{layer_id}")
         else:
-            model = dict(own["model_config"]["text_config"], image_token_id=own["model_config"]["image_token_id"])
-            definitions = make_prefill_engram_entries(capacity, own["hash_constants"], model,
-                own["engram_shards"], history.cache_rows, 1, topology["tp"])
+            model = dict(
+                own["model_config"]["text_config"], image_token_id=own["model_config"]["image_token_id"]
+            )
+            definitions = make_prefill_engram_entries(
+                capacity,
+                own["hash_constants"],
+                model,
+                own["engram_shards"],
+                history.cache_rows,
+                1,
+                topology["tp"],
+            )
             for name in ("engram_projection", "engram_gate"):
                 if name not in shared_entries:
-                    shared_entries[name] = Executable(definitions[name], directory / "compiled" / name,
-                                                      diagnostics=runtime.get("diagnostics", True))
+                    shared_entries[name] = Executable(
+                        definitions[name],
+                        directory / "compiled" / name,
+                        diagnostics=runtime.get("diagnostics", True),
+                    )
             entries = shared_entries
         rotation, receipt = runtime.get("load_rotation", load_rotation)(contract["checkpoint"], 5120)
 
@@ -216,10 +288,13 @@ def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_la
                 runtime["execute_entry"](entries[name], rank, arguments)
                 return
             capture = directory / "captures" / f"rank-{rank}-{case}-{name}.pt"
-            entries[name].execute(arguments, outputs, rank, roles, capture, runtime["reports"][rank], runtime["memory"])
+            entries[name].execute(
+                arguments, outputs, rank, roles, capture, runtime["reports"][rank], runtime["memory"]
+            )
 
-        contexts[layer_id] = dict(prefix=prefix, slot=slot, execute=execute, rotation=rotation,
-                                  rotation_receipt=receipt)
+        contexts[layer_id] = dict(
+            prefix=prefix, slot=slot, execute=execute, rotation=rotation, rotation_receipt=receipt
+        )
         states[layer_id] = [{} for _ in range(world)]
     history.prepared.add(identity)
     constants = contract["hash_constants"]
@@ -229,25 +304,61 @@ def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_la
             cache = history.caches[rank][case]
             before = cache.clone() if runtime.get("capture_state", False) else None
             total = len(original["full_input_ids"])
-            update_slot_history(original["full_input_ids"], constants["token_map"],
-                ready["mask"][:total] == 0, _hash_slots(original["metadata"]["slot_mapping"]), cache)
+            update_slot_history(
+                original["full_input_ids"],
+                constants["token_map"],
+                ready["mask"][:total] == 0,
+                _hash_slots(original["metadata"]["slot_mapping"]),
+                cache,
+            )
             after = cache.clone() if runtime.get("capture_state", False) else None
             report = runtime["reports"][rank]
-            report.setdefault("network_engram_hash", {})[case] = dict(owner_layer=1,
-                epoch=identity[0], token_map_id=identity[1], status="host_prepared", device_hash_executions=0)
+            report.setdefault("network_engram_hash", {})[case] = dict(
+                owner_layer=1,
+                epoch=identity[0],
+                token_map_id=identity[1],
+                status="host_prepared",
+                device_hash_executions=0,
+            )
             for layer in (1, 14):
-                state = dict(local=ready["local"][layer], local_mask=ready["local_mask"],
-                    full=ready["full"][layer], hashes=ready["hashes"], mask=ready["mask"],
-                    hash_cache_before=before, hash_cache_after=after, shared_history_owner=1,
-                    physical_layer=layer, slot=contexts[layer]["slot"], epoch=identity[0], token_map_id=identity[1])
+                state = dict(
+                    local=ready["local"][layer],
+                    local_mask=ready["local_mask"],
+                    full=ready["full"][layer],
+                    hashes=ready["hashes"],
+                    mask=ready["mask"],
+                    hash_cache_before=before,
+                    hash_cache_after=after,
+                    shared_history_owner=1,
+                    physical_layer=layer,
+                    slot=contexts[layer]["slot"],
+                    epoch=identity[0],
+                    token_map_id=identity[1],
+                )
                 states[layer][rank][case] = state
                 report.setdefault("network_engram_storage", {})[str(layer)] = dict(
-                    lookup="host_prepared_BF16_rows", table_device_registration=False,
-                    rotation=contexts[layer]["rotation_receipt"], shared_history_owner=1, slot=state["slot"])
+                    lookup="host_prepared_BF16_rows",
+                    table_device_registration=False,
+                    rotation=contexts[layer]["rotation_receipt"],
+                    shared_history_owner=1,
+                    slot=state["slot"],
+                )
                 observe = runtime.get("observe_discrete")
                 if observe is not None:
-                    observe(layer, rank, case, dict(total=total, physical=original["SP_physical_rows"],
-                        valid=original["SP_valid_rows"], hashing=total > 0, hash_ids=ready["hashes"],
-                        token_mask=ready["mask"], lookup_full=ready["full"][layer],
-                        lookup_local=ready["local"][layer], local_mask=ready["local_mask"]))
+                    observe(
+                        layer,
+                        rank,
+                        case,
+                        dict(
+                            total=total,
+                            physical=original["SP_physical_rows"],
+                            valid=original["SP_valid_rows"],
+                            hashing=total > 0,
+                            hash_ids=ready["hashes"],
+                            token_mask=ready["mask"],
+                            lookup_full=ready["full"][layer],
+                            lookup_local=ready["local"][layer],
+                            local_mask=ready["local_mask"],
+                        ),
+                    )
     return PreparedNetworkEngram(batch, history, states, contexts, raw_for_layer, runtime)

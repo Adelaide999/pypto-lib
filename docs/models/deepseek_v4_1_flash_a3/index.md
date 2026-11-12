@@ -56,11 +56,20 @@ The original source names in this manifest are intentional provenance.
 | Original 40-layer composition | `prefill_layer.run_prefill_network_inmemory` |
 | Actual checkpoint, persistent state, HCCL and L39 head | `prefill_network_runtime.run_network_runtime` |
 | Input embedding / HC and final output kernels | `prefill_embedding.py`, `prefill_network_input.py`, `prefill_output.py` |
-| SWA and C2/C1 attention | `prefill_swa.py`, `prefill_c2a*.py`, `prefill_compressed_reuse.py`, `prefill_sparse_attention.py`, `prefill_c1a.py` |
+| SWA and C2/C1 attention | `prefill_swa.py`, `prefill_c2a.py`, `prefill_compressed_reuse.py`, `prefill_sparse_attention.py`, `compressor.py` |
 | Persistent source/cache ownership | `prefill_network_state.py`, `prefill_network_cache.py`, `prefill_layer_state.py` |
 | Two Engram slots and singleton history | `engram_host.py`, `prefill_network_engram.py`, `prefill_engram_runtime.py`, `engram_storage.py` |
 | EP MoE and actual communication | `prefill_moe.py`, `moe.py`, `moe_transport.py` |
 | Shared primitives | `quant.py`, `ecotech_linear*.py`, `qkv*.py`, `hc.py`, `gemm.py` |
+
+Compression projection/pooling/publication now share `compressor.py`; Indexer
+cache/query/candidate operations share `indexer.py`; Engram device kernels and
+their validators share `engram.py`; all checkpoint readers and the EP2 Decode
+weight ABI live in `weights.py`. Normalization variants share `rmsnorm.py`.
+This removes 28 fragmented Python modules while preserving the separate phase
+numerical boundaries. See the
+[ownership map](../../../models/deepseek_v4_1_flash_a3/MODULE_ALIGNMENT.md)
+for the official structure comparison and retained distinctions.
 
 The public entry is `prefill_fwd.prefill_fwd`; `run_prefill` remains an alias
 for existing callers. It explicitly accepts inputs,

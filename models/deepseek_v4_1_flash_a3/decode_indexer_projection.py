@@ -10,7 +10,14 @@
 
 import pypto.language as pl
 
-from .decode_primitives import N_TILE, make_dequantize, make_dot, make_pack_weight, make_quantize, make_rope
+from .linear_primitives import (
+    N_TILE,
+    make_decode_dequantize as make_dequantize,
+    make_dot,
+    make_pack_weight,
+    make_decode_quantize as make_quantize,
+    make_decode_rope as make_rope,
+)
 from .decode_qkv_proj_rope import make_bf16_projection_staged
 
 
@@ -33,7 +40,7 @@ def make_indexer_projection(capacity, config):
     pairs = rope_width // 2
     index_width = INDEX_HEADS * INDEX_WIDTH
     packed_rows = latent * (index_width // N_TILE)
-    weights_scale = INDEX_WIDTH ** -0.5 * INDEX_HEADS ** -0.5
+    weights_scale = INDEX_WIDTH**-0.5 * INDEX_HEADS**-0.5
     quantize = make_quantize(capacity, latent)
     pack = make_pack_weight(latent, index_width)
     dot = make_dot(capacity, latent, index_width)
@@ -72,10 +79,12 @@ def make_indexer_projection(capacity, config):
             block = pl.tile.get_block_idx()
             row = block * WEIGHT_ROWS_TILE
             rows = pl.min(WEIGHT_ROWS_TILE, active - row)
-            value = pl.slice(projected_weights, [WEIGHT_ROWS_TILE, INDEX_HEADS], [row, 0], valid_shape=[rows, INDEX_HEADS])
+            value = pl.slice(
+                projected_weights, [WEIGHT_ROWS_TILE, INDEX_HEADS], [row, 0], valid_shape=[rows, INDEX_HEADS]
+            )
             scaled = pl.mul(pl.cast(value, pl.FP32), weights_scale)
             narrowed = pl.cast(scaled, pl.FP16, mode="rint")
-            weights[row:row + WEIGHT_ROWS_TILE, :] = pl.set_validshape(narrowed, rows, INDEX_HEADS)
+            weights[row : row + WEIGHT_ROWS_TILE, :] = pl.set_validshape(narrowed, rows, INDEX_HEADS)
         return query, weights
 
     return indexer_projection
@@ -104,16 +113,16 @@ def make_indexer_query_quantize(capacity):
             maximum = pl.row_max(pl.abs(value))
             raw_scale = pl.div(maximum, 127.0)
             rounded_scale = pl.cast(pl.cast(raw_scale, pl.FP16, mode="rint"), pl.FP32)
-            scale = pl.maximum(rounded_scale, 2.0 ** -24)
+            scale = pl.maximum(rounded_scale, 2.0**-24)
             normalized = pl.row_expand_div(value, scale)
             rounded = pl.cast(normalized, pl.INT32, mode="rint")
             bounded = pl.minimum(pl.maximum(rounded, -127), 127)
             quantized = pl.cast(bounded, pl.INT8, mode="trunc")
-            output[row:row + QUANT_ROWS_TILE, :] = pl.set_validshape(quantized, rows, INDEX_WIDTH)
+            output[row : row + QUANT_ROWS_TILE, :] = pl.set_validshape(quantized, rows, INDEX_WIDTH)
             scale_row = pl.reshape(pl.cast(scale, pl.FP16, mode="rint"), [1, QUANT_ROWS_TILE])
             token = row // INDEX_HEADS
             head = row % INDEX_HEADS
-            scales[token:token + 1, head:head + QUANT_ROWS_TILE] = scale_row
+            scales[token : token + 1, head : head + QUANT_ROWS_TILE] = scale_row
         return payload, scales
 
     return indexer_query_quantize
@@ -129,13 +138,15 @@ def make_empty_selection(capacity):
     ):
         with pl.spmd(active, name_hint="a2_empty_sparse_selection"):
             token = pl.tile.get_block_idx()
-            raw_selected[token:token + 1, :] = pl.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
+            raw_selected[token : token + 1, :] = pl.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
         return raw_selected
 
     return empty_selection
 
 
-def make_sparse_controls(capacity, requests, long_pages, window_pages, long_page_rows=64, *, compress_ratio=2):
+def make_sparse_controls(
+    capacity, requests, long_pages, window_pages, long_page_rows=64, *, compress_ratio=2
+):
     """Filter and sort QLI logical IDs, then map both caches to physical rows."""
     if long_page_rows not in (64, 128):
         raise ValueError("A2 compressed page rows must match the actual 64/128-row cache ABI")
@@ -171,7 +182,9 @@ def make_sparse_controls(capacity, requests, long_pages, window_pages, long_page
             sorted_pairs = pl.tile.sort32(sort_scores, pl.reinterpret_view(sort_ids, pl.UINT32))
             sorted_pairs = pl.tile.mrgsort(sorted_pairs, block_len=64)
             sorted_pairs = pl.tile.mrgsort(sorted_pairs, block_len=256)
-            logical_ids = pl.tile.gather_mask(sorted_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+            logical_ids = pl.tile.gather_mask(
+                sorted_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
+            )
             pl.store(logical_ids, [token, 0], selected)
             physical_ids = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
             for lane in pl.range(INDEX_TOPK):

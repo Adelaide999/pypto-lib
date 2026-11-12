@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 
-from .prefill_cache_publish import make_compressed_cache_publish
+from .compressor import make_compressed_cache_publish
 from .o_proj import make_o_proj_inline
 from .linear_primitives import N_TILE
 from .qkv_w8a8 import make_qkv_w8a8_inline
@@ -51,9 +51,24 @@ def make_consumer_qkv_publish(capacity, config):
         flat_window = pl.reshape(swa_cache, [2, 128, head_dim])
         unused_legacy_lengths = pl.create_tensor([2], dtype=pl.INT32)
         qkv(
-            x, wq_a, wq_a_scale, q_norm, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm,
-            rope_cos, rope_sin, positions, query_latent, query, window_kv,
-            flat_window, unused_legacy_lengths, active,
+            x,
+            wq_a,
+            wq_a_scale,
+            q_norm,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            wkv_scale,
+            kv_norm,
+            rope_cos,
+            rope_sin,
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            flat_window,
+            unused_legacy_lengths,
+            active,
         )
         publish(window_kv, window_slots, swa_cache, active)
         return positions, query_latent, query, window_kv, swa_cache
@@ -111,9 +126,11 @@ def make_consumer_projection(capacity, config):
         for narrow_block in pl.spmd(active * (width // N_TILE), name_hint="consumer_attention_bf16"):
             narrow_token = narrow_block // (width // N_TILE)
             narrow_column = narrow_block % (width // N_TILE) * N_TILE
-            narrow_source = attention[narrow_token:narrow_token + 1, narrow_column:narrow_column + N_TILE]
+            narrow_source = attention[narrow_token : narrow_token + 1, narrow_column : narrow_column + N_TILE]
             narrow_result = pl.cast(narrow_source, pl.BF16, mode="rint")
-            narrowed_attention[narrow_token:narrow_token + 1, narrow_column:narrow_column + N_TILE] = narrow_result
+            narrowed_attention[narrow_token : narrow_token + 1, narrow_column : narrow_column + N_TILE] = (
+                narrow_result
+            )
         project(narrowed_attention, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, output, active)
         return output
 

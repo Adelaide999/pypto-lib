@@ -35,16 +35,18 @@ from .decode_swa import (
     decode_ep2_rank,
 )
 from .engram import K as ENGRAM_K, N as ENGRAM_N, make_gate
-from .decode_hc import make_hc_post_inline, make_hc_pre_inline
-from .indexer_prepare import (
-    make_indexer_prepare); from .decode_indexer_projection import (
-    make_indexer_projection); from .decode_indexer_projection import (
-    make_indexer_query_quantize); from .decode_indexer_select import (
-    make_indexer_select)
-from .decode_compressor_c2 import make_c2_index_publish_inline
+from .hc import (
+    make_decode_hc_post_inline as make_hc_post_inline,
+    make_decode_hc_pre_inline as make_hc_pre_inline,
+)
+from .indexer import make_indexer_prepare
+from .decode_indexer_projection import make_indexer_projection
+from .decode_indexer_projection import make_indexer_query_quantize
+from .indexer import make_indexer_select
+from .compressor import make_decode_c2_index_publish_inline as make_c2_index_publish_inline
 from .decode_output_proj import make_output_projection_bf16
 from .decode_qkv_w8a8 import make_qkv_w8a8_inline
-from .decode_rmsnorm import NORM_T_TILE, rms_norm_tiled, rms_norm_tiled_with_fp32
+from .rmsnorm import NORM_T_TILE, rms_norm_tiled, rms_norm_tiled_with_fp32
 from .decode_sparse_attention import make_sparse_attention
 from .decode_swa_cache import make_swa_cache_publish
 
@@ -90,9 +92,7 @@ def _engram_linear(
             lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), 16, 256)
             rhs = pl.slice(weight, [256, 64], [k0, n0])
             acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
-        output[t0:t0 + 16, n0:n0 + 64] = pl.set_validshape(
-            pl.cast(acc, pl.BF16, mode="rint"), rows, 64
-        )
+        output[t0 : t0 + 16, n0 : n0 + 64] = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, 64)
 
 
 ENGRAM_GATE = pl.jit.inline(make_gate(16)._func)
@@ -124,9 +124,7 @@ def _pad_index_cache(
         pl.write(output_scale, [row], pl.cast(1.0, pl.FP16))
 
 
-SPARSE = pl.jit.inline(
-    make_sparse_attention(16, HEADS, HEAD_DIM, WINDOW, INDEX_TOPK, VALUE_PADDING)._func
-)
+SPARSE = pl.jit.inline(make_sparse_attention(16, HEADS, HEAD_DIM, WINDOW, INDEX_TOPK, VALUE_PADDING)._func)
 OUTPUT = pl.jit.inline(
     make_output_projection_bf16(
         16, HEADS, HEAD_DIM, FLASH.qk_rope_head_dim, FLASH.o_groups, O_RANK, HIDDEN
@@ -155,8 +153,8 @@ def _gather_rows(
         physical_index = index + COMPRESSED_PAGE_OFFSET
         if index >= 0 and physical_index < COMPRESSED_BLOCKS * COMPRESSED_ROWS:
             row = pl.cast(physical_index, pl.INDEX)
-            value[0:1, VALUE_PADDING:] = cache_flat[row:row + 1, :]
-        selected_flat[block:block + 1, :] = value
+            value[0:1, VALUE_PADDING:] = cache_flat[row : row + 1, :]
+        selected_flat[block : block + 1, :] = value
 
 
 @pl.jit.inline(auto_scope=False)
@@ -176,8 +174,8 @@ def _gather_window(
         value = pl.full([1, HEAD_DIM + VALUE_PADDING], dtype=pl.BF16, value=0.0)
         if index >= 0 and index < 2 * 128:
             row = pl.cast(index, pl.INDEX)
-            value[0:1, VALUE_PADDING:] = cache_flat[row:row + 1, :]
-        selected_flat[block:block + 1, :] = value
+            value[0:1, VALUE_PADDING:] = cache_flat[row : row + 1, :]
+        selected_flat[block : block + 1, :] = value
 
 
 @pl.jit(auto_scope=False)
@@ -296,17 +294,41 @@ def decode_layer_ep2_sparse_rank(
         attention_input = engram_hidden
     attn_collapsed_fp32 = pl.create_tensor([16, HIDDEN], dtype=pl.FP32)
     HC_PRE(
-        attention_input, attn_hc_function, attn_hc_scale, attn_hc_base, attn_incoming,
-        attn_next_pre, attn_post, attn_comb, attn_collapsed, attn_collapsed_fp32, active,
+        attention_input,
+        attn_hc_function,
+        attn_hc_scale,
+        attn_hc_base,
+        attn_incoming,
+        attn_next_pre,
+        attn_post,
+        attn_comb,
+        attn_collapsed,
+        attn_collapsed_fp32,
+        active,
     )
     for block in pl.spmd((active + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="dsv41_c2a_attn_norm"):
         rms_norm_tiled(attn_collapsed, attn_norm_weight, attn_normed, block, active)
 
     qkv_cache = pl.reshape(cache, [2, 128, HEAD_DIM])
     QKV(
-        attn_normed, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-        wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, positions,
-        query_latent, query, window_kv, qkv_cache, cache_lens, active,
+        attn_normed,
+        wq_a,
+        wq_a_scale,
+        q_norm_weight,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        wkv_scale,
+        kv_norm_weight,
+        rope_cos,
+        rope_sin,
+        positions,
+        query_latent,
+        query,
+        window_kv,
+        qkv_cache,
+        cache_lens,
+        active,
     )
     SWA_PUBLISH(window_kv, slots, cache, active)
 
@@ -323,12 +345,27 @@ def decode_layer_ep2_sparse_rank(
         compressed = pl.create_tensor([16, HEAD_DIM], dtype=pl.BF16)
         index_key = pl.create_tensor([16, 128], dtype=pl.BF16)
         C2_PUBLISH(
-            attn_normed, compressor_wkv, compressor_wgate, compressor_norm,
-            index_wk, index_norm, rope_cos, rope_sin, positions32, compressed_slots,
+            attn_normed,
+            compressor_wkv,
+            compressor_wgate,
+            compressor_norm,
+            index_wk,
+            index_norm,
+            rope_cos,
+            rope_sin,
+            positions32,
+            compressed_slots,
             index_slots,
-            query_start, requests, state_block_table, compressor_state,
-            compressed_cache_pub, index_cache_pub, index_scale_pub,
-            compressed, index_key, active,
+            query_start,
+            requests,
+            state_block_table,
+            compressor_state,
+            compressed_cache_pub,
+            index_cache_pub,
+            index_scale_pub,
+            compressed,
+            index_key,
+            active,
         )
 
         index_query = pl.create_tensor([16, 32, 128], dtype=pl.BF16)
@@ -336,8 +373,16 @@ def decode_layer_ep2_sparse_rank(
         index_query_scale = pl.create_tensor([16, 32], dtype=pl.FP16)
         index_weights = pl.create_tensor([16, 32], dtype=pl.FP16)
         INDEXER_PROJECTION(
-            attn_normed, query_latent, index_wq_b, index_wq_b_scale,
-            index_weights_proj, rope_cos, rope_sin, index_query, index_weights, active,
+            attn_normed,
+            query_latent,
+            index_wq_b,
+            index_wq_b_scale,
+            index_weights_proj,
+            rope_cos,
+            rope_sin,
+            index_query,
+            index_weights,
+            active,
         )
         INDEXER_QUERY_QUANTIZE(index_query, index_payload, index_query_scale, active)
         index_key_flat = pl.reshape(index_cache_pub, [256, 128])
@@ -348,8 +393,15 @@ def decode_layer_ep2_sparse_rank(
         qli_scores = pl.create_tensor([16, 512], dtype=pl.FP32)
         qli_indices = pl.create_tensor([16, INDEX_TOPK], dtype=pl.INT32)
         INDEXER_SELECT(
-            index_payload, index_query_scale, key_payload, key_scale,
-            index_weights, positions32, qli_scores, qli_indices, active,
+            index_payload,
+            index_query_scale,
+            key_payload,
+            key_scale,
+            index_weights,
+            positions32,
+            qli_scores,
+            qli_indices,
+            active,
         )
         INDEXER_PREPARE(qli_indices, positions32, prepared_indices, active)
     window_rows = pl.create_tensor([16, WINDOW, HEAD_DIM + VALUE_PADDING], dtype=pl.BF16)
@@ -359,18 +411,24 @@ def decode_layer_ep2_sparse_rank(
     sparse_padded = pl.create_tensor([16, HEADS, HEAD_DIM + VALUE_PADDING], dtype=pl.BF16)
     query_heads = pl.reshape(query, [16, HEADS, HEAD_DIM])
     SPARSE(
-        query_heads, window_rows, indices,
-        compressed_rows, prepared_for_attention, sink, sparse_padded, active,
+        query_heads,
+        window_rows,
+        indices,
+        compressed_rows,
+        prepared_for_attention,
+        sink,
+        sparse_padded,
+        active,
     )
     if reuse == 1:
         for block in pl.spmd(active, name_hint="dsv41_c2a_reuse_candidates_out"):
-            prepared_indices[block:block + 1, :] = prepared_for_attention[block:block + 1, :]
+            prepared_indices[block : block + 1, :] = prepared_for_attention[block : block + 1, :]
     attended = pl.create_tensor([16, WIDTH], dtype=pl.BF16)
     for block in pl.spmd(active * (HEADS // 16), name_hint="dsv41_c2a_sparse_unpad"):
         token = block // (HEADS // 16)
         head = (block % (HEADS // 16)) * 16
-        attended[token:token + 1, head * HEAD_DIM:(head + 16) * HEAD_DIM] = pl.reshape(
-            sparse_padded[token:token + 1, head:head + 16, VALUE_PADDING:],
+        attended[token : token + 1, head * HEAD_DIM : (head + 16) * HEAD_DIM] = pl.reshape(
+            sparse_padded[token : token + 1, head : head + 16, VALUE_PADDING:],
             [1, 16 * HEAD_DIM],
         )
     rotated = pl.create_tensor([16, WIDTH], dtype=pl.BF16)
@@ -379,8 +437,17 @@ def decode_layer_ep2_sparse_rank(
     HC_POST(attn_output, attention_input, attn_post, attn_comb, after_attention, active)
     ffn_collapsed_fp32 = pl.create_tensor([16, HIDDEN], dtype=pl.FP32)
     HC_PRE(
-        after_attention, ffn_hc_function, ffn_hc_scale, ffn_hc_base,
-        attn_next_pre, ffn_next_pre, ffn_post, ffn_comb, ffn_collapsed, ffn_collapsed_fp32, active,
+        after_attention,
+        ffn_hc_function,
+        ffn_hc_scale,
+        ffn_hc_base,
+        attn_next_pre,
+        ffn_next_pre,
+        ffn_post,
+        ffn_comb,
+        ffn_collapsed,
+        ffn_collapsed_fp32,
+        active,
     )
     ffn_router_normed = pl.create_tensor([16, HIDDEN], dtype=pl.FP32)
     for block in pl.spmd((active + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="dsv41_c2a_ffn_norm"):
@@ -395,12 +462,35 @@ def decode_layer_ep2_sparse_rank(
             active,
         )
     EP2_RANK(
-        ffn_normed, ffn_router_normed, gate_weight, text_bias, vision_bias, input_ids,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2,
-        routed_w2_scale, shared_gate_up, shared_gate_up_scale, shared_down,
-        shared_down_scale, lane_x, lane_aux, lane_count, lane_ready, slot_out,
-        return_ready, logits, route_ids, route_weights, moe_output, active,
-        rank, epoch,
+        ffn_normed,
+        ffn_router_normed,
+        gate_weight,
+        text_bias,
+        vision_bias,
+        input_ids,
+        routed_w1,
+        routed_w1_scale,
+        routed_w3,
+        routed_w3_scale,
+        routed_w2,
+        routed_w2_scale,
+        shared_gate_up,
+        shared_gate_up_scale,
+        shared_down,
+        shared_down_scale,
+        lane_x,
+        lane_aux,
+        lane_count,
+        lane_ready,
+        slot_out,
+        return_ready,
+        logits,
+        route_ids,
+        route_weights,
+        moe_output,
+        active,
+        rank,
+        epoch,
     )
     HC_POST(moe_output, after_attention, ffn_post, ffn_comb, output, active)
     return output
@@ -443,7 +533,9 @@ def decode_layer_ep2_sparse(
     window_kv: pl.InOut[pl.Tensor[[EP_SIZE, 16, HEAD_DIM], pl.BF16]],
     cache: pl.InOut[pl.Tensor[[EP_SIZE, 2, 128, 1, HEAD_DIM], pl.BF16]],
     cache_lens: pl.InOut[pl.Tensor[[EP_SIZE, 2], pl.INT32]],
-    compressed_cache: pl.InOut[pl.Tensor[[EP_SIZE, COMPRESSED_BLOCKS, COMPRESSED_ROWS, 1, HEAD_DIM], pl.BF16]],
+    compressed_cache: pl.InOut[
+        pl.Tensor[[EP_SIZE, COMPRESSED_BLOCKS, COMPRESSED_ROWS, 1, HEAD_DIM], pl.BF16]
+    ],
     index_cache: pl.InOut[pl.Tensor[[EP_SIZE, COMPRESSED_BLOCKS, COMPRESSED_ROWS, 1, 128], pl.INT8]],
     index_scale: pl.InOut[pl.Tensor[[EP_SIZE, COMPRESSED_BLOCKS, COMPRESSED_ROWS, 1, 1], pl.FP16]],
     compressor_state: pl.InOut[pl.Tensor[[EP_SIZE, 4, 32, 2 * HEAD_DIM], pl.FP32]],
@@ -515,30 +607,106 @@ def decode_layer_ep2_sparse(
         slot_out = pld.window(slot_out_buf, [16 * TOPK, D], dtype=pl.FP32)
         return_ready = pld.window(return_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
         decode_layer_ep2_sparse_rank(
-            x_hc[rank], engram_lookup[rank], engram_wkv[rank], engram_channel_weight[rank],
-            engram_mask[rank], engram_kv[rank], engram_hidden[rank],
-            attn_hc_function[rank], attn_hc_scale[rank], attn_hc_base[rank],
-            attn_incoming[rank], attn_norm_weight[rank], wq_a[rank], wq_a_scale[rank],
-            q_norm_weight[rank], wq_b[rank], wq_b_scale[rank], wkv[rank], wkv_scale[rank],
-            kv_norm_weight[rank], wo_a[rank], wo_b[rank], rope_cos[rank], rope_sin[rank],
-            slots[rank], indices[rank], prepared_indices[rank], prepared_indices_source[rank],
-            sink[rank], positions[rank],
-            query_latent[rank], query[rank], window_kv[rank], cache[rank], cache_lens[rank],
-            compressed_cache[rank], index_cache[rank], index_scale[rank], compressor_state[rank],
-            positions32[rank], compressed_slots[rank], index_slots[rank], query_start[rank], requests[rank],
-            state_block_table[rank], compressor_wkv[rank], compressor_wgate[rank], compressor_norm[rank],
-            index_wk[rank], index_norm[rank], index_wq_b[rank], index_wq_b_scale[rank],
-            index_weights_proj[rank], attn_output[rank], attn_next_pre[rank], attn_post[rank],
-            attn_comb[rank], attn_collapsed[rank], attn_normed[rank], after_attention[rank],
-            ffn_hc_function[rank], ffn_hc_scale[rank], ffn_hc_base[rank], ffn_norm_weight[rank],
-            ffn_next_pre[rank], ffn_post[rank], ffn_comb[rank], ffn_collapsed[rank], ffn_normed[rank],
-            gate_weight[rank], text_bias[rank], vision_bias[rank], input_ids[rank], routed_w1[rank],
-            routed_w1_scale[rank], routed_w3[rank], routed_w3_scale[rank], routed_w2[rank],
-            routed_w2_scale[rank], shared_gate_up[rank], shared_gate_up_scale[rank], shared_down[rank],
-            shared_down_scale[rank], lane_x, lane_aux, lane_count, lane_ready,
-            slot_out, return_ready,
-            logits[rank], route_ids[rank], route_weights[rank], moe_output[rank], output[rank],
-            active, rank, epoch, reuse, has_engram, device=rank,
+            x_hc[rank],
+            engram_lookup[rank],
+            engram_wkv[rank],
+            engram_channel_weight[rank],
+            engram_mask[rank],
+            engram_kv[rank],
+            engram_hidden[rank],
+            attn_hc_function[rank],
+            attn_hc_scale[rank],
+            attn_hc_base[rank],
+            attn_incoming[rank],
+            attn_norm_weight[rank],
+            wq_a[rank],
+            wq_a_scale[rank],
+            q_norm_weight[rank],
+            wq_b[rank],
+            wq_b_scale[rank],
+            wkv[rank],
+            wkv_scale[rank],
+            kv_norm_weight[rank],
+            wo_a[rank],
+            wo_b[rank],
+            rope_cos[rank],
+            rope_sin[rank],
+            slots[rank],
+            indices[rank],
+            prepared_indices[rank],
+            prepared_indices_source[rank],
+            sink[rank],
+            positions[rank],
+            query_latent[rank],
+            query[rank],
+            window_kv[rank],
+            cache[rank],
+            cache_lens[rank],
+            compressed_cache[rank],
+            index_cache[rank],
+            index_scale[rank],
+            compressor_state[rank],
+            positions32[rank],
+            compressed_slots[rank],
+            index_slots[rank],
+            query_start[rank],
+            requests[rank],
+            state_block_table[rank],
+            compressor_wkv[rank],
+            compressor_wgate[rank],
+            compressor_norm[rank],
+            index_wk[rank],
+            index_norm[rank],
+            index_wq_b[rank],
+            index_wq_b_scale[rank],
+            index_weights_proj[rank],
+            attn_output[rank],
+            attn_next_pre[rank],
+            attn_post[rank],
+            attn_comb[rank],
+            attn_collapsed[rank],
+            attn_normed[rank],
+            after_attention[rank],
+            ffn_hc_function[rank],
+            ffn_hc_scale[rank],
+            ffn_hc_base[rank],
+            ffn_norm_weight[rank],
+            ffn_next_pre[rank],
+            ffn_post[rank],
+            ffn_comb[rank],
+            ffn_collapsed[rank],
+            ffn_normed[rank],
+            gate_weight[rank],
+            text_bias[rank],
+            vision_bias[rank],
+            input_ids[rank],
+            routed_w1[rank],
+            routed_w1_scale[rank],
+            routed_w3[rank],
+            routed_w3_scale[rank],
+            routed_w2[rank],
+            routed_w2_scale[rank],
+            shared_gate_up[rank],
+            shared_gate_up_scale[rank],
+            shared_down[rank],
+            shared_down_scale[rank],
+            lane_x,
+            lane_aux,
+            lane_count,
+            lane_ready,
+            slot_out,
+            return_ready,
+            logits[rank],
+            route_ids[rank],
+            route_weights[rank],
+            moe_output[rank],
+            output[rank],
+            active,
+            rank,
+            epoch,
+            reuse,
+            has_engram,
+            device=rank,
         )
 
 

@@ -11,8 +11,11 @@
 import pypto.language as pl
 
 from .decode_attention import make_attention_inline
-from .decode_hc import make_hc_pre_inline, make_hc_post_inline
-from .decode_rmsnorm import D, EPS, NORM_T_TILE, rms_norm_tiled
+from .hc import (
+    make_decode_hc_pre_inline as make_hc_pre_inline,
+    make_decode_hc_post_inline as make_hc_post_inline,
+)
+from .rmsnorm import DECODE_D as D, DECODE_EPS as EPS, NORM_T_TILE, rms_norm_tiled
 
 
 def make_attention_block(capacity, config):
@@ -76,21 +79,61 @@ def make_attention_block(capacity, config):
 
         collapsed_fp32 = pl.create_tensor([capacity, hidden], dtype=pl.FP32)
         pre(
-            x_hc, hc_function, hc_scale, hc_base, incoming, next_pre, post, comb,
-            collapsed, collapsed_fp32, active,
+            x_hc,
+            hc_function,
+            hc_scale,
+            hc_base,
+            incoming,
+            next_pre,
+            post,
+            comb,
+            collapsed,
+            collapsed_fp32,
+            active,
         )
         for block in pl.spmd((active + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="a2_block_norm"):
             rms_norm_tiled(collapsed, norm_weight, normed, block, active)
         attention(
-            normed, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-            kv_norm_weight, wo_a, wo_b,
-            rope_cos, rope_sin, slots, indices, sink,
-            positions, query_latent, query, window_kv, cache, cache_lens, output, active,
+            normed,
+            wq_a,
+            wq_a_scale,
+            q_norm_weight,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            wkv_scale,
+            kv_norm_weight,
+            wo_a,
+            wo_b,
+            rope_cos,
+            rope_sin,
+            slots,
+            indices,
+            sink,
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            cache,
+            cache_lens,
+            output,
+            active,
         )
         post_fn(output, x_hc, post, comb, hidden_output, active)
         return (
-            positions, query_latent, query, window_kv, cache, cache_lens, output,
-            next_pre, post, comb, collapsed, normed, hidden_output,
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            cache,
+            cache_lens,
+            output,
+            next_pre,
+            post,
+            comb,
+            collapsed,
+            normed,
+            hidden_output,
         )
 
     return attention_block

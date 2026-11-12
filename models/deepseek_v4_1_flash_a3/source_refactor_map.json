@@ -68,7 +68,7 @@
     {
       "source": "staged.py",
       "definition": "make_index_quantize",
-      "target": "index_cache.py",
+      "target": "indexer.py",
       "symbol": "make_index_quantize",
       "kind": "relocated"
     },

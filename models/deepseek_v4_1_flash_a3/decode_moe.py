@@ -31,7 +31,7 @@ import pypto.language.distributed as pld
 from .config import FLASH
 from .moe import make_decode_moe_router_inline as make_moe_router_inline
 from .moe import make_decode_shared_moe_w8a8_inline as make_shared_moe_w8a8_inline
-from .decode_quant import make_dynamic_int8_quantize
+from .quant import make_decode_dynamic_int8_quantize as make_dynamic_int8_quantize
 from .moe import (
     make_decode_routed_expert_projection as make_routed_expert_projection,
     make_decode_routed_expert_w8a8 as make_routed_expert_w8a8,
@@ -45,7 +45,10 @@ from .moe import (
 from .moe import make_decode_moe_router as make_moe_router
 from .moe import make_decode_shared_moe_w8a8 as make_shared_moe_w8a8
 from .decode_expert_routed import expert_routed_inline
-from .moe import make_decode_dispatch_layout as make_dispatch_layout, make_decode_route_restore as make_route_restore
+from .moe import (
+    make_decode_dispatch_layout as make_dispatch_layout,
+    make_decode_route_restore as make_route_restore,
+)
 
 
 # EP2 product topology and Decode capacity.
@@ -199,7 +202,9 @@ def decode_ep2_arrive(
                 pl.write(route_scale, [flat, 0], pl.read(lane_aux, [lane_row, AUX_SCALE]))
                 pl.write(route_weight, [flat, 0], pl.read(lane_aux, [lane_row, AUX_WEIGHT]))
                 pl.write(route_id, [flat, 0], pl.cast(pl.read(lane_aux, [lane_row, AUX_ROUTE]), pl.INT32))
-                pl.write(route_expert, [flat, 0], pl.cast(pl.read(lane_aux, [lane_row, AUX_EXPERT]), pl.INT32))
+                pl.write(
+                    route_expert, [flat, 0], pl.cast(pl.read(lane_aux, [lane_row, AUX_EXPERT]), pl.INT32)
+                )
                 pl.write(route_source, [flat, 0], pl.cast(source, pl.INT32))
             running = running + rows
         pl.write(route_count, [0], pl.cast(running, pl.INT32))
@@ -211,7 +216,7 @@ def decode_ep2_arrive(
         for row in pl.range(rows):
             flat = base + row
             lane_row = source * LANE_CAP + row
-            route_x[flat:flat + 1, :] = lane_x[lane_row:lane_row + 1, :]
+            route_x[flat : flat + 1, :] = lane_x[lane_row : lane_row + 1, :]
     return prefix_tid
 
 
@@ -270,7 +275,7 @@ def decode_ep2_regroup(
         for row in pl.range(rows):
             source_row = pl.cast(pl.read(bucket, [base + row]), pl.INDEX)
             target_row = expert * RECV_MAX + row
-            recv_x_flat[target_row:target_row + 1, :] = route_x[source_row:source_row + 1, :]
+            recv_x_flat[target_row : target_row + 1, :] = route_x[source_row : source_row + 1, :]
     return meta_tid
 
 
@@ -285,7 +290,9 @@ def decode_ep2_return(
     """Return weighted expert rows to the source rank's route slots."""
 
     flat = pl.reshape(expert_output, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dsv41_ep2_return", allow_early_resolve=True) as return_tid:
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="dsv41_ep2_return", allow_early_resolve=True
+    ) as return_tid:
         for expert in pl.range(N_LOCAL_EXPERTS):
             rows = pl.cast(pl.read(recv_count, [expert, 0]), pl.INDEX)
             for row in pl.range(rows):
@@ -316,7 +323,9 @@ def decode_ep2_combine(
 ) -> pl.Scalar[pl.TASK_ID]:
     """Wait for every rank and add routed output to the shared expert."""
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dsv41_ep2_return_notify", deps=[return_tid]) as notify_tid:
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="dsv41_ep2_return_notify", deps=[return_tid]
+    ) as notify_tid:
         for peer in pl.range(EP_SIZE):
             if peer != rank:
                 pld.system.notify(
@@ -342,18 +351,18 @@ def decode_ep2_combine(
             routed = pl.full([1, D], dtype=pl.FP32, value=0.0)
             for route in pl.range(TOPK):
                 slot = token * TOPK + route
-                routed_row = pl.cast(slot_out[slot:slot + 1, :], pl.BF16, mode="rint")
+                routed_row = pl.cast(slot_out[slot : slot + 1, :], pl.BF16, mode="rint")
                 routed = pl.add(routed, pl.cast(routed_row, pl.FP32))
-            shared = pl.cast(shared_output[token:token + 1, :], pl.FP32)
+            shared = pl.cast(shared_output[token : token + 1, :], pl.FP32)
             if _DEBUG_COMPONENT == 1:
                 combined = routed
             elif _DEBUG_COMPONENT == 2:
                 combined = shared
             else:
                 combined = pl.add(shared, routed)
-            output[token:token + 1, :] = pl.cast(combined, pl.BF16, mode="rint")
+            output[token : token + 1, :] = pl.cast(combined, pl.BF16, mode="rint")
         else:
-            output[token:token + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+            output[token : token + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
     return wait_tid
 
 
@@ -396,10 +405,31 @@ def decode_ep2_rank(
     QUANTIZE(value, x_int8, x_scale, active)
     pl.dump_tag(x_int8)
     pl.dump_tag(x_scale)
-    ROUTER(value, router_value, gate_weight, text_bias, vision_bias, input_ids, logits, route_ids, route_weights, active)
+    ROUTER(
+        value,
+        router_value,
+        gate_weight,
+        text_bias,
+        vision_bias,
+        input_ids,
+        logits,
+        route_ids,
+        route_weights,
+        active,
+    )
 
     pack_tid = decode_ep2_pack(
-        route_ids, route_weights, x_int8, x_scale, lane_x, lane_aux, lane_count, lane_ready, active, rank, epoch,
+        route_ids,
+        route_weights,
+        x_int8,
+        x_scale,
+        lane_x,
+        lane_aux,
+        lane_count,
+        lane_ready,
+        active,
+        rank,
+        epoch,
     )
     route_x = pl.create_tensor([LANE_ROWS, D], dtype=pl.INT8)
     route_scale = pl.create_tensor([LANE_ROWS, 1], dtype=pl.FP32)
@@ -409,8 +439,20 @@ def decode_ep2_rank(
     route_source = pl.create_tensor([LANE_ROWS, 1], dtype=pl.INT32)
     route_count = pl.create_tensor([1], dtype=pl.INT32)
     decode_ep2_arrive(
-        lane_x, lane_aux, lane_count, lane_ready, route_x, route_scale, route_weight,
-        route_id, route_expert, route_source, route_count, rank, epoch, pack_tid,
+        lane_x,
+        lane_aux,
+        lane_count,
+        lane_ready,
+        route_x,
+        route_scale,
+        route_weight,
+        route_id,
+        route_expert,
+        route_source,
+        route_count,
+        rank,
+        epoch,
+        pack_tid,
     )
 
     recv_x = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.INT8)
@@ -421,14 +463,28 @@ def decode_ep2_rank(
     recv_count = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
     expert_offsets = pl.create_tensor([N_LOCAL_EXPERTS + 1], dtype=pl.INT32)
     decode_ep2_regroup(
-        route_expert, route_source, route_id, route_x, route_scale, route_weight, route_count,
-        recv_x, recv_scale, recv_weight, recv_source, recv_route, recv_count, expert_offsets,
+        route_expert,
+        route_source,
+        route_id,
+        route_x,
+        route_scale,
+        route_weight,
+        route_count,
+        recv_x,
+        recv_scale,
+        recv_weight,
+        recv_source,
+        recv_route,
+        recv_count,
+        expert_offsets,
     )
 
     routed_output = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP32)
     routed_output_flat = pl.reshape(routed_output, [N_LOCAL_EXPERTS * RECV_MAX, D])
     d_tiles = D // 256
-    with pl.spmd(N_LOCAL_EXPERTS * (RECV_MAX // 64) * d_tiles, name_hint="dsv41_ep2_expert_output_zero") as inputs_ready:
+    with pl.spmd(
+        N_LOCAL_EXPERTS * (RECV_MAX // 64) * d_tiles, name_hint="dsv41_ep2_expert_output_zero"
+    ) as inputs_ready:
         block = pl.tile.get_block_idx()
         zero_row = (block // d_tiles) * 64
         zero_col = (block % d_tiles) * 256
@@ -444,12 +500,20 @@ def decode_ep2_rank(
             flat_tile_row = local_e * RECV_MAX + tile_row
             recv_y_tile = pl.create_tensor([64, D], dtype=pl.FP32)
             expert_routed_tile(
-                recv_x, recv_scale, recv_weight,
-                routed_w1, routed_w1_scale,
-                routed_w3, routed_w3_scale,
-                routed_w2, routed_w2_scale,
+                recv_x,
+                recv_scale,
+                recv_weight,
+                routed_w1,
+                routed_w1_scale,
+                routed_w3,
+                routed_w3_scale,
+                routed_w2,
+                routed_w2_scale,
                 recv_y_tile,
-                local_e, tile_row, valid_rows, inputs_ready,
+                local_e,
+                tile_row,
+                valid_rows,
+                inputs_ready,
             )
             routed_output_flat[flat_tile_row : flat_tile_row + 64, :] = recv_y_tile
     return_tid = decode_ep2_return(routed_output, recv_source, recv_route, recv_count, slot_out)
@@ -501,12 +565,35 @@ def decode_ep2(
         slot_out = pld.window(slot_out_buf, [N_ROUTES, D], dtype=pl.FP32)
         return_ready = pld.window(return_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
         decode_ep2_rank(
-            value[rank], router_value[rank], gate_weight[rank], text_bias[rank], vision_bias[rank], input_ids[rank],
-            routed_w1[rank], routed_w1_scale[rank], routed_w3[rank], routed_w3_scale[rank],
-            routed_w2[rank], routed_w2_scale[rank], shared_gate_up[rank], shared_gate_up_scale[rank],
-            shared_down[rank], shared_down_scale[rank], lane_x, lane_aux, lane_count, lane_ready,
-            slot_out, return_ready, logits[rank], route_ids[rank], route_weights[rank], output[rank],
-            active, rank, epoch,
+            value[rank],
+            router_value[rank],
+            gate_weight[rank],
+            text_bias[rank],
+            vision_bias[rank],
+            input_ids[rank],
+            routed_w1[rank],
+            routed_w1_scale[rank],
+            routed_w3[rank],
+            routed_w3_scale[rank],
+            routed_w2[rank],
+            routed_w2_scale[rank],
+            shared_gate_up[rank],
+            shared_gate_up_scale[rank],
+            shared_down[rank],
+            shared_down_scale[rank],
+            lane_x,
+            lane_aux,
+            lane_count,
+            lane_ready,
+            slot_out,
+            return_ready,
+            logits[rank],
+            route_ids[rank],
+            route_weights[rank],
+            output[rank],
+            active,
+            rank,
+            epoch,
             device=rank,
         )
 
@@ -533,7 +620,9 @@ def product_contract() -> dict[str, object]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--contract", action="store_true", help="print the EP2 product ABI")
-    parser.add_argument("--compile-only", action="store_true", help="reserved for the queued PyPTO compile harness")
+    parser.add_argument(
+        "--compile-only", action="store_true", help="reserved for the queued PyPTO compile harness"
+    )
     args = parser.parse_args(argv)
     if args.contract or args.compile_only:
         import json

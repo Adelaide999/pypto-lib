@@ -10,11 +10,11 @@
 
 import pypto.language as pl
 
-from .prefill_cache_publish import make_compressed_cache_publish
+from .compressor import make_compressed_cache_publish
 from .prefill_swa import GEOMETRY, make_builders
 from .hc import make_hc_post_inline
 from .prefill_indexer import make_sparse_controls
-from .prefill_norm import make_prefill_norm
+from .rmsnorm import make_prefill_norm
 from .prefill_sparse_attention import make_consumer_sparse_core
 
 
@@ -145,15 +145,28 @@ def make_consumer_entries(active, *, compress_ratio, compressed_blocks=1):
     return dict(
         attention_norm=make_prefill_norm(16, 5120),
         qkv_publish=make_qkv_publish(16, config),
-        sparse_controls=make_sparse_controls(16, 1, native_pages, 2, page_rows, compress_ratio=compress_ratio),
+        sparse_controls=make_sparse_controls(
+            16, 1, native_pages, 2, page_rows, compress_ratio=compress_ratio
+        ),
         sparse_core=make_consumer_sparse_core(active, config, compressed_blocks=compressed_blocks),
         projection=make_sparse_projection(16, config),
         HC_post=make_hc_post(16, config),
     )
 
 
-def make_physical_consumer_entries(capacity, config, cache_blocks, requests, table_pages, *,
-                                   compress_ratio=2, cache_layout=None, layer_id=3, role=None, network_cache=False):
+def make_physical_consumer_entries(
+    capacity,
+    config,
+    cache_blocks,
+    requests,
+    table_pages,
+    *,
+    compress_ratio=2,
+    cache_layout=None,
+    layer_id=3,
+    role=None,
+    network_cache=False,
+):
     """Build full-head compressed attention with readonly source selection and own SWA."""
     from .norm_rope import make_rope_tables
     from .prefill_indexer import make_sparse_index_pack
@@ -167,9 +180,14 @@ def make_physical_consumer_entries(capacity, config, cache_blocks, requests, tab
     theta, scaling = config["compress_rope_theta"], config.get("rope_scaling")
     page_rows = 128 // compress_ratio
     controls = make_sparse_controls(
-        capacity, requests, table_pages, table_pages,
-        long_page_rows=page_rows, compress_ratio=compress_ratio,
-        long_page_stride=128, selection_ready=True,
+        capacity,
+        requests,
+        table_pages,
+        table_pages,
+        long_page_rows=page_rows,
+        compress_ratio=compress_ratio,
+        long_page_stride=128,
+        selection_ready=True,
     )
     entries = dict(
         rope_tables=make_rope_tables(capacity, 64, theta, scaling),
@@ -180,26 +198,43 @@ def make_physical_consumer_entries(capacity, config, cache_blocks, requests, tab
     if compress_ratio == 1 and not network_cache:
         from .prefill_cache_layout import make_paged_cache_copy, physical_consumer_geometry
 
-        geometry = physical_consumer_geometry(cache_layout, f"model.layers.{layer_id}.self_attn.",
-            source_prefix, cache_blocks)
+        geometry = physical_consumer_geometry(
+            cache_layout, f"model.layers.{layer_id}.self_attn.", source_prefix, cache_blocks
+        )
         entries["consumer_cache_load"] = make_paged_cache_copy(
-            cache_blocks, geometry["payload"], geometry["stride"], geometry["payload"],
-            source_offset=geometry["offset"])
+            cache_blocks,
+            geometry["payload"],
+            geometry["stride"],
+            geometry["payload"],
+            source_offset=geometry["offset"],
+        )
         entries["consumer_cache_store"] = make_paged_cache_copy(
-            cache_blocks, geometry["payload"], geometry["payload"], geometry["stride"],
-            destination_offset=geometry["offset"], first_page=geometry["first_owned"])
+            cache_blocks,
+            geometry["payload"],
+            geometry["payload"],
+            geometry["stride"],
+            destination_offset=geometry["offset"],
+            first_page=geometry["first_owned"],
+        )
     if role["mode"] == "reindex":
         from .prefill_cache_layout import physical_index_geometry
         from .prefill_indexer import make_physical_index_query_entries
 
-        entries.update(make_physical_index_query_entries(capacity, config, cache_blocks, requests, table_pages, 1))
+        entries.update(
+            make_physical_index_query_entries(capacity, config, cache_blocks, requests, table_pages, 1)
+        )
         if not network_cache:
             geometry = physical_index_geometry(cache_layout, source_prefix, cache_blocks)
             for name, descriptor in geometry.items():
                 dtype = pl.INT8 if name == "codes" else pl.FP16
                 entries["refresh_cache_load_" + name] = make_paged_cache_copy(
-                    cache_blocks, descriptor["payload"], descriptor["stride"], descriptor["payload"],
-                    source_offset=descriptor["offset"], dtype=dtype)
+                    cache_blocks,
+                    descriptor["payload"],
+                    descriptor["stride"],
+                    descriptor["payload"],
+                    source_offset=descriptor["offset"],
+                    dtype=dtype,
+                )
     if network_cache:
         from .prefill_network_cache import make_network_cache_entries, network_cache_geometry
 

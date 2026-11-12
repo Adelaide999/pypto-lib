@@ -19,7 +19,7 @@ from time import perf_counter
 import torch
 
 from .prefill_network_runtime import network_parameter_abi
-from .prefill_norm import make_prefill_norm
+from .rmsnorm import make_prefill_norm
 from .prefill_resident import ResidentNetworkRuntime
 from .rmsnorm import golden_rms_norm
 from .runtime_config import configure_devices
@@ -43,7 +43,11 @@ def main():
         compiled = CompiledProgram.from_dir(args.compiled)
     abi = network_parameter_abi(compiled)
     if args.compile_only:
-        print(json.dumps(dict(status="compiled", device_initialization="not_run", compiled=str(compiled.output_dir))))
+        print(
+            json.dumps(
+                dict(status="compiled", device_initialization="not_run", compiled=str(compiled.output_dir))
+            )
+        )
         return
     torch.manual_seed(41)
     weight = torch.randn(5120, dtype=torch.bfloat16)
@@ -57,8 +61,14 @@ def main():
                 output = torch.zeros_like(source)
                 runtime.execute(compiled, rank, [source, weight, output, 16], abi)
                 torch.testing.assert_close(output, golden_rms_norm(source, weight), rtol=0.05, atol=0.05)
-            values = [{"test": {"value": torch.arange(8, dtype=torch.float32).reshape(2, 4) + rank * 10 + step * 100}}
-                      for rank in range(2)]
+            values = [
+                {
+                    "test": {
+                        "value": torch.arange(8, dtype=torch.float32).reshape(2, 4) + rank * 10 + step * 100
+                    }
+                }
+                for rank in range(2)
+            ]
             gathered, _ = runtime.exchange(f"gather-{step}", values, "all_gather", "ep")
             expected = torch.cat([row["test"]["value"] for row in values])
             for row in gathered:
@@ -70,15 +80,21 @@ def main():
             reduced, _ = runtime.exchange(f"reduce-{step}", values, "reduce_scatter", "tp")
             total = sum(source["test"]["value"] for source in values)
             for rank, row in enumerate(reduced):
-                torch.testing.assert_close(row["test"]["value"], total[rank:rank + 1], rtol=0, atol=0)
+                torch.testing.assert_close(row["test"]["value"], total[rank : rank + 1], rtol=0, atol=0)
         summary = runtime.summary()
         if summary["weight_bytes"] != [10240, 10240] or summary["worker_initializations"] != 2:
             raise RuntimeError("Resident worker/weight ownership was not preserved across steps")
         if len(runtime.channels) != 2 or summary["transport_calls"] != 6:
             raise RuntimeError("Persistent HCCL groups were not reused")
-    report = dict(status="PASS", scope="Resident norm dispatch and three repeated two-rank collectives",
-                  devices=devices, seconds=perf_counter() - begin, runtime=summary,
-                  full_model_accuracy="not_run", full_model_speedup="not_measured")
+    report = dict(
+        status="PASS",
+        scope="Resident norm dispatch and three repeated two-rank collectives",
+        devices=devices,
+        seconds=perf_counter() - begin,
+        runtime=summary,
+        full_model_accuracy="not_run",
+        full_model_speedup="not_measured",
+    )
     (args.output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report), flush=True)
 

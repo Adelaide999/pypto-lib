@@ -44,7 +44,7 @@ from .decode_swa import (
     WINDOW,
 )
 from .engram import COLS, K as ENGRAM_K, N as ENGRAM_N, ROW_WIDTH, make_gate
-from .decode_rmsnorm import NORM_T_TILE, rms_norm_tiled_with_fp32
+from .rmsnorm import NORM_T_TILE, rms_norm_tiled_with_fp32
 
 
 ENGRAM_TABLE_ROWS = T * COLS
@@ -72,13 +72,15 @@ def _engram_linear(
             lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), 16, 256)
             rhs = pl.slice(weight, [256, n_tile], [k0, n0])
             acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
-        output_2d[t0:t0 + 16, n0:n0 + n_tile] = pl.set_validshape(
+        output_2d[t0 : t0 + 16, n0 : n0 + n_tile] = pl.set_validshape(
             pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
         )
 
 
 ENGRAM_LINEAR = _engram_linear
 ENGRAM_GATE = pl.jit.inline(auto_scope=False)(make_gate(T)._func)
+
+
 @pl.jit(auto_scope=False)
 def decode_layer_ep2_engram_rank(
     x_hc: pl.Tensor[[T, HC, HIDDEN], pl.BF16],
@@ -216,7 +218,8 @@ def decode_layer_ep2_engram_rank(
         ffn_next_pre,
         ffn_post,
         ffn_comb,
-        ffn_collapsed, ffn_collapsed_fp32,
+        ffn_collapsed,
+        ffn_collapsed_fp32,
         active,
     )
     ffn_router_normed = pl.create_tensor([T, HIDDEN], dtype=pl.FP32)
@@ -224,9 +227,7 @@ def decode_layer_ep2_engram_rank(
         # The fused reference normalizes the BF16 HC collapse and exposes its
         # FP32 result to the router.  Keep the BF16 store boundary before both
         # outputs so expert input and router input share the same source.
-        rms_norm_tiled_with_fp32(
-            ffn_collapsed, ffn_norm_weight, ffn_normed, ffn_router_normed, block, active
-        )
+        rms_norm_tiled_with_fp32(ffn_collapsed, ffn_norm_weight, ffn_normed, ffn_router_normed, block, active)
     EP2_RANK(
         ffn_normed,
         ffn_router_normed,
@@ -260,6 +261,7 @@ def decode_layer_ep2_engram_rank(
     )
     FFN_POST(moe_output, after_attention, ffn_post, ffn_comb, output, active)
     return output
+
 
 @pl.jit.host
 def decode_layer_ep2_engram(
@@ -353,22 +355,85 @@ def decode_layer_ep2_engram(
         return_ready = pld.window(return_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
         decode_layer_ep2_engram_rank(
             x_hc[rank],
-            engram_hash_ids[rank], engram_table[rank], engram_wkv[rank],
-            engram_channel_weight[rank], engram_mask[rank], engram_lookup[rank], engram_kv[rank], engram_hidden[rank],
-            attn_hc_function[rank], attn_hc_scale[rank], attn_hc_base[rank], attn_incoming[rank],
-            attn_norm_weight[rank], wq_a[rank], wq_a_scale[rank], q_norm_weight[rank], wq_b[rank],
-            wq_b_scale[rank], wkv[rank], wkv_scale[rank], kv_norm_weight[rank], wo_a[rank], wo_b[rank],
-            rope_cos[rank], rope_sin[rank], slots[rank], indices[rank], sink[rank], positions[rank],
-            query_latent[rank], query[rank], window_kv[rank], cache[rank], cache_lens[rank],
-            attn_output[rank], attn_next_pre[rank], attn_post[rank], attn_comb[rank], attn_collapsed[rank],
-            attn_normed[rank], after_attention[rank], ffn_hc_function[rank], ffn_hc_scale[rank],
-            ffn_hc_base[rank], ffn_norm_weight[rank], ffn_next_pre[rank], ffn_post[rank], ffn_comb[rank],
-            ffn_collapsed[rank], ffn_normed[rank], gate_weight[rank], text_bias[rank], vision_bias[rank],
-            input_ids[rank], routed_w1[rank], routed_w1_scale[rank], routed_w3[rank], routed_w3_scale[rank],
-            routed_w2[rank], routed_w2_scale[rank], shared_gate_up[rank], shared_gate_up_scale[rank],
-            shared_down[rank], shared_down_scale[rank], lane_x, lane_aux, lane_count, lane_ready, slot_out,
-            return_ready, logits[rank], route_ids[rank], route_weights[rank], moe_output[rank], output[rank],
-            active, rank, epoch, device=rank,
+            engram_hash_ids[rank],
+            engram_table[rank],
+            engram_wkv[rank],
+            engram_channel_weight[rank],
+            engram_mask[rank],
+            engram_lookup[rank],
+            engram_kv[rank],
+            engram_hidden[rank],
+            attn_hc_function[rank],
+            attn_hc_scale[rank],
+            attn_hc_base[rank],
+            attn_incoming[rank],
+            attn_norm_weight[rank],
+            wq_a[rank],
+            wq_a_scale[rank],
+            q_norm_weight[rank],
+            wq_b[rank],
+            wq_b_scale[rank],
+            wkv[rank],
+            wkv_scale[rank],
+            kv_norm_weight[rank],
+            wo_a[rank],
+            wo_b[rank],
+            rope_cos[rank],
+            rope_sin[rank],
+            slots[rank],
+            indices[rank],
+            sink[rank],
+            positions[rank],
+            query_latent[rank],
+            query[rank],
+            window_kv[rank],
+            cache[rank],
+            cache_lens[rank],
+            attn_output[rank],
+            attn_next_pre[rank],
+            attn_post[rank],
+            attn_comb[rank],
+            attn_collapsed[rank],
+            attn_normed[rank],
+            after_attention[rank],
+            ffn_hc_function[rank],
+            ffn_hc_scale[rank],
+            ffn_hc_base[rank],
+            ffn_norm_weight[rank],
+            ffn_next_pre[rank],
+            ffn_post[rank],
+            ffn_comb[rank],
+            ffn_collapsed[rank],
+            ffn_normed[rank],
+            gate_weight[rank],
+            text_bias[rank],
+            vision_bias[rank],
+            input_ids[rank],
+            routed_w1[rank],
+            routed_w1_scale[rank],
+            routed_w3[rank],
+            routed_w3_scale[rank],
+            routed_w2[rank],
+            routed_w2_scale[rank],
+            shared_gate_up[rank],
+            shared_gate_up_scale[rank],
+            shared_down[rank],
+            shared_down_scale[rank],
+            lane_x,
+            lane_aux,
+            lane_count,
+            lane_ready,
+            slot_out,
+            return_ready,
+            logits[rank],
+            route_ids[rank],
+            route_weights[rank],
+            moe_output[rank],
+            output[rank],
+            active,
+            rank,
+            epoch,
+            device=rank,
         )
 
 

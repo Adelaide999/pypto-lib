@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """Shared MoE kernels, distinct phase boundaries, Torch goldens and validation."""
+
 if __package__ in (None, ""):
     import sys
     from pathlib import Path
@@ -18,28 +19,54 @@ if __package__ in (None, ""):
 import torch
 import pypto.language as pl
 
-from .gemm import make_fp32_dequantize as _moe_make_fp32_dequantize, make_int8_gemm as _moe_make_int8_gemm, make_pack_weight as _moe_make_pack_weight
+from .gemm import (
+    make_fp32_dequantize as _moe_make_fp32_dequantize,
+    make_int8_gemm as _moe_make_int8_gemm,
+    make_pack_weight as _moe_make_pack_weight,
+)
 from .quant import make_dynamic_int8_quantize as _moe_make_dynamic_int8_quantize
 from .quant import w8a8_linear as _moe_w8a8_linear
 
 from .linear_primitives import make_cast_tile as _router_make_cast_tile
 
-from .linear_primitives import N_TILE as SHARED_N_TILE, VEC_M_TILE as SHARED_VEC_M_TILE, make_dequantize as _shared_make_dequantize, make_dot as _shared_make_dot, make_pack_weight as _shared_make_pack_weight, make_quantize as _shared_make_quantize
+from .linear_primitives import (
+    N_TILE as SHARED_N_TILE,
+    VEC_M_TILE as SHARED_VEC_M_TILE,
+    make_dequantize as _shared_make_dequantize,
+    make_dot as _shared_make_dot,
+    make_pack_weight as _shared_make_pack_weight,
+    make_quantize as _shared_make_quantize,
+)
 
 from .ecotech_linear import prepare_ecotech_dynamic_weight as _ecotech_shared_prepare_ecotech_dynamic_weight
 from .ecotech_linear_tail import prepare_ecotech_tail_weight as _ecotech_shared_prepare_ecotech_tail_weight
-from .linear_primitives import make_dequantize as _ecotech_shared_make_dequantize, make_dot as _ecotech_shared_make_dot, make_pack_weight as _ecotech_shared_make_pack_weight, make_quantize as _ecotech_shared_make_quantize
+from .linear_primitives import (
+    make_dequantize as _ecotech_shared_make_dequantize,
+    make_dot as _ecotech_shared_make_dot,
+    make_pack_weight as _ecotech_shared_make_pack_weight,
+    make_quantize as _ecotech_shared_make_quantize,
+)
 
-from .decode_gemm import make_fp32_dequantize as _decode_moe_make_fp32_dequantize, make_int8_gemm as _decode_moe_make_int8_gemm, make_pack_weight as _decode_moe_make_pack_weight
-from .decode_quant import make_dynamic_int8_quantize as _decode_moe_make_dynamic_int8_quantize
-from .decode_quant import w8a8_linear as _decode_moe_w8a8_linear
+from .gemm import (
+    make_fp32_dequantize as _decode_moe_make_fp32_dequantize,
+    make_int8_gemm as _decode_moe_make_int8_gemm,
+    make_pack_weight as _decode_moe_make_pack_weight,
+)
+from .quant import make_decode_dynamic_int8_quantize as _decode_moe_make_dynamic_int8_quantize
+from .quant import w8a8_linear as _decode_moe_w8a8_linear
 
-from .decode_primitives import N_TILE as DECODE_SHARED_N_TILE, VEC_M_TILE as DECODE_SHARED_VEC_M_TILE, make_dequantize as _decode_shared_make_dequantize, make_dot as _decode_shared_make_dot, make_pack_weight as _decode_shared_make_pack_weight, make_quantize as _decode_shared_make_quantize
+from .linear_primitives import (
+    N_TILE as DECODE_SHARED_N_TILE,
+    VEC_M_TILE as DECODE_SHARED_VEC_M_TILE,
+    make_decode_dequantize as _decode_shared_make_dequantize,
+    make_dot as _decode_shared_make_dot,
+    make_pack_weight as _decode_shared_make_pack_weight,
+    make_decode_quantize as _decode_shared_make_quantize,
+)
 
 
 MOE_VEC_M_TILE = 8
 MOE_ACT_TILE = 256
-
 
 
 # tiling
@@ -186,7 +213,10 @@ def make_shared_expert_w8a8(
         dequant_gate_up(gate_up_acc, x_scale, gate_up_scale, gate_up, active)
 
         activation = pl.create_tensor([capacity, intermediate], dtype=pl.BF16)
-        for block in pl.spmd((active + MOE_VEC_M_TILE - 1) // MOE_VEC_M_TILE * (intermediate // MOE_ACT_TILE), name_hint="dsv41_a2a3_swiglu_v2"):
+        for block in pl.spmd(
+            (active + MOE_VEC_M_TILE - 1) // MOE_VEC_M_TILE * (intermediate // MOE_ACT_TILE),
+            name_hint="dsv41_a2a3_swiglu_v2",
+        ):
             token = block // (intermediate // MOE_ACT_TILE) * MOE_VEC_M_TILE
             column = block % (intermediate // MOE_ACT_TILE) * MOE_ACT_TILE
             rows = pl.min(MOE_VEC_M_TILE, active - token)
@@ -194,7 +224,9 @@ def make_shared_expert_w8a8(
             # BF16.  Use FP32 only for the exponential, then multiply the
             # BF16 sigmoid, gate, and up values without an FP32 promotion.
             gate = pl.cast(pl.slice(gate_up, [MOE_VEC_M_TILE, MOE_ACT_TILE], [token, column]), pl.FP32)
-            up = pl.cast(pl.slice(gate_up, [MOE_VEC_M_TILE, MOE_ACT_TILE], [token, intermediate + column]), pl.FP32)
+            up = pl.cast(
+                pl.slice(gate_up, [MOE_VEC_M_TILE, MOE_ACT_TILE], [token, intermediate + column]), pl.FP32
+            )
             gate = pl.minimum(gate, clamp_limit)
             up = pl.maximum(pl.minimum(up, clamp_limit), -clamp_limit)
             sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate)), 1.0))
@@ -202,7 +234,7 @@ def make_shared_expert_w8a8(
             silu = pl.mul(gate, pl.cast(sigmoid_bf16, pl.FP32))
             silu_bf16 = pl.cast(silu, pl.BF16, mode="rint")
             activated = pl.mul(pl.cast(silu_bf16, pl.FP32), up)
-            activation[token:token + MOE_VEC_M_TILE, column:column + MOE_ACT_TILE] = pl.set_validshape(
+            activation[token : token + MOE_VEC_M_TILE, column : column + MOE_ACT_TILE] = pl.set_validshape(
                 pl.cast(activated, pl.BF16, mode="rint"), rows, MOE_ACT_TILE
             )
 
@@ -258,18 +290,18 @@ def make_moe_router_inline(capacity, config, input_dtype=pl.BF16):
             dot_sum = pl.full([1, ROUTER_EXPERT_TILE], dtype=pl.FP32, value=0.0)
             for inner in pl.range(0, hidden, ROUTER_D_TILE):
                 source_storage = pl.create_tensor([1, ROUTER_D_TILE], dtype=input_dtype)
-                source_storage[:, :] = x[token:token + 1, inner:inner + ROUTER_D_TILE]
+                source_storage[:, :] = x[token : token + 1, inner : inner + ROUTER_D_TILE]
                 source = widen(source_storage)
-                weight = gate_weight[expert:expert + ROUTER_EXPERT_TILE, inner:inner + ROUTER_D_TILE]
+                weight = gate_weight[expert : expert + ROUTER_EXPERT_TILE, inner : inner + ROUTER_D_TILE]
                 product = pl.col_expand_mul(weight, source)
                 partial = pl.reshape(pl.row_sum(product), [1, ROUTER_EXPERT_TILE])
                 dot_sum = pl.add(dot_sum, partial)
-            logits[token:token + 1, expert:expert + ROUTER_EXPERT_TILE] = dot_sum
+            logits[token : token + 1, expert : expert + ROUTER_EXPERT_TILE] = dot_sum
 
         raw_scores = pl.create_tensor([capacity, experts], dtype=pl.FP32)
         selected_ids = pl.create_tensor([capacity, ROUTER_TOPK_TILE], dtype=pl.INT32)
         for token in pl.spmd(active, name_hint="a2_moe_route_sort"):
-            gate_logits = logits[token:token + 1, :]
+            gate_logits = logits[token : token + 1, :]
             positive = pl.maximum(gate_logits, 0.0)
             negative_abs = pl.neg(pl.abs(gate_logits))
             exponential = pl.exp(negative_abs)
@@ -281,7 +313,7 @@ def make_moe_router_inline(capacity, config, input_dtype=pl.BF16):
             negative_floor = pl.mul(negative_mask, negative_exp)
             softplus = pl.maximum(softplus_log, negative_floor)
             scores = pl.sqrt(softplus)
-            raw_scores[token:token + 1, :] = scores
+            raw_scores[token : token + 1, :] = scores
 
             bias = pl.reshape(text_bias[:], [1, experts])
             token_id = pl.read(input_ids, [token])
@@ -298,7 +330,7 @@ def make_moe_router_inline(capacity, config, input_dtype=pl.BF16):
             sorted_pairs = pl.mrgsort(first, second, third)
             top_pairs = sorted_pairs[:, 0:16]
             top_ids = pl.gather(top_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-            selected_ids[token:token + 1, :] = top_ids
+            selected_ids[token : token + 1, :] = top_ids
 
         # Serialize adjacent 24-byte routing rows sharing a 64-byte cache line.
         for _block in pl.spmd(1, name_hint="a2_moe_route_normalize"):
@@ -387,8 +419,8 @@ def make_ep_dispatch_pack(capacity, hidden, experts, topk, world):
             column = block % (hidden // DISPATCH_D_TILE) * DISPATCH_D_TILE
             source_token = route_index // topk
             target_index = pl.cast(pl.read(route_map, [route_index, 0]), pl.INDEX)
-            source_row = x[source_token:source_token + 1, column:column + DISPATCH_D_TILE]
-            sent_hidden[target_index:target_index + 1, column:column + DISPATCH_D_TILE] = source_row
+            source_row = x[source_token : source_token + 1, column : column + DISPATCH_D_TILE]
+            sent_hidden[target_index : target_index + 1, column : column + DISPATCH_D_TILE] = source_row
         return x, sent_routes, sent_hidden, sent_counts
 
     return ep_dispatch_pack
@@ -447,9 +479,9 @@ def make_ep_dispatch_unpack(capacity, hidden, experts, topk, world, expert_capac
             if packet % routes < bucket_rows:
                 target = pl.cast(pl.read(packet_map, [packet, 0]), pl.INDEX)
                 compact = pl.cast(pl.read(packet_map, [packet, 1]), pl.INDEX)
-                value = packet_hidden[packet:packet + 1, column:column + DISPATCH_D_TILE]
-                expert_x[target:target + 1, column:column + DISPATCH_D_TILE] = value
-                recv_hidden[compact:compact + 1, column:column + DISPATCH_D_TILE] = value
+                value = packet_hidden[packet : packet + 1, column : column + DISPATCH_D_TILE]
+                expert_x[target : target + 1, column : column + DISPATCH_D_TILE] = value
+                recv_hidden[compact : compact + 1, column : column + DISPATCH_D_TILE] = value
         return packet_hidden, recv_routes, recv_hidden, expert_x, expert_counts, packet_map, received_total
 
     return ep_dispatch_unpack
@@ -476,8 +508,8 @@ def make_ep_return_pack(capacity, hidden, experts, topk, world, expert_capacity=
             count = pl.read(packet_counts, [packet // routes, 0])
             if packet % routes < count:
                 source = pl.cast(pl.read(packet_map, [packet, 0]), pl.INDEX)
-                expert_row = expert_y[source:source + 1, column:column + DISPATCH_D_TILE]
-                sent_hidden[packet:packet + 1, column:column + DISPATCH_D_TILE] = expert_row
+                expert_row = expert_y[source : source + 1, column : column + DISPATCH_D_TILE]
+                sent_hidden[packet : packet + 1, column : column + DISPATCH_D_TILE] = expert_row
         return sent_hidden
 
     return ep_return_pack
@@ -524,8 +556,8 @@ def make_dispatch_layout(tokens):
             column = block % (DISPATCH_D // DISPATCH_D_TILE) * DISPATCH_D_TILE
             dispatched = pl.read(expanded, [original])
             target = pl.read(route_map, [original, 0])
-            value = payload[dispatched:dispatched + 1, column:column + DISPATCH_D_TILE]
-            recv_flat[target:target + 1, column:column + DISPATCH_D_TILE] = value
+            value = payload[dispatched : dispatched + 1, column : column + DISPATCH_D_TILE]
+            recv_flat[target : target + 1, column : column + DISPATCH_D_TILE] = value
         return recv_x, recv_scale, recv_weights, recv_count, route_map
 
     return dispatch_layout
@@ -546,8 +578,8 @@ def make_route_restore(tokens):
             original = block // (DISPATCH_D // DISPATCH_D_TILE)
             column = block % (DISPATCH_D // DISPATCH_D_TILE) * DISPATCH_D_TILE
             source = pl.read(route_map, [original, 0])
-            value = recv_flat[source:source + 1, column:column + DISPATCH_D_TILE]
-            dispatch_y[original:original + 1, column:column + DISPATCH_D_TILE] = value
+            value = recv_flat[source : source + 1, column : column + DISPATCH_D_TILE]
+            dispatch_y[original : original + 1, column : column + DISPATCH_D_TILE] = value
         return dispatch_y
 
     return route_restore
@@ -592,14 +624,14 @@ def make_moe_combine(capacity, hidden=COMBINE_D, topk=COMBINE_TOPK, world=2):
                 route_row = token * topk + slot
                 packet = pl.cast(pl.read(route_map, [route_row, 0]), pl.INDEX)
                 if packet >= 0:
-                    value = pl.cast(packet_hidden[packet:packet + 1, :], pl.FP32)
+                    value = pl.cast(packet_hidden[packet : packet + 1, :], pl.FP32)
                     weight = pl.read(route_weights, [token, slot])
                     acc = pl.add(acc, pl.mul(value, weight))
             narrowed = pl.cast(acc, pl.BF16, mode="rint")
-            routed[token:token + 1, :] = narrowed
-            shared_row = pl.cast(shared[token:token + 1, :], pl.FP32)
+            routed[token : token + 1, :] = narrowed
+            shared_row = pl.cast(shared[token : token + 1, :], pl.FP32)
             total = pl.add(pl.cast(narrowed, pl.FP32), shared_row)
-            output[token:token + 1, :] = pl.cast(total, pl.BF16, mode="rint")
+            output[token : token + 1, :] = pl.cast(total, pl.BF16, mode="rint")
         return routed, output, returned_routes
 
     return moe_combine
@@ -612,6 +644,7 @@ def _make_shared_activation(capacity, intermediate, limit, fused_activation, fus
     dequantize = _shared_make_dequantize(capacity, width)
 
     if not fused_activation:
+
         @pl.jit.inline
         def bf16_activation(
             accumulator: pl.Tensor[[capacity, width], pl.INT32],
@@ -628,10 +661,18 @@ def _make_shared_activation(capacity, intermediate, limit, fused_activation, fus
                 column = block % (intermediate // tile) * tile
                 rows = pl.min(SHARED_VEC_M_TILE, active - token)
                 up_column = intermediate + column
-                gate_bf16 = pl.slice(gate_up, [SHARED_VEC_M_TILE, tile], [token, column], valid_shape=[rows, tile])
-                up_bf16 = pl.slice(gate_up, [SHARED_VEC_M_TILE, tile], [token, up_column], valid_shape=[rows, tile])
-                gate_bf16 = pl.set_validshape(pl.fillpad(gate_bf16, pad_value=pl.PadValue.zero), SHARED_VEC_M_TILE, tile)
-                up_bf16 = pl.set_validshape(pl.fillpad(up_bf16, pad_value=pl.PadValue.zero), SHARED_VEC_M_TILE, tile)
+                gate_bf16 = pl.slice(
+                    gate_up, [SHARED_VEC_M_TILE, tile], [token, column], valid_shape=[rows, tile]
+                )
+                up_bf16 = pl.slice(
+                    gate_up, [SHARED_VEC_M_TILE, tile], [token, up_column], valid_shape=[rows, tile]
+                )
+                gate_bf16 = pl.set_validshape(
+                    pl.fillpad(gate_bf16, pad_value=pl.PadValue.zero), SHARED_VEC_M_TILE, tile
+                )
+                up_bf16 = pl.set_validshape(
+                    pl.fillpad(up_bf16, pad_value=pl.PadValue.zero), SHARED_VEC_M_TILE, tile
+                )
                 gate = pl.minimum(pl.cast(gate_bf16, pl.FP32), limit)
                 up = pl.maximum(pl.minimum(pl.cast(up_bf16, pl.FP32), limit), -limit)
                 sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate)), 1.0))
@@ -639,7 +680,9 @@ def _make_shared_activation(capacity, intermediate, limit, fused_activation, fus
                 silu_bf16 = pl.cast(pl.mul(gate, pl.cast(sigmoid_bf16, pl.FP32)), pl.BF16, mode="rint")
                 activated = pl.mul(pl.cast(silu_bf16, pl.FP32), up)
                 narrowed = pl.cast(activated, pl.BF16, mode="rint")
-                output[token:token + SHARED_VEC_M_TILE, column:column + tile] = pl.set_validshape(narrowed, rows, tile)
+                output[token : token + SHARED_VEC_M_TILE, column : column + tile] = pl.set_validshape(
+                    narrowed, rows, tile
+                )
             return output
 
         return bf16_activation
@@ -660,11 +703,15 @@ def _make_shared_activation(capacity, intermediate, limit, fused_activation, fus
             column = block % (intermediate // tile) * tile
             rows = pl.min(SHARED_VEC_M_TILE, active - token)
             up_column = intermediate + column
-            gate_i32 = pl.slice(accumulator, [SHARED_VEC_M_TILE, tile], [token, column], valid_shape=[rows, tile])
-            up_i32 = pl.slice(accumulator, [SHARED_VEC_M_TILE, tile], [token, up_column], valid_shape=[rows, tile])
-            gate_channels = pl.reshape(channels[column:column + tile], [1, tile])
-            up_channels = pl.reshape(channels[up_column:up_column + tile], [1, tile])
-            row_scale = pl.row_min(scales[token:token + SHARED_VEC_M_TILE, :])
+            gate_i32 = pl.slice(
+                accumulator, [SHARED_VEC_M_TILE, tile], [token, column], valid_shape=[rows, tile]
+            )
+            up_i32 = pl.slice(
+                accumulator, [SHARED_VEC_M_TILE, tile], [token, up_column], valid_shape=[rows, tile]
+            )
+            gate_channels = pl.reshape(channels[column : column + tile], [1, tile])
+            up_channels = pl.reshape(channels[up_column : up_column + tile], [1, tile])
+            row_scale = pl.row_min(scales[token : token + SHARED_VEC_M_TILE, :])
             gate_channel = pl.col_expand_mul(pl.cast(gate_i32, pl.FP32), gate_channels)
             up_channel = pl.col_expand_mul(pl.cast(up_i32, pl.FP32), up_channels)
             if fp16_channel:
@@ -682,7 +729,9 @@ def _make_shared_activation(capacity, intermediate, limit, fused_activation, fus
             denominator = pl.add(pl.exp(pl.neg(gate)), 1.0)
             silu = pl.div(gate, denominator)
             activated = pl.mul(silu, up)
-            output[token:token + SHARED_VEC_M_TILE, column:column + tile] = pl.set_validshape(activated, rows, tile)
+            output[token : token + SHARED_VEC_M_TILE, column : column + tile] = pl.set_validshape(
+                activated, rows, tile
+            )
         return output
 
     return fp32_activation
@@ -750,7 +799,10 @@ def make_shared_moe_w8a8(capacity, config, *, fused_activation=False, fused_chan
     intermediate = config["moe_intermediate_size"]
     gate_up_width = intermediate * 2
     compute = make_shared_moe_w8a8_inline(
-        capacity, config, fused_activation=fused_activation, fused_channel_dtype=fused_channel_dtype,
+        capacity,
+        config,
+        fused_activation=fused_activation,
+        fused_channel_dtype=fused_channel_dtype,
     )
 
     @pl.jit
@@ -802,9 +854,9 @@ def ecotech_shared_make_shared_activation(capacity, intermediate, padded_interme
             rows = pl.min(8, active - token)
             gate_i32 = pl.slice(accumulator, [8, 32], [token, column], valid_shape=[rows, 32])
             up_i32 = pl.slice(accumulator, [8, 32], [token, up_column], valid_shape=[rows, 32])
-            gate_channels = pl.reshape(channels[column:column + 32], [1, 32])
-            up_channels = pl.reshape(channels[up_column:up_column + 32], [1, 32])
-            row_scale = pl.row_min(scales[token:token + 8, :])
+            gate_channels = pl.reshape(channels[column : column + 32], [1, 32])
+            up_channels = pl.reshape(channels[up_column : up_column + 32], [1, 32])
+            row_scale = pl.row_min(scales[token : token + 8, :])
             gate_fp32 = pl.cast(gate_i32, pl.FP32, mode="rint")
             up_fp32 = pl.cast(up_i32, pl.FP32, mode="rint")
             gate_channel_scaled = pl.col_expand_mul(gate_fp32, gate_channels)
@@ -823,12 +875,14 @@ def ecotech_shared_make_shared_activation(capacity, intermediate, padded_interme
             denominator = pl.add(exponent, 1.0)
             silu = pl.div(gate, denominator)
             activation = pl.mul(silu, up)
-            output[token:token + 8, column:column + 32] = activation
+            output[token : token + 8, column : column + 32] = activation
         if intermediate < padded_intermediate:
             for block in pl.spmd((active + 7) // 8, name_hint="ecotech_shared_activation_pad"):
                 token = block * 8
                 for column in pl.range(intermediate, padded_intermediate, 32):
-                    output[token:token + 8, column:column + 32] = pl.full([8, 32], dtype=pl.FP32, value=0.0)
+                    output[token : token + 8, column : column + 32] = pl.full(
+                        [8, 32], dtype=pl.FP32, value=0.0
+                    )
         return output
 
     return activate
@@ -880,7 +934,15 @@ def make_ecotech_shared_inline(capacity, hidden, intermediate, *, limit=10.0):
         down_accumulator = pl.create_tensor([capacity, hidden], dtype=pl.INT32)
         dot_down(down_payload, down_packed, down_accumulator, active)
         dequantize_down(down_accumulator, down_scale, down_token_scale, output, active)
-        return output, input_payload, input_scale, gate_accumulator, activation, down_payload, down_token_scale
+        return (
+            output,
+            input_payload,
+            input_scale,
+            gate_accumulator,
+            activation,
+            down_payload,
+            down_token_scale,
+        )
 
     return shared
 
@@ -1010,15 +1072,27 @@ def make_decode_shared_expert_w8a8(
         dequant_gate_up(gate_up_acc, x_scale, gate_up_scale, gate_up, active)
 
         activation = pl.create_tensor([capacity, intermediate], dtype=pl.BF16)
-        for block in pl.spmd((active + DECODE_MOE_VEC_M_TILE - 1) // DECODE_MOE_VEC_M_TILE * (intermediate // DECODE_MOE_ACT_TILE), name_hint="dsv41_a2a3_swiglu_v2"):
+        for block in pl.spmd(
+            (active + DECODE_MOE_VEC_M_TILE - 1)
+            // DECODE_MOE_VEC_M_TILE
+            * (intermediate // DECODE_MOE_ACT_TILE),
+            name_hint="dsv41_a2a3_swiglu_v2",
+        ):
             token = block // (intermediate // DECODE_MOE_ACT_TILE) * DECODE_MOE_VEC_M_TILE
             column = block % (intermediate // DECODE_MOE_ACT_TILE) * DECODE_MOE_ACT_TILE
             rows = pl.min(DECODE_MOE_VEC_M_TILE, active - token)
             # vLLM's A2/A3 ``SiluAndMulWithClamp`` keeps the two products in
             # BF16.  Use FP32 only for the exponential, then multiply the
             # BF16 sigmoid, gate, and up values without an FP32 promotion.
-            gate = pl.cast(pl.slice(gate_up, [DECODE_MOE_VEC_M_TILE, DECODE_MOE_ACT_TILE], [token, column]), pl.FP32)
-            up = pl.cast(pl.slice(gate_up, [DECODE_MOE_VEC_M_TILE, DECODE_MOE_ACT_TILE], [token, intermediate + column]), pl.FP32)
+            gate = pl.cast(
+                pl.slice(gate_up, [DECODE_MOE_VEC_M_TILE, DECODE_MOE_ACT_TILE], [token, column]), pl.FP32
+            )
+            up = pl.cast(
+                pl.slice(
+                    gate_up, [DECODE_MOE_VEC_M_TILE, DECODE_MOE_ACT_TILE], [token, intermediate + column]
+                ),
+                pl.FP32,
+            )
             gate = pl.minimum(gate, clamp_limit)
             up = pl.maximum(pl.minimum(up, clamp_limit), -clamp_limit)
             sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate)), 1.0))
@@ -1026,8 +1100,8 @@ def make_decode_shared_expert_w8a8(
             silu = pl.mul(gate, pl.cast(sigmoid_bf16, pl.FP32))
             silu_bf16 = pl.cast(silu, pl.BF16, mode="rint")
             activated = pl.mul(pl.cast(silu_bf16, pl.FP32), up)
-            activation[token:token + DECODE_MOE_VEC_M_TILE, column:column + DECODE_MOE_ACT_TILE] = pl.set_validshape(
-                pl.cast(activated, pl.BF16, mode="rint"), rows, DECODE_MOE_ACT_TILE
+            activation[token : token + DECODE_MOE_VEC_M_TILE, column : column + DECODE_MOE_ACT_TILE] = (
+                pl.set_validshape(pl.cast(activated, pl.BF16, mode="rint"), rows, DECODE_MOE_ACT_TILE)
             )
 
         hidden_payload = pl.create_tensor([capacity, intermediate], dtype=pl.INT8)
@@ -1080,17 +1154,19 @@ def make_decode_moe_router_inline(capacity, config):
             expert = block % (experts // DECODE_ROUTER_EXPERT_TILE) * DECODE_ROUTER_EXPERT_TILE
             dot_sum = pl.full([1, DECODE_ROUTER_EXPERT_TILE], dtype=pl.FP32, value=0.0)
             for inner in pl.range(0, hidden, DECODE_ROUTER_D_TILE):
-                source = router_x[token:token + 1, inner:inner + DECODE_ROUTER_D_TILE]
-                weight = gate_weight[expert:expert + DECODE_ROUTER_EXPERT_TILE, inner:inner + DECODE_ROUTER_D_TILE]
+                source = router_x[token : token + 1, inner : inner + DECODE_ROUTER_D_TILE]
+                weight = gate_weight[
+                    expert : expert + DECODE_ROUTER_EXPERT_TILE, inner : inner + DECODE_ROUTER_D_TILE
+                ]
                 product = pl.col_expand_mul(weight, source)
                 partial = pl.reshape(pl.row_sum(product), [1, DECODE_ROUTER_EXPERT_TILE])
                 dot_sum = pl.add(dot_sum, partial)
-            logits[token:token + 1, expert:expert + DECODE_ROUTER_EXPERT_TILE] = dot_sum
+            logits[token : token + 1, expert : expert + DECODE_ROUTER_EXPERT_TILE] = dot_sum
 
         raw_scores = pl.create_tensor([capacity, experts], dtype=pl.FP32)
         selected_ids = pl.create_tensor([capacity, DECODE_ROUTER_TOPK_TILE], dtype=pl.INT32)
         for token in pl.spmd(active, name_hint="a2_moe_route_sort"):
-            gate_logits = logits[token:token + 1, :]
+            gate_logits = logits[token : token + 1, :]
             positive = pl.maximum(gate_logits, 0.0)
             negative_abs = pl.neg(pl.abs(gate_logits))
             exponential = pl.exp(negative_abs)
@@ -1102,7 +1178,7 @@ def make_decode_moe_router_inline(capacity, config):
             negative_floor = pl.mul(negative_mask, negative_exp)
             softplus = pl.maximum(softplus_log, negative_floor)
             scores = pl.sqrt(softplus)
-            raw_scores[token:token + 1, :] = scores
+            raw_scores[token : token + 1, :] = scores
 
             bias = pl.reshape(text_bias[:], [1, experts])
             token_id = pl.read(input_ids, [token])
@@ -1119,7 +1195,7 @@ def make_decode_moe_router_inline(capacity, config):
             sorted_pairs = pl.mrgsort(first, second, third)
             top_pairs = sorted_pairs[:, 0:16]
             top_ids = pl.gather(top_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-            selected_ids[token:token + 1, :] = top_ids
+            selected_ids[token : token + 1, :] = top_ids
 
         # Each row is only 6 INT32/FP32 values (24 bytes), so parallel scalar
         # stores would share a 64-byte cache line and lose neighboring rows.
@@ -1163,7 +1239,18 @@ def make_decode_moe_router(capacity, config):
         route_weights: pl.InOut[pl.Tensor[[capacity, topk], pl.FP32]],
         active: pl.Scalar[pl.INT32],
     ):
-        compute(x, router_x, gate_weight, text_bias, vision_bias, input_ids, logits, route_ids, route_weights, active)
+        compute(
+            x,
+            router_x,
+            gate_weight,
+            text_bias,
+            vision_bias,
+            input_ids,
+            logits,
+            route_ids,
+            route_weights,
+            active,
+        )
         return logits, route_ids, route_weights
 
     return moe_router
@@ -1180,7 +1267,9 @@ def make_decode_dispatch_layout(tokens):
         counts: pl.Tensor[[DECODE_DISPATCH_EXPERTS], pl.INT64],
         expanded: pl.Tensor[[routes], pl.INT32],
         weights: pl.Tensor[[tokens, DECODE_DISPATCH_TOPK], pl.FP32],
-        recv_x: pl.InOut[pl.Tensor[[DECODE_DISPATCH_EXPERTS, DECODE_DISPATCH_RECV_MAX, DECODE_DISPATCH_D], pl.INT8]],
+        recv_x: pl.InOut[
+            pl.Tensor[[DECODE_DISPATCH_EXPERTS, DECODE_DISPATCH_RECV_MAX, DECODE_DISPATCH_D], pl.INT8]
+        ],
         recv_scale: pl.InOut[pl.Tensor[[DECODE_DISPATCH_EXPERTS, DECODE_DISPATCH_RECV_MAX], pl.FP32]],
         recv_weights: pl.InOut[pl.Tensor[[DECODE_DISPATCH_EXPERTS, DECODE_DISPATCH_RECV_MAX], pl.FP32]],
         recv_count: pl.InOut[pl.Tensor[[DECODE_DISPATCH_EXPERTS, 1], pl.INT32]],
@@ -1196,7 +1285,9 @@ def make_decode_dispatch_layout(tokens):
                     dispatched = pl.read(expanded, [original])
                     if dispatched >= begin and dispatched < begin + count:
                         row = dispatched - begin
-                        route_weight = pl.read(weights, [original // DECODE_DISPATCH_TOPK, original % DECODE_DISPATCH_TOPK])
+                        route_weight = pl.read(
+                            weights, [original // DECODE_DISPATCH_TOPK, original % DECODE_DISPATCH_TOPK]
+                        )
                         token_scale = pl.read(scales, [dispatched])
                         pl.write(recv_scale, [expert, row], token_scale)
                         pl.write(recv_weights, [expert, row], route_weight)
@@ -1204,14 +1295,18 @@ def make_decode_dispatch_layout(tokens):
                         pl.write(route_map, [original, 0], target)
                 begin = begin + count
 
-        recv_flat = pl.reshape(recv_x, [DECODE_DISPATCH_EXPERTS * DECODE_DISPATCH_RECV_MAX, DECODE_DISPATCH_D])
-        for block in pl.spmd(routes * (DECODE_DISPATCH_D // DECODE_DISPATCH_D_TILE), name_hint="a2_moe_dispatch_payload"):
+        recv_flat = pl.reshape(
+            recv_x, [DECODE_DISPATCH_EXPERTS * DECODE_DISPATCH_RECV_MAX, DECODE_DISPATCH_D]
+        )
+        for block in pl.spmd(
+            routes * (DECODE_DISPATCH_D // DECODE_DISPATCH_D_TILE), name_hint="a2_moe_dispatch_payload"
+        ):
             original = block // (DECODE_DISPATCH_D // DECODE_DISPATCH_D_TILE)
             column = block % (DECODE_DISPATCH_D // DECODE_DISPATCH_D_TILE) * DECODE_DISPATCH_D_TILE
             dispatched = pl.read(expanded, [original])
             target = pl.read(route_map, [original, 0])
-            value = payload[dispatched:dispatched + 1, column:column + DECODE_DISPATCH_D_TILE]
-            recv_flat[target:target + 1, column:column + DECODE_DISPATCH_D_TILE] = value
+            value = payload[dispatched : dispatched + 1, column : column + DECODE_DISPATCH_D_TILE]
+            recv_flat[target : target + 1, column : column + DECODE_DISPATCH_D_TILE] = value
         return recv_x, recv_scale, recv_weights, recv_count, route_map
 
     return dispatch_layout
@@ -1227,13 +1322,17 @@ def make_decode_route_restore(tokens):
         route_map: pl.Tensor[[routes, DECODE_DISPATCH_MAP_PAD], pl.INT32],
         dispatch_y: pl.Out[pl.Tensor[[routes, DECODE_DISPATCH_D], pl.FP32]],
     ):
-        recv_flat = pl.reshape(recv_y, [DECODE_DISPATCH_EXPERTS * DECODE_DISPATCH_RECV_MAX, DECODE_DISPATCH_D])
-        for block in pl.spmd(routes * (DECODE_DISPATCH_D // DECODE_DISPATCH_D_TILE), name_hint="a2_moe_route_restore"):
+        recv_flat = pl.reshape(
+            recv_y, [DECODE_DISPATCH_EXPERTS * DECODE_DISPATCH_RECV_MAX, DECODE_DISPATCH_D]
+        )
+        for block in pl.spmd(
+            routes * (DECODE_DISPATCH_D // DECODE_DISPATCH_D_TILE), name_hint="a2_moe_route_restore"
+        ):
             original = block // (DECODE_DISPATCH_D // DECODE_DISPATCH_D_TILE)
             column = block % (DECODE_DISPATCH_D // DECODE_DISPATCH_D_TILE) * DECODE_DISPATCH_D_TILE
             source = pl.read(route_map, [original, 0])
-            value = recv_flat[source:source + 1, column:column + DECODE_DISPATCH_D_TILE]
-            dispatch_y[original:original + 1, column:column + DECODE_DISPATCH_D_TILE] = value
+            value = recv_flat[source : source + 1, column : column + DECODE_DISPATCH_D_TILE]
+            dispatch_y[original : original + 1, column : column + DECODE_DISPATCH_D_TILE] = value
         return dispatch_y
 
     return route_restore
@@ -1246,6 +1345,7 @@ def decode_shared_make_shared_activation(capacity, intermediate, limit, fused_ac
     dequantize = _decode_shared_make_dequantize(capacity, width)
 
     if not fused_activation:
+
         @pl.jit.inline
         def bf16_activation(
             accumulator: pl.Tensor[[capacity, width], pl.INT32],
@@ -1262,10 +1362,18 @@ def decode_shared_make_shared_activation(capacity, intermediate, limit, fused_ac
                 column = block % (intermediate // tile) * tile
                 rows = pl.min(DECODE_SHARED_VEC_M_TILE, active - token)
                 up_column = intermediate + column
-                gate_bf16 = pl.slice(gate_up, [DECODE_SHARED_VEC_M_TILE, tile], [token, column], valid_shape=[rows, tile])
-                up_bf16 = pl.slice(gate_up, [DECODE_SHARED_VEC_M_TILE, tile], [token, up_column], valid_shape=[rows, tile])
-                gate_bf16 = pl.set_validshape(pl.fillpad(gate_bf16, pad_value=pl.PadValue.zero), DECODE_SHARED_VEC_M_TILE, tile)
-                up_bf16 = pl.set_validshape(pl.fillpad(up_bf16, pad_value=pl.PadValue.zero), DECODE_SHARED_VEC_M_TILE, tile)
+                gate_bf16 = pl.slice(
+                    gate_up, [DECODE_SHARED_VEC_M_TILE, tile], [token, column], valid_shape=[rows, tile]
+                )
+                up_bf16 = pl.slice(
+                    gate_up, [DECODE_SHARED_VEC_M_TILE, tile], [token, up_column], valid_shape=[rows, tile]
+                )
+                gate_bf16 = pl.set_validshape(
+                    pl.fillpad(gate_bf16, pad_value=pl.PadValue.zero), DECODE_SHARED_VEC_M_TILE, tile
+                )
+                up_bf16 = pl.set_validshape(
+                    pl.fillpad(up_bf16, pad_value=pl.PadValue.zero), DECODE_SHARED_VEC_M_TILE, tile
+                )
                 gate = pl.minimum(pl.cast(gate_bf16, pl.FP32), limit)
                 up = pl.maximum(pl.minimum(pl.cast(up_bf16, pl.FP32), limit), -limit)
                 sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate)), 1.0))
@@ -1273,7 +1381,9 @@ def decode_shared_make_shared_activation(capacity, intermediate, limit, fused_ac
                 silu_bf16 = pl.cast(pl.mul(gate, pl.cast(sigmoid_bf16, pl.FP32)), pl.BF16, mode="rint")
                 activated = pl.mul(pl.cast(silu_bf16, pl.FP32), up)
                 narrowed = pl.cast(activated, pl.BF16, mode="rint")
-                output[token:token + DECODE_SHARED_VEC_M_TILE, column:column + tile] = pl.set_validshape(narrowed, rows, tile)
+                output[token : token + DECODE_SHARED_VEC_M_TILE, column : column + tile] = pl.set_validshape(
+                    narrowed, rows, tile
+                )
             return output
 
         return bf16_activation
@@ -1292,21 +1402,29 @@ def decode_shared_make_shared_activation(capacity, intermediate, limit, fused_ac
             column = block % (intermediate // tile) * tile
             rows = pl.min(DECODE_SHARED_VEC_M_TILE, active - token)
             up_column = intermediate + column
-            gate_i32 = pl.slice(accumulator, [DECODE_SHARED_VEC_M_TILE, tile], [token, column], valid_shape=[rows, tile])
-            up_i32 = pl.slice(accumulator, [DECODE_SHARED_VEC_M_TILE, tile], [token, up_column], valid_shape=[rows, tile])
-            gate_channels = pl.reshape(channels[column:column + tile], [1, tile])
-            up_channels = pl.reshape(channels[up_column:up_column + tile], [1, tile])
-            row_scale = pl.row_min(scales[token:token + DECODE_SHARED_VEC_M_TILE, :])
+            gate_i32 = pl.slice(
+                accumulator, [DECODE_SHARED_VEC_M_TILE, tile], [token, column], valid_shape=[rows, tile]
+            )
+            up_i32 = pl.slice(
+                accumulator, [DECODE_SHARED_VEC_M_TILE, tile], [token, up_column], valid_shape=[rows, tile]
+            )
+            gate_channels = pl.reshape(channels[column : column + tile], [1, tile])
+            up_channels = pl.reshape(channels[up_column : up_column + tile], [1, tile])
+            row_scale = pl.row_min(scales[token : token + DECODE_SHARED_VEC_M_TILE, :])
             gate = pl.row_expand_mul(pl.col_expand_mul(pl.cast(gate_i32, pl.FP32), gate_channels), row_scale)
             up = pl.row_expand_mul(pl.col_expand_mul(pl.cast(up_i32, pl.FP32), up_channels), row_scale)
-            gate = pl.set_validshape(pl.fillpad(gate, pad_value=pl.PadValue.zero), DECODE_SHARED_VEC_M_TILE, tile)
+            gate = pl.set_validshape(
+                pl.fillpad(gate, pad_value=pl.PadValue.zero), DECODE_SHARED_VEC_M_TILE, tile
+            )
             up = pl.set_validshape(pl.fillpad(up, pad_value=pl.PadValue.zero), DECODE_SHARED_VEC_M_TILE, tile)
             gate = pl.minimum(gate, limit)
             up = pl.maximum(pl.minimum(up, limit), -limit)
             denominator = pl.add(pl.exp(pl.neg(gate)), 1.0)
             silu = pl.div(gate, denominator)
             activated = pl.mul(silu, up)
-            output[token:token + DECODE_SHARED_VEC_M_TILE, column:column + tile] = pl.set_validshape(activated, rows, tile)
+            output[token : token + DECODE_SHARED_VEC_M_TILE, column : column + tile] = pl.set_validshape(
+                activated, rows, tile
+            )
         return output
 
     return fp32_activation
@@ -1470,8 +1588,8 @@ def routed_expert_reference(
     for token in range(value.shape[0]):
         for route in range(expert_ids.shape[1]):
             expert = int(expert_ids[token, route])
-            gate = w8a8_expert_linear(value[token:token + 1], w1[expert], w1_scale[expert]).float()
-            up = w8a8_expert_linear(value[token:token + 1], w3[expert], w3_scale[expert]).float()
+            gate = w8a8_expert_linear(value[token : token + 1], w1[expert], w1_scale[expert]).float()
+            up = w8a8_expert_linear(value[token : token + 1], w3[expert], w3_scale[expert]).float()
             gate = gate.clamp(max=clamp_limit)
             up = up.clamp(-clamp_limit, clamp_limit)
             sigmoid_bf16 = torch.sigmoid(gate).to(torch.bfloat16)
@@ -1676,8 +1794,10 @@ def decode_moe_routed_expert_reference(
     for token in range(value.shape[0]):
         for route in range(expert_ids.shape[1]):
             expert = int(expert_ids[token, route])
-            gate = decode_moe_w8a8_expert_linear(value[token:token + 1], w1[expert], w1_scale[expert]).float()
-            up = decode_moe_w8a8_expert_linear(value[token:token + 1], w3[expert], w3_scale[expert]).float()
+            gate = decode_moe_w8a8_expert_linear(
+                value[token : token + 1], w1[expert], w1_scale[expert]
+            ).float()
+            up = decode_moe_w8a8_expert_linear(value[token : token + 1], w3[expert], w3_scale[expert]).float()
             gate = gate.clamp(max=clamp_limit)
             up = up.clamp(-clamp_limit, clamp_limit)
             sigmoid_bf16 = torch.sigmoid(gate).to(torch.bfloat16)
@@ -1697,8 +1817,13 @@ def validate_moe_router(*, device=0, compile_only=False, platform="a2a3", sim=Fa
 
     torch.manual_seed(41)
     capacity, hidden, experts, topk = 16, 256, 384, 6
-    config = {"hidden_size": hidden, "n_routed_experts": experts, "num_experts_per_tok": topk,
-              "routed_scaling_factor": 1.5, "image_sentinel_base_id": 129264}
+    config = {
+        "hidden_size": hidden,
+        "n_routed_experts": experts,
+        "num_experts_per_tok": topk,
+        "routed_scaling_factor": 1.5,
+        "image_sentinel_base_id": 129264,
+    }
     for controlled in (False, True):
         settings = dict(config, controlled_routing=controlled)
         for active in (0, 1, 7, 16):
@@ -1716,7 +1841,7 @@ def validate_moe_router(*, device=0, compile_only=False, platform="a2a3", sim=Fa
                 ScalarSpec("active", torch.int32, active),
             ]
             result = run(
-                         compile_only=compile_only,
+                compile_only=compile_only,
                 fn=make_moe_router(capacity, settings),
                 specs=specs,
                 golden_fn=partial(golden_moe_router, config=settings),
@@ -1725,7 +1850,9 @@ def validate_moe_router(*, device=0, compile_only=False, platform="a2a3", sim=Fa
                 atol=0.001,
             )
             if not result.passed:
-                raise RuntimeError(f"Router validation failed: controlled={controlled}, active={active}: {result.error}")
+                raise RuntimeError(
+                    f"Router validation failed: controlled={controlled}, active={active}: {result.error}"
+                )
 
 
 def validate_received_routes(packet, rank, layout, routes, valid_by_rank=None):
@@ -1786,7 +1913,7 @@ def validate_ep_dispatch(*, device=0, compile_only=False, platform="a2a3", sim=F
                 ScalarSpec("source_rank", torch.int32, 0),
             ]
             result = run(
-                         compile_only=compile_only,
+                compile_only=compile_only,
                 fn=make_ep_dispatch_pack(capacity, hidden, experts, topk, world),
                 specs=pack_specs,
                 golden_fn=golden_ep_dispatch_pack,
@@ -1816,7 +1943,7 @@ def validate_ep_dispatch(*, device=0, compile_only=False, platform="a2a3", sim=F
                 ScalarSpec("owner_rank", torch.int32, 0),
             ]
             result = run(
-                         compile_only=compile_only,
+                compile_only=compile_only,
                 fn=make_ep_dispatch_unpack(capacity, hidden, experts, topk, world),
                 specs=unpack_specs,
                 golden_fn=golden_ep_dispatch_unpack,
@@ -1838,7 +1965,7 @@ def validate_ep_dispatch(*, device=0, compile_only=False, platform="a2a3", sim=F
                 TensorSpec("sent_hidden", [packet_rows, hidden], torch.bfloat16, init_value=0.0),
             ]
             result = run(
-                         compile_only=compile_only,
+                compile_only=compile_only,
                 fn=make_ep_return_pack(capacity, hidden, experts, topk, world),
                 specs=return_specs,
                 golden_fn=golden_ep_return_pack,
@@ -1878,7 +2005,7 @@ def validate_moe_combine(*, device=0, compile_only=False, platform="a2a3", sim=F
             ScalarSpec("active", torch.int32, active),
         ]
         result = run(
-                     compile_only=compile_only,
+            compile_only=compile_only,
             fn=make_moe_combine(capacity, hidden, topk),
             specs=specs,
             golden_fn=golden_moe_combine,
@@ -1917,11 +2044,16 @@ def validate_shared_moe(*, device=0, compile_only=False, platform="a2a3", sim=Fa
             result = run(
                 compile_only=compile_only,
                 fn=make_shared_moe_w8a8(
-                    capacity, config, fused_activation=fused, fused_channel_dtype=channel_dtype,
+                    capacity,
+                    config,
+                    fused_activation=fused,
+                    fused_channel_dtype=channel_dtype,
                 ),
                 specs=specs,
                 golden_fn=partial(
-                    golden_shared_moe_w8a8, fused_activation=fused, fused_channel_dtype=channel_dtype,
+                    golden_shared_moe_w8a8,
+                    fused_activation=fused,
+                    fused_channel_dtype=channel_dtype,
                 ),
                 config={"backend_type": platform, "execution_mode": sim, "device_id": device},
                 rtol=0.05,

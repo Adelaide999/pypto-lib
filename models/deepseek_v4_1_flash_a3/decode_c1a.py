@@ -34,18 +34,20 @@ from .decode_swa import (
     TOPK,
     decode_ep2_rank,
 )
-from .decode_hc import make_hc_post_inline, make_hc_pre_inline
-from .indexer_prepare import (
-    make_indexer_prepare); from .decode_indexer_projection import (
-    make_indexer_projection); from .decode_indexer_projection import (
-    make_indexer_query_quantize); from .decode_indexer_select import (
-    make_indexer_select); from .decode_indexer_select import (
-    make_indexer_select_restricted); from .decode_candidate_pool import (
-    make_candidate_block_pool)
+from .hc import (
+    make_decode_hc_post_inline as make_hc_post_inline,
+    make_decode_hc_pre_inline as make_hc_pre_inline,
+)
+from .indexer import make_indexer_prepare
+from .decode_indexer_projection import make_indexer_projection
+from .decode_indexer_projection import make_indexer_query_quantize
+from .indexer import make_indexer_select
+from .indexer import make_indexer_select_restricted
+from .indexer import make_decode_candidate_block_pool as make_candidate_block_pool
 from .decode_output_proj import make_output_projection_bf16
 from .decode_qkv_w8a8 import make_qkv_w8a8_inline
-from .decode_compressor_c1 import make_ratio1_compress_publish
-from .decode_rmsnorm import NORM_T_TILE, rms_norm_tiled, rms_norm_tiled_with_fp32
+from .compressor import make_decode_ratio1_compress_publish as make_ratio1_compress_publish
+from .rmsnorm import NORM_T_TILE, rms_norm_tiled, rms_norm_tiled_with_fp32
 from .decode_sparse_attention import make_sparse_attention
 from .decode_projection import make_bf16_linear
 from .decode_swa_cache import make_swa_cache_publish
@@ -80,9 +82,7 @@ INDEXER_PREPARE = pl.jit.inline(make_indexer_prepare(16, topk=INDEX_TOPK, compre
 CANDIDATE_POOL = pl.jit.inline(make_candidate_block_pool(16)._func)
 C1_PROJECT = pl.jit.inline(make_bf16_linear(16, HIDDEN, HEAD_DIM)._func)
 C1_PUBLISH = pl.jit.inline(make_ratio1_compress_publish(16, CONFIG, cache_blocks=2)._func)
-SPARSE = pl.jit.inline(
-    make_sparse_attention(16, HEADS, HEAD_DIM, WINDOW, INDEX_TOPK, VALUE_PADDING)._func
-)
+SPARSE = pl.jit.inline(make_sparse_attention(16, HEADS, HEAD_DIM, WINDOW, INDEX_TOPK, VALUE_PADDING)._func)
 SWA_ONLY = pl.jit.inline(make_swa_inline(16, 2, CONFIG)._func)
 OUTPUT = pl.jit.inline(
     make_output_projection_bf16(
@@ -128,8 +128,8 @@ def _gather_rows_c1(
         value = pl.full([1, HEAD_DIM + VALUE_PADDING], dtype=pl.BF16, value=0.0)
         if index >= 0 and index < INDEX_ROWS:
             row = pl.cast(index, pl.INDEX)
-            value[0:1, VALUE_PADDING:] = cache_flat[row:row + 1, :]
-        selected_flat[block:block + 1, :] = value
+            value[0:1, VALUE_PADDING:] = cache_flat[row : row + 1, :]
+        selected_flat[block : block + 1, :] = value
 
 
 @pl.jit.inline(auto_scope=False)
@@ -149,8 +149,8 @@ def _gather_window_c1(
         value = pl.full([1, HEAD_DIM + VALUE_PADDING], dtype=pl.BF16, value=0.0)
         if index >= 0 and index < 2 * 128:
             row = pl.cast(index, pl.INDEX)
-            value[0:1, VALUE_PADDING:] = cache_flat[row:row + 1, :]
-        selected_flat[block:block + 1, :] = value
+            value[0:1, VALUE_PADDING:] = cache_flat[row : row + 1, :]
+        selected_flat[block : block + 1, :] = value
 
 
 @pl.jit.inline(auto_scope=False)
@@ -224,31 +224,70 @@ def _c1a_tail(
         _gather_rows_c1(compressed_cache, prepared_indices, compressed_rows, active)
         sparse_padded = pl.create_tensor([16, HEADS, HEAD_DIM + VALUE_PADDING], dtype=pl.BF16)
         query_heads = pl.reshape(query, [16, HEADS, HEAD_DIM])
-        SPARSE(query_heads, window_rows, indices, compressed_rows, prepared_indices, sink, sparse_padded, active)
+        SPARSE(
+            query_heads, window_rows, indices, compressed_rows, prepared_indices, sink, sparse_padded, active
+        )
         for block in pl.spmd(active * (HEADS // 16), name_hint="dsv41_c1a_sparse_unpad"):
             token = block // (HEADS // 16)
             head = (block % (HEADS // 16)) * 16
-            attended[token:token + 1, head * HEAD_DIM:(head + 16) * HEAD_DIM] = pl.reshape(
-                sparse_padded[token:token + 1, head:head + 16, VALUE_PADDING:], [1, 16 * HEAD_DIM]
+            attended[token : token + 1, head * HEAD_DIM : (head + 16) * HEAD_DIM] = pl.reshape(
+                sparse_padded[token : token + 1, head : head + 16, VALUE_PADDING:], [1, 16 * HEAD_DIM]
             )
     rotated = pl.create_tensor([16, WIDTH], dtype=pl.BF16)
     grouped = pl.create_tensor([16, 8 * O_RANK], dtype=pl.BF16)
     OUTPUT(attended, wo_a, wo_b, rope_cos, rope_sin, rotated, grouped, attn_output, active)
     HC_POST(attn_output, x_hc, attn_post, attn_comb, after_attention, active)
     ffn_collapsed_fp32 = pl.create_tensor([16, HIDDEN], dtype=pl.FP32)
-    HC_PRE(after_attention, ffn_hc_function, ffn_hc_scale, ffn_hc_base, attn_next_pre,
-           ffn_next_pre, ffn_post, ffn_comb, ffn_collapsed, ffn_collapsed_fp32, active)
+    HC_PRE(
+        after_attention,
+        ffn_hc_function,
+        ffn_hc_scale,
+        ffn_hc_base,
+        attn_next_pre,
+        ffn_next_pre,
+        ffn_post,
+        ffn_comb,
+        ffn_collapsed,
+        ffn_collapsed_fp32,
+        active,
+    )
     ffn_router_normed = pl.create_tensor([16, HIDDEN], dtype=pl.FP32)
     for block in pl.spmd((active + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="dsv41_c1a_ffn_norm"):
         # The fused reference normalizes the BF16 HC collapse and exposes its
         # FP32 result to the router.  Keep the BF16 store boundary before both
         # outputs so expert input and router input share the same source.
         rms_norm_tiled_with_fp32(ffn_collapsed, ffn_norm_weight, ffn_normed, ffn_router_normed, block, active)
-    EP2_RANK(ffn_normed, ffn_router_normed, gate_weight, text_bias, vision_bias, input_ids,
-             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
-             shared_gate_up, shared_gate_up_scale, shared_down, shared_down_scale,
-             lane_x, lane_aux, lane_count, lane_ready, slot_out, return_ready,
-             logits, route_ids, route_weights, moe_output, active, rank, epoch)
+    EP2_RANK(
+        ffn_normed,
+        ffn_router_normed,
+        gate_weight,
+        text_bias,
+        vision_bias,
+        input_ids,
+        routed_w1,
+        routed_w1_scale,
+        routed_w3,
+        routed_w3_scale,
+        routed_w2,
+        routed_w2_scale,
+        shared_gate_up,
+        shared_gate_up_scale,
+        shared_down,
+        shared_down_scale,
+        lane_x,
+        lane_aux,
+        lane_count,
+        lane_ready,
+        slot_out,
+        return_ready,
+        logits,
+        route_ids,
+        route_weights,
+        moe_output,
+        active,
+        rank,
+        epoch,
+    )
     HC_POST(moe_output, after_attention, ffn_post, ffn_comb, output, active)
     return output
 
@@ -338,23 +377,101 @@ def decode_layer_ep2_c1a_reuse_rank(
     epoch: pl.Scalar[pl.INT32],
 ):
     attn_collapsed_fp32 = pl.create_tensor([16, HIDDEN], dtype=pl.FP32)
-    HC_PRE(x_hc, attn_hc_function, attn_hc_scale, attn_hc_base, attn_incoming,
-           attn_next_pre, attn_post, attn_comb, attn_collapsed, attn_collapsed_fp32, active)
+    HC_PRE(
+        x_hc,
+        attn_hc_function,
+        attn_hc_scale,
+        attn_hc_base,
+        attn_incoming,
+        attn_next_pre,
+        attn_post,
+        attn_comb,
+        attn_collapsed,
+        attn_collapsed_fp32,
+        active,
+    )
     for block in pl.spmd((active + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="dsv41_c1a_attn_norm"):
         rms_norm_tiled(attn_collapsed, attn_norm_weight, attn_normed, block, active)
     qkv_cache = pl.reshape(cache, [2, 128, HEAD_DIM])
-    QKV(attn_normed, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-        wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, positions,
-        query_latent, query, window_kv, qkv_cache, cache_lens, active)
+    QKV(
+        attn_normed,
+        wq_a,
+        wq_a_scale,
+        q_norm_weight,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        wkv_scale,
+        kv_norm_weight,
+        rope_cos,
+        rope_sin,
+        positions,
+        query_latent,
+        query,
+        window_kv,
+        qkv_cache,
+        cache_lens,
+        active,
+    )
     SWA_PUBLISH(window_kv, slots, cache, active)
-    _c1a_tail(query, indices, slots, prepared_indices_source, sink, cache, compressed_cache, window_kv, wo_a, wo_b,
-              rope_cos, rope_sin, attn_output, attn_post, attn_comb, x_hc, after_attention,
-              ffn_hc_function, ffn_hc_scale, ffn_hc_base, ffn_next_pre, ffn_post, ffn_comb,
-              ffn_collapsed, ffn_normed, ffn_norm_weight, gate_weight, text_bias, vision_bias,
-              input_ids, routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2,
-              routed_w2_scale, shared_gate_up, shared_gate_up_scale, shared_down, shared_down_scale,
-              lane_x, lane_aux, lane_count, lane_ready, slot_out, return_ready, logits, route_ids,
-              route_weights, moe_output, output, attn_next_pre, active, rank, epoch, 1)
+    _c1a_tail(
+        query,
+        indices,
+        slots,
+        prepared_indices_source,
+        sink,
+        cache,
+        compressed_cache,
+        window_kv,
+        wo_a,
+        wo_b,
+        rope_cos,
+        rope_sin,
+        attn_output,
+        attn_post,
+        attn_comb,
+        x_hc,
+        after_attention,
+        ffn_hc_function,
+        ffn_hc_scale,
+        ffn_hc_base,
+        ffn_next_pre,
+        ffn_post,
+        ffn_comb,
+        ffn_collapsed,
+        ffn_normed,
+        ffn_norm_weight,
+        gate_weight,
+        text_bias,
+        vision_bias,
+        input_ids,
+        routed_w1,
+        routed_w1_scale,
+        routed_w3,
+        routed_w3_scale,
+        routed_w2,
+        routed_w2_scale,
+        shared_gate_up,
+        shared_gate_up_scale,
+        shared_down,
+        shared_down_scale,
+        lane_x,
+        lane_aux,
+        lane_count,
+        lane_ready,
+        slot_out,
+        return_ready,
+        logits,
+        route_ids,
+        route_weights,
+        moe_output,
+        output,
+        attn_next_pre,
+        active,
+        rank,
+        epoch,
+        1,
+    )
     return output
 
 
@@ -444,20 +561,82 @@ def decode_layer_ep2_c1a_reuse(
         slot_out = pld.window(slot_out_buf, [16 * TOPK, D], dtype=pl.FP32)
         return_ready = pld.window(return_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
         decode_layer_ep2_c1a_reuse_rank(
-            x_hc[rank], attn_hc_function[rank], attn_hc_scale[rank], attn_hc_base[rank], attn_incoming[rank],
-            attn_norm_weight[rank], wq_a[rank], wq_a_scale[rank], q_norm_weight[rank], wq_b[rank], wq_b_scale[rank],
-            wkv[rank], wkv_scale[rank], kv_norm_weight[rank], wo_a[rank], wo_b[rank], rope_cos[rank], rope_sin[rank],
-            slots[rank], indices[rank], prepared_indices[rank], prepared_indices_source[rank],
-            sink[rank], positions[rank], query_latent[rank],
-            query[rank], window_kv[rank], cache[rank], cache_lens[rank], compressed_cache[rank], index_cache[rank],
-            index_scale[rank], attn_output[rank], attn_next_pre[rank], attn_post[rank], attn_comb[rank],
-            attn_collapsed[rank], attn_normed[rank], after_attention[rank], ffn_hc_function[rank], ffn_hc_scale[rank],
-            ffn_hc_base[rank], ffn_norm_weight[rank], ffn_next_pre[rank], ffn_post[rank], ffn_comb[rank],
-            ffn_collapsed[rank], ffn_normed[rank], gate_weight[rank], text_bias[rank], vision_bias[rank], input_ids[rank],
-            routed_w1[rank], routed_w1_scale[rank], routed_w3[rank], routed_w3_scale[rank], routed_w2[rank], routed_w2_scale[rank],
-            shared_gate_up[rank], shared_gate_up_scale[rank], shared_down[rank], shared_down_scale[rank],
-            lane_x, lane_aux, lane_count, lane_ready, slot_out, return_ready,
-            logits[rank], route_ids[rank], route_weights[rank], moe_output[rank], output[rank], active, rank, epoch,
+            x_hc[rank],
+            attn_hc_function[rank],
+            attn_hc_scale[rank],
+            attn_hc_base[rank],
+            attn_incoming[rank],
+            attn_norm_weight[rank],
+            wq_a[rank],
+            wq_a_scale[rank],
+            q_norm_weight[rank],
+            wq_b[rank],
+            wq_b_scale[rank],
+            wkv[rank],
+            wkv_scale[rank],
+            kv_norm_weight[rank],
+            wo_a[rank],
+            wo_b[rank],
+            rope_cos[rank],
+            rope_sin[rank],
+            slots[rank],
+            indices[rank],
+            prepared_indices[rank],
+            prepared_indices_source[rank],
+            sink[rank],
+            positions[rank],
+            query_latent[rank],
+            query[rank],
+            window_kv[rank],
+            cache[rank],
+            cache_lens[rank],
+            compressed_cache[rank],
+            index_cache[rank],
+            index_scale[rank],
+            attn_output[rank],
+            attn_next_pre[rank],
+            attn_post[rank],
+            attn_comb[rank],
+            attn_collapsed[rank],
+            attn_normed[rank],
+            after_attention[rank],
+            ffn_hc_function[rank],
+            ffn_hc_scale[rank],
+            ffn_hc_base[rank],
+            ffn_norm_weight[rank],
+            ffn_next_pre[rank],
+            ffn_post[rank],
+            ffn_comb[rank],
+            ffn_collapsed[rank],
+            ffn_normed[rank],
+            gate_weight[rank],
+            text_bias[rank],
+            vision_bias[rank],
+            input_ids[rank],
+            routed_w1[rank],
+            routed_w1_scale[rank],
+            routed_w3[rank],
+            routed_w3_scale[rank],
+            routed_w2[rank],
+            routed_w2_scale[rank],
+            shared_gate_up[rank],
+            shared_gate_up_scale[rank],
+            shared_down[rank],
+            shared_down_scale[rank],
+            lane_x,
+            lane_aux,
+            lane_count,
+            lane_ready,
+            slot_out,
+            return_ready,
+            logits[rank],
+            route_ids[rank],
+            route_weights[rank],
+            moe_output[rank],
+            output[rank],
+            active,
+            rank,
+            epoch,
             device=rank,
         )
 
@@ -557,14 +736,42 @@ def decode_layer_ep2_c1a_full_rank(
     c1_mode: pl.Scalar[pl.INT32],
 ):
     attn_collapsed_fp32 = pl.create_tensor([16, HIDDEN], dtype=pl.FP32)
-    HC_PRE(x_hc, attn_hc_function, attn_hc_scale, attn_hc_base, attn_incoming,
-           attn_next_pre, attn_post, attn_comb, attn_collapsed, attn_collapsed_fp32, active)
+    HC_PRE(
+        x_hc,
+        attn_hc_function,
+        attn_hc_scale,
+        attn_hc_base,
+        attn_incoming,
+        attn_next_pre,
+        attn_post,
+        attn_comb,
+        attn_collapsed,
+        attn_collapsed_fp32,
+        active,
+    )
     for block in pl.spmd((active + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="dsv41_c1a_full_attn_norm"):
         rms_norm_tiled(attn_collapsed, attn_norm_weight, attn_normed, block, active)
     qkv_cache = pl.reshape(cache, [2, 128, HEAD_DIM])
-    QKV(attn_normed, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-        wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, positions,
-        query_latent, query, window_kv, qkv_cache, cache_lens, active)
+    QKV(
+        attn_normed,
+        wq_a,
+        wq_a_scale,
+        q_norm_weight,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        wkv_scale,
+        kv_norm_weight,
+        rope_cos,
+        rope_sin,
+        positions,
+        query_latent,
+        query,
+        window_kv,
+        qkv_cache,
+        cache_lens,
+        active,
+    )
     SWA_PUBLISH(window_kv, slots, cache, active)
     # L20 is the C1A source and publishes compressed KV plus index keys. L24
     # is a reindex consumer: it must retain L20's cache planes and only
@@ -576,16 +783,40 @@ def decode_layer_ep2_c1a_full_rank(
         compressed = pl.create_tensor([16, HEAD_DIM], dtype=pl.BF16)
         index_key = pl.create_tensor([16, 128], dtype=pl.BF16)
         C1_PUBLISH(
-            projected, compressor_norm, index_wk, index_norm, rope_cos, rope_sin, positions,
-            requests, compressed_slots, compressed, compressed_cache, index_key, index_cache,
-            index_scale, source_positions, cache_lengths, active,
+            projected,
+            compressor_norm,
+            index_wk,
+            index_norm,
+            rope_cos,
+            rope_sin,
+            positions,
+            requests,
+            compressed_slots,
+            compressed,
+            compressed_cache,
+            index_key,
+            index_cache,
+            index_scale,
+            source_positions,
+            cache_lengths,
+            active,
         )
     index_query = pl.create_tensor([16, 32, 128], dtype=pl.BF16)
     index_payload = pl.create_tensor([16, 32, 128], dtype=pl.INT8)
     index_query_scale = pl.create_tensor([16, 32], dtype=pl.FP16)
     index_weights = pl.create_tensor([16, 32], dtype=pl.FP16)
-    INDEXER_PROJECTION(attn_normed, query_latent, index_wq_b, index_wq_b_scale,
-                       index_weights_proj, rope_cos, rope_sin, index_query, index_weights, active)
+    INDEXER_PROJECTION(
+        attn_normed,
+        query_latent,
+        index_wq_b,
+        index_wq_b_scale,
+        index_weights_proj,
+        rope_cos,
+        rope_sin,
+        index_query,
+        index_weights,
+        active,
+    )
     INDEXER_QUERY_QUANTIZE(index_query, index_payload, index_query_scale, active)
     index_key_flat = pl.reshape(index_cache, [INDEX_ROWS, 128])
     index_scale_flat = pl.reshape(index_scale, [INDEX_ROWS])
@@ -636,14 +867,64 @@ def decode_layer_ep2_c1a_full_rank(
             for token in pl.range(16):
                 if token < active:
                     pl.write(candidate_topk_lengths, [token], pl.cast(positions32[token] + 1, pl.INT32))
-    _c1a_tail(query, indices, slots, prepared_indices, sink, cache, compressed_cache, window_kv, wo_a, wo_b,
-              rope_cos, rope_sin, attn_output, attn_post, attn_comb, x_hc, after_attention,
-              ffn_hc_function, ffn_hc_scale, ffn_hc_base, ffn_next_pre, ffn_post, ffn_comb,
-              ffn_collapsed, ffn_normed, ffn_norm_weight, gate_weight, text_bias, vision_bias,
-              input_ids, routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2,
-              routed_w2_scale, shared_gate_up, shared_gate_up_scale, shared_down, shared_down_scale,
-              lane_x, lane_aux, lane_count, lane_ready, slot_out, return_ready, logits, route_ids,
-              route_weights, moe_output, output, attn_next_pre, active, rank, epoch, 1)
+    _c1a_tail(
+        query,
+        indices,
+        slots,
+        prepared_indices,
+        sink,
+        cache,
+        compressed_cache,
+        window_kv,
+        wo_a,
+        wo_b,
+        rope_cos,
+        rope_sin,
+        attn_output,
+        attn_post,
+        attn_comb,
+        x_hc,
+        after_attention,
+        ffn_hc_function,
+        ffn_hc_scale,
+        ffn_hc_base,
+        ffn_next_pre,
+        ffn_post,
+        ffn_comb,
+        ffn_collapsed,
+        ffn_normed,
+        ffn_norm_weight,
+        gate_weight,
+        text_bias,
+        vision_bias,
+        input_ids,
+        routed_w1,
+        routed_w1_scale,
+        routed_w3,
+        routed_w3_scale,
+        routed_w2,
+        routed_w2_scale,
+        shared_gate_up,
+        shared_gate_up_scale,
+        shared_down,
+        shared_down_scale,
+        lane_x,
+        lane_aux,
+        lane_count,
+        lane_ready,
+        slot_out,
+        return_ready,
+        logits,
+        route_ids,
+        route_weights,
+        moe_output,
+        output,
+        attn_next_pre,
+        active,
+        rank,
+        epoch,
+        1,
+    )
     return output
 
 
@@ -748,23 +1029,98 @@ def decode_layer_ep2_c1a_full(
         slot_out = pld.window(slot_out_buf, [16 * TOPK, D], dtype=pl.FP32)
         return_ready = pld.window(return_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
         decode_layer_ep2_c1a_full_rank(
-            x_hc[rank], attn_hc_function[rank], attn_hc_scale[rank], attn_hc_base[rank], attn_incoming[rank],
-            attn_norm_weight[rank], wq_a[rank], wq_a_scale[rank], q_norm_weight[rank], wq_b[rank], wq_b_scale[rank],
-            wkv[rank], wkv_scale[rank], kv_norm_weight[rank], wo_a[rank], wo_b[rank], rope_cos[rank], rope_sin[rank],
-            slots[rank], indices[rank], prepared_indices[rank], sink[rank], positions[rank], query_latent[rank],
-            query[rank], window_kv[rank], cache[rank], cache_lens[rank], compressed_cache[rank], index_cache[rank],
-            index_scale[rank], compressed_slots[rank], positions32[rank], requests[rank], compressor_wkv[rank],
-            compressor_norm[rank], index_wk[rank], index_norm[rank], index_wq_b[rank], index_wq_b_scale[rank],
-            index_weights_proj[rank], source_positions[rank], cache_lengths[rank], candidate_block_ids[rank],
-            candidate_block_counts[rank], candidate_topk_lengths[rank], attn_output[rank], attn_next_pre[rank],
-            attn_post[rank], attn_comb[rank], attn_collapsed[rank], attn_normed[rank], after_attention[rank],
-            ffn_hc_function[rank], ffn_hc_scale[rank], ffn_hc_base[rank], ffn_norm_weight[rank], ffn_next_pre[rank],
-            ffn_post[rank], ffn_comb[rank], ffn_collapsed[rank], ffn_normed[rank], gate_weight[rank], text_bias[rank],
-            vision_bias[rank], input_ids[rank], routed_w1[rank], routed_w1_scale[rank], routed_w3[rank], routed_w3_scale[rank],
-            routed_w2[rank], routed_w2_scale[rank], shared_gate_up[rank], shared_gate_up_scale[rank], shared_down[rank],
-            shared_down_scale[rank], lane_x, lane_aux, lane_count, lane_ready, slot_out, return_ready,
-            logits[rank], route_ids[rank], route_weights[rank],
-            moe_output[rank], output[rank], active, rank, epoch, c1_mode, device=rank,
+            x_hc[rank],
+            attn_hc_function[rank],
+            attn_hc_scale[rank],
+            attn_hc_base[rank],
+            attn_incoming[rank],
+            attn_norm_weight[rank],
+            wq_a[rank],
+            wq_a_scale[rank],
+            q_norm_weight[rank],
+            wq_b[rank],
+            wq_b_scale[rank],
+            wkv[rank],
+            wkv_scale[rank],
+            kv_norm_weight[rank],
+            wo_a[rank],
+            wo_b[rank],
+            rope_cos[rank],
+            rope_sin[rank],
+            slots[rank],
+            indices[rank],
+            prepared_indices[rank],
+            sink[rank],
+            positions[rank],
+            query_latent[rank],
+            query[rank],
+            window_kv[rank],
+            cache[rank],
+            cache_lens[rank],
+            compressed_cache[rank],
+            index_cache[rank],
+            index_scale[rank],
+            compressed_slots[rank],
+            positions32[rank],
+            requests[rank],
+            compressor_wkv[rank],
+            compressor_norm[rank],
+            index_wk[rank],
+            index_norm[rank],
+            index_wq_b[rank],
+            index_wq_b_scale[rank],
+            index_weights_proj[rank],
+            source_positions[rank],
+            cache_lengths[rank],
+            candidate_block_ids[rank],
+            candidate_block_counts[rank],
+            candidate_topk_lengths[rank],
+            attn_output[rank],
+            attn_next_pre[rank],
+            attn_post[rank],
+            attn_comb[rank],
+            attn_collapsed[rank],
+            attn_normed[rank],
+            after_attention[rank],
+            ffn_hc_function[rank],
+            ffn_hc_scale[rank],
+            ffn_hc_base[rank],
+            ffn_norm_weight[rank],
+            ffn_next_pre[rank],
+            ffn_post[rank],
+            ffn_comb[rank],
+            ffn_collapsed[rank],
+            ffn_normed[rank],
+            gate_weight[rank],
+            text_bias[rank],
+            vision_bias[rank],
+            input_ids[rank],
+            routed_w1[rank],
+            routed_w1_scale[rank],
+            routed_w3[rank],
+            routed_w3_scale[rank],
+            routed_w2[rank],
+            routed_w2_scale[rank],
+            shared_gate_up[rank],
+            shared_gate_up_scale[rank],
+            shared_down[rank],
+            shared_down_scale[rank],
+            lane_x,
+            lane_aux,
+            lane_count,
+            lane_ready,
+            slot_out,
+            return_ready,
+            logits[rank],
+            route_ids[rank],
+            route_weights[rank],
+            moe_output[rank],
+            output[rank],
+            active,
+            rank,
+            epoch,
+            c1_mode,
+            device=rank,
         )
 
 

@@ -23,9 +23,13 @@ from typing import Any, Mapping
 import torch
 import pypto.language as pl
 
-from .decode_gemm import make_fp32_dequantize, make_int8_gemm, make_pack_weight
+from .gemm import make_fp32_dequantize, make_int8_gemm, make_pack_weight
 from .decode_norm_rope import make_rope, make_rmsnorm, rms_norm_reference, rope_reference
-from .decode_quant import int8_matmul, make_dynamic_int8_quantize, quantize_per_token_int8
+from .quant import (
+    int8_matmul,
+    make_decode_dynamic_int8_quantize as make_dynamic_int8_quantize,
+    quantize_per_token_int8,
+)
 
 
 @dataclass(frozen=True)
@@ -96,7 +100,9 @@ def qkv_reference(
     )
 
     kv_i32 = int8_matmul(x_i8, weights["wkv"].transpose(-2, -1).contiguous())
-    kv_linear = (kv_i32.float() * x_scale.float() * weights["wkv_scale"].float().reshape(1, -1)).to(torch.bfloat16)
+    kv_linear = (kv_i32.float() * x_scale.float() * weights["wkv_scale"].float().reshape(1, -1)).to(
+        torch.bfloat16
+    )
     kv_normed = rms_norm_reference(kv_linear, weights["kv_norm_weight"], shape.rms_norm_eps)
     window_kv = rope_reference(kv_normed, cosine, sine, 1, shape.head_dim, shape.qk_rope_head_dim)
     return {
@@ -202,9 +208,16 @@ def make_qkv_w8a8(capacity: int, config: Mapping[str, Any] | QKVShape):
         norm_kv(wkv_output, kv_norm_weight, wkv_normed_output, active)
         rope_kv(wkv_normed_output, cosine, sine, window_kv, active)
         return (
-            positions, query_latent, query, window_kv,
-            wq_a_output, wq_b_output, wkv_output, wkv_normed_output,
-            cache, cache_lens,
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            wq_a_output,
+            wq_b_output,
+            wkv_output,
+            wkv_normed_output,
+            cache,
+            cache_lens,
         )
 
     @pl.jit
@@ -233,10 +246,28 @@ def make_qkv_w8a8(capacity: int, config: Mapping[str, Any] | QKVShape):
         active: pl.Scalar[pl.INT32],
     ):
         return qkv_w8a8_inline(
-            value, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-            wkv, wkv_scale, kv_norm_weight, cosine, sine, positions,
-            query_latent, query, window_kv, wq_a_output, wq_b_output,
-            wkv_output, wkv_normed_output, cache, cache_lens, active,
+            value,
+            wq_a,
+            wq_a_scale,
+            q_norm_weight,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            wkv_scale,
+            kv_norm_weight,
+            cosine,
+            sine,
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            wq_a_output,
+            wq_b_output,
+            wkv_output,
+            wkv_normed_output,
+            cache,
+            cache_lens,
+            active,
         )
 
     qkv_w8a8.inline = qkv_w8a8_inline

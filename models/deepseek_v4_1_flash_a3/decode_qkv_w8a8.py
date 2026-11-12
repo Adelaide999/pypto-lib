@@ -10,7 +10,15 @@
 
 import pypto.language as pl
 
-from .decode_primitives import N_TILE, make_quantize, make_pack_weight, make_dot, make_dequantize, make_norm, make_rope
+from .linear_primitives import (
+    N_TILE,
+    make_decode_quantize as make_quantize,
+    make_pack_weight,
+    make_dot,
+    make_decode_dequantize as make_dequantize,
+    make_decode_norm as make_norm,
+    make_decode_rope as make_rope,
+)
 
 
 def make_qkv_w8a8_inline(capacity, config):
@@ -132,9 +140,24 @@ def make_qkv_w8a8(capacity, config):
         active: pl.Scalar[pl.INT32],
     ):
         compute(
-            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-            kv_norm_weight, rope_cos, rope_sin,
-            positions, query_latent, query, window_kv, cache, cache_lens, active,
+            x,
+            wq_a,
+            wq_a_scale,
+            q_norm_weight,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            wkv_scale,
+            kv_norm_weight,
+            rope_cos,
+            rope_sin,
+            positions,
+            query_latent,
+            query,
+            window_kv,
+            cache,
+            cache_lens,
+            active,
         )
         return positions, query_latent, query, window_kv, cache, cache_lens
 
