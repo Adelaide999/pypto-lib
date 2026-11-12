@@ -63,10 +63,10 @@ def make_prefill_layer_entries(
 ):
     """Construct shared physical-layer attention, HC and MoE computations."""
     from .hc import make_hc_post_inline, make_hc_pre_inline
-    from .moe import make_moe_combine
-    from .moe import make_ep_dispatch_pack, make_ep_dispatch_unpack, make_ep_return_pack
-    from .moe import make_moe_router
-    from .moe import make_shared_moe_w8a8
+    from .prefill_moe import make_moe_combine
+    from .prefill_moe import make_ep_dispatch_pack, make_ep_dispatch_unpack, make_ep_return_pack
+    from .prefill_moe import make_moe_router
+    from .prefill_moe import make_shared_moe_w8a8
     from .rope import make_rope_tables
     from .input_pack import make_head_pack, make_sp_gather_unpack, make_sp_masked_zero, make_sp_reduce_pack
     from .rmsnorm import make_prefill_norm_cast
@@ -145,7 +145,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     exchange callback. It does not load a fixture, read a reference, or restore
     next-layer inputs from files. Buffers are local SP shards, not gathered output.
     """
-    from .moe import DISPATCH_MAP_PAD as MAP_PAD, validate_received_routes, validate_returned_routes
+    from .prefill_moe import DISPATCH_MAP_PAD as MAP_PAD, validate_received_routes, validate_returned_routes
     from .prefill_compressed_runtime import run_compressed_attention
     from .prefill_consumer_runtime import run_consumer_attention
     from .cache import invalidate_live_versions, publish_live_versions

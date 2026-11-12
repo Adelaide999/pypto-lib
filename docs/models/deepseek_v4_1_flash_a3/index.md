@@ -25,7 +25,8 @@ for the implemented Decode scope and remaining work.
 | Bounded SWA Decode | `decode_fwd.py` |
 | Vocabulary embedding, initial HC and output head | `input_pack.py`, `prefill_network_input.py`, `lm_head.py` |
 | Attention, compression and Indexer | `swa.py`, `sparse_attention.py`, `compressor.py`, `indexer.py`, phase compositions |
-| MoE routing, dispatch and experts | `moe.py`, `expert_routed.py` |
+| Phase MoE routing, dispatch and shared experts | `prefill_moe.py`, `decode_moe.py` |
+| Grouped routed-expert computation | `expert_routed.py` |
 | Linear, quantization, Norm, RoPE and HC | `gemm.py`, `quant.py`, `rmsnorm.py`, `rope.py`, `hc.py` |
 | Checkpoint operands and phase layouts | `weights.py` |
 | Cache ownership and device lifetime | `cache.py`, `state.py`, `prefill_resident.py` |
@@ -40,6 +41,21 @@ Historical audits, independent-layer runners, reference-capture workers,
 state replay, tensor collectors and identity-lock manifests are removed.
 Their source remains in Git history. Operators retain their local Torch
 goldens and standard Golden Harness entries.
+
+MoE phase files own their kernels, Torch goldens and validation entries.
+Shared GEMM and quantization primitives remain in independent child modules;
+the phase modules do not import each other. Prefill controlled routing and
+FP16/FP32 fused-channel variants remain distinct from Decode FP32 router
+inputs and activation boundaries. Standalone validation uses the same kernels
+as composition:
+
+```bash
+python -m models.deepseek_v4_1_flash_a3.prefill_moe -p a2a3 --compile-only
+python -m models.deepseek_v4_1_flash_a3.decode_moe -p a2a3 --compile-only
+```
+
+These commands compile bounded operator cases; they do not execute a network.
+Omit `--compile-only` on an allocated A3 device to run operator comparisons.
 
 ## Whole-network Prefill
 

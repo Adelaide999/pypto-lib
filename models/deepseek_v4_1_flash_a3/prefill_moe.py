@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Shared MoE kernels, distinct phase boundaries, Torch goldens and validation."""
+"""A3 W8A8 Prefill routing, dispatch, experts and Torch validation."""
 
 import sys
 from pathlib import Path
@@ -16,54 +16,44 @@ if __package__ in (None, ""):
     __package__ = "models.deepseek_v4_1_flash_a3"
 import pypto.language as pl
 import torch
-from .gemm import VEC_M_TILE as DECODE_SHARED_VEC_M_TILE, VEC_M_TILE as SHARED_VEC_M_TILE, make_dot as _decode_shared_make_dot, make_dot as _ecotech_shared_make_dot, make_dot as _shared_make_dot, make_fp32_dequantize as _decode_moe_make_fp32_dequantize, make_fp32_dequantize as _moe_make_fp32_dequantize, make_int8_gemm as _decode_moe_make_int8_gemm, make_int8_gemm as _moe_make_int8_gemm, prepare_ecotech_dynamic_weight as _ecotech_shared_prepare_ecotech_dynamic_weight, prepare_ecotech_tail_weight as _ecotech_shared_prepare_ecotech_tail_weight
-from .quant import make_cast_tile as _router_make_cast_tile, make_decode_dequantize as _decode_shared_make_dequantize, make_decode_dynamic_int8_quantize as _decode_moe_make_dynamic_int8_quantize, make_decode_quantize as _decode_shared_make_quantize, make_dequantize as _ecotech_shared_make_dequantize, make_dequantize as _shared_make_dequantize, make_dynamic_int8_quantize as _moe_make_dynamic_int8_quantize, make_quantize as _ecotech_shared_make_quantize, make_quantize as _shared_make_quantize, w8a8_linear as _decode_moe_w8a8_linear, w8a8_linear as _moe_w8a8_linear
+
+from .gemm import (
+    VEC_M_TILE as SHARED_VEC_M_TILE,
+    make_dot as _ecotech_shared_make_dot,
+    make_dot as _shared_make_dot,
+    make_fp32_dequantize as _moe_make_fp32_dequantize,
+    make_int8_gemm as _moe_make_int8_gemm,
+    prepare_ecotech_dynamic_weight as _ecotech_shared_prepare_ecotech_dynamic_weight,
+    prepare_ecotech_tail_weight as _ecotech_shared_prepare_ecotech_tail_weight,
+)
+from .quant import (
+    make_cast_tile as _router_make_cast_tile,
+    make_dequantize as _ecotech_shared_make_dequantize,
+    make_dequantize as _shared_make_dequantize,
+    make_dynamic_int8_quantize as _moe_make_dynamic_int8_quantize,
+    make_quantize as _ecotech_shared_make_quantize,
+    make_quantize as _shared_make_quantize,
+    w8a8_linear as _moe_w8a8_linear,
+)
 from .utils import pack_blocked_weight, unpack_blocked_weight
-
-
-MOE_VEC_M_TILE = 8
-MOE_ACT_TILE = 256
-
-
-# tiling
-ROUTER_D_TILE = 256
-ROUTER_EXPERT_TILE = 8
-ROUTER_TOPK_TILE = 8
 
 
 # model config
 DISPATCH_EXPERTS = 384
 DISPATCH_TOPK = 6
 DISPATCH_D = 5120
-DISPATCH_RECV_MAX = 64
-
-# tiling
-DISPATCH_D_TILE = 512
-DISPATCH_MAP_PAD = 8
-
 COMBINE_TOPK = 6
 COMBINE_D = 5120
 
-
-DECODE_MOE_VEC_M_TILE = 8
-DECODE_MOE_ACT_TILE = 256
-
-
 # tiling
-DECODE_ROUTER_D_TILE = 256
-DECODE_ROUTER_EXPERT_TILE = 8
-DECODE_ROUTER_TOPK_TILE = 8
-
-
-# model config
-DECODE_DISPATCH_EXPERTS = 384
-DECODE_DISPATCH_TOPK = 6
-DECODE_DISPATCH_D = 5120
-DECODE_DISPATCH_RECV_MAX = 64
-
-# tiling
-DECODE_DISPATCH_D_TILE = 512
-DECODE_DISPATCH_MAP_PAD = 8
+MOE_VEC_M_TILE = 8
+MOE_ACT_TILE = 256
+ROUTER_D_TILE = 256
+ROUTER_EXPERT_TILE = 8
+ROUTER_TOPK_TILE = 8
+DISPATCH_RECV_MAX = 64
+DISPATCH_D_TILE = 512
+DISPATCH_MAP_PAD = 8
 
 
 def w8a8_expert_linear(
@@ -903,563 +893,6 @@ def make_ecotech_shared(capacity, hidden, intermediate):
     return shared
 
 
-def decode_moe_w8a8_expert_linear(
-    value: torch.Tensor,
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Run one W8A8 expert projection using the shared linear golden."""
-
-    return _decode_moe_w8a8_linear(value, weight, scale, out_dtype=out_dtype)
-
-
-def make_decode_w8a8_expert_projection(capacity: int, input_width: int, output_width: int):
-    """Build the shared leaf used by routed and shared W8A8 projections.
-
-    Dispatch/combine metadata stays outside this kernel.  Each routed expert
-    receives a contiguous token slice and uses the same A2/A3 W8A8 boundary as
-    the shared expert: dynamic INT8 activation, INT32 dot, FP32 scales, BF16
-    output.
-    """
-
-    quantize = _decode_moe_make_dynamic_int8_quantize(capacity, input_width)
-    gemm = _decode_moe_make_int8_gemm(capacity, input_width, output_width)
-    dequantize = _decode_moe_make_fp32_dequantize(capacity, output_width)
-
-    @pl.jit.inline
-    def projection(
-        value: pl.Tensor[[capacity, input_width], pl.BF16],
-        packed_weight: pl.Tensor[[input_width * (output_width // 64), 64], pl.INT8],
-        channel_scale: pl.Tensor[[output_width], pl.FP32],
-        payload: pl.Tensor[[capacity, input_width], pl.INT8],
-        token_scale: pl.Tensor[[capacity, 1], pl.FP32],
-        accumulator: pl.Tensor[[capacity, output_width], pl.INT32],
-        output: pl.Tensor[[capacity, output_width], pl.BF16],
-        active: pl.Scalar[pl.INT32],
-    ):
-        quantize(value, payload, token_scale, active)
-        gemm(payload, packed_weight, accumulator, active)
-        dequantize(accumulator, token_scale, channel_scale, output, active)
-        return output
-
-    return projection
-
-
-def make_decode_shared_expert_projection(capacity: int, input_width: int, output_width: int):
-    """Alias the W8A8 projection leaf for the shared expert path."""
-
-    return make_decode_w8a8_expert_projection(capacity, input_width, output_width)
-
-
-def make_decode_routed_expert_projection(capacity: int, input_width: int, output_width: int):
-    """Alias the W8A8 projection leaf for one grouped routed expert."""
-
-    return make_decode_w8a8_expert_projection(capacity, input_width, output_width)
-
-
-def make_decode_shared_expert_w8a8(
-    capacity: int,
-    hidden: int,
-    intermediate: int,
-    clamp_limit: float = 10.0,
-):
-    """Build the complete W8A8 shared expert for one dispatched token slab.
-
-    The activation is evaluated in FP32, narrowed to BF16 at the same point
-    as vLLM-Ascend, then dynamically re-quantized before the down projection.
-    A routed expert uses this exact entry point after host dispatch has made a
-    contiguous ``[tokens, hidden]`` slice for one expert.
-    """
-
-    if capacity % 16 or hidden % 256 or intermediate % 256:
-        raise ValueError("A2/A3 expert GEMM requires capacity multiple of 16 and K widths multiple of 256")
-    gate_up_width = intermediate * 2
-    quant_x = _decode_moe_make_dynamic_int8_quantize(capacity, hidden)
-    quant_hidden = _decode_moe_make_dynamic_int8_quantize(capacity, intermediate)
-    dot_gate_up = _decode_moe_make_int8_gemm(capacity, hidden, gate_up_width)
-    dot_down = _decode_moe_make_int8_gemm(capacity, intermediate, hidden)
-    dequant_gate_up = _decode_moe_make_fp32_dequantize(capacity, gate_up_width)
-    dequant_down = _decode_moe_make_fp32_dequantize(capacity, hidden)
-
-    @pl.jit
-    def shared_expert(
-        value: pl.Tensor[[capacity, hidden], pl.BF16],
-        gate_up_weight: pl.Tensor[[hidden * (gate_up_width // 64), 64], pl.INT8],
-        gate_up_scale: pl.Tensor[[gate_up_width], pl.FP32],
-        down_weight: pl.Tensor[[intermediate * (hidden // 64), 64], pl.INT8],
-        down_scale: pl.Tensor[[hidden], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        x_payload = pl.create_tensor([capacity, hidden], dtype=pl.INT8)
-        x_scale = pl.create_tensor([capacity, 1], dtype=pl.FP32)
-        quant_x(value, x_payload, x_scale, active)
-
-        gate_up_acc = pl.create_tensor([capacity, gate_up_width], dtype=pl.INT32)
-        dot_gate_up(x_payload, gate_up_weight, gate_up_acc, active)
-        gate_up = pl.create_tensor([capacity, gate_up_width], dtype=pl.BF16)
-        dequant_gate_up(gate_up_acc, x_scale, gate_up_scale, gate_up, active)
-
-        activation = pl.create_tensor([capacity, intermediate], dtype=pl.BF16)
-        for block in pl.spmd(
-            (active + DECODE_MOE_VEC_M_TILE - 1)
-            // DECODE_MOE_VEC_M_TILE
-            * (intermediate // DECODE_MOE_ACT_TILE),
-            name_hint="dsv41_a2a3_swiglu_v2",
-        ):
-            token = block // (intermediate // DECODE_MOE_ACT_TILE) * DECODE_MOE_VEC_M_TILE
-            column = block % (intermediate // DECODE_MOE_ACT_TILE) * DECODE_MOE_ACT_TILE
-            rows = pl.min(DECODE_MOE_VEC_M_TILE, active - token)
-            # vLLM's A2/A3 ``SiluAndMulWithClamp`` keeps the two products in
-            # BF16.  Use FP32 only for the exponential, then multiply the
-            # BF16 sigmoid, gate, and up values without an FP32 promotion.
-            gate = pl.cast(
-                pl.slice(gate_up, [DECODE_MOE_VEC_M_TILE, DECODE_MOE_ACT_TILE], [token, column]), pl.FP32
-            )
-            up = pl.cast(
-                pl.slice(
-                    gate_up, [DECODE_MOE_VEC_M_TILE, DECODE_MOE_ACT_TILE], [token, intermediate + column]
-                ),
-                pl.FP32,
-            )
-            gate = pl.minimum(gate, clamp_limit)
-            up = pl.maximum(pl.minimum(up, clamp_limit), -clamp_limit)
-            sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate)), 1.0))
-            sigmoid_bf16 = pl.cast(sigmoid, pl.BF16, mode="rint")
-            silu = pl.mul(gate, pl.cast(sigmoid_bf16, pl.FP32))
-            silu_bf16 = pl.cast(silu, pl.BF16, mode="rint")
-            activated = pl.mul(pl.cast(silu_bf16, pl.FP32), up)
-            activation[token : token + DECODE_MOE_VEC_M_TILE, column : column + DECODE_MOE_ACT_TILE] = (
-                pl.set_validshape(pl.cast(activated, pl.BF16, mode="rint"), rows, DECODE_MOE_ACT_TILE)
-            )
-
-        hidden_payload = pl.create_tensor([capacity, intermediate], dtype=pl.INT8)
-        hidden_scale = pl.create_tensor([capacity, 1], dtype=pl.FP32)
-        quant_hidden(activation, hidden_payload, hidden_scale, active)
-        down_acc = pl.create_tensor([capacity, hidden], dtype=pl.INT32)
-        dot_down(hidden_payload, down_weight, down_acc, active)
-        dequant_down(down_acc, hidden_scale, down_scale, output, active)
-        return output
-
-    return shared_expert
-
-
-def make_decode_routed_expert_w8a8(capacity: int, hidden: int, intermediate: int, clamp_limit: float = 10.0):
-    """Alias the full expert kernel for one post-dispatch routed expert."""
-
-    return make_decode_shared_expert_w8a8(capacity, hidden, intermediate, clamp_limit)
-
-
-def make_decode_moe_router_inline(capacity, config):
-    """Build full-precision gate projection and 384-expert top-six routing."""
-    hidden = config["hidden_size"]
-    experts = config["n_routed_experts"]
-    topk = config["num_experts_per_tok"]
-    route_scale = config["routed_scaling_factor"]
-    sentinel_base = config["image_sentinel_base_id"]
-    sentinel_end = sentinel_base + 5
-    if experts != 384 or topk != 6:
-        raise ValueError("The A2 router requires 384 experts and six selected experts")
-    if hidden % DECODE_ROUTER_D_TILE:
-        raise ValueError("The gate hidden size must be divisible by D_TILE")
-
-    @pl.jit.inline
-    def moe_router_inline(
-        x: pl.Tensor[[capacity, hidden], pl.BF16],
-        router_x: pl.Tensor[[capacity, hidden], pl.FP32],
-        gate_weight: pl.Tensor[[experts, hidden], pl.FP32],
-        text_bias: pl.Tensor[[experts], pl.FP32],
-        vision_bias: pl.Tensor[[experts], pl.FP32],
-        input_ids: pl.Tensor[[capacity], pl.INT64],
-        logits: pl.Tensor[[capacity, experts], pl.FP32],
-        route_ids: pl.Tensor[[capacity, topk], pl.INT32],
-        route_weights: pl.Tensor[[capacity, topk], pl.FP32],
-        active: pl.Scalar[pl.INT32],
-    ):
-        for block in pl.spmd(active * (experts // DECODE_ROUTER_EXPERT_TILE), name_hint="a2_moe_gate_fp32"):
-            token = block // (experts // DECODE_ROUTER_EXPERT_TILE)
-            expert = block % (experts // DECODE_ROUTER_EXPERT_TILE) * DECODE_ROUTER_EXPERT_TILE
-            dot_sum = pl.full([1, DECODE_ROUTER_EXPERT_TILE], dtype=pl.FP32, value=0.0)
-            for inner in pl.range(0, hidden, DECODE_ROUTER_D_TILE):
-                source = router_x[token : token + 1, inner : inner + DECODE_ROUTER_D_TILE]
-                weight = gate_weight[
-                    expert : expert + DECODE_ROUTER_EXPERT_TILE, inner : inner + DECODE_ROUTER_D_TILE
-                ]
-                product = pl.col_expand_mul(weight, source)
-                partial = pl.reshape(pl.row_sum(product), [1, DECODE_ROUTER_EXPERT_TILE])
-                dot_sum = pl.add(dot_sum, partial)
-            logits[token : token + 1, expert : expert + DECODE_ROUTER_EXPERT_TILE] = dot_sum
-
-        raw_scores = pl.create_tensor([capacity, experts], dtype=pl.FP32)
-        selected_ids = pl.create_tensor([capacity, DECODE_ROUTER_TOPK_TILE], dtype=pl.INT32)
-        for token in pl.spmd(active, name_hint="a2_moe_route_sort"):
-            gate_logits = logits[token : token + 1, :]
-            positive = pl.maximum(gate_logits, 0.0)
-            negative_abs = pl.neg(pl.abs(gate_logits))
-            exponential = pl.exp(negative_abs)
-            log_tail = pl.log(pl.add(exponential, 1.0))
-            softplus_log = pl.add(positive, log_tail)
-            negative_shift = pl.sub(pl.neg(gate_logits), 10.0)
-            negative_mask = pl.minimum(pl.maximum(negative_shift, 0.0), 1.0)
-            negative_exp = pl.exp(pl.minimum(gate_logits, 0.0))
-            negative_floor = pl.mul(negative_mask, negative_exp)
-            softplus = pl.maximum(softplus_log, negative_floor)
-            scores = pl.sqrt(softplus)
-            raw_scores[token : token + 1, :] = scores
-
-            bias = pl.reshape(text_bias[:], [1, experts])
-            token_id = pl.read(input_ids, [token])
-            if token_id >= sentinel_base:
-                if token_id < sentinel_end:
-                    bias = pl.reshape(vision_bias[:], [1, experts])
-            biased_scores = pl.add(scores, bias)
-            index_range = pl.arange(0, [1, experts], dtype=pl.UINT32)
-            sorted_32 = pl.sort32(biased_scores, index_range)
-            sorted_64 = pl.mrgsort(sorted_32, block_len=64)
-            first = sorted_64[:, 0:256]
-            second = sorted_64[:, 256:512]
-            third = sorted_64[:, 512:768]
-            sorted_pairs = pl.mrgsort(first, second, third)
-            top_pairs = sorted_pairs[:, 0:16]
-            top_ids = pl.gather(top_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-            selected_ids[token : token + 1, :] = top_ids
-
-        # Each row is only 6 INT32/FP32 values (24 bytes), so parallel scalar
-        # stores would share a 64-byte cache line and lose neighboring rows.
-        # Serialize this small write-back until the output is padded or tile
-        # stores can provide an atomic full-line update.
-        for _block in pl.spmd(1, name_hint="a2_moe_route_normalize"):
-            for token in pl.range(active):
-                score_sum = pl.cast(0.0, pl.FP32)
-                for rank in pl.range(topk):
-                    selected_expert_idx = pl.cast(pl.read(selected_ids, [token, rank]), pl.INDEX)
-                    score = pl.read(raw_scores, [token, selected_expert_idx])
-                    score_sum = score_sum + score
-                for rank in pl.range(topk):
-                    selected_expert_idx = pl.cast(pl.read(selected_ids, [token, rank]), pl.INDEX)
-                    score = pl.read(raw_scores, [token, selected_expert_idx])
-                    normalized = (score / score_sum) * route_scale
-                    pl.write(route_ids, [token, rank], pl.cast(selected_expert_idx, pl.INT32))
-                    pl.write(route_weights, [token, rank], normalized)
-        return logits, route_ids, route_weights
-
-    return moe_router_inline
-
-
-def make_decode_moe_router(capacity, config):
-    """Build the standalone MoE router entry with untouched inactive rows."""
-    hidden = config["hidden_size"]
-    experts = config["n_routed_experts"]
-    topk = config["num_experts_per_tok"]
-    compute = make_decode_moe_router_inline(capacity, config)
-
-    @pl.jit
-    def moe_router(
-        x: pl.Tensor[[capacity, hidden], pl.BF16],
-        router_x: pl.Tensor[[capacity, hidden], pl.FP32],
-        gate_weight: pl.Tensor[[experts, hidden], pl.FP32],
-        text_bias: pl.Tensor[[experts], pl.FP32],
-        vision_bias: pl.Tensor[[experts], pl.FP32],
-        input_ids: pl.Tensor[[capacity], pl.INT64],
-        logits: pl.InOut[pl.Tensor[[capacity, experts], pl.FP32]],
-        route_ids: pl.InOut[pl.Tensor[[capacity, topk], pl.INT32]],
-        route_weights: pl.InOut[pl.Tensor[[capacity, topk], pl.FP32]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        compute(
-            x,
-            router_x,
-            gate_weight,
-            text_bias,
-            vision_bias,
-            input_ids,
-            logits,
-            route_ids,
-            route_weights,
-            active,
-        )
-        return logits, route_ids, route_weights
-
-    return moe_router
-
-
-def make_decode_dispatch_layout(tokens):
-    """Map native count-mode dispatch into the full384 expert ABI."""
-    routes = tokens * DECODE_DISPATCH_TOPK
-
-    @pl.jit
-    def dispatch_layout(
-        payload: pl.Tensor[[routes, DECODE_DISPATCH_D], pl.INT8],
-        scales: pl.Tensor[[routes], pl.FP32],
-        counts: pl.Tensor[[DECODE_DISPATCH_EXPERTS], pl.INT64],
-        expanded: pl.Tensor[[routes], pl.INT32],
-        weights: pl.Tensor[[tokens, DECODE_DISPATCH_TOPK], pl.FP32],
-        recv_x: pl.InOut[
-            pl.Tensor[[DECODE_DISPATCH_EXPERTS, DECODE_DISPATCH_RECV_MAX, DECODE_DISPATCH_D], pl.INT8]
-        ],
-        recv_scale: pl.InOut[pl.Tensor[[DECODE_DISPATCH_EXPERTS, DECODE_DISPATCH_RECV_MAX], pl.FP32]],
-        recv_weights: pl.InOut[pl.Tensor[[DECODE_DISPATCH_EXPERTS, DECODE_DISPATCH_RECV_MAX], pl.FP32]],
-        recv_count: pl.InOut[pl.Tensor[[DECODE_DISPATCH_EXPERTS, 1], pl.INT32]],
-        route_map: pl.InOut[pl.Tensor[[routes, DECODE_DISPATCH_MAP_PAD], pl.INT32]],
-    ):
-        # Serialize narrow scalar stores that can share a cache line.
-        for _block in pl.spmd(1, name_hint="a2_moe_dispatch_metadata"):
-            begin = pl.cast(0, pl.INT32)
-            for expert in pl.range(DECODE_DISPATCH_EXPERTS):
-                count = pl.cast(pl.read(counts, [expert]), pl.INT32)
-                pl.write(recv_count, [expert, 0], count)
-                for original in pl.range(routes):
-                    dispatched = pl.read(expanded, [original])
-                    if dispatched >= begin and dispatched < begin + count:
-                        row = dispatched - begin
-                        route_weight = pl.read(
-                            weights, [original // DECODE_DISPATCH_TOPK, original % DECODE_DISPATCH_TOPK]
-                        )
-                        token_scale = pl.read(scales, [dispatched])
-                        pl.write(recv_scale, [expert, row], token_scale)
-                        pl.write(recv_weights, [expert, row], route_weight)
-                        target = pl.cast(expert * DECODE_DISPATCH_RECV_MAX, pl.INT32) + row
-                        pl.write(route_map, [original, 0], target)
-                begin = begin + count
-
-        recv_flat = pl.reshape(
-            recv_x, [DECODE_DISPATCH_EXPERTS * DECODE_DISPATCH_RECV_MAX, DECODE_DISPATCH_D]
-        )
-        for block in pl.spmd(
-            routes * (DECODE_DISPATCH_D // DECODE_DISPATCH_D_TILE), name_hint="a2_moe_dispatch_payload"
-        ):
-            original = block // (DECODE_DISPATCH_D // DECODE_DISPATCH_D_TILE)
-            column = block % (DECODE_DISPATCH_D // DECODE_DISPATCH_D_TILE) * DECODE_DISPATCH_D_TILE
-            dispatched = pl.read(expanded, [original])
-            target = pl.read(route_map, [original, 0])
-            value = payload[dispatched : dispatched + 1, column : column + DECODE_DISPATCH_D_TILE]
-            recv_flat[target : target + 1, column : column + DECODE_DISPATCH_D_TILE] = value
-        return recv_x, recv_scale, recv_weights, recv_count, route_map
-
-    return dispatch_layout
-
-
-def make_decode_route_restore(tokens):
-    """Gather every actual weighted expert result in original token/top6 order."""
-    routes = tokens * DECODE_DISPATCH_TOPK
-
-    @pl.jit
-    def route_restore(
-        recv_y: pl.Tensor[[DECODE_DISPATCH_EXPERTS, DECODE_DISPATCH_RECV_MAX, DECODE_DISPATCH_D], pl.FP32],
-        route_map: pl.Tensor[[routes, DECODE_DISPATCH_MAP_PAD], pl.INT32],
-        dispatch_y: pl.Out[pl.Tensor[[routes, DECODE_DISPATCH_D], pl.FP32]],
-    ):
-        recv_flat = pl.reshape(
-            recv_y, [DECODE_DISPATCH_EXPERTS * DECODE_DISPATCH_RECV_MAX, DECODE_DISPATCH_D]
-        )
-        for block in pl.spmd(
-            routes * (DECODE_DISPATCH_D // DECODE_DISPATCH_D_TILE), name_hint="a2_moe_route_restore"
-        ):
-            original = block // (DECODE_DISPATCH_D // DECODE_DISPATCH_D_TILE)
-            column = block % (DECODE_DISPATCH_D // DECODE_DISPATCH_D_TILE) * DECODE_DISPATCH_D_TILE
-            source = pl.read(route_map, [original, 0])
-            value = recv_flat[source : source + 1, column : column + DECODE_DISPATCH_D_TILE]
-            dispatch_y[original : original + 1, column : column + DECODE_DISPATCH_D_TILE] = value
-        return dispatch_y
-
-    return route_restore
-
-
-def decode_shared_make_shared_activation(capacity, intermediate, limit, fused_activation):
-    """Select native fused FP32 or the preserved standalone BF16 rounding."""
-    width = intermediate * 2
-    tile = 256
-    dequantize = _decode_shared_make_dequantize(capacity, width)
-
-    if not fused_activation:
-
-        @pl.jit.inline
-        def bf16_activation(
-            accumulator: pl.Tensor[[capacity, width], pl.INT32],
-            channels: pl.Tensor[[width], pl.FP32],
-            scales: pl.Tensor[[capacity, 8], pl.FP32],
-            output: pl.Tensor[[capacity, intermediate], pl.BF16],
-            active: pl.Scalar[pl.INT32],
-        ):
-            gate_up = pl.create_tensor([capacity, width], dtype=pl.BF16)
-            dequantize(accumulator, channels, scales, gate_up, active)
-            row_blocks = (active + DECODE_SHARED_VEC_M_TILE - 1) // DECODE_SHARED_VEC_M_TILE
-            for block in pl.spmd(row_blocks * (intermediate // tile), name_hint="a2_moe_swiglu"):
-                token = block // (intermediate // tile) * DECODE_SHARED_VEC_M_TILE
-                column = block % (intermediate // tile) * tile
-                rows = pl.min(DECODE_SHARED_VEC_M_TILE, active - token)
-                up_column = intermediate + column
-                gate_bf16 = pl.slice(
-                    gate_up, [DECODE_SHARED_VEC_M_TILE, tile], [token, column], valid_shape=[rows, tile]
-                )
-                up_bf16 = pl.slice(
-                    gate_up, [DECODE_SHARED_VEC_M_TILE, tile], [token, up_column], valid_shape=[rows, tile]
-                )
-                gate_bf16 = pl.set_validshape(
-                    pl.fillpad(gate_bf16, pad_value=pl.PadValue.zero), DECODE_SHARED_VEC_M_TILE, tile
-                )
-                up_bf16 = pl.set_validshape(
-                    pl.fillpad(up_bf16, pad_value=pl.PadValue.zero), DECODE_SHARED_VEC_M_TILE, tile
-                )
-                gate = pl.minimum(pl.cast(gate_bf16, pl.FP32), limit)
-                up = pl.maximum(pl.minimum(pl.cast(up_bf16, pl.FP32), limit), -limit)
-                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate)), 1.0))
-                sigmoid_bf16 = pl.cast(sigmoid, pl.BF16, mode="rint")
-                silu_bf16 = pl.cast(pl.mul(gate, pl.cast(sigmoid_bf16, pl.FP32)), pl.BF16, mode="rint")
-                activated = pl.mul(pl.cast(silu_bf16, pl.FP32), up)
-                narrowed = pl.cast(activated, pl.BF16, mode="rint")
-                output[token : token + DECODE_SHARED_VEC_M_TILE, column : column + tile] = pl.set_validshape(
-                    narrowed, rows, tile
-                )
-            return output
-
-        return bf16_activation
-
-    @pl.jit.inline
-    def fp32_activation(
-        accumulator: pl.Tensor[[capacity, width], pl.INT32],
-        channels: pl.Tensor[[width], pl.FP32],
-        scales: pl.Tensor[[capacity, 8], pl.FP32],
-        output: pl.Tensor[[capacity, intermediate], pl.FP32],
-        active: pl.Scalar[pl.INT32],
-    ):
-        row_blocks = (active + DECODE_SHARED_VEC_M_TILE - 1) // DECODE_SHARED_VEC_M_TILE
-        for block in pl.spmd(row_blocks * (intermediate // tile), name_hint="a2_moe_swiglu_fused"):
-            token = block // (intermediate // tile) * DECODE_SHARED_VEC_M_TILE
-            column = block % (intermediate // tile) * tile
-            rows = pl.min(DECODE_SHARED_VEC_M_TILE, active - token)
-            up_column = intermediate + column
-            gate_i32 = pl.slice(
-                accumulator, [DECODE_SHARED_VEC_M_TILE, tile], [token, column], valid_shape=[rows, tile]
-            )
-            up_i32 = pl.slice(
-                accumulator, [DECODE_SHARED_VEC_M_TILE, tile], [token, up_column], valid_shape=[rows, tile]
-            )
-            gate_channels = pl.reshape(channels[column : column + tile], [1, tile])
-            up_channels = pl.reshape(channels[up_column : up_column + tile], [1, tile])
-            row_scale = pl.row_min(scales[token : token + DECODE_SHARED_VEC_M_TILE, :])
-            gate = pl.row_expand_mul(pl.col_expand_mul(pl.cast(gate_i32, pl.FP32), gate_channels), row_scale)
-            up = pl.row_expand_mul(pl.col_expand_mul(pl.cast(up_i32, pl.FP32), up_channels), row_scale)
-            gate = pl.set_validshape(
-                pl.fillpad(gate, pad_value=pl.PadValue.zero), DECODE_SHARED_VEC_M_TILE, tile
-            )
-            up = pl.set_validshape(pl.fillpad(up, pad_value=pl.PadValue.zero), DECODE_SHARED_VEC_M_TILE, tile)
-            gate = pl.minimum(gate, limit)
-            up = pl.maximum(pl.minimum(up, limit), -limit)
-            denominator = pl.add(pl.exp(pl.neg(gate)), 1.0)
-            silu = pl.div(gate, denominator)
-            activated = pl.mul(silu, up)
-            output[token : token + DECODE_SHARED_VEC_M_TILE, column : column + tile] = pl.set_validshape(
-                activated, rows, tile
-            )
-        return output
-
-    return fp32_activation
-
-
-def make_decode_shared_moe_w8a8_inline(capacity, config, *, fused_activation=False):
-    """Build shared gate/up, clamped SwiGLU, and down projection."""
-    hidden = config["hidden_size"]
-    intermediate = config["moe_intermediate_size"]
-    gate_up_width = intermediate * 2
-    limit = config["swiglu_limit"]
-    activation_dtype = pl.FP32 if fused_activation else pl.BF16
-    activate = decode_shared_make_shared_activation(capacity, intermediate, limit, fused_activation)
-
-    quant_x = _decode_shared_make_quantize(capacity, hidden)
-    quant_hidden = _decode_shared_make_quantize(capacity, intermediate, activation_dtype)
-    dot_gate_up = _decode_shared_make_dot(capacity, hidden, gate_up_width)
-    dot_down = _decode_shared_make_dot(capacity, intermediate, hidden)
-    # vLLM's quantized down projection emits BF16 before the shared/routed
-    # combine. Keep the fused activation's FP32 intermediates, but preserve
-    # that output boundary.
-    dequant_down = _decode_shared_make_dequantize(capacity, hidden)
-
-    if fused_activation:
-
-        @pl.jit.inline
-        def shared_moe_w8a8_inline_fused(
-            x: pl.Tensor[[capacity, hidden], pl.BF16],
-            gate_up_weight: pl.Tensor[[hidden * (gate_up_width // 64), 64], pl.INT8],
-            gate_up_scale: pl.Tensor[[gate_up_width], pl.FP32],
-            down_weight: pl.Tensor[[intermediate * (hidden // 64), 64], pl.INT8],
-            down_scale: pl.Tensor[[hidden], pl.FP32],
-            output: pl.Tensor[[capacity, hidden], pl.BF16],
-            active: pl.Scalar[pl.INT32],
-        ):
-            x_payload = pl.create_tensor([capacity, hidden], dtype=pl.INT8)
-            x_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
-            quant_x(x, x_payload, x_scale, active)
-
-            gate_up_acc = pl.create_tensor([capacity, gate_up_width], dtype=pl.INT32)
-            dot_gate_up(x_payload, gate_up_weight, gate_up_acc, active)
-            activation = pl.create_tensor([capacity, intermediate], dtype=activation_dtype)
-            activate(gate_up_acc, gate_up_scale, x_scale, activation, active)
-
-            hidden_payload = pl.create_tensor([capacity, intermediate], dtype=pl.INT8)
-            hidden_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
-            quant_hidden(activation, hidden_payload, hidden_scale, active)
-            down_acc = pl.create_tensor([capacity, hidden], dtype=pl.INT32)
-            dot_down(hidden_payload, down_weight, down_acc, active)
-            dequant_down(down_acc, down_scale, hidden_scale, output, active)
-            return output
-
-        return shared_moe_w8a8_inline_fused
-
-    @pl.jit.inline
-    def shared_moe_w8a8_inline(
-        x: pl.Tensor[[capacity, hidden], pl.BF16],
-        gate_up_weight: pl.Tensor[[hidden * (gate_up_width // 64), 64], pl.INT8],
-        gate_up_scale: pl.Tensor[[gate_up_width], pl.FP32],
-        down_weight: pl.Tensor[[intermediate * (hidden // 64), 64], pl.INT8],
-        down_scale: pl.Tensor[[hidden], pl.FP32],
-        output: pl.Tensor[[capacity, hidden], pl.BF16],
-        active: pl.Scalar[pl.INT32],
-    ):
-        x_payload = pl.create_tensor([capacity, hidden], dtype=pl.INT8)
-        x_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
-        quant_x(x, x_payload, x_scale, active)
-
-        gate_up_acc = pl.create_tensor([capacity, gate_up_width], dtype=pl.INT32)
-        dot_gate_up(x_payload, gate_up_weight, gate_up_acc, active)
-        activation = pl.create_tensor([capacity, intermediate], dtype=activation_dtype)
-        activate(gate_up_acc, gate_up_scale, x_scale, activation, active)
-
-        hidden_payload = pl.create_tensor([capacity, intermediate], dtype=pl.INT8)
-        hidden_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
-        quant_hidden(activation, hidden_payload, hidden_scale, active)
-        down_acc = pl.create_tensor([capacity, hidden], dtype=pl.INT32)
-        dot_down(hidden_payload, down_weight, down_acc, active)
-        dequant_down(down_acc, down_scale, hidden_scale, output, active)
-        return output
-
-    return shared_moe_w8a8_inline
-
-
-def make_decode_shared_moe_w8a8(capacity, config, *, fused_activation=False):
-    """Build a standalone JIT kernel for the shared expert."""
-    hidden = config["hidden_size"]
-    intermediate = config["moe_intermediate_size"]
-    gate_up_width = intermediate * 2
-    compute = make_decode_shared_moe_w8a8_inline(capacity, config, fused_activation=fused_activation)
-
-    @pl.jit
-    def shared_moe_w8a8(
-        x: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
-        gate_up_weight: pl.Tensor[[hidden * (gate_up_width // 64), 64], pl.INT8],
-        gate_up_scale: pl.Tensor[[gate_up_width], pl.FP32],
-        down_weight: pl.Tensor[[intermediate * (hidden // 64), 64], pl.INT8],
-        down_scale: pl.Tensor[[hidden], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        compute(x, gate_up_weight, gate_up_scale, down_weight, down_scale, output, active)
-        return x, output
-
-    return shared_moe_w8a8
-
-
 def shared_expert_reference(
     value: torch.Tensor,
     gate_up_weight: torch.Tensor,
@@ -1665,64 +1098,6 @@ def golden_shared_moe_w8a8(tensors, *, fused_activation=False, fused_channel_dty
     payload, scale = quantize(activation)
     down = dot(payload, tensors["down_weight"], tensors["down_scale"], scale)
     tensors["output"][:active] = down.to(torch.bfloat16)
-
-
-def decode_moe_shared_expert_reference(
-    value: torch.Tensor,
-    gate_up_weight: torch.Tensor,
-    gate_up_scale: torch.Tensor,
-    down_weight: torch.Tensor,
-    down_scale: torch.Tensor,
-    clamp_limit: float = 10.0,
-) -> torch.Tensor:
-    """Reference for a shared W8A8 SwiGLU expert."""
-
-    gate_up = decode_moe_w8a8_expert_linear(value, gate_up_weight, gate_up_scale, torch.bfloat16).float()
-    gate, up = gate_up.chunk(2, dim=-1)
-    gate = gate.clamp(max=clamp_limit)
-    up = up.clamp(-clamp_limit, clamp_limit)
-    # vLLM-Ascend's A2/A3 clipped SwiGLU performs both products in BF16.
-    sigmoid_bf16 = torch.sigmoid(gate).to(torch.bfloat16)
-    silu_bf16 = gate.to(torch.bfloat16) * sigmoid_bf16
-    hidden = silu_bf16 * up.to(torch.bfloat16)
-    return decode_moe_w8a8_expert_linear(hidden, down_weight, down_scale)
-
-
-def decode_moe_routed_expert_reference(
-    value: torch.Tensor,
-    expert_ids: torch.Tensor,
-    router_weights: torch.Tensor,
-    w1: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2: torch.Tensor,
-    w2_scale: torch.Tensor,
-    w3: torch.Tensor,
-    w3_scale: torch.Tensor,
-    clamp_limit: float = 10.0,
-) -> torch.Tensor:
-    """Reference for top-k routed W8A8 SwiGLU experts.
-
-    ``w1`` and ``w3`` are gate/up weights with shape ``[E, I, D]`` and ``w2``
-    is the down weight with shape ``[E, D, I]``.  Routing is kept explicit so
-    each expert boundary can be compared with the vLLM A2/A3 dump.
-    """
-
-    result = torch.zeros_like(value, dtype=torch.float32)
-    for token in range(value.shape[0]):
-        for route in range(expert_ids.shape[1]):
-            expert = int(expert_ids[token, route])
-            gate = decode_moe_w8a8_expert_linear(
-                value[token : token + 1], w1[expert], w1_scale[expert]
-            ).float()
-            up = decode_moe_w8a8_expert_linear(value[token : token + 1], w3[expert], w3_scale[expert]).float()
-            gate = gate.clamp(max=clamp_limit)
-            up = up.clamp(-clamp_limit, clamp_limit)
-            sigmoid_bf16 = torch.sigmoid(gate).to(torch.bfloat16)
-            silu_bf16 = gate.to(torch.bfloat16) * sigmoid_bf16
-            hidden = silu_bf16 * up.to(torch.bfloat16)
-            down = decode_moe_w8a8_expert_linear(hidden, w2[expert], w2_scale[expert]).float()
-            result[token] += down[0] * router_weights[token, route].float()
-    return result.to(torch.bfloat16)
 
 
 def validate_moe_router(*, device=0, compile_only=False, platform="a2a3", sim=False):
@@ -1982,7 +1357,7 @@ def validate_shared_moe(*, device=0, compile_only=False, platform="a2a3", sim=Fa
 
 
 def main():
-    """Validate the shared MoE operations using their original goldens."""
+    """Validate Prefill MoE operations using their original goldens."""
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)

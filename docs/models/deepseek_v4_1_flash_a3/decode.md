@@ -11,7 +11,7 @@ gates and independent reference-capture scripts are removed.
 | --- | --- |
 | Bounded single-step SWA forward and local golden | `decode_fwd.py` |
 | Local attention and mHC composition | `decode_swa.py` |
-| Routing, dispatch and shared-expert variants | `moe.py` |
+| Routing, dispatch and shared-expert variants | `decode_moe.py` |
 | Routed expert computation | `expert_routed.py` |
 | Compression, Indexer and Engram | `compressor.py`, `indexer.py`, `engram.py` |
 | Linear, quantization, Norm, RoPE and cache operations | Shared child operators |
@@ -35,6 +35,14 @@ python -m models.deepseek_v4_1_flash_a3.decode_fwd -p a2a3 --sim --compile-only
 ```
 
 This compiles an operator case; it is not a full-network accuracy result.
+`decode_moe.py` additionally owns bounded router/shared-expert validation:
+
+```bash
+python -m models.deepseek_v4_1_flash_a3.decode_moe -p a2a3 --compile-only
+```
+
+Its local Torch goldens retain the FP32 router input and both standalone BF16
+and fused FP32 activation boundaries, including empty and partial token slabs.
 Remaining work includes the EP16 driver and collectives, per-layer weight and
 cache binding, request/position/finished/epoch transitions, Prefill state
 handoff, and device accuracy/memory/performance verification. Continuous

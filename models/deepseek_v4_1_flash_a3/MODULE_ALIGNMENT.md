@@ -20,7 +20,8 @@ MXFP8/MXFP4 kernels or topology.
 | Index cache, query projection, selection and candidate pooling | `indexer.py`, `prefill_indexer.py` |
 | Engram device computation | `engram.py` |
 | Host Engram tables, rows, rotation and slot ownership | `engram_host.py` |
-| MoE routing, dispatch, shared expert and combination | `moe.py` |
+| Prefill routing, dispatch, shared expert and combination | `prefill_moe.py` |
+| Decode routing, dispatch and shared expert | `decode_moe.py` |
 | Routed expert computation | `expert_routed.py` |
 | Linear, quantization, Norm, RoPE, QKV and attention leaves | `gemm.py`, `quant.py`, `rmsnorm.py`, `rope.py`, `qkv_proj_rope.py`, `o_proj.py`, `swa.py`, `sparse_attention.py` |
 | Checkpoint readers and phase weight layouts | `weights.py` |
@@ -42,7 +43,15 @@ separate names within their computation owner when numerical semantics differ:
 - `rmsnorm.py` preserves normalization and FP32 router boundaries.
 - `compressor.py` and `indexer.py` retain norm, RoPE, candidate bounds and
   cache publication semantics.
-- `moe.py` preserves shared-expert rounding and routing/communication contracts.
+- `prefill_moe.py` and `decode_moe.py` own their phase kernels, Torch goldens
+  and validation entries. Prefill retains controlled routing and FP16/FP32
+  fused-channel options; Decode retains its authoritative FP32 router input
+  and its separate activation/quantization boundaries. Neither imports the other.
+  Both use independent `gemm.py` and `quant.py` primitives.
+
+`expert_routed.py` owns grouped expert computation, and `moe_transport.py`
+owns CANN/HCCL resources. The unused native dispatch adapter is removed;
+there is no compatibility `moe.py` facade.
 
 L2 regions inline existing children between host communication boundaries.
 They do not change operation order, BF16 buffers or source/cache ownership.

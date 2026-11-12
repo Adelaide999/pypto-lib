@@ -8,6 +8,8 @@ modules organized by computation responsibility.
 - `prefill_fwd.compile_prefill`: reusable compilation from request/cache geometry.
 - `prefill_layer.py`: generic layer composition and L2 compute regions.
 - `decode_fwd.py`: bounded single-step SWA; the full EP16 driver remains unimplemented.
+- `prefill_moe.py` / `decode_moe.py`: phase routing, dispatch, shared experts,
+  Torch goldens and standalone validation; `expert_routed.py` owns grouped experts.
 
 Historical regression runners, replay/capture paths and task admission tooling
 are removed. Operator files retain Torch goldens and standard validation
