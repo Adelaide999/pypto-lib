@@ -233,3 +233,60 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
     validate_bf16_projection(device=args.device, compile_only=args.compile_only, platform=args.platform, sim=args.sim)
+
+
+from .runtime_config import validate_tp
+
+
+def make_prefill_grouped_output(tp=1):
+    """Specialize grouped Wo-A for an explicit TP1/2/4 shard."""
+    validate_tp(tp)
+    LOCAL_H = M.num_attention_heads // tp
+
+    LOCAL_O_GROUPS = M.o_groups // tp
+
+    LOCAL_O_WIDTH = M.o_groups // tp * M.o_lora_rank
+
+    HEAD_DIM = M.head_dim
+
+    O_LORA = M.o_lora_rank
+
+    O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
+
+
+    @pl.jit.inline
+    def prefill_grouped_output(
+        x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+        weight: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+        output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        """Stage Wo-A values with Vector startup and FP32 Vector stores before narrowing."""
+        tokens = pl.tensor.dim(x, 0)
+        accumulated = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.FP32)
+        blocks = (num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE)
+        with pl.spmd(blocks, name_hint="prefill_grouped_o_a_cube") as cube_tid:
+            block = pl.tile.get_block_idx()
+            t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
+            n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
+            group = n0 // O_LORA
+            local_n = n0 % O_LORA
+            rows = pl.min(M_TILE, num_tokens - t0)
+            acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
+            for kb in pl.range(O_GROUP_IN // K_TILE):
+                k0 = kb * K_TILE
+                a = pl.slice(x, [M_TILE, K_TILE], [t0, group * O_GROUP_IN + k0], valid_shape=[rows, K_TILE])
+                a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
+                w = pl.reshape(weight[group : group + 1, local_n : local_n + N_TILE, k0 : k0 + K_TILE], [N_TILE, K_TILE])
+                acc = pl.matmul_acc(acc, a, w, b_trans=True, init_cond=(kb == 0))
+            accumulated[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE)
+        with pl.spmd(blocks, name_hint="prefill_grouped_o_a_cast", deps=[cube_tid]):
+            block = pl.tile.get_block_idx()
+            t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
+            n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
+            rows = pl.min(M_TILE, num_tokens - t0)
+            value = pl.slice(accumulated, [M_TILE, N_TILE], [t0, n0], valid_shape=[rows, N_TILE])
+            output[t0 : t0 + M_TILE, n0 : n0 + N_TILE] = pl.cast(value, pl.BF16, mode="rint")
+        return output
+
+    return prefill_grouped_output

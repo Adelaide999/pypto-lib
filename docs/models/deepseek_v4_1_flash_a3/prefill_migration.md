@@ -19,8 +19,8 @@ Full-network acceptance is not inferred from those independent-layer results.
 
 1. Relocate the model package to `models.deepseek_v4_1_flash_a3`, including the
    explicit subprocess module and loaded-source discovery paths.
-2. Rename only `grouped_output.py` to `prefill_grouped_output.py` and update
-   its caller. Other dedicated Prefill files already carry the prefix.
+2. Initially rename `grouped_output.py` to `prefill_grouped_output.py`; its
+   active computation now belongs to `qkv_proj_rope.py` with its caller updated.
 3. Retain numerical definitions, internal native symbols, shared A2/A3 ABI
    names, layouts, parameter directions, and compiler name hints.
 4. Include the original 40-layer plan with identical layer data. Remove only
@@ -41,25 +41,16 @@ from the existing norm/RoPE contracts. `output_proj`, `activation`, `index_cache
 and `swa_attention` own the remaining staged computations. Pure direct-linear
 forwarding now resolves directly to `gemm.make_int8_linear_direct`.
 
-`prefill_grouped_output` and the paged sparse core capture explicit TP values
-in builders instead of module-level command-line state. L1/L3 fixed-ID wrappers
-and all six misleading Decode facades were removed. L0/L2 files retain their
-actual computations and references, with the generic complete-layer CLI as the
-single execution interface. No Decode execution claim has been added.
+The active layer-2 kernels now belong to `compressor_projection.py`; grouped
+TP output belongs to `qkv_proj_rope.py`. Generic layer selection remains in
+`prefill_layer.py`. Unused historical fixed-layer implementations and pure
+wrappers have been removed after checking retained callers.
 
-| Native helper | Retained purpose and caller |
-| --- | --- |
-| `hc_pre_runtime` | Explicit native HC-pre boundary used by `prefill_mhc_ffn_staged.EcotechMhcFfnStaged.execute`; not selected by the default complete-network builder |
-| `prefill_hc_full2_runtime` | Optional explicit HC capture boundary; no maintained main-path importer |
-| `qli_runtime`, `prefill_qli_full2_runtime`, `qli_boundary` | Explicit native QLI capture/contract tools; no default complete-network importer |
-| `norm_runtime`, `projection_runtime` | Explicit native norm/projection capture tools; no maintained main-path importer |
-| `bf16_linear_native.register` | Opt-in BF16 custom-op reference instrumentation; no maintained model caller or automatic registration |
-
-These helpers require their own explicit native configuration and dependencies.
-They are not exported as a Decode forward or silently selected as a numerical
-fallback. Their historical provenance remains in `source_manifest.json`.
-Actual product transport remains `moe_transport.py` with ctypes CANN/HCCL
-bindings; no custom product C++ translation unit is missing.
+Decode is integrated into the same A3 package; its independent contract and
+historical evidence are documented in [Decode](decode.md). MoE shared kernels,
+goldens and validation live in `moe.py`; actual Prefill/Decode orchestration,
+communication, cache ownership and routed-expert kernels have separate roles.
+Different phase rounding and state boundaries remain explicit implementations.
 
 ## Provenance and correctness checks
 
@@ -67,6 +58,9 @@ bindings; no custom product C++ translation unit is missing.
   and hashes describe that export, including modules subsequently consolidated.
 - `source_refactor_map.json` maps original definitions/facades to maintained
   owners and documents API/configuration changes.
+- `package_refactor_map.json` records the A3/Decode package consolidation,
+  scope-aware binding renames and preserved source/destination definitions.
+- `decode_source_manifest.json` preserves the incoming Decode provenance.
 - `maintenance_baseline.json` records the explicitly reviewed post-refactor
   definitions. `python -m models.deepseek_v4_1_flash_a3.audit_source` checks this
   optional identity baseline. Use `--original-root /path/to/exported-checkout`

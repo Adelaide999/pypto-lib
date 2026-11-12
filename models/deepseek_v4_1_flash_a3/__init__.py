@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek V4.1 Flash A3 Prefill product and retained shared operators."""
+"""DeepSeek V4.1 Flash A3 Prefill and Decode product operators."""
 
 from importlib import import_module
 
@@ -35,10 +35,8 @@ _EXPORTS = {
     "make_shared_expert_w8a8": ("moe", "make_shared_expert_w8a8"),
     "make_prefill_layer_entries": ("prefill_layer", "make_prefill_layer_entries"),
     "run_prefill_layer": ("prefill_layer", "run_prefill_layer"),
-    "make_physical_compressed_entries": ("prefill_full2", "make_physical_compressed_entries"),
+    "make_physical_compressed_entries": ("prefill_c2a", "make_physical_compressed_entries"),
     "make_prefill_engram_entries": ("prefill_engram", "make_prefill_engram_entries"),
-    "layer0_reference": ("prefill_layer0", "layer0_reference"),
-    "route_reference": ("prefill_layer0", "route_reference"),
     "engram_reference": ("engram", "engram_reference"),
     "make_gate": ("engram", "make_gate"),
     "make_lookup": ("engram", "make_lookup"),
@@ -61,44 +59,15 @@ _EXPORTS = {
     "make_indexer_select": ("indexer_select", "make_indexer_select"),
     "make_indexer_prepare": ("indexer_prepare", "make_indexer_prepare"),
     "prepare_indexer_indices_reference": ("indexer_prepare", "prepare_indexer_indices_reference"),
-    "LAYER14": ("layer14_15", "LAYER14"),
-    "LAYER15": ("layer14_15", "LAYER15"),
-    "Layer14A2A3Contract": ("layer14_15", "Layer14A2A3Contract"),
-    "Layer15A2A3Contract": ("layer14_15", "Layer15A2A3Contract"),
-    "index_key_reference": ("layer14_15", "index_key_reference"),
-    "dequantize_engram_rows_reference": ("layer14_15", "dequantize_engram_rows_reference"),
-    "engram_a2a3_reference": ("layer14_15", "engram_a2a3_reference"),
-    "layer14_source_reference": ("layer14_15", "layer14_source_reference"),
-    "layer15_reuse_reference": ("layer14_15", "layer15_reuse_reference"),
-    "load_a2a3_layer14_15_bundle": ("layer14_15", "load_a2a3_layer14_15_bundle"),
-    "make_layer14_stages": ("layer14_15", "make_layer14_stages"),
-    "make_layer15_stages": ("layer14_15", "make_layer15_stages"),
-    "make_ratio2_projection": ("layer14_15", "make_ratio2_projection"),
-    "quantize_engram_rows_reference": ("layer14_15", "quantize_engram_rows_reference"),
-    "ratio2_pool_reference": ("layer14_15", "ratio2_pool_reference"),
-    "update_ratio2_state_reference": ("layer14_15", "update_ratio2_state_reference"),
-    "validate_layer14_15_contract": ("layer14_15", "validate_layer14_15_contract"),
     "RawCheckpoint": ("raw_checkpoint", "RawCheckpoint"),
     "flatten_scale": ("raw_checkpoint", "flatten_scale"),
     "load_attention_weights": ("raw_checkpoint", "load_attention_weights"),
     "load_decoder_layer_weights": ("raw_checkpoint", "load_decoder_layer_weights"),
-    "LAYER19": ("layers19_25", "LAYER19"),
-    "LAYER20": ("layers19_25", "LAYER20"),
-    "LAYER21": ("layers19_25", "LAYER21"),
-    "LAYER24": ("layers19_25", "LAYER24"),
-    "LAYER25": ("layers19_25", "LAYER25"),
-    "TARGET_LAYERS": ("layers19_25", "TARGET_LAYERS"),
-    "c1a_full_reference": ("layers19_25", "c1a_full_reference"),
-    "c1a_reindex_reference": ("layers19_25", "c1a_reindex_reference"),
-    "c1a_reuse_reference": ("layers19_25", "c1a_reuse_reference"),
-    "c2a_reuse_reference": ("layers19_25", "c2a_reuse_reference"),
-    "layer_contract": ("layers19_25", "layer_contract"),
-    "make_decoder_layer_stages": ("layers19_25", "make_decoder_layer_stages"),
-    "select_candidate_block_pool_reference": ("layers19_25", "select_candidate_block_pool_reference"),
-    "validate_layer19_20_21_24_25_contracts": (
-        "layers19_25",
-        "validate_layer19_20_21_24_25_contracts",
-    ),
+    "compile_prefill": ("prefill_fwd", "compile_prefill"),
+    "make_decode_step": ("decode_fwd", "make_decode_step"),
+    "validate_decode_contract": ("decode_fwd", "validate_decode_contract"),
+    "decode_ep2": ("decode_moe", "decode_ep2"),
+    "get_layer_entry": ("decode_layer", "get_layer_entry"),
 }
 
 

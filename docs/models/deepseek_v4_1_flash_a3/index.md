@@ -1,10 +1,11 @@
-# DeepSeek V4.1 Flash A3 Prefill
+# DeepSeek V4.1 Flash A3 Prefill and Decode
 
 This A3 implementation contains real PyPTO operators and the runtime wiring
 for the original 40-layer text backbone. The exported product snapshot is
 `ebf19ad0ae7d668b4f7f2b04b526c9dcff2785a9`. Its historical source directory
-was `models/deepseek_v4_1_flash_a2`; this delivery uses the separate
-`models/deepseek_v4_1_flash_a3` package and actual A3 task sources.
+was `models/deepseek_v4_1_flash_a2`; the maintained Prefill and Decode
+implementations now share `models/deepseek_v4_1_flash_a3`.
+See [Decode](decode.md) for its independent entry points and evidence scope.
 
 ## Development priorities
 
@@ -30,7 +31,7 @@ was `models/deepseek_v4_1_flash_a2`; this delivery uses the separate
 | Full-network accuracy and actual L39 output | Not established at export; original task validation was in progress |
 | Fixed-16 TP1/TP2 full-network compatibility | Not established |
 | Full real-weight and both Engram tables in HBM | Not established by code or host weight-byte counts |
-| Dataset score / Decode / serving integration | Not established by this delivery |
+| Dataset score / full-network Decode / serving integration | Not established by this delivery |
 | Relocated package device execution | Not run; HOST checks do not replace NPU validation |
 
 Independent alignment uses the same complete-layer inputs and legal source/cache
@@ -55,10 +56,10 @@ The original source names in this manifest are intentional provenance.
 | Original 40-layer composition | `prefill_layer.run_prefill_network_inmemory` |
 | Actual checkpoint, persistent state, HCCL and L39 head | `prefill_network_runtime.run_network_runtime` |
 | Input embedding / HC and final output kernels | `prefill_embedding.py`, `prefill_network_input.py`, `prefill_output.py` |
-| SWA and C2/C1 attention | `prefill_swa.py`, `prefill_full2*.py`, `prefill_consumer*.py`, `prefill_ratio1.py` |
+| SWA and C2/C1 attention | `prefill_swa.py`, `prefill_c2a*.py`, `prefill_compressed_reuse.py`, `prefill_sparse_attention.py`, `prefill_c1a.py` |
 | Persistent source/cache ownership | `prefill_network_state.py`, `prefill_network_cache.py`, `prefill_layer_state.py` |
 | Two Engram slots and singleton history | `engram_host.py`, `prefill_network_engram.py`, `prefill_engram_runtime.py`, `engram_storage.py` |
-| EP MoE and actual communication | `prefill_moe_ep.py`, `moe_dispatch.py`, `moe_transport.py` |
+| EP MoE and actual communication | `prefill_moe.py`, `moe.py`, `moe_transport.py` |
 | Shared primitives | `quant.py`, `ecotech_linear*.py`, `qkv*.py`, `hc.py`, `gemm.py` |
 
 The public entry is `prefill_fwd.prefill_fwd`; `run_prefill` remains an alias

@@ -32,6 +32,10 @@ def test_chunk_reuse_does_not_rebuild_ir_and_rejects_changed_constants(tmp_path,
         builds.append(args)
         return {"lookup": definition}
 
+    def engram_definitions(*args):
+        builds.append(args)
+        return {"engram_projection": definition, "engram_gate": definition}
+
     class HostEntry:
         def __init__(self, function, directory):
             self.artifacts = {}
@@ -39,7 +43,7 @@ def test_chunk_reuse_does_not_rebuild_ir_and_rejects_changed_constants(tmp_path,
     monkeypatch.setattr(pool, "Executable", HostEntry)
     monkeypatch.setattr(pool, "make_input_entries", definitions)
     monkeypatch.setattr(pool, "make_network_layer_entries", lambda *args: (definitions(), {}, 16))
-    monkeypatch.setattr(pool, "make_prefill_engram_entries", definitions)
+    monkeypatch.setattr(pool, "make_prefill_engram_entries", engram_definitions)
     monkeypatch.setattr(pool, "make_output_entries", definitions)
     # This contract probe replaces stage computations; real L2 composition is checked by the model entry.
     monkeypatch.setattr(pool, "make_network_l2_entries", lambda definitions, *args: definitions)
@@ -55,7 +59,7 @@ def test_chunk_reuse_does_not_rebuild_ir_and_rejects_changed_constants(tmp_path,
     program.compile(provider, model, topology, contracts)
     assert len(builds) == first_builds
     assert program.summary()["unique_entries"] == 1
-    assert program.summary()["stage_bindings"] == 44
+    assert program.summary()["stage_bindings"] == 46
     assert program.entries_for_stage("layer39") is program.stages["layer39"]
     with pytest.raises(ValueError, match="does not cover"):
         program.entries_for_stage("missing")

@@ -50,6 +50,15 @@ def definition_hashes(path):
     return definitions
 
 
+def binding_hash(path):
+    """Include imports, constants and module initialization in the optional identity audit."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree.body = [node for node in tree.body
+                 if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    normalized = ast.dump(ComputeIdentity().visit(tree), include_attributes=False)
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
 def audit_original(root):
     """Verify an unmodified exported source checkout against its original manifest."""
     manifest = json.loads((ROOT / "source_manifest.json").read_text(encoding="utf-8"))
@@ -66,12 +75,18 @@ def audit_maintained():
     original_sha = hashlib.sha256((ROOT / "source_manifest.json").read_bytes()).hexdigest()
     if original_sha != baseline["original_manifest_sha256"]:
         raise ValueError("The original export manifest differs from the maintenance audit baseline")
+    for name, key in (("decode_source_manifest.json", "decode_manifest_sha256"),
+                      ("package_refactor_map.json", "package_refactor_map_sha256")):
+        if hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != baseline[key]:
+            raise ValueError("The maintained provenance differs from its audit baseline: " + name)
     paths = {path.name: path for path in ROOT.glob("*.py")}
     if paths.keys() != baseline["definitions"].keys():
         raise ValueError("Maintained module set differs from the explicit audit baseline")
     for name, path in paths.items():
         if definition_hashes(path) != baseline["definitions"][name]:
             raise ValueError("Maintained source identity changed: " + name)
+        if binding_hash(path) != baseline["module_bindings"][name]:
+            raise ValueError("Maintained global bindings changed: " + name)
     return {"maintained_modules": len(paths), "source_identity": "matched", "numerical_validation": "not_run"}
 
 

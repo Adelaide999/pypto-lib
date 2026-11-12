@@ -134,6 +134,6 @@ def test_a3_embedding_entry_has_a2a3_platform_ownership(monkeypatch):
 def test_a3_shared_config_change_selects_downstream_routed_expert(monkeypatch):
     monkeypatch.chdir(REPO)
     leaf = "models/deepseek_v4_1_flash_a3/config.py"
-    entry = "models/deepseek_v4_1_flash_a3/moe_routed.py"
+    entry = "models/deepseek_v4_1_flash_a3/expert_routed.py"
     assert entry in detect.select_runnable([leaf], "a2a3")
     assert detect.select_runnable([leaf], "a5") == []

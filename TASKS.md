@@ -41,7 +41,7 @@ pass. vLLM/vLLM-Ascend and Torch-NPU are reference/diagnostic processes only.
 The product import closure scan is:
 
 ```bash
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_acceptance --json
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_acceptance --json
 ```
 
 It must report `product_dependency_scan.status=pass`. `_runtime.py` modules
@@ -52,7 +52,7 @@ are recorded separately and do not constitute product computation.
 ## Fixed contract
 
 The machine-readable contract is emitted by
-`models/deepseek_v4_1_flash_a2/decode_acceptance.py` and includes:
+`models/deepseek_v4_1_flash_a3/decode_acceptance.py` and includes:
 
 - `hidden_size=5120`, `num_attention_heads=64`, `num_key_value_heads=1`,
   `head_dim=512`, `q_lora_rank=1280`, `o_groups=8`, `o_lora_rank=1024`;
@@ -233,7 +233,7 @@ The following checks were run in the pinned shared environment on 2026-11-05:
 | --- | --- | --- |
 | fixed A3 environment activation | `pass` | PyPTO `72a62d13efabbb25d240e35944f68ba5bcc22b7f`, Python 3.10.22, `SOC_VERSION=ascend910_9382`, workspace state directory |
 | queued EP2 A3 device preflight | `pass` | `task_20261105_101415_246219319021`; `TASK_DEVICE=0,1`, `ASCEND_RT_VISIBLE_DEVICES=0,1`, Ascend910 health OK; no model compute |
-| product import/dependency scan | `pass` | `python -m models.deepseek_v4_1_flash_a2.decode_acceptance --static-scan` |
+| product import/dependency scan | `pass` | `python -m models.deepseek_v4_1_flash_a3.decode_acceptance --static-scan` |
 | PyPTO single-step compile | `pass` | `decode_fwd -p a2a3 --sim --compile-only` |
 | PyPTO replay compile | `pass` | `decode_replay --steps 1/2/8 -p a2a3 --sim --compile-only` |
 | EP2 PyPTO MoE code generation | `pass` | `decode_moe_compile`; `.pypto-a3-state/decode-ep2-compile.json`; A3 artifact generated with 384 routed experts and 192 local experts per rank |
@@ -269,9 +269,9 @@ expert and does not constitute an EP2 NPU or accuracy gate.
 The gate entry points are:
 
 ```bash
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_gate \
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_gate \
   --topology ep2_gate --record .pypto-a3-state/decode-ep2-gate.json
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_gate \
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a3.decode_gate \
   --topology main --record .pypto-a3-state/decode-main-gate.json
 ```
 

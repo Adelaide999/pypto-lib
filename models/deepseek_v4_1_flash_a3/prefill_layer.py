@@ -48,10 +48,10 @@ def make_prefill_layer_entries(
 ):
     """Construct shared physical-layer attention, HC and MoE computations."""
     from .hc import make_hc_post_inline, make_hc_pre_inline
-    from .moe_combine import make_moe_combine
-    from .moe_dispatch import make_ep_dispatch_pack, make_ep_dispatch_unpack, make_ep_return_pack
-    from .moe_router import make_moe_router
-    from .moe_shared import make_shared_moe_w8a8
+    from .moe import make_moe_combine
+    from .moe import make_ep_dispatch_pack, make_ep_dispatch_unpack, make_ep_return_pack
+    from .moe import make_moe_router
+    from .moe import make_shared_moe_w8a8
     from .norm_rope import make_rope_tables
     from .prefill_cp import make_head_pack, make_sp_gather_unpack, make_sp_masked_zero, make_sp_reduce_pack
     from .prefill_norm import make_prefill_norm_cast
@@ -87,7 +87,7 @@ def make_prefill_layer_entries(
         mask_output=make_sp_masked_zero(capacity, 20480),
     )
     if role["mode"] == "full":
-        from .prefill_full2 import make_physical_compressed_entries
+        from .prefill_c2a import make_physical_compressed_entries
 
         ratio = role["ratio"]
         compressed = make_physical_compressed_entries(
@@ -96,7 +96,7 @@ def make_prefill_layer_entries(
         )
         entries = dict(compressed, **{name: entry for name, entry in entries.items() if name not in compressed})
     if role["mode"] in ("reuse", "reindex"):
-        from .prefill_consumer import make_physical_consumer_entries
+        from .prefill_compressed_reuse import make_physical_consumer_entries
 
         consumer = make_physical_consumer_entries(
             capacity, config, cache_blocks, requests, table_pages,
@@ -113,7 +113,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     exchange callback. It does not load a fixture, read a reference, or restore
     next-layer inputs from files. Buffers are local SP shards, not gathered output.
     """
-    from .moe_dispatch import MAP_PAD, validate_received_routes, validate_returned_routes
+    from .moe import DISPATCH_MAP_PAD as MAP_PAD, validate_received_routes, validate_returned_routes
     from .prefill_l2 import execute_region
     from .prefill_compressed_runtime import run_compressed_attention
     from .prefill_consumer_runtime import run_consumer_attention

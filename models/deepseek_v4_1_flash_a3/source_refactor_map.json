@@ -120,7 +120,7 @@
   ],
   "explicit_specializations": [
     {
-      "module": "prefill_grouped_output.py",
+      "module": "qkv_proj_rope.py",
       "factory": "make_prefill_grouped_output",
       "parameter": "tp",
       "values": [
@@ -159,6 +159,8 @@
     "historical_continuation_audit": "audit_task.audit_task_continuation",
     "daily_validation": "validate.py: import DAG, exports, roles, scheduler controls and explicit runtime configuration",
     "source_identity_audit": "audit_source.py with immutable source_manifest.json and separate maintenance_baseline.json",
-    "fixed_layer_cli": "prefill_layer --layer-id replaces fixed L0/L1/L2/L3 command wrappers; actual L0/L2 implementations remain"
-  }
+    "fixed_layer_cli": "prefill_layer --layer-id selects generic computation; active compressor and grouped-output kernels have role-based owners"
+  },
+  "package_consolidation": "package_refactor_map.json",
+  "removed_facades_scope": "Historical reference aliases from the recorded baseline; the current decode_swa.py instead owns the real SWA Decode block"
 }
