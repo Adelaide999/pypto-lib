@@ -130,6 +130,7 @@ def run_index_query_selection(state, q_input, latent, cosine, sine, operands,
                       "indexer.selected_indices": selected[:query_rows].clone()})
     visible_lengths = zeros(capacity, dtype=torch.int32)
     ratio = state["role"]["ratio"]
-    visible_lengths[:query_rows] = ((q_positions[:query_rows] + 1) // ratio).int()
+    visible = [(position + 1) // ratio for position in q_positions[:query_rows].tolist()]
+    visible_lengths[:query_rows].copy_(torch.tensor(visible, dtype=torch.int32))
     return dict(selected=selected, lengths=lengths, compressed=compressed_indices,
                 window=window_indices, scores=candidate_scores, visible_lengths=visible_lengths)

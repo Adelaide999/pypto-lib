@@ -23,13 +23,14 @@ from .runtime_utils import tensor_sha
 class CheckpointOperands:
     """Read original sharded safetensors and record each consumed operand."""
 
-    def __init__(self, root):
+    def __init__(self, root, *, diagnostics=True):
         import json
 
         self.root = Path(root).resolve()
         index = self.root / "quant_model_weights.safetensors.index.json"
         self.index = json.loads(index.read_text())["weight_map"]
         self.consumed = {}
+        self.diagnostics = diagnostics
         self.read_seconds, self.read_calls = 0.0, 0
 
     def load(self, name):
@@ -42,8 +43,10 @@ class CheckpointOperands:
             value = source.get_tensor(name)
         self.consumed[name] = {
             "file": path.name, "shape": list(value.shape), "dtype": str(value.dtype),
-            "selected_rows": None, "sha256": tensor_sha(value),
+            "selected_rows": None,
         }
+        if self.diagnostics:
+            self.consumed[name]["sha256"] = tensor_sha(value)
         self.read_seconds += perf_counter() - begin
         self.read_calls += 1
         return value

@@ -58,7 +58,10 @@ class CANNMemory:
         _bind(self.library, "aclrtFree", [pointer])
         _bind(self.library, "aclrtMemcpy", [pointer, size, pointer, size, integer])
         _bind(self.library, "aclrtGetMemInfo", [integer, ctypes.POINTER(size), ctypes.POINTER(size)])
-        _check(self.library.aclInit(None), "aclInit")
+        status = self.library.aclInit(None)
+        # A persistent ChipWorker can already own this process's ACL initialization.
+        if status != 100002:  # ACL_ERROR_REPEAT_INITIALIZE
+            _check(status, "aclInit")
         self.samples = []
         self.intervals = []
 
@@ -94,7 +97,16 @@ class CANNMemory:
 class HCCLBytes:
     """Exchange equal contiguous peer blocks without interpreting model tensors."""
 
-    def __init__(self, memory, rank, world, directory, group_ranks=None):
+    @staticmethod
+    def root_info(memory):
+        """Create communicator bootstrap bytes in the coordinating process."""
+        library = ctypes.CDLL("libhccl.so", mode=ctypes.RTLD_GLOBAL)
+        function = _bind(library, "HcclGetRootInfo", [ctypes.c_void_p])
+        root = ctypes.create_string_buffer(4108)
+        _check(function(root), "HcclGetRootInfo")
+        return root.raw
+
+    def __init__(self, memory, rank, world, directory, group_ranks=None, *, root_info=None):
         self.memory, self.rank, self.world = memory, rank, world
         self.group_ranks = list(range(world)) if group_ranks is None else group_ranks
         local_rank = self.group_ranks.index(rank)
@@ -109,29 +121,40 @@ class HCCLBytes:
         _bind(self.library, "HcclReduceScatter", [pointer, pointer, u64, integer, integer, pointer, pointer])
         self.stream, self.comm = pointer(), pointer()
         _check(memory.library.aclrtCreateStream(ctypes.byref(self.stream)), "aclrtCreateStream")
-        root = ctypes.create_string_buffer(4108)
-        path = directory / ("hccl-root-" + "-".join(map(str, self.group_ranks)) + ".bin")
-        if local_rank == 0:
-            _check(self.library.HcclGetRootInfo(root), "HcclGetRootInfo")
-            temporary = path.with_suffix(".tmp")
-            temporary.write_bytes(root.raw)
-            temporary.replace(path)
-        else:
-            deadline = time.monotonic() + 180
-            while not path.exists():
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("Timed out waiting for the HCCL root communicator")
-                time.sleep(0.02)
-            data = path.read_bytes()
-            if len(data) != ctypes.sizeof(root):
-                raise ValueError("Invalid HCCL root information size")
-            ctypes.memmove(root, data, len(data))
-        arguments = [world, root, local_rank, ctypes.byref(self.comm)]
-        _check(self.library.HcclCommInitRootInfo(*arguments), "HcclCommInitRootInfo")
+        try:
+            root = ctypes.create_string_buffer(4108)
+            path = None if directory is None else directory / ("hccl-root-" + "-".join(map(str, self.group_ranks)) + ".bin")
+            if root_info is not None:
+                if len(root_info) != ctypes.sizeof(root):
+                    raise ValueError("Invalid in-memory HCCL root information size")
+                ctypes.memmove(root, root_info, len(root_info))
+            elif path is None:
+                raise ValueError("HCCL bootstrap requires explicit root bytes or a rendezvous directory")
+            elif local_rank == 0:
+                _check(self.library.HcclGetRootInfo(root), "HcclGetRootInfo")
+                temporary = path.with_suffix(".tmp")
+                temporary.write_bytes(root.raw)
+                temporary.replace(path)
+            else:
+                deadline = time.monotonic() + 180
+                while not path.exists():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Timed out waiting for the HCCL root communicator")
+                    time.sleep(0.02)
+                data = path.read_bytes()
+                if len(data) != ctypes.sizeof(root):
+                    raise ValueError("Invalid HCCL root information size")
+                ctypes.memmove(root, data, len(data))
+            arguments = [world, root, local_rank, ctypes.byref(self.comm)]
+            _check(self.library.HcclCommInitRootInfo(*arguments), "HcclCommInitRootInfo")
+        except BaseException:
+            self.close()
+            raise
         self.buffers_peak = 0
         self.transfers = []
 
     def exchange(self, value, stage, collective="all_to_all"):
+        self.memory.select(self.rank)
         if value.device.type != "cpu" or not value.is_contiguous():
             raise ValueError("HCCL byte transport requires a contiguous CPU staging container")
         byte_count = value.numel() * value.element_size()
@@ -183,8 +206,15 @@ class HCCLBytes:
         return received
 
     def close(self):
-        _check(self.library.HcclCommDestroy(self.comm), "HcclCommDestroy")
-        _check(self.memory.library.aclrtDestroyStream(self.stream), "aclrtDestroyStream")
+        self.memory.select(self.rank)
+        try:
+            if self.comm.value:
+                _check(self.library.HcclCommDestroy(self.comm), "HcclCommDestroy")
+                self.comm = ctypes.c_void_p()
+        finally:
+            if self.stream.value:
+                _check(self.memory.library.aclrtDestroyStream(self.stream), "aclrtDestroyStream")
+                self.stream = ctypes.c_void_p()
 
 
 def main():

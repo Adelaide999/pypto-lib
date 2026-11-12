@@ -249,8 +249,12 @@ def check_chunk_continuation():
 
             class Provider:
                 def __init__(self, *args, **kwargs):
+                    class History(list):
+                        caches = []
+
                     self.shared = [{"fresh": {"topk_indices": SimpleNamespace(fill_=lambda value: None)}}]
-                    self.kv, self.history, self.finished = bytearray(), [], -1
+                    self.arenas = []
+                    self.kv, self.history, self.finished = bytearray(), History(), -1
                     observed["providers"].append(self)
 
                 def require_network_geometry(self):
@@ -268,13 +272,32 @@ def check_chunk_continuation():
                             self.kv.append(255)
 
             class Weights:
-                def __init__(self, path, topology, model_config):
+                def __init__(self, path, topology, model_config, resident=None):
                     self.path, self.releases = path, 0
                     self.layout = ExpertParallelConfig(topology["dp"], topology["tp"], topology["ep"])
                     observed["weights"].append(self)
 
                 def release_current(self):
                     self.releases += 1
+
+                def preload(self, progress=None):
+                    require(self.releases == 0, "Resident weights loaded after teardown")
+
+                def close(self):
+                    self.release_current()
+
+            class Resident:
+                def __init__(self, assigned, topology):
+                    self.table_stack = ExitStack()
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exception):
+                    self.table_stack.close()
+
+                def pin(self, *args, **kwargs):
+                    return None
 
             class Program:
                 def __init__(self, directory):
@@ -293,7 +316,7 @@ def check_chunk_continuation():
                 provider.begin_chunk(epoch=0, token_map_id=contract["input_contract_sha256"])
                 return provider
 
-            def snapshot(provider, storage):
+            def snapshot(provider, storage, *, diagnostics=True):
                 return dict(kv_owner=id(provider.kv), kv=provider.kv.hex(), history_owner=id(provider.history),
                     history=list(provider.history), table_owner=id(storage), tables=list(storage or {}))
 
@@ -337,12 +360,17 @@ def check_chunk_continuation():
             module.run_network_runtime = namespace["run_network_runtime"]
             transport = ModuleType(__package__ + ".moe_transport")
             transport.CANNMemory = SimpleNamespace
+            resident_module = ModuleType(__package__ + ".prefill_resident")
+            resident_module.ResidentNetworkRuntime = Resident
+            resident_weights = ModuleType(__package__ + ".prefill_resident_weights")
+            resident_weights.ResidentNetworkWeights = Weights
             cache = dict(cache_ABI=[], cache_ABI_sources=[],
                 engram_contracts={layer: dict(topology=topology, engram_shards=[0] * 4) for layer in (1, 14)})
             continuation = packets[1] if legacy else continuations()
             if count == 1:
                 continuation = [] if empty else None
-            modules = {module.__name__: module, transport.__name__: transport}
+            modules = {module.__name__: module, transport.__name__: transport,
+                       resident_module.__name__: resident_module, resident_weights.__name__: resident_weights}
             try:
                 with patch.dict(os.environ, {}, clear=True), patch.dict(sys.modules, modules):
                     result = prefill_fwd.run_prefill(packets[0]["inputs"], weights=checkpoint or "original-checkpoint",
@@ -356,7 +384,8 @@ def check_chunk_continuation():
                             "The aggregate omitted completed chunks")
                     require(observed["outputs"][1:] == [f"continuation-chunk{epoch}" for epoch in expected[1:]],
                             "Continuation output directories collided")
-                require(all(row["before"] == row["after"] and row["exact"] for row in observed["continuity"]),
+                require(all(row["before"] == row["after"] and row["allocation_identity_exact"]
+                            for row in observed["continuity"]),
                         "Chunk admission changed persistent state")
                 require(observed["providers"][0].history == list(range(len(expected) * 16)),
                         "Final history does not contain the complete token stream")

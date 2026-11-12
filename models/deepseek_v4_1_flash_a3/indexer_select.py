@@ -29,7 +29,7 @@ NEGATIVE_INF = -3.0e38
 # tiling
 KEY_TILE = 32
 HEAD_TILE = 16
-SORT_TILE = 512
+SORT_TILE = 2048
 
 
 def indexer_select_reference(
@@ -114,7 +114,6 @@ def make_indexer_select(
         key_scale: pl.Tensor[[key_capacity], pl.FP16],
         weights: pl.Tensor[[capacity, heads], pl.FP16],
         positions: pl.Tensor[[capacity], pl.INT32],
-        running_pairs: pl.Tensor[[capacity, 2 * topk], pl.FP32],
         scores: pl.Tensor[[capacity, key_capacity], pl.FP32],
         indices: pl.Tensor[[capacity, topk], pl.INT32],
     ):
@@ -141,32 +140,25 @@ def make_indexer_select(
             total = pl.mul(reduced_row, scale_tile)
             scores[token:token + 1, k0:k0 + KEY_TILE] = total
 
-        # Fixed 512-key leaves, causal masking and running Top-512 pairs.
-        for leaf0 in pl.range(0, key_capacity, SORT_TILE):
-            row_raw = pl.load(scores, [token, leaf0], [1, SORT_TILE])
-            ramp = pl.tile.arange(0, [1, SORT_TILE], dtype=pl.INT32)
-            absolute = pl.add(ramp, pl.cast(leaf0, pl.INT32))
-            distance = pl.mul(pl.sub(absolute, pl.cast(visible, pl.INT32)), -1)
-            valid = pl.minimum(pl.maximum(distance, 0), 1)
-            invalid = pl.sub(pl.tile.full([1, SORT_TILE], dtype=pl.INT32, value=1), valid)
-            valid_scores = pl.mul(row_raw, pl.cast(valid, pl.FP32))
-            invalid_scores = pl.mul(pl.cast(invalid, pl.FP32), NEGATIVE_INF)
-            row = pl.add(valid_scores, invalid_scores)
-            leaf_indices = pl.sub(absolute, pl.mul(pl.add(absolute, 1), invalid))
-            sort_tmp = pl.tile.create([1, 2 * SORT_TILE], dtype=pl.FP32)
-            leaf_pairs = pl.tile.sort32(row, pl.reinterpret_view(leaf_indices, pl.UINT32), tmp=sort_tmp)
-            leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=64)
-            leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=256)
-            if leaf0 == 0:
-                pl.store(leaf_pairs, [token, 0], running_pairs)
-            else:
-                previous = pl.load(running_pairs, [token, 0], [1, 2 * topk])
-                merge_tmp = pl.tile.create([1, 4 * topk], dtype=pl.FP32)
-                merged = pl.tile.mrgsort(previous, leaf_pairs, tmp=merge_tmp)
-                leading = pl.tile.slice(merged, [1, 2 * topk], [0, 0])
-                pl.store(leading, [token, 0], running_pairs)
-        pairs = pl.load(running_pairs, [token, 0], [1, 2 * topk])
-        selected = pl.tile.gather_mask(pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+        # One fixed padded row and the documented three-stage four-way merge.
+        actual_scores = pl.load(scores, [token, 0], [1, key_capacity])
+        row_raw = pl.tile.full([1, SORT_TILE], dtype=pl.FP32, value=NEGATIVE_INF)
+        row_raw = pl.tile.assemble(row_raw, actual_scores, [0, 0])
+        absolute = pl.tile.arange(0, [1, SORT_TILE], dtype=pl.INT32)
+        distance = pl.mul(pl.sub(absolute, pl.cast(visible, pl.INT32)), -1)
+        valid = pl.minimum(pl.maximum(distance, 0), 1)
+        invalid = pl.sub(pl.tile.full([1, SORT_TILE], dtype=pl.INT32, value=1), valid)
+        valid_scores = pl.mul(row_raw, pl.cast(valid, pl.FP32))
+        invalid_scores = pl.mul(pl.cast(invalid, pl.FP32), NEGATIVE_INF)
+        row = pl.add(valid_scores, invalid_scores)
+        logical_ids = pl.sub(absolute, pl.mul(pl.add(absolute, 1), invalid))
+        sort_tmp = pl.tile.create([1, 2 * SORT_TILE], dtype=pl.FP32)
+        pairs = pl.tile.sort32(row, pl.reinterpret_view(logical_ids, pl.UINT32), tmp=sort_tmp)
+        pairs = pl.tile.mrgsort(pairs, block_len=64)
+        pairs = pl.tile.mrgsort(pairs, block_len=256)
+        pairs = pl.tile.mrgsort(pairs, block_len=1024)
+        leading = pl.tile.slice(pairs, [1, 2 * topk], [0, 0])
+        selected = pl.tile.gather_mask(leading, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
         pl.store(selected, [token, 0], indices)
         return scores, indices
 
@@ -182,11 +174,10 @@ def make_indexer_select(
         indices: pl.Out[pl.Tensor[[capacity, topk], pl.INT32]],
         active: pl.Scalar[pl.INT32],
     ):
-        running_pairs = pl.create_tensor([capacity, 2 * topk], dtype=pl.FP32)
         for _worker in pl.spmd(active, name_hint="dsv41_a2a3_qli_select"):
             select_one(
                 query, query_scale, key, key_scale, weights, positions,
-                running_pairs, scores, indices,
+                scores, indices,
             )
         return scores, indices
 

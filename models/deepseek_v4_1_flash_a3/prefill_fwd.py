@@ -62,7 +62,8 @@ def _merge_inputs(inputs, cache):
     return dict(inputs, **cache)
 
 
-def prefill_fwd(inputs, *, weights, cache, config, devices, output, compiled=None, continuation=None, diagnostics=False):
+def prefill_fwd(inputs, *, weights, cache, config, devices, output, compiled=None,
+                continuation=None, diagnostics=False, progress=None):
     """Execute the existing network using explicit checkpoint and cache-state providers.
 
     ``inputs`` accepts raw completion text, 1..2048 token IDs, or prepared
@@ -74,6 +75,9 @@ def prefill_fwd(inputs, *, weights, cache, config, devices, output, compiled=Non
     Engram contracts. No historical task release or layer receipt is required.
     ``continuation`` accepts one prepared chunk or a lazy iterable of chunks;
     each chunk follows the preceding input's hash and next epoch.
+    Ordinary execution preloads all compute weights and retains workers,
+    caches and communication groups until the complete stream ends.
+    Diagnostics retain the streaming checkpoint path for independent capture.
     """
     from .runtime_config import configure_devices
 
@@ -92,7 +96,8 @@ def prefill_fwd(inputs, *, weights, cache, config, devices, output, compiled=Non
 
     return run_network_runtime(
         _merge_inputs(inputs, cache), contract=config, checkpoint=weights,
-        devices=devices, output=output, compiled=compiled, continuation=continuation, diagnostics=diagnostics,
+        devices=devices, output=output, compiled=compiled, continuation=continuation,
+        diagnostics=diagnostics, progress=progress,
     )
 
 

@@ -23,12 +23,13 @@ from .runtime_utils import Executable, file_sha
 class MappedLookup:
     """Own public ChipWorker calls, resolved descriptors and registered host storage."""
 
-    def __init__(self, executable, codes, scales, rank, memory):
+    def __init__(self, executable, codes, scales, rank, memory, *, worker=None):
         from simpler.task_interface import ChipWorker
 
         self.executable, self.codes, self.scales = executable, codes, scales
         self.rank, self.memory = rank, memory
-        self.worker = ChipWorker()
+        self.owns_worker = worker is None
+        self.worker = ChipWorker() if worker is None else worker
         self.buffers = []
         self.handle = None
         self.arguments = None
@@ -41,7 +42,8 @@ class MappedLookup:
             with self.memory.interval(self.rank, "load", "engram_lookup/init"):
                 compiled = self.executable.compiled
                 bins = RuntimeBuilder("a2a3").get_binaries(compiled.runtime_name)
-                self.worker.init(self.rank, bins)
+                if self.owns_worker:
+                    self.worker.init(self.rank, bins)
                 self.handle = self.worker.register_callable(compiled.chip_callable)
                 self.code_address = self.codes.register(self.memory, self.rank)
                 self.scale_address = self.scales.register(self.memory, self.rank)
@@ -93,25 +95,31 @@ class MappedLookup:
         self.executable.record(arguments, dict(lookup=lookup), self.rank,
                                ["engram_lookup"], capture, report)
         self.arguments = None
+        while self.buffers:
+            _check(self.memory.library.aclrtFree(self.buffers[-1]), "aclrtFree/Engram-call")
+            self.buffers.pop()
 
     def _retire_arguments(self):
         """Retire registered host ranges and caller-owned argument allocations."""
         self.memory.select(self.rank)
         self.scales.unregister(self.memory, self.rank)
         self.codes.unregister(self.memory, self.rank)
-        for pointer in self.buffers:
-            _check(self.memory.library.aclrtFree(pointer), "aclrtFree/Engram")
-        self.buffers.clear()
+        while self.buffers:
+            _check(self.memory.library.aclrtFree(self.buffers[-1]), "aclrtFree/Engram")
+            self.buffers.pop()
 
     def __exit__(self, exc_type, exc, traceback):
         if not self.run_pending:
             try:
-                if self.handle is not None:
-                    self.worker.unregister_callable(self.handle)
-                    self.handle = None
-                self._retire_arguments()
+                try:
+                    if self.handle is not None:
+                        self.worker.unregister_callable(self.handle)
+                        self.handle = None
+                finally:
+                    self._retire_arguments()
             finally:
-                self.worker.finalize()
+                if self.owns_worker:
+                    self.worker.finalize()
         else:
             # A failed native run retains arguments through successful teardown.
             self.worker.finalize()

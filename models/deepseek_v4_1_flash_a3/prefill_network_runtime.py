@@ -76,6 +76,14 @@ class NetworkWeights:
     def raw_for_layer(self, layer_id):
         return self.for_layer(layer_id)["raw"]
 
+    def projection_for_layer(self, layer_id):
+        return self.raw_for_layer(layer_id)[f"layers.{layer_id}.engram.wkv.weight"].T.contiguous()
+
+    def head_for_rank(self, rank):
+        head = self.reader.load("head.weight")
+        count = head.shape[0] // self.layout.tp
+        return head.narrow(0, rank % self.layout.tp * count, count).T.contiguous()
+
     def expert(self, rank, expert):
         if self.current_layer is None or not 0 <= rank < self.layout.ep:
             raise ValueError("An actual current layer and allocated expert rank are required")
@@ -239,22 +247,54 @@ class NetworkExecutor:
     """Compile exact existing per-layer entries and record invocations without retaining all tensor captures."""
 
     def __init__(self, output, config, topology, provider, ownership, memory, runtime_path, reports,
-                 program, namespace="chunk0", diagnostics=True):
+                 program, namespace="chunk0", diagnostics=True, resident=None):
         self.output, self.config, self.topology = Path(output), config, topology
         self.provider, self.ownership, self.memory = provider, ownership, memory
         self.runtime_path, self.reports = runtime_path, reports
         self.namespace = namespace
         self.diagnostics = diagnostics
         self.program = program
+        self.resident = resident
         self.current_layer, self.current_entries = None, None
         self.compiled = {}
         self.entry_abis = {}
+        self.resident_abis = {}
+        # The public ChipWorker retains registrations until close (64 slots).
+        # IO entries use only CPU boundaries; give them independent workers and
+        # buffers so resident expert operands keep their original live owners.
+        self.staged_entries = {
+            id(entry.compiled)
+            for stage in ("embedding", "output")
+            for entry in program.entries_for_stage(stage).values()
+        }
+        direct_entries = {
+            id(entry.compiled)
+            for stage, entries in program.stages.items()
+            if stage not in ("embedding", "output")
+            for name, entry in entries.items()
+            if not name.startswith("engram_lookup_")
+        }
+        if len(direct_entries) > 64 or len(self.staged_entries) > 64:
+            raise ValueError("The network entry partition exceeds public worker registration capacity")
+
+    def execute_entry(self, entry, rank, arguments):
+        """Bind one existing compiled entry to the generation's persistent worker."""
+        if self.resident is None:
+            raise ValueError("Ordinary execution requires an initialized resident runtime")
+        key = id(entry.compiled)
+        if key not in self.resident_abis:
+            self.resident_abis[key] = network_parameter_abi(entry.compiled)
+        self.resident.execute(entry.compiled, rank, arguments, self.resident_abis[key],
+                              staged=key in self.staged_entries)
 
     def exchange(self, stage, values, collective, group, *, packets=False):
         if not stage or "/" in stage or ".." in stage:
             raise ValueError("HCCL stages require distinct safe chunk/layer identities")
         transport = values if packets else [{case: {"value": value} for case, value in row.items()} for row in values]
-        result, receipts = communicate(stage, transport, self.output, self.runtime_path, collective=collective, group=group)
+        if self.resident is None:
+            result, receipts = communicate(stage, transport, self.output, self.runtime_path, collective=collective, group=group)
+        else:
+            result, receipts = self.resident.exchange(stage, transport, collective, group)
         for rank, receipt in enumerate(receipts):
             self.reports[rank]["communication"].append(receipt)
         if packets:
@@ -294,7 +334,7 @@ class NetworkExecutor:
             entry = self.current_entries[name]
             config = RunConfig(arch=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD, device_id=rank)
             if not self.diagnostics:
-                entry.compiled(*arguments, config=config)
+                self.execute_entry(entry, rank, arguments)
                 return
             abi = self.entry_abis[name]
             readonly, writable = network_argument_protection(arguments, outputs, abi)
@@ -366,8 +406,7 @@ def embed_network_input(input_contract, weights, executor, config, output):
 
     def execute(name, rank, arguments, outputs):
         if not executor.diagnostics:
-            run = RunConfig(arch=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD, device_id=rank)
-            entries[name].compiled(*arguments, config=run)
+            executor.execute_entry(entries[name], rank, arguments)
             return
         readonly = [(index, tensor_sha(value)) for index, value in enumerate(arguments)
                     if isinstance(value, torch.Tensor) and all(value is not out for out in outputs.values())]
@@ -415,8 +454,7 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
 
     def execute(name, rank, case, arguments, outputs, responsibility=None):
         if not executor.diagnostics:
-            config = RunConfig(arch=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD, device_id=rank)
-            entries[name].compiled(*arguments, config=config)
+            executor.execute_entry(entries[name], rank, arguments)
             return
         mutable = {value.untyped_storage().data_ptr() for value in outputs.values()}
         before = [(index, tensor_sha(value)) for index, value in enumerate(arguments)
@@ -443,7 +481,7 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
             normalized = torch.full((capacity, 5120), -19, dtype=torch.bfloat16)
             local_logits = torch.full((capacity, config["vocab_size"] // tp), -23, dtype=torch.bfloat16)
             count = config["vocab_size"] // tp
-            weight = head.narrow(0, rank % tp * count, count).T.contiguous()
+            weight = weights.head_for_rank(rank)
             if tuple(weight.shape) != (5120, count):
                 raise ValueError("Output head must use canonical KN vocabulary shard layout")
             execute_region({"execute_l2": execute}, "head_l2", rank, case, (
@@ -470,8 +508,8 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
     return dict(files=files, logits=actual_logits)
 
 
-def _network_owner_snapshot(provider, storage):
-    """Bind each persistent object's identity and exact own bytes across chunk admission."""
+def _network_owner_snapshot(provider, storage, *, diagnostics=True):
+    """Bind persistent allocation identities, with optional diagnostic byte hashes."""
     result = {"provider": id(provider), "history": id(provider.history), "arrays": {}, "tables": {}}
     for family, values in (("raw", provider.arenas), ("shared", provider.shared), ("history", provider.history.caches)):
         for rank, cases in enumerate(values):
@@ -479,12 +517,15 @@ def _network_owner_snapshot(provider, storage):
                 items = tensors.items() if isinstance(tensors, dict) else (("history", tensors),)
                 for name, value in items:
                     key = f"{family}/{rank}/{case}/{name}"
-                    result["arrays"][key] = dict(object_id=id(value), storage=value.untyped_storage().data_ptr(),
-                                                sha256=tensor_sha(value))
+                    record = dict(object_id=id(value), storage=value.untyped_storage().data_ptr(),
+                                  shape=list(value.shape), dtype=str(value.dtype))
+                    if diagnostics:
+                        record["sha256"] = tensor_sha(value)
+                    result["arrays"][key] = record
     for key, record in storage.items():
         value = record["array"]
         if value.mapping is None or value.live:
-            raise ValueError("Retained Engram table must be open and have no live rank registration")
+            raise ValueError("Retained Engram table must be open with valid registration ownership")
         result["tables"][str(key)] = dict(object_id=id(value), receipt=dict(value.receipt), host_pointer=value.host_pointer)
     return result
 
@@ -520,7 +561,8 @@ def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=F
     return provider
 
 
-def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, continuation=None, compiled=None, diagnostics=True):
+def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, continuation=None,
+                        compiled=None, diagnostics=True, progress=None):
     """Execute a fresh chunk and a lazy stream of continuations with shared live state.
 
     ``continuation`` is one chunk mapping or an iterable of chunk mappings.
@@ -550,6 +592,8 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
     from .moe_transport import CANNMemory
 
     output.mkdir(parents=True, exist_ok=False)
+    if progress is not None:
+        progress(dict(stage="compiling_network", epoch=0))
     provider = prepare_network_provider(inputs, contract, output.name, geometry_only=True)
     program = compiled if compiled is not None else PrefillProgram(output / "compiled")
     if compiled is not None and not compiled.ready:
@@ -557,16 +601,33 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
     program.compile(provider, contract["model_config"], topology, inputs["engram_contracts"])
     provider = prepare_network_provider(inputs, contract, output.name)
     with ExitStack() as stack:
-        weights = NetworkWeights(contract["checkpoint"], topology, contract["model_config"])
-        stack.callback(weights.release_current)
+        resident = None
+        if diagnostics:
+            weights = NetworkWeights(contract["checkpoint"], topology, contract["model_config"])
+            stack.callback(weights.release_current)
+        else:
+            from .prefill_resident import ResidentNetworkRuntime
+            from .prefill_resident_weights import ResidentNetworkWeights
+
+            resident = stack.enter_context(ResidentNetworkRuntime(assigned, topology))
+            weights = ResidentNetworkWeights(contract["checkpoint"], topology, contract["model_config"], resident)
+            stack.callback(weights.close)
+            weights.preload(progress)
+            for family, values in (("raw", provider.arenas), ("shared", provider.shared),
+                                   ("history", provider.history.caches)):
+                for rank, cases in enumerate(values):
+                    for case, tensors in cases.items():
+                        items = tensors.items() if isinstance(tensors, dict) else (("history", tensors),)
+                        for name, value in items:
+                            resident.pin(value, [rank], readonly=False, name=f"{family}/{rank}/{case}/{name}")
         memory = CANNMemory(diagnostics=diagnostics)
         ownership = [weights.layout.ownership(rank) for rank in range(16)]
-        table_storage = {} if continuation is not None else None
-        table_stack = stack if continuation is not None else None
+        table_storage = {} if continuation is not None or resident is not None else None
+        table_stack = resident.table_stack if resident is not None else (stack if continuation is not None else None)
         first = _run_network_chunk(inputs, contract=contract, output=output, provider=provider,
             weights=weights, memory=memory, ownership=ownership, assigned=assigned,
             engram_contracts=inputs["engram_contracts"], program=program, epoch=0, table_storage=table_storage,
-            table_stack=table_stack, diagnostics=diagnostics)
+            table_stack=table_stack, diagnostics=diagnostics, progress=progress, resident=resident)
         if continuation is None:
             return first
         completed = [first]
@@ -606,22 +667,24 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
                 metadata.append(torch.load(record["path"], map_location="cpu", weights_only=True))
                 receipts.append(dict(rank=rank, metadata_sha256=record["sha256"]))
             following = dict(following, cache_ABI=metadata)
-            before = _network_owner_snapshot(provider, table_storage)
+            before = _network_owner_snapshot(provider, table_storage, diagnostics=diagnostics)
             provider.begin_chunk(epoch=epoch, token_map_id=next_contract["input_contract_sha256"],
                 input_by_case={"fresh": actual_input}, metadata_by_case={"fresh": metadata},
                 metadata_sources_by_case={"fresh": receipts})
-            after = _network_owner_snapshot(provider, table_storage)
+            after = _network_owner_snapshot(provider, table_storage, diagnostics=diagnostics)
             if before != after:
                 raise RuntimeError("Chunk admission changed persistent raw/shared/history/table owners or bytes")
             program.compile(provider, next_contract["model_config"], topology, inputs["engram_contracts"])
             chunk_output = output / f"continuation-chunk{epoch}"
             chunk_output.mkdir(exist_ok=False)
             write_json(chunk_output / "own-state-continuity.json", dict(before=before, after=after,
-                exact=True, previous_complete_output=True,
-                scope="Own previous-final to current-initial; no cross-framework float byte gate"))
+                allocation_identity_exact=True, bytes_compared=diagnostics, previous_complete_output=True,
+                scope="Persistent allocation identities; optional own-byte diagnostic comparison"))
             result = _run_network_chunk(following, contract=next_contract, output=chunk_output,
                 provider=provider, weights=weights, memory=memory, ownership=ownership, assigned=assigned,
-                engram_contracts=inputs["engram_contracts"], program=program, epoch=epoch, table_storage=table_storage, table_stack=table_stack, diagnostics=diagnostics)
+                engram_contracts=inputs["engram_contracts"], program=program, epoch=epoch,
+                table_storage=table_storage, table_stack=table_stack, diagnostics=diagnostics,
+                progress=progress, resident=resident)
             completed.append(result)
             previous_contract = next_contract
         if len(completed) == 1:
@@ -630,7 +693,8 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
 
 
 def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, ownership,
-                       assigned, engram_contracts, program, epoch, table_storage, table_stack, diagnostics=True):
+                       assigned, engram_contracts, program, epoch, table_storage, table_stack,
+                       diagnostics=True, progress=None, resident=None):
     """Execute embedding, the complete backbone and the final head with persistent owners."""
     begin = perf_counter()
     initial_load_seconds, initial_load_calls = weights.load_seconds, weights.load_calls
@@ -638,6 +702,8 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
     topology, model_config = contract["topology"], contract["model_config"]
     text = dict(model_config["text_config"], image_sentinel_base_id=model_config["image_token_id"])
     namespace = f"chunk{epoch}"
+    if progress is not None:
+        progress(dict(stage="executing_embedding", epoch=epoch))
     state_guard = NetworkStatePreservation(
         provider, contract["state_regions"]["path"], contract["state_regions"]["sha256"],
         contract["input_contract_sha256"],
@@ -667,7 +733,7 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
                        output / f"rank-{rank}-initial-state.pt")
     reports = [dict(rank=rank, kernels=[], communication=[]) for rank in range(16)]
     executor = NetworkExecutor(output, text, topology, provider, ownership, memory, runtime_path, reports,
-                               program, namespace, diagnostics=diagnostics)
+                               program, namespace, diagnostics=diagnostics, resident=resident)
     executor.precheck()
     if "product_input_paths" in inputs:
         hidden, premix = load_product_backbone_input(
@@ -678,6 +744,8 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
         hidden, premix = embed_network_input(inputs["input_contract"], weights, executor, text, output / "embedding")
     hash_batch = provider.hash_batch()
     common_engram = engram_contracts[1]
+    if progress is not None:
+        progress(dict(stage="preparing_engram", epoch=epoch))
     captured_constants = provider.hash_constants(layer_ids=[1, 14], pad_id=text["engram_pad_token_id"])
     for item in engram_contracts.values():
         for name in ("token_map", "multipliers", "primes", "offsets"):
@@ -697,7 +765,11 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
                        stage_namespace=namespace + "-engram", output=output / "engram", reports=reports,
                        memory=memory, exchange=executor.exchange, capture_nodes=False, capture_state=diagnostics,
                        diagnostics=diagnostics, observe_discrete=observe_engram if diagnostics else None,
-                       entries_for_stage=program.entries_for_stage)
+                       entries_for_stage=program.entries_for_stage, execute_entry=executor.execute_entry,
+                       projection_for_layer=weights.projection_for_layer)
+    if resident is not None:
+        eng_runtime["mapped_lookup"] = resident.mapped_lookup
+        eng_runtime["load_rotation"] = resident.load_rotation
     prepared_engram = prepare_network_engram(
         common_engram, hash_batch, provider.history, engram_contracts, weights.raw_for_layer, eng_runtime,
         storage=table_storage, storage_stack=table_stack, storage_namespace=provider.allocation_id,
@@ -708,6 +780,8 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
     discrete_pending = {}
 
     def runtime_for_layer(layer):
+        if progress is not None:
+            progress(dict(stage="executing_layer", epoch=epoch, layer=layer))
         actual = executor.for_layer(layer)
         if diagnostics:
             state_guard.begin_layer(layer)
@@ -725,6 +799,8 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
             state_guard.finish_layer(layer, output / f"{namespace}-layer{layer}" / "state-preservation.json")
         provider.observe_layer(layer, result)
         completed_layers.append(layer)
+        if progress is not None:
+            progress(dict(stage="layer_complete", epoch=epoch, layer=layer))
         directory = output / f"{namespace}-layer{layer}"
         if not diagnostics:
             print(dict(stage="full40_layer_complete", layer=layer, diagnostics=False), flush=True)
@@ -768,6 +844,8 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
             hidden, premix, batch_for_layer=provider.batch_for_layer, cache_for_layer=provider.cache_for_layer,
             weights_for_layer=weights.for_layer, runtime_for_layer=runtime_for_layer, observe_layer=observe_layer,
         )
+        if progress is not None:
+            progress(dict(stage="executing_output_head", epoch=epoch))
         output_result = run_output_boundary(
             result, batch=provider.batch_for_layer(39), topology=topology, config=text,
             weights=weights, executor=executor, output=output / "actual-layer39-output",
@@ -779,6 +857,8 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
         loaded_source_files(runtime)
         runtime.update(status="executed_full40_not_compared", completed_layers=list(range(40)),
                        actual_Layer39_boundary=True, final_output_files=output_result["files"], formal_accuracy="not_run")
+        if resident is not None:
+            runtime["resident_runtime"] = resident.summary()
         write_json(runtime_path, runtime)
         write_json(output / "execution.json", dict(
             at=datetime.now(timezone.utc).isoformat(), outcome="executed_actual_full40_Prefill_pending_independent_comparison",

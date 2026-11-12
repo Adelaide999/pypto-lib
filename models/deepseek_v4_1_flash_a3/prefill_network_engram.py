@@ -90,7 +90,8 @@ class PreparedNetworkEngram:
         runtime, capacity = self.runtime, self.runtime["capacity"]
         raw = self.raw_for_layer(layer_id)
         prefix = context["prefix"]
-        projection = raw[prefix + ".wkv.weight"].T.contiguous()
+        projection = (runtime["projection_for_layer"](layer_id) if "projection_for_layer" in runtime
+                      else raw[prefix + ".wkv.weight"].T.contiguous())
         if projection.dtype != torch.bfloat16 or tuple(projection.shape) != (6144, 25600):
             raise ValueError("Require the actual complete BF16 Engram projection")
         result = [{} for _ in self.history.caches]
@@ -133,6 +134,22 @@ class PreparedNetworkEngram:
                     network_history_owner=1, network_hash_slot=role["engram_slot"])
         self.applied.add(layer_id)
         return result
+
+
+def _hash_slots(slots):
+    """Bind canonical page/offset coordinates to the hash kernel's physical row vector."""
+    if slots.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Engram history slots require integer coordinates")
+    if slots.ndim == 1:
+        return slots.to(torch.int64)
+    if slots.ndim != 2 or slots.shape[1] != 2:
+        raise ValueError("Engram history slots require rows or page/offset pairs")
+    values = []
+    for page, offset in slots.tolist():
+        if offset >= 128:
+            raise ValueError("Engram history offset exceeds its 128-row page")
+        values.append(page * 128 + offset if page >= 0 and offset >= 0 else -1)
+    return torch.tensor(values, dtype=torch.int64)
 
 
 def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_layer, runtime, *,
@@ -214,6 +231,8 @@ def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_la
         entries = {}
         if "entries_for_stage" in runtime:
             entries = runtime["entries_for_stage"](f"engram{layer_id}")
+            for entry in entries.values():
+                entry.diagnostics = runtime.get("diagnostics", True)
         else:
             functions = make_prefill_engram_entries(capacity, constants, config, own_contract["engram_shards"],
                                                     history.cache_rows, max_blocks, tp)
@@ -225,15 +244,11 @@ def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_la
                 else:
                     entry = shared_entries[name]
                 entries[name] = entry
-        rotation, rotation_receipt = load_rotation(contract["checkpoint"], 5120)
+        rotation, rotation_receipt = runtime.get("load_rotation", load_rotation)(contract["checkpoint"], 5120)
 
         def execute(name, rank, case, arguments, outputs, roles, *, entries=entries, directory=directory):
             if not runtime.get("diagnostics", True):
-                from pypto.backend import BackendType
-                from pypto.runtime import ExecutionMode, RunConfig
-
-                run = RunConfig(arch=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD, device_id=rank)
-                entries[name].compiled(*arguments, config=run)
+                runtime["execute_entry"](entries[name], rank, arguments)
                 return
             capture = directory / "captures" / f"rank-{rank}-{case}-{name}-{len(reports[rank]['kernels'])}.pt"
             entries[name].execute(arguments, outputs, rank, roles, capture, reports[rank], memory)
@@ -264,7 +279,7 @@ def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_la
                     value = original["lookback_token_ids"]
                     lookback[:len(value)].copy_(value)
                 arguments = [_pad(original["full_input_ids"], capacity), _pad(original["positions"], capacity),
-                    _pad(starts, capacity + 1, total), _pad(metadata["slot_mapping"], capacity, -1), blocks, lookback,
+                    _pad(starts, capacity + 1, total), _pad(_hash_slots(metadata["slot_mapping"]), capacity, -1), blocks, lookback,
                     constants["token_map"], constants["multipliers"], constants["primes"].reshape(-1, 24),
                     constants["offsets"], cache, ids, mask, total, len(starts) - 1]
                 contexts[1]["execute"]("engram_hash", rank, case, arguments,
@@ -315,7 +330,8 @@ def prepare_network_engram(contract, batch, history, layer_contracts, raw_for_la
                         reports[rank]["network_engram_storage"][str(layer_id)]["registration"] = "not_run_empty_DP"
                         continue
                     name = f"engram_lookup_{tp_rank}"
-                    with MappedLookup(context["entries"][name], codes, scales, rank, memory) as mapped:
+                    lookup = runtime.get("mapped_lookup", MappedLookup)(context["entries"][name], codes, scales, rank, memory)
+                    with lookup as mapped:
                         for case in batch["cases"]:
                             if hashing[rank][case]:
                                 ids = hashes[rank][case]["hashes"][:, context["slot"], :].contiguous()

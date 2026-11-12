@@ -8,10 +8,12 @@ was `models/deepseek_v4_1_flash_a2`; this delivery uses the separate
 
 ## Development priorities
 
-- Performance target: correctness of the A3 complete Prefill path, with
-  Eco-Tech real W8A8, 384 routed experts, Top6, and original Engram state.
-- Deferred performance work: final throughput and latency tuning until
-  complete-network accuracy is independently established.
+- Performance target: complete-network correctness and continuous generation
+  with generation-scoped workers, compute weights, caches and communication,
+  retaining Eco-Tech real W8A8, 384 routed experts, Top6 and original Engram state.
+- Deferred performance work: fused device layer scheduling and final throughput
+  tuning. Residency is an active target; elapsed-time improvements require
+  measurements on an allocated device group.
 - Compatibility requirements: preserve original layer roles, byte aliases,
   cache/source lifetime, quantization, dtypes, and explicit DP/TP/EP mappings.
   TP1/TP2 fixed-16 full-network compatibility remains unvalidated.
@@ -136,8 +138,8 @@ and vocabulary unpack stay on their respective sides of host communication.
 functions separately from unique compiled entries and total stage bindings.
 
 This is **not a single L2 graph for all forty layers**; `compilation.json`
-continues to report `single_l2: false`. Python owns the HCCL boundaries and
-active routed-expert checkpoint reads. The existing HCCL BF16 reduction is
+continues to report `single_l2: false`. Python owns the HCCL boundaries. Ordinary generation now preloads routed
+experts once; diagnostic execution retains on-demand expert reads. The existing HCCL BF16 reduction is
 retained, rather than replacing its reduction order during a composition
 change. The standalone child path remains a consumer for independent-layer
 validation; removing the host network scheduler requires a separately
@@ -222,6 +224,17 @@ produces 128 chunks at the default size, retaining earlier cache/history state.
 This is sequential chunked Prefill; it does not make the executable query
 capacity 2048 or implement Decode, sampling or an autoregressive text loop.
 The final result points to the last chunk's output-head artifacts.
+
+The separate `generate` caller supplies a lazy greedy feedback stream to this
+same forward. It uses the original encoded chat prompt, selects each token
+from the last valid product vocabulary row, advances positions and consumed
+history, and stops at the original EOS or the recorded token limit. It reserves
+the bounded context up front and retains one cache/history provider, compiled
+program and finite Engram table owner across all chunks. Every new token costs
+one complete 40-layer Prefill forward; this is not a Decode implementation.
+With diagnostics disabled, continuation checks allocation identities and
+functional metadata lineage without optional persistent-tensor byte hashes.
+The optional `progress` callback reports execution stages without tensor captures.
 
 For the CLI, replace `inputs` with either `prompt` or `token_ids`, omit
 `continuations`, and optionally set `chunk_size` and `dp_rank`:
@@ -383,3 +396,113 @@ explicit public entry, operator ownership and five L2 compute regions. The
 commit `79a584e64cb8cee5e0f3b816f77c014cba9911cc`. Shared-expert precision and
 admitted-program reuse retain their documented validation limits above.
 The original A3 source manifest remains unchanged.
+
+
+## A5-style generation-scoped construction
+
+Ordinary `prefill_fwd(..., diagnostics=False)` and `generate.py` now construct
+one resident runtime around the entire lazy chunk/token stream. This follows
+the resource lifetime used by A5 `prefill_fwd.py::generate`, while retaining
+A3 Eco-Tech W8A8, DP4/TP4/EP16 and the existing arithmetic. A3 does not import
+A5 MXFP8/MXFP4 operands or substitute its communication order.
+
+- `prefill_resident_weights.py` preloads all forty compute layer banks, all 384
+  routed experts per layer on their actual EP owner, one shared expert replica
+  per rank, and the vocabulary shards. Expert source tensors are released
+  after upload; device operands persist until generation ends. Nonexpert host
+  views remain the binding identities. No weight payload hashes are taken by
+  the ordinary loader. Diagnostics preserve the previous hashes and captures.
+- `prefill_resident.py` owns one public PyPTO `ChipWorker` per logical rank,
+  persistent typed weight/cache allocations and retained HCCL communicators.
+  Boundary transfers use concurrent in-process CANN/HCCL calls, preserving the
+  existing gather, all-to-all and BF16/FP32 sum semantics. They do not write
+  transport packets to files or launch new transport processes.
+- Both full Engram tables retain their existing INT8/FP32 shared-host contract.
+  Their mappings and lookup workers persist across tokens. These are host
+  tables; compute-weight residency is not an all-model-HBM acceptance claim.
+- Existing cache typed views bind to their complete owning byte allocation.
+  Current host consumers still receive writable state readback. CPU metadata,
+  active-expert selection and the layer scheduler remain on the host. Each
+  generated token still executes all forty layers, reusing the same program,
+  workers, weights and cache owners.
+
+This is a resident host-scheduled A3 runtime, **not** an A5-style single device
+backbone graph. Reports explicitly set `single_device_graph: false` and retain
+`numerical_acceptance: not_established_by_residency`. The independent
+`diagnostics=True` path still needs streaming weights and exact captures; it is
+an actual diagnostic consumer rather than a generation performance fallback.
+An allocation, worker or collective failure aborts generation and attempts to
+release the owned resources. A poisoned device can also fail during cleanup;
+the observed second-token failure below includes this case. Generation does
+not silently fall back to checkpoint streaming.
+
+`resident_runtime` records initializations, allocated compute-weight/state
+bytes per rank, actual dispatch/transfer counts and H2D/D2H traffic. Startup
+preload time is separate from chunk time. These counters are not observed
+whole-device HBM peaks or speedup measurements.
+
+Bounded validation commands, run from the repository root:
+
+```bash
+python -B -m models.deepseek_v4_1_flash_a3.validate
+python -B -m models.deepseek_v4_1_flash_a3.validate_resident
+# Device IDs must come from one two-rank site allocation.
+python -B -m models.deepseek_v4_1_flash_a3.validate_resident_device \
+  --devices "$TASK_DEVICE" --output build_output/resident-validation
+```
+
+The resident HOST validation uses real Torch byte aliases and the public
+`DeviceTensor` representation with bounded CPU worker substitutes. It checks
+multi-rank weight slices, repeated calls, independent typed cache aliases,
+overlapping argument views, host mutation detection and failure cleanup.
+A synthetic forty-layer bank checks all expert owners and two traversals
+without checkpoint reloads. It initializes no NPU and establishes no model
+accuracy or latency result. The separate device entry checks actual repeated
+RMSNorm dispatch and three two-rank HCCL collectives; even a pass there is not
+a full40 or two-token performance acceptance.
+
+### Resident execution snapshot (2026-11-12)
+
+This snapshot extends `1a91a1964d13880c1306623cdd123656cf52c79a` with the
+resident implementation used by a cold full40 generation attempt. It includes
+the operator sources, the flattened INT64 Engram slot binding and explicit
+current-device selection for allocation, copies, dispatch and retirement.
+Embedding and output-head entries use separate CPU-staged workers per rank
+to stay within the primary worker's 64-callable limit. Those workers still
+share the primary worker's process; process isolation is not included here.
+
+The attempt allocated sixteen device IDs with DP4/TP4/EP16, capacity 16 and
+four fixed-baseline requests. It used PyPTO `72a62d13efab`, simpler
+`6b6b88f2353c`, PTOAS 0.70, CANN 9.1.0 and Torch 2.10.0 CPU. The private
+fixed-baseline driver invoked the public forward path; it did not validate
+the separate chat-oriented `generate.py` entry end to end.
+
+| Observed phase | Elapsed time | Scope |
+| --- | ---: | --- |
+| Queue start to first complete logits | 1937.819 s | About 32 min 18 s; file-write completion, not client delivery |
+| Total failed attempt | 2178.038 s | About 36 min 18 s, including error handling and cleanup |
+| Compilation preparation | 357.143 s | Includes 314.673 s of IR/PTO/C++ generation; excludes lazy device-binary builds |
+| Compute-weight preload | 746.580 s | Includes checkpoint reads, CPU preparation, allocation and upload |
+| First network chunk | 814.991 s | Includes input/Engram preparation, all forty layers and output head |
+| Layer0 through layer39 | About 212.924 s | Estimated from timestamped progress boundaries inside the chunk |
+
+Compilation retained 76 unique entries for 947 stage bindings. Compute-weight
+allocations totaled 653,354,818,560 bytes across the sixteen ranks. Both Engram
+tables remained shared host mappings, totaling 221,190,580,800 bytes of unique
+codes and scales. Their cold preparation still copies and SHA-256 checks whole
+table shards in `engram_storage.py`, even with ordinary tensor diagnostics
+disabled. None of these counters is a measured whole-device HBM peak.
+
+All forty layers and the output head executed for the first token of each
+request. The floating comparison against the captured reference failed at
+`rtol=0.05, atol=0.05`, and greedy token IDs matched only two of four requests.
+The second token failed in Engram hash dispatch with `valid_reshape` and host
+error 507018; a subsequent resource-retirement error also occurred. This is an
+execution snapshot with known failures, not numerical acceptance, continuous
+generation acceptance or a steady-state latency benchmark. No second-token
+latency or complete answer was measured.
+
+The bounded `validate` and `validate_resident` commands passed on this Python
+snapshot. They cover host controls, aliases, expert ownership, retained worker
+lifetimes and partial HCCL cleanup with substitutes; they establish no further
+device precision or performance result.
