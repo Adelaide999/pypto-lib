@@ -408,7 +408,7 @@ def run_index_query_selection(state, q_input, latent, cosine, sine, operands,
                               execute, rank, case, capacity, requests, table_pages,
                               source_prefix, own_prefix, codes, scales):
     """Compute quantized index queries, paged-key scores and sparse controls with PyPTO."""
-    original, total, nodes = state["original"], state["total"], state["nodes"]
+    original, total = state["original"], state["total"]
     start, end, _per_rank, _padded = original["cp_token_range"]
     query_rows = max(0, min(end, total) - min(start, total))
     metadata = original["cache_metadata"]["actual_metadata"]
@@ -484,12 +484,6 @@ def run_index_query_selection(state, q_input, latent, cosine, sine, operands,
                      selected, lengths, compressed_indices, window_indices, query_rows]
     execute("sparse_controls", rank, case, controls_args,
             dict(selected=selected, lengths=lengths, compressed=compressed_indices, window=window_indices), "index_select")
-    if not hasattr(nodes, "enabled") or nodes.enabled:
-        nodes.update({"indexer.wq_b": index_qb[:query_rows].clone(),
-                      "indexer.weights_proj": weights_proj[:query_rows].clone(),
-                      "indexer.query_before_quantize": query_key[:query_rows].reshape(query_rows, 32, 128).clone(),
-                      "indexer.quantized_query_and_scale": (query_codes[:query_rows].clone(), query_scales[:query_rows].clone()),
-                      "indexer.selected_indices": selected[:query_rows].clone()})
     visible_lengths = zeros(capacity, dtype=torch.int32)
     ratio = state["role"]["ratio"]
     visible = [(position + 1) // ratio for position in q_positions[:query_rows].tolist()]
