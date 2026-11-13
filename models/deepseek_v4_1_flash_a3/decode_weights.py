@@ -16,7 +16,7 @@ PyPTO to own all device computation and quantization boundaries.
 from __future__ import annotations
 
 import json
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -40,6 +40,8 @@ class DecodeSafetensorsCheckpoint:
         self.weight_map: dict[str, str] = {str(name): str(shard) for name, shard in weight_map.items()}
         self.config = self._load_json("config.json")
         self.quantization_description = self._load_json("quant_model_description.json")
+        self._file_stack = None
+        self._open_files = {}
 
     def _load_json(self, name: str) -> dict[str, Any]:
         path = self.root / name
@@ -64,6 +66,19 @@ class DecodeSafetensorsCheckpoint:
         return path
 
     @contextmanager
+    def cached_files(self):
+        """Retain file handles during one layer's streaming weight conversion."""
+        if self._file_stack is not None:
+            raise RuntimeError("Checkpoint file-cache scopes cannot be nested")
+        with ExitStack() as stack:
+            self._file_stack = stack
+            try:
+                yield self
+            finally:
+                self._file_stack = None
+                self._open_files.clear()
+
+    @contextmanager
     def open_tensor(self, name: str) -> Iterator[Any]:
         """Yield one safetensors handle and the requested tensor name."""
 
@@ -72,6 +87,13 @@ class DecodeSafetensorsCheckpoint:
         except ImportError as exc:  # pragma: no cover - environment dependent
             raise RuntimeError("Aurora Decode weights require the safetensors package") from exc
         path = self.shard_for(name)
+        if self._file_stack is not None:
+            if path not in self._open_files:
+                self._open_files[path] = self._file_stack.enter_context(
+                    safe_open(str(path), framework="pt", device="cpu")
+                )
+            yield self._open_files[path], name
+            return
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             if name not in handle.keys():
                 raise KeyError(f"tensor {name!r} is not present in indexed shard {path}")

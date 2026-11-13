@@ -32,7 +32,7 @@ from .prefill_network_guard import NetworkStatePreservation
 from .prefill_network_state import NetworkCacheProvider
 from .prefill_network_input import run_input_boundary
 from .prefill_program import PrefillProgram, network_layer_geometry
-from .prefill_swa import prepare_product_operands
+from .weights import prepare_product_operands
 from .runtime_config import ExpertParallelConfig
 from .runtime_utils import communicate, file_sha, loaded_source_files, tensor_sha, write_json
 from .weights import CheckpointOperands
@@ -259,6 +259,11 @@ class NetworkExecutor:
         self.compiled = {}
         self.entry_abis = {}
         self.resident_abis = {}
+        self.call_timings = dict(entries={}, collectives={})
+        self.entry_names = {}
+        for entries in program.stages.values():
+            for name, entry in entries.items():
+                self.entry_names.setdefault(id(entry.compiled), name)
         # The public ChipWorker retains registrations until close (64 slots).
         # IO entries use only CPU boundaries; give them independent workers and
         # buffers so resident expert operands keep their original live owners.
@@ -281,13 +286,18 @@ class NetworkExecutor:
         """Bind one existing compiled entry to the generation's persistent worker."""
         if self.resident is None:
             raise ValueError("Ordinary execution requires an initialized resident runtime")
+        begin = perf_counter()
         key = id(entry.compiled)
         if key not in self.resident_abis:
             self.resident_abis[key] = network_parameter_abi(entry.compiled)
         self.resident.execute(entry.compiled, rank, arguments, self.resident_abis[key],
                               staged=key in self.staged_entries)
+        record = self.call_timings["entries"].setdefault(self.entry_names[key], dict(calls=0, seconds=0.0))
+        record["calls"] += 1
+        record["seconds"] += perf_counter() - begin
 
     def exchange(self, stage, values, collective, group, *, packets=False):
+        begin = perf_counter()
         if not stage or "/" in stage or ".." in stage:
             raise ValueError("HCCL stages require distinct safe chunk/layer identities")
         transport = values if packets else [{case: {"value": value} for case, value in row.items()} for row in values]
@@ -297,6 +307,9 @@ class NetworkExecutor:
             result, receipts = self.resident.exchange(stage, transport, collective, group)
         for rank, receipt in enumerate(receipts):
             self.reports[rank]["communication"].append(receipt)
+        record = self.call_timings["collectives"].setdefault(group + "/" + collective, dict(calls=0, seconds=0.0))
+        record["calls"] += 1
+        record["seconds"] += perf_counter() - begin
         if packets:
             return result
         return [{case: packet["value"] for case, packet in row.items()} for row in result]
@@ -528,18 +541,20 @@ def _network_owner_snapshot(provider, *, diagnostics=True):
 def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=False):
     """Allocate canonical cache owners and validate the complete original network ABI."""
     topology = contract["topology"]
-    if topology != dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1):
-        raise ValueError("The current network runtime requires DP4/TP4/EP16/PP1/PCP1/DCP1")
+    tp, dp = topology["tp"], topology["dp"]
+    if (tp not in (1, 2, 4) or dp * tp != 16
+            or topology != dict(dp=dp, tp=tp, ep=16, pp=1, pcp=1, dcp=1)):
+        raise ValueError("The network runtime requires EP16 with TP1/2/4 and PP1/PCP1/DCP1")
     if not all(contract["required_modes"].values()) or contract["capacity"] != 16 or contract["scheduler_capacity"] != 8192:
         raise ValueError("Retain the original model modes and bounded actual scheduler ABI")
     if contract.get("fresh_shared_initialization") != {"topk_indices": -1}:
         raise ValueError("Freeze the same deterministic initial TopK storage as the independent reference")
     engram_contracts = inputs.get("engram_contracts")
     if not isinstance(engram_contracts, dict) or set(engram_contracts) != {1, 14}:
-        raise ValueError("Real independent TP4 complete-table Engram slot contracts are still required")
+        raise ValueError("Complete checkpoint Engram contracts are required for both slots")
     for item in engram_contracts.values():
-        if item["topology"] != topology or len(item["engram_shards"]) != 4:
-            raise ValueError("A TP2 or diagnostic Engram contract cannot be reused as TP4")
+        if item["topology"] != topology or len(item["engram_shards"]) != tp:
+            raise ValueError("Engram table ownership must match the runtime topology")
 
     model_config = contract["model_config"]
     provider = NetworkCacheProvider(
@@ -564,6 +579,8 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
     Each item supplies inputs, its contract and every rank's metadata sources.
     The iterable advances only after the preceding complete chunk returns.
     """
+    runtime_begin = perf_counter()
+    runtime_timings = {}
     if "engram_lookup" not in inputs:
         raise ValueError("Prepare Engram rows on the host before calling the forward")
     if continuation is None:
@@ -578,8 +595,10 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
         except TypeError as error:
             raise ValueError("Continuation must be a chunk mapping or iterable") from error
     topology = contract["topology"]
-    if topology != dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1):
-        raise ValueError("The current network runtime requires DP4/TP4/EP16/PP1/PCP1/DCP1")
+    tp, dp = topology["tp"], topology["dp"]
+    if (tp not in (1, 2, 4) or dp * tp != 16
+            or topology != dict(dp=dp, tp=tp, ep=16, pp=1, pcp=1, dcp=1)):
+        raise ValueError("The network runtime requires EP16 with TP1/2/4 and PP1/PCP1/DCP1")
     from .runtime_config import configure_devices
 
     assigned = configure_devices(devices, world=topology["ep"])
@@ -596,8 +615,23 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
     program = compiled if compiled is not None else PrefillProgram(output / "compiled")
     if compiled is not None and not compiled.ready:
         raise ValueError("The supplied Prefill program is incomplete")
+    runtime_timings["validation_and_geometry_seconds"] = perf_counter() - runtime_begin
+    stage_begin = perf_counter()
     program.compile(provider, contract["model_config"], topology, inputs["engram_contracts"])
+    runtime_timings["compilation_seconds"] = perf_counter() - stage_begin
+    stage_begin = perf_counter()
     provider = prepare_network_provider(inputs, contract, output.name)
+    runtime_timings["cache_allocation_seconds"] = perf_counter() - stage_begin
+    stage_begin = perf_counter()
+
+    def finish(result):
+        export_begin = perf_counter()
+        if contract.get("export_state"):
+            provider.export_state(contract["export_state"])
+        runtime_timings["state_export_seconds"] = perf_counter() - export_begin
+        runtime_timings["body_seconds"] = perf_counter() - runtime_begin
+        return dict(result, runtime_timings=runtime_timings)
+
     with ExitStack() as stack:
         resident = None
         if diagnostics:
@@ -608,9 +642,13 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
             from .prefill_resident_weights import ResidentNetworkWeights
 
             resident = stack.enter_context(ResidentNetworkRuntime(assigned, topology))
-            weights = ResidentNetworkWeights(contract["checkpoint"], topology, contract["model_config"], resident)
-            stack.callback(weights.close)
-            weights.preload(progress)
+            if contract.get("weight_residency") == "layer_streaming":
+                weights = NetworkWeights(contract["checkpoint"], topology, contract["model_config"])
+                stack.callback(weights.release_current)
+            else:
+                weights = ResidentNetworkWeights(contract["checkpoint"], topology, contract["model_config"], resident)
+                stack.callback(weights.close)
+                weights.preload(progress)
             for family, values in (("raw", provider.arenas), ("shared", provider.shared)):
                 for rank, cases in enumerate(values):
                     for case, tensors in cases.items():
@@ -619,12 +657,13 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
                             resident.pin(value, [rank], readonly=False, name=f"{family}/{rank}/{case}/{name}")
         memory = CANNMemory(diagnostics=diagnostics)
         ownership = [weights.layout.ownership(rank) for rank in range(16)]
+        runtime_timings["runtime_initialization_and_upload_seconds"] = perf_counter() - stage_begin
         first = _run_network_chunk(inputs, contract=contract, output=output, provider=provider,
             weights=weights, memory=memory, ownership=ownership, assigned=assigned,
             engram_contracts=inputs["engram_contracts"], program=program, epoch=0,
             diagnostics=diagnostics, progress=progress, resident=resident)
         if continuation is None:
-            return first
+            return finish(first)
         completed = [first]
         previous_contract = contract
         fixed = ("topology", "checkpoint", "model_config", "required_modes", "capacity", "scheduler_capacity")
@@ -686,8 +725,8 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
             completed.append(result)
             previous_contract = next_contract
         if len(completed) == 1:
-            return first
-        return dict(completed[-1], completed_prefill_chunks=completed, complete_network_acceptance="not_run")
+            return finish(first)
+        return finish(dict(completed[-1], completed_prefill_chunks=completed, complete_network_acceptance="not_run"))
 
 
 def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, ownership,
@@ -695,6 +734,8 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
                        diagnostics=True, progress=None, resident=None):
     """Execute embedding, the complete backbone and the final head with persistent owners."""
     begin = perf_counter()
+    stage_timings = dict(layers=[])
+    layer_starts = {}
     initial_load_seconds, initial_load_calls = weights.load_seconds, weights.load_calls
     initial_read_seconds, initial_read_calls = weights.reader.read_seconds, weights.reader.read_calls
     topology, model_config = contract["topology"], contract["model_config"]
@@ -710,8 +751,9 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
     runtime = dict(
         topology=topology, assigned_devices=assigned, logical_rank_mapping=list(range(16)),
         source_root=str(Path(__file__).resolve().parents[2]), source_files={},
-        groups=dict(ep=[list(range(16))], tp=[list(range(dp * 4, dp * 4 + 4)) for dp in range(4)],
-                    dp=[[dp * 4 + lane for dp in range(4)] for lane in range(4)]),
+        groups=dict(ep=[list(range(topology["ep"]))],
+                    tp=[list(range(start, start + topology["tp"])) for start in range(0, topology["ep"], topology["tp"])],
+                    dp=[list(range(lane, topology["ep"], topology["tp"])) for lane in range(topology["tp"])]),
         status="executing_not_compared", epoch=epoch, namespace=namespace,
         input_contract_sha256=contract["input_contract_sha256"],
         state_regions_sha256=contract["state_regions"]["sha256"], diagnostics=diagnostics,
@@ -733,6 +775,8 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
     executor = NetworkExecutor(output, text, topology, provider, ownership, memory, runtime_path, reports,
                                program, namespace, diagnostics=diagnostics, resident=resident)
     executor.precheck()
+    stage_timings["setup_and_group_precheck_seconds"] = perf_counter() - begin
+    stage_begin = perf_counter()
     if "product_input_paths" in inputs:
         hidden, premix = load_product_backbone_input(
             inputs["product_input_paths"], input_contract=inputs["input_contract"], provider=provider,
@@ -740,6 +784,8 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
         )
     else:
         hidden, premix = embed_network_input(inputs["input_contract"], weights, executor, text, output / "embedding")
+    stage_timings["embedding_seconds"] = perf_counter() - stage_begin
+    stage_begin = perf_counter()
     hash_batch = provider.hash_batch()
     common_engram = engram_contracts[1]
     if progress is not None:
@@ -748,9 +794,9 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
     for item in engram_contracts.values():
         for name in ("token_map", "multipliers", "primes", "offsets"):
             if not torch.equal(item["hash_constants"][name], captured_constants[name]):
-                raise ValueError("TP4 Engram contract differs from actual captured hash constants")
+                raise ValueError("Engram contract differs from actual captured hash constants")
         if tuple(item["hash_constants"]["layer_ids"]) != (1, 14) or item["hash_constants"]["pad_id"] != captured_constants["pad_id"]:
-            raise ValueError("TP4 Engram contract differs from the original slot/pad layout")
+            raise ValueError("Engram contract differs from the original slot/pad layout")
     def observe_engram(layer, rank, case, observation):
         directory = output / "engram-discrete"
         directory.mkdir(exist_ok=True)
@@ -773,10 +819,12 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
     )
     for layer in (1, 14):
         prepared_engram.attach(layer, provider.state_handles_for_layer(layer))
+    stage_timings["engram_setup_seconds"] = perf_counter() - stage_begin
 
     discrete_pending = {}
 
     def runtime_for_layer(layer):
+        layer_starts[layer] = dict(begin=perf_counter(), weights=weights.load_seconds, reads=weights.reader.read_seconds)
         if progress is not None:
             progress(dict(stage="executing_layer", epoch=epoch, layer=layer))
         actual = executor.for_layer(layer)
@@ -790,6 +838,15 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
         return actual
 
     completed_layers = []
+
+    def finish_layer_timing(layer):
+        start = layer_starts[layer]
+        record = dict(layer=layer, seconds=perf_counter() - start["begin"],
+            weight_load_seconds=weights.load_seconds - start["weights"],
+            checkpoint_read_seconds=weights.reader.read_seconds - start["reads"])
+        stage_timings["layers"].append(record)
+        if progress is not None:
+            progress(dict(stage="layer_timing", epoch=epoch, **record))
 
     def observe_layer(layer, result):
         if diagnostics:
@@ -807,6 +864,7 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
                     torch.save(dict(hidden=result["hidden"][rank], pre_mix=result["pre_mix"][rank]),
                                output / f"rank-{rank}-actual-layer39-boundary.pt")
             weights.release_current()
+            finish_layer_timing(layer)
             return
         discrete = end_product_observation(provider, layer, result, discrete_pending.pop(layer))
         for rank in range(16):
@@ -835,18 +893,23 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
                 torch.save(dict(hidden=result["hidden"][rank], pre_mix=result["pre_mix"][rank]),
                            output / f"rank-{rank}-actual-layer39-boundary.pt")
         weights.release_current()
+        finish_layer_timing(layer)
 
     try:
+        stage_begin = perf_counter()
         result = run_prefill_network_inmemory(
             hidden, premix, batch_for_layer=provider.batch_for_layer, cache_for_layer=provider.cache_for_layer,
             weights_for_layer=weights.for_layer, runtime_for_layer=runtime_for_layer, observe_layer=observe_layer,
         )
+        stage_timings["backbone_seconds"] = perf_counter() - stage_begin
         if progress is not None:
             progress(dict(stage="executing_output_head", epoch=epoch))
+        stage_begin = perf_counter()
         output_result = run_output_boundary(
             result, batch=provider.batch_for_layer(39), topology=topology, config=text,
             weights=weights, executor=executor, output=output / "actual-layer39-output",
         )
+        stage_timings["head_seconds"] = perf_counter() - stage_begin
         if diagnostics:
             for rank in range(16):
                 torch.save(dict(raw=provider.arenas[rank], shared=provider.shared[rank], versions=provider.versions[rank],
@@ -856,6 +919,12 @@ def _run_network_chunk(inputs, *, contract, output, provider, weights, memory, o
                        actual_Layer39_boundary=True, final_output_files=output_result["files"], formal_accuracy="not_run")
         if resident is not None:
             runtime["resident_runtime"] = resident.summary()
+        stage_timings["total_seconds"] = perf_counter() - begin
+        stage_timings["call_timings"] = executor.call_timings
+        stage_timings["scope"] = "Host wall time; entry and collective totals are subsets of the enclosing stages"
+        stage_timings["weight_load_seconds"] = weights.load_seconds - initial_load_seconds
+        stage_timings["checkpoint_read_seconds"] = weights.reader.read_seconds - initial_read_seconds
+        runtime["stage_timings"] = stage_timings
         write_json(runtime_path, runtime)
         write_json(output / "execution.json", dict(
             at=datetime.now(timezone.utc).isoformat(), outcome="executed_actual_full40_Prefill_pending_independent_comparison",

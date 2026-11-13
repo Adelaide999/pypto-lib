@@ -22,9 +22,11 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 
 from .config import FLASH
+from .norm_rope import make_rope_tables
 from .decode_swa import (
     AUX_PAD,
     COUNT_PAD,
+    SIGNAL_PAD,
     D,
     EP_SIZE,
     LANE_ROWS,
@@ -89,6 +91,11 @@ OUTPUT = pl.jit.inline(
         16, HEADS, HEAD_DIM, FLASH.qk_rope_head_dim, FLASH.o_groups, O_RANK, HIDDEN
     )._func
 )
+COMPRESSED_ROPE = pl.jit.inline(make_rope_tables(
+    16, FLASH.qk_rope_head_dim, FLASH.compress_rope_theta,
+    dict(factor=FLASH.rope_factor, beta_fast=FLASH.beta_fast, beta_slow=FLASH.beta_slow,
+         original_max_position_embeddings=FLASH.original_max_position_embeddings),
+)._func)
 HC_PRE = make_hc_pre_inline(16, CONFIG)
 HC_POST = make_hc_post_inline(16, CONFIG)
 EP2_RANK = pl.jit.inline(decode_ep2_rank._func)
@@ -198,9 +205,9 @@ def _c1a_tail(
     lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
     lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[EP_SIZE, COUNT_PAD], pl.INT32],
-    lane_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    lane_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     slot_out: pld.DistributedTensor[[16 * TOPK, D], pl.FP32],
-    return_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    return_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     logits: pl.InOut[pl.Tensor[[16, N_EXPERTS], pl.FP32]],
     route_ids: pl.InOut[pl.Tensor[[16, TOPK], pl.INT32]],
     route_weights: pl.InOut[pl.Tensor[[16, TOPK], pl.FP32]],
@@ -290,8 +297,8 @@ def decode_layer_ep2_c1a_reuse_rank(
     cache: pl.InOut[pl.Tensor[[2, 128, 1, HEAD_DIM], pl.BF16]],
     cache_lens: pl.InOut[pl.Tensor[[2], pl.INT32]],
     compressed_cache: pl.InOut[pl.Tensor[[2, 128, 1, HEAD_DIM], pl.BF16]],
-    index_cache: pl.Tensor[[2, 128, 1, 128], pl.INT8],
-    index_scale: pl.Tensor[[2, 128, 1, 1], pl.FP16],
+    index_cache: pl.InOut[pl.Tensor[[2, 128, 1, 128], pl.INT8]],
+    index_scale: pl.InOut[pl.Tensor[[2, 128, 1, 1], pl.FP16]],
     attn_output: pl.InOut[pl.Tensor[[16, HIDDEN], pl.BF16]],
     attn_next_pre: pl.InOut[pl.Tensor[[16, HC], pl.FP32]],
     attn_post: pl.InOut[pl.Tensor[[16, HC], pl.FP32]],
@@ -325,9 +332,9 @@ def decode_layer_ep2_c1a_reuse_rank(
     lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
     lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[EP_SIZE, COUNT_PAD], pl.INT32],
-    lane_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    lane_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     slot_out: pld.DistributedTensor[[16 * TOPK, D], pl.FP32],
-    return_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    return_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     logits: pl.InOut[pl.Tensor[[16, N_EXPERTS], pl.FP32]],
     route_ids: pl.InOut[pl.Tensor[[16, TOPK], pl.INT32]],
     route_weights: pl.InOut[pl.Tensor[[16, TOPK], pl.FP32]],
@@ -390,8 +397,8 @@ def decode_layer_ep2_c1a_reuse(
     cache: pl.InOut[pl.Tensor[[EP_SIZE, 2, 128, 1, HEAD_DIM], pl.BF16]],
     cache_lens: pl.InOut[pl.Tensor[[EP_SIZE, 2], pl.INT32]],
     compressed_cache: pl.InOut[pl.Tensor[[EP_SIZE, 2, 128, 1, HEAD_DIM], pl.BF16]],
-    index_cache: pl.Tensor[[EP_SIZE, 2, 128, 1, 128], pl.INT8],
-    index_scale: pl.Tensor[[EP_SIZE, 2, 128, 1, 1], pl.FP16],
+    index_cache: pl.InOut[pl.Tensor[[EP_SIZE, 2, 128, 1, 128], pl.INT8]],
+    index_scale: pl.InOut[pl.Tensor[[EP_SIZE, 2, 128, 1, 1], pl.FP16]],
     attn_output: pl.InOut[pl.Tensor[[EP_SIZE, 16, HIDDEN], pl.BF16]],
     attn_next_pre: pl.InOut[pl.Tensor[[EP_SIZE, 16, HC], pl.FP32]],
     attn_post: pl.InOut[pl.Tensor[[EP_SIZE, 16, HC], pl.FP32]],
@@ -433,16 +440,16 @@ def decode_layer_ep2_c1a_reuse(
     lane_x_buf = pld.alloc_window_buffer([LANE_ROWS, D], dtype=pl.INT8)
     lane_aux_buf = pld.alloc_window_buffer([LANE_ROWS, AUX_PAD], dtype=pl.FP32)
     lane_count_buf = pld.alloc_window_buffer([EP_SIZE, COUNT_PAD], dtype=pl.INT32)
-    lane_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    lane_ready_buf = pld.alloc_window_buffer([EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     slot_out_buf = pld.alloc_window_buffer([16 * TOPK, D], dtype=pl.FP32)
-    return_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    return_ready_buf = pld.alloc_window_buffer([EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     for rank in pl.range(EP_SIZE):
         lane_x = pld.window(lane_x_buf, [LANE_ROWS, D], dtype=pl.INT8)
         lane_aux = pld.window(lane_aux_buf, [LANE_ROWS, AUX_PAD], dtype=pl.FP32)
         lane_count = pld.window(lane_count_buf, [EP_SIZE, COUNT_PAD], dtype=pl.INT32)
-        lane_ready = pld.window(lane_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
+        lane_ready = pld.window(lane_ready_buf, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
         slot_out = pld.window(slot_out_buf, [16 * TOPK, D], dtype=pl.FP32)
-        return_ready = pld.window(return_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
+        return_ready = pld.window(return_ready_buf, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
         decode_layer_ep2_c1a_reuse_rank(
             x_hc[rank], attn_hc_function[rank], attn_hc_scale[rank], attn_hc_base[rank], attn_incoming[rank],
             attn_norm_weight[rank], wq_a[rank], wq_a_scale[rank], q_norm_weight[rank], wq_b[rank], wq_b_scale[rank],
@@ -493,8 +500,8 @@ def decode_layer_ep2_c1a_full_rank(
     cache: pl.InOut[pl.Tensor[[2, 128, 1, HEAD_DIM], pl.BF16]],
     cache_lens: pl.InOut[pl.Tensor[[2], pl.INT32]],
     compressed_cache: pl.InOut[pl.Tensor[[2, 128, 1, HEAD_DIM], pl.BF16]],
-    index_cache: pl.Tensor[[2, 128, 1, 128], pl.INT8],
-    index_scale: pl.Tensor[[2, 128, 1, 1], pl.FP16],
+    index_cache: pl.InOut[pl.Tensor[[2, 128, 1, 128], pl.INT8]],
+    index_scale: pl.InOut[pl.Tensor[[2, 128, 1, 1], pl.FP16]],
     compressed_slots: pl.Tensor[[16], pl.INT64],
     positions32: pl.Tensor[[16], pl.INT32],
     requests: pl.Tensor[[16], pl.INT32],
@@ -543,9 +550,9 @@ def decode_layer_ep2_c1a_full_rank(
     lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
     lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[EP_SIZE, COUNT_PAD], pl.INT32],
-    lane_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    lane_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     slot_out: pld.DistributedTensor[[16 * TOPK, D], pl.FP32],
-    return_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    return_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     logits: pl.InOut[pl.Tensor[[16, N_EXPERTS], pl.FP32]],
     route_ids: pl.InOut[pl.Tensor[[16, TOPK], pl.INT32]],
     route_weights: pl.InOut[pl.Tensor[[16, TOPK], pl.FP32]],
@@ -570,13 +577,16 @@ def decode_layer_ep2_c1a_full_rank(
     # is a reindex consumer: it must retain L20's cache planes and only
     # recompute the target layer's QLI selection. Keep both schedules in one
     # ABI so the product fixture does not grow a second cache layout.
+    compressed_cos = pl.create_tensor([16, ROPE_PAIRS], dtype=pl.FP32)
+    compressed_sin = pl.create_tensor([16, ROPE_PAIRS], dtype=pl.FP32)
+    COMPRESSED_ROPE(positions, compressed_cos, compressed_sin, active)
     if c1_mode == 0:
         projected = pl.create_tensor([16, HEAD_DIM], dtype=pl.BF16)
         C1_PROJECT(attn_normed, compressor_wkv, projected, active)
         compressed = pl.create_tensor([16, HEAD_DIM], dtype=pl.BF16)
         index_key = pl.create_tensor([16, 128], dtype=pl.BF16)
         C1_PUBLISH(
-            projected, compressor_norm, index_wk, index_norm, rope_cos, rope_sin, positions,
+            projected, compressor_norm, index_wk, index_norm, compressed_cos, compressed_sin, positions,
             requests, compressed_slots, compressed, compressed_cache, index_key, index_cache,
             index_scale, source_positions, cache_lengths, active,
         )
@@ -585,7 +595,7 @@ def decode_layer_ep2_c1a_full_rank(
     index_query_scale = pl.create_tensor([16, 32], dtype=pl.FP16)
     index_weights = pl.create_tensor([16, 32], dtype=pl.FP16)
     INDEXER_PROJECTION(attn_normed, query_latent, index_wq_b, index_wq_b_scale,
-                       index_weights_proj, rope_cos, rope_sin, index_query, index_weights, active)
+                       index_weights_proj, compressed_cos, compressed_sin, index_query, index_weights, active)
     INDEXER_QUERY_QUANTIZE(index_query, index_payload, index_query_scale, active)
     index_key_flat = pl.reshape(index_cache, [INDEX_ROWS, 128])
     index_scale_flat = pl.reshape(index_scale, [INDEX_ROWS])
@@ -678,8 +688,8 @@ def decode_layer_ep2_c1a_full(
     cache: pl.InOut[pl.Tensor[[EP_SIZE, 2, 128, 1, HEAD_DIM], pl.BF16]],
     cache_lens: pl.InOut[pl.Tensor[[EP_SIZE, 2], pl.INT32]],
     compressed_cache: pl.InOut[pl.Tensor[[EP_SIZE, 2, 128, 1, HEAD_DIM], pl.BF16]],
-    index_cache: pl.Tensor[[EP_SIZE, 2, 128, 1, 128], pl.INT8],
-    index_scale: pl.Tensor[[EP_SIZE, 2, 128, 1, 1], pl.FP16],
+    index_cache: pl.InOut[pl.Tensor[[EP_SIZE, 2, 128, 1, 128], pl.INT8]],
+    index_scale: pl.InOut[pl.Tensor[[EP_SIZE, 2, 128, 1, 1], pl.FP16]],
     compressed_slots: pl.Tensor[[EP_SIZE, 16], pl.INT64],
     positions32: pl.Tensor[[EP_SIZE, 16], pl.INT32],
     requests: pl.Tensor[[EP_SIZE, 16], pl.INT32],
@@ -737,16 +747,16 @@ def decode_layer_ep2_c1a_full(
     lane_x_buf = pld.alloc_window_buffer([LANE_ROWS, D], dtype=pl.INT8)
     lane_aux_buf = pld.alloc_window_buffer([LANE_ROWS, AUX_PAD], dtype=pl.FP32)
     lane_count_buf = pld.alloc_window_buffer([EP_SIZE, COUNT_PAD], dtype=pl.INT32)
-    lane_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    lane_ready_buf = pld.alloc_window_buffer([EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     slot_out_buf = pld.alloc_window_buffer([16 * TOPK, D], dtype=pl.FP32)
-    return_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    return_ready_buf = pld.alloc_window_buffer([EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     for rank in pl.range(EP_SIZE):
         lane_x = pld.window(lane_x_buf, [LANE_ROWS, D], dtype=pl.INT8)
         lane_aux = pld.window(lane_aux_buf, [LANE_ROWS, AUX_PAD], dtype=pl.FP32)
         lane_count = pld.window(lane_count_buf, [EP_SIZE, COUNT_PAD], dtype=pl.INT32)
-        lane_ready = pld.window(lane_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
+        lane_ready = pld.window(lane_ready_buf, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
         slot_out = pld.window(slot_out_buf, [16 * TOPK, D], dtype=pl.FP32)
-        return_ready = pld.window(return_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
+        return_ready = pld.window(return_ready_buf, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
         decode_layer_ep2_c1a_full_rank(
             x_hc[rank], attn_hc_function[rank], attn_hc_scale[rank], attn_hc_base[rank], attn_incoming[rank],
             attn_norm_weight[rank], wq_a[rank], wq_a_scale[rank], q_norm_weight[rank], wq_b[rank], wq_b_scale[rank],

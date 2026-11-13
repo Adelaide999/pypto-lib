@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from .config import FLASH, AttentionMode
 from .decode_swa import (
     AUX_PAD,
     ATTENTION,
@@ -50,10 +51,12 @@ from .decode_engram import decode_layer_ep2_engram, decode_layer_ep2_engram_rank
 from .decode_c2a import decode_layer_ep2_sparse, decode_layer_ep2_sparse_rank
 
 
-C2A_LAYERS = (2, 3, 14, 15, 19)
+C2A_LAYERS = tuple(layer for layer in range(40) if FLASH.compress_ratios[layer] == 2)
 C1A_FULL_LAYERS = (20,)
-C1A_REINDEX_LAYERS = (24,)
-C1A_REUSE_LAYERS = (21, 25)
+C1A_REINDEX_LAYERS = tuple(layer for layer in FLASH.index_source_layer_ids if layer > 20)
+C1A_REUSE_LAYERS = tuple(
+    layer for layer in range(20, 40) if FLASH.layer_config(layer).mode == AttentionMode.REUSE
+)
 
 
 LAYER_ENTRIES = {

@@ -6,264 +6,250 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Feed actual greedy output tokens through persistent complete-network Prefill chunks."""
+"""Run checkpoint Prefill40, transfer request state and generate with Decode40."""
 
 import argparse
 from datetime import datetime, timezone
+import importlib.util
 import json
-import math
-import os
+import multiprocessing
 from pathlib import Path
-from time import monotonic
+import sys
+from time import perf_counter
 import traceback
 
 import torch
-from tokenizers import Tokenizer
-from torch.utils._python_dispatch import _disable_current_modes
 
-from .prefill_fwd import prefill_fwd
-from .prefill_network_guard import build_state_regions
-from .prefill_prepare import build_chunk_metadata, reserve_cache_layouts
-from .runtime_utils import file_sha, write_json
+from .runtime_config import configure_devices
+from .runtime_utils import write_json
 
 
-TOPOLOGY = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
+TOPOLOGY = dict(dp=16, tp=1, ep=16, pp=1, pcp=1, dcp=1)
 
 
-def atomic_json(path, value):
-    """Publish a small receipt with an atomic rename."""
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
-    temporary.replace(path)
+def run_prompt(checkpoint, tokens, devices, output, chunk_size, compile_only=False):
+    """Execute genuine Prefill in a process whose device workers end at the phase boundary."""
+    begin = perf_counter()
+    from .prefill_fwd import compile_prefill, prefill_fwd
+    from .prefill_prepare import checkpoint_cache
+
+    cache, config = checkpoint_cache(checkpoint, TOPOLOGY)
+    timings = dict(checkpoint_cache_preparation_seconds=perf_counter() - begin)
+    config.update(replicate_prompt=True, chunk_size=chunk_size, export_state=str(output / "handoff.pt"))
+    def progress(event):
+        print(json.dumps(dict(event, phase="prefill", at=datetime.now(timezone.utc).isoformat())), flush=True)
+    if compile_only:
+        program = compile_prefill(tokens, weights=checkpoint, cache=cache, config=config,
+            output=output / "prefill-compiled")
+        write_json(output / "prefill-compilation.json", program.summary())
+        return
+    stage_begin = perf_counter()
+    result = prefill_fwd(tokens, weights=checkpoint, cache=cache, config=config, devices=devices,
+        output=output / "prefill", diagnostics=False, progress=progress)
+    timings["forward_seconds"] = perf_counter() - stage_begin
+    timings["runtime"] = result["runtime_timings"]
+    chunks = result.get("completed_prefill_chunks", [result])
+    timings["chunks"] = [chunk["stage_timings"] for chunk in chunks]
+    timings["automatic_chunk_preparation_and_cleanup_seconds"] = timings["forward_seconds"] - timings["runtime"]["body_seconds"]
+    stage_begin = perf_counter()
+    if result["completed_layers"] != list(range(40)):
+        raise RuntimeError("Prefill did not complete every layer")
+    logits = torch.stack([row["fresh"][-1] for row in result["logits"]])
+    if list(logits.shape) != [16, 129280] or not torch.isfinite(logits).all():
+        raise RuntimeError("Prefill head did not produce a finite complete vocabulary row per rank")
+    torch.save(dict(logits=logits, tokens=logits.argmax(-1)), output / "prefill-head.pt")
+    timings["head_validation_and_save_seconds"] = perf_counter() - stage_begin
+    timings["child_seconds"] = perf_counter() - begin
+    write_json(output / "prefill-result.json", dict(status="executed", layers=40,
+        topology=TOPOLOGY, context_length=len(tokens), prefill_chunks=(len(tokens) + chunk_size - 1) // chunk_size,
+        logits_shape=list(logits.shape), finite=True, accuracy="not_run", timings=timings))
+    print("[generation] Prefill40+LMhead RUN PASS; state exported", flush=True)
 
 
-class FeedbackInputs:
-    """Own fixed original cache geometry and prepare controls for actual consumed token history."""
-
-    def __init__(self, checkpoint, assets, directory, prompt, maximum):
-        self.checkpoint, self.directory, self.prompt = checkpoint, directory, prompt
-        self.model = json.loads((checkpoint / "config.json").read_text())
-        self.base = json.loads((assets / "input-contract.json").read_text())
-        self.templates = torch.load(assets / "cache-ABI.pt", map_location="cpu", weights_only=True)
-        self.engram = torch.load(assets / "engram-contracts.pt", map_location="cpu", weights_only=True)["layers"]
-        if self.base["topology"] != TOPOLOGY or set(self.engram) != {1, 14}:
-            raise ValueError("Require the original complete DP4/TP4/EP16 cache and Engram contracts")
-        self.reservation = len(prompt["input_token_ids"]) + maximum
-        # Only original host metadata arithmetic is outside the product container-only guard.
-        with _disable_current_modes():
-            self.layouts, self.allocations, self.reserved = reserve_cache_layouts(self.templates, self.reservation)
-        self.identities = {name: record["sha256"] for name, record in prompt["assets"].items()}
-        self.directory.mkdir(parents=True, exist_ok=False)
-
-    def chunk(self, epoch, current, history, predecessor):
-        """Build positions, valid lengths, original aliases and lineage for one actual chunk."""
-        if not 1 <= len(current) <= 16 or len(history) + len(current) > self.reservation:
-            raise ValueError("Feedback exceeds the fixed query or persistent context reservation")
-        request = dict(request_slot=0, token_ids=list(current), history_tokens=list(history),
-            initial_context_length=len(history), live_token_mask=[1] * len(current),
-            position_ids=list(range(len(history), len(history) + len(current))))
-        actual = dict(topology=TOPOLOGY, checkpoint=str(self.checkpoint), checkpoint_sha256=self.identities,
-            epoch=epoch, predecessor_input_sha256=predecessor,
-            DP_engines=[dict(dp_rank=dp, active=len(current) if dp == 0 else 0,
-                            requests=[request] if dp == 0 else []) for dp in range(4)])
-        directory = self.directory / f"chunk-{epoch}"
-        directory.mkdir(exist_ok=False)
-        input_path = directory / "input-contract.json"
-        write_json(input_path, actual)
-        identity = file_sha(input_path)
-        payloads, sources = [], []
-        # These functions operate solely on integer scheduler controls, never model activations or logits.
-        with _disable_current_modes():
-            for rank, template in enumerate(self.templates):
-                payload = build_chunk_metadata(template, self.layouts[rank], self.allocations[rank],
-                    tokens=current, context=len(history), tp_rank=rank % 4, active=rank // 4 == 0,
-                    reserved=self.reserved)
-                payloads.append(payload)
-            regions = build_state_regions(payloads, identity)
-        for rank, payload in enumerate(payloads):
-            path = directory / f"rank-{rank}-metadata.pt"
-            torch.save(payload, path)
-            sources.append(dict(rank=rank, path=str(path), sha256=file_sha(path)))
-        region_path = directory / "state-regions.json"
-        write_json(region_path, regions)
-        contract = dict(topology=TOPOLOGY, checkpoint=str(self.checkpoint), model_config=self.model,
-            required_modes=self.base["required_modes"], capacity=16, scheduler_capacity=8192,
-            fresh_shared_initialization={"topk_indices": -1}, input_contract_path=str(input_path),
-            input_contract_sha256=identity, state_regions=dict(path=str(region_path), sha256=file_sha(region_path)))
-        cache = dict(cache_ABI=payloads, engram_contracts=self.engram,
-            cache_ABI_sources=[dict(rank=row["rank"], payload_sha256=row["sha256"], report_sha256=row["sha256"])
-                               for row in sources])
-        return dict(inputs=dict(input_contract=actual, prepare_input_stage=True), cache=cache,
-                    contract=contract, metadata_sources=sources)
-
-
-def load_prompt(path, checkpoint):
-    """Verify and re-encode the original chat template rather than a completion prompt."""
-    import importlib.util
-
-    prompt = json.loads(path.read_text())
-    for name, record in prompt["assets"].items():
-        if file_sha(checkpoint / name) != record["sha256"]:
-            raise ValueError("Original tokenizer/checkpoint metadata changed: " + name)
-    spec = importlib.util.spec_from_file_location("original_chat_encoder", checkpoint / "encoding/encoding.py")
-    encoder = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(encoder)
-    tokenizer = Tokenizer.from_file(str(checkpoint / "tokenizer.json"))
-    tokenizer.no_truncation()
-    tokenizer.no_padding()
-    rendered = encoder.encode_messages(prompt["messages"], thinking_mode=prompt["thinking_mode"])
-    ids = tokenizer.encode(rendered, add_special_tokens=False).ids
-    if rendered != prompt["rendered_prompt"] or ids != prompt["input_token_ids"]:
-        raise ValueError("Original chat template or exact prompt token IDs differ")
-    model = json.loads((checkpoint / "config.json").read_text())
-    eos = model.get("eos_token_id", model["text_config"].get("eos_token_id"))
-    if eos != prompt["eos_token_id"] or tokenizer.token_to_id("<｜end▁of▁sentence｜>") != eos:
-        raise ValueError("Original EOS identity differs")
-    return prompt, tokenizer
-
-
-def main():
-    """Run one actual public-leased greedy generation or a bounded metadata readiness check."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--assets", type=Path, required=True)
-    parser.add_argument("--prompt", type=Path, required=True)
-    parser.add_argument("--source-identity", type=Path, required=True)
-    parser.add_argument("--submission", type=Path)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--result", type=Path, required=True)
-    parser.add_argument("--check-only", action="store_true")
-    args = parser.parse_args()
-    args.output.mkdir(parents=True, exist_ok=False)
-    args.result.mkdir(parents=True, exist_ok=True)
-    prompt, tokenizer = load_prompt(args.prompt, args.checkpoint)
-    identity = json.loads(args.source_identity.read_text())
-    report = dict(at=datetime.now(timezone.utc).isoformat(), status="preparing", prompt=prompt["prompt"],
-        source=identity, checkpoint=str(args.checkpoint), tokenizer=prompt["assets"],
-        rendered_prompt=prompt["rendered_prompt"], input_token_ids=prompt["input_token_ids"],
-        eos_token_id=prompt["eos_token_id"], topology=TOPOLOGY, diagnostics=False,
-        initial_max_new_tokens=128, maximum_new_tokens=256, active_token_limit=128,
-        generated_token_ids=[], raw_decoded_answer="", steps=[], eos=False, truncated=False,
-        complete_answer_observed=False, accuracy="not_run", exit_code=None, device_computation="PyPTO only",
-        algorithm="Persistent-cache sequential Prefill feedback; one complete 40-layer forward per new token",
-        optional_intermediate_precision_captures_hash_gates=False)
-    start = monotonic()
-    generated, steps = report["generated_token_ids"], report["steps"]
-
-    def publish(event):
-        report.update(event)
-        report.update(updated_at=datetime.now(timezone.utc).isoformat(), elapsed_seconds=monotonic() - start)
-        atomic_json(args.result / "generation-result.json", report)
-        atomic_json(args.result / "status.json", dict(
-            at=report["updated_at"], stage=report.get("stage"), epoch=report.get("epoch"), layer=report.get("layer"),
-            task_id=report.get("task_id"), lease=report.get("lease"), actual_devices=report.get("actual_devices"),
-            status=report["status"], generated_tokens=len(generated), generated_token_ids=list(generated),
-            eos=report["eos"], truncated=report["truncated"], complete_answer_observed=report["complete_answer_observed"],
-            elapsed_seconds=report["elapsed_seconds"], result=str(args.result / "generation-result.json")))
-        print(json.dumps(event, ensure_ascii=False), flush=True)
-
-    (args.result / "answer.txt").write_text("")
-    publish(dict(stage="preparing_metadata"))
+def _prompt_process(settings):
+    """Publish failures before releasing the Prefill runtime process."""
     try:
-        builder = FeedbackInputs(args.checkpoint, args.assets, args.output / "prepared", prompt, 256)
-        history, current = [], list(prompt["input_token_ids"])
-        chunk = builder.chunk(0, current, history, None)
-        if args.check_only:
-            from .prefill_network_runtime import prepare_network_provider
-
-            provider = prepare_network_provider(dict(chunk["inputs"], **chunk["cache"]), chunk["contract"],
-                                                "generation-readiness", geometry_only=True)
-            geometry = provider.runtime_geometry()
-            if geometry["table_pages"] != 3 or provider.history.cache_rows != geometry["cache_blocks"] * 128:
-                raise ValueError("Reserved context/history geometry differs")
-            if [row["SP_valid_rows"] for row in provider.batch_for_layer(0)["cases"]["fresh"]] != [2] * 4 + [0] * 12:
-                raise ValueError("Original chat input is not mapped to its actual active TP rows")
-            publish(dict(status="host_interfaces_ready", stage="readiness_complete", geometry=geometry,
-                execution="not_run", compilation="not_run", reserved_context_tokens=builder.reservation, exit_code=0))
-            return
-        if args.submission is None:
-            raise ValueError("Actual generation requires its real public submission receipt")
-        submission = json.loads(args.submission.read_text())
-        job = Path(os.environ["DS41_JOB_ROOT"])
-        lease_path = job / "lease.json"
-        lease = json.loads(lease_path.read_text())
-        devices = [int(value) for value in os.environ["TASK_DEVICE"].split(",")]
-        if lease["assigned_devices"] != devices or len(devices) != 16:
-            raise ValueError("Actual device mapping differs from the leased public group")
-        report.update(task_id=submission["task_id"], lease=str(lease_path), lease_at_start=lease,
-                      actual_devices=devices, logical_rank_mapping=list(range(16)), status="executing")
-
-        from .engram_host import HostEngram
-
-        host = HostEngram(args.checkpoint, chunk["cache"]["engram_contracts"], args.output.name)
-
-        def feedback():
-            nonlocal chunk, current, history
-            for epoch in range(256):
-                network = args.output / "network"
-                chunk_output = network if epoch == 0 else network / f"continuation-chunk{epoch}"
-                execution = json.loads((chunk_output / "execution.json").read_text())
-                runtime = json.loads((chunk_output / "runtime_config.json").read_text())
-                if runtime["completed_layers"] != list(range(40)):
-                    raise RuntimeError("Greedy feedback requires an actual completed full40 forward")
-                logits_path = chunk_output / "actual-layer39-output/rank-0-fresh-network-logits.pt"
-                result = torch.load(logits_path, map_location="cpu", weights_only=True)
-                positions = list(range(len(history), len(history) + len(current)))
-                actual_positions = result["positions"]
-                if isinstance(actual_positions, torch.Tensor):
-                    actual_positions = actual_positions.tolist()
-                if (result["active"] != len(current) or actual_positions != positions
-                        or result["DP_rank"] != 0):
-                    raise RuntimeError("Final logits do not cover the actual request's last valid row")
-                row = result["logits"][len(current) - 1].tolist()
-                if len(row) != builder.model["text_config"]["vocab_size"] or not all(map(math.isfinite, row)):
-                    raise RuntimeError("Final valid vocabulary logits are incomplete or nonfinite")
-                token = max(range(len(row)), key=row.__getitem__)
-                generated.append(token)
-                steps.append(dict(step=epoch, input_contract=chunk["contract"]["input_contract_path"],
-                    input_sha256=chunk["contract"]["input_contract_sha256"], input_token_ids=list(current),
-                    positions=positions, context_length=len(history), valid_length=len(current),
-                    logits_path=str(logits_path), logits_sha256=file_sha(logits_path),
-                    last_valid_row=len(current) - 1, token_id=token, greedy_logit=row[token],
-                    timing=execution["timings"]))
-                report["raw_decoded_answer"] = tokenizer.decode(generated, skip_special_tokens=False)
-                (args.result / "answer.txt").write_text(report["raw_decoded_answer"])
-                atomic_json(args.result / "tokens.json", generated)
-                publish(dict(stage="generated_real_product_token", epoch=epoch, layer=None, token_id=token,
-                             raw_decoded_answer=report["raw_decoded_answer"]))
-                if token == prompt["eos_token_id"]:
-                    publish(dict(status="completed_eos", stage="generation_complete", eos=True,
-                                 stop_reason="eos", complete_answer_observed=True))
-                    return
-                if len(generated) == 128:
-                    publish(dict(stage="extending_token_limit", active_token_limit=256))
-                if len(generated) == 256:
-                    publish(dict(status="completed_token_limit", stage="generation_complete",
-                                 truncated=True, stop_reason="token_limit"))
-                    return
-                history += current
-                current = [token]
-                chunk = builder.chunk(epoch + 1, current, history, chunk["contract"]["input_contract_sha256"])
-                chunk["inputs"]["engram_lookup"] = host.lookup(chunk["inputs"], cache=chunk["cache"], config=chunk["contract"])
-                yield {name: chunk[name] for name in ("inputs", "contract", "metadata_sources")}
-
-        try:
-            chunk["inputs"]["engram_lookup"] = host.lookup(chunk["inputs"], cache=chunk["cache"], config=chunk["contract"])
-            result = prefill_fwd(chunk["inputs"], weights=args.checkpoint, cache=chunk["cache"],
-                config=chunk["contract"], devices=devices, output=args.output / "network",
-                continuation=feedback(), diagnostics=False, progress=publish)
-        finally:
-            host.close()
-        report["compilation"] = result["compilation"]
-        report["resident_runtime"] = result["resident_runtime"]
-        publish(dict(stage="generation_terminal", exit_code=0))
-    except BaseException as error:
-        failure = dict(error_type=type(error).__name__, error=str(error), traceback=traceback.format_exc())
-        atomic_json(args.result / "failure.json", failure)
-        publish(dict(status="failed", stage="functional_failure", exit_code=1, **failure))
+        run_prompt(**settings)
+    except BaseException:
+        write_json(settings["output"] / "prefill-failure.json", dict(traceback=traceback.format_exc()))
         raise
 
 
-if __name__ == "__main__":
-    main()
+def prepare_prompt(args):
+    """Load the tokenizer and render an optional single-user checkpoint chat template."""
+    from tokenizers import Tokenizer
 
+    from .prefill_prepare import tokenize_prompt
+
+    tokenizer = Tokenizer.from_file(str(args.checkpoint / "tokenizer.json"))
+    tokenizer.no_truncation()
+    tokenizer.no_padding()
+    model = json.loads((args.checkpoint / "config.json").read_text())
+    rendered = args.prompt
+    if args.chat:
+        spec = importlib.util.spec_from_file_location("checkpoint_chat_encoding", args.checkpoint / "encoding/encoding.py")
+        encoder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(encoder)
+        rendered = encoder.encode_messages([dict(role="user", content=args.prompt)], thinking_mode="chat")
+        raw = tokenizer.encode(rendered, add_special_tokens=False).ids
+    elif args.prompt is not None:
+        raw = tokenizer.encode(args.prompt).ids
+    else:
+        raw = [int(token) for token in args.tokens.split(",")]
+    tokens = tokenize_prompt(raw, args.checkpoint, model["text_config"]["vocab_size"])
+    return model, tokenizer, tokens, rendered
+
+
+def publish_token(output, tokenizer, generated, *, source, position, started):
+    """Write actual decoded text and return one timestamped token event."""
+    ids = [row[0] for row in generated]
+    raw_text = tokenizer.decode(ids, skip_special_tokens=False)
+    text = tokenizer.decode(ids, skip_special_tokens=True)
+    event = dict(step=len(generated), source=source, token_ids=generated[-1], token_id=ids[-1],
+        token_piece=tokenizer.id_to_token(ids[-1]), text=text, raw_text=raw_text,
+        logits_position=position, available_seconds=perf_counter() - started,
+        at=datetime.now(timezone.utc).isoformat())
+    (output / "answer.txt").write_text(text, encoding="utf-8")
+    (output / "raw-answer.txt").write_text(raw_text, encoding="utf-8")
+    write_json(output / "tokens.json", generated)
+    with (output / "token-events.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+    print("[generation-token] " + json.dumps(event, ensure_ascii=False), flush=True)
+    return event
+
+
+def main(argv=None):
+    """Generate a bounded greedy continuation on the caller's allocated sixteen devices."""
+    begin = perf_counter()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--devices", type=lambda value: [int(item) for item in value.split(",")])
+    parser.add_argument("--ep", type=int, choices=(16,), default=16)
+    parser.add_argument("--tp", type=int, choices=(1,), default=1)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--prompt", help="Raw completion text encoded with the checkpoint tokenizer")
+    inputs.add_argument("--tokens", help="Comma-separated explicit vocabulary token IDs")
+    parser.add_argument("--chat", action="store_true", help="Wrap --prompt with the checkpoint's chat template")
+    parser.add_argument("--max-new-tokens", type=int, default=3)
+    parser.add_argument("--chunk-size", type=int, default=16)
+    parser.add_argument("--ignore-eos", action="store_true", help="Run the fixed token count for execution acceptance")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args(argv)
+    if not args.compile_only and args.devices is None:
+        parser.error("Execution requires explicit allocated --devices")
+    if not 1 <= args.chunk_size <= 16 or args.max_new_tokens < 1:
+        parser.error("Require chunk size 1..16 and a positive new-token limit")
+    if args.chat and args.prompt is None:
+        parser.error("--chat requires a text --prompt")
+    if args.devices is not None:
+        configure_devices(args.devices, world=16)
+    model, tokenizer, tokens, rendered = prepare_prompt(args)
+    if len(tokens) + args.max_new_tokens - 1 > 256:
+        parser.error("Prompt plus consumed Decode tokens must fit the 256-position cache")
+    args.output = args.output.resolve()
+    args.output.mkdir(parents=True, exist_ok=False)
+    write_json(args.output / "prompt.json", dict(prompt=args.prompt, rendered_prompt=rendered,
+        input_ids=tokens, input_tokens=len(tokens), chat_template=args.chat,
+        checkpoint=str(args.checkpoint.resolve()), max_new_tokens=args.max_new_tokens,
+        topology=TOPOLOGY, assigned_devices=args.devices))
+    timings = dict(prompt_preparation_seconds=perf_counter() - begin, decode_steps=[])
+    stage_begin = perf_counter()
+    settings = dict(checkpoint=args.checkpoint, tokens=tokens, devices=args.devices, output=args.output,
+        chunk_size=args.chunk_size, compile_only=args.compile_only)
+    process = multiprocessing.get_context("spawn").Process(target=_prompt_process, args=(settings,))
+    process.start()
+    process.join()
+    timings["prefill_process_seconds"] = perf_counter() - stage_begin
+    if process.exitcode != 0:
+        raise RuntimeError(f"Prefill process failed with exit code {process.exitcode}; see prefill-failure.json")
+    # The parent has not initialized CANN before the distributed Decode workers fork.
+    # Decode's existing factories read their parallel specialization during import.
+    stage_begin = perf_counter()
+    if not any(arg == "--ep" or arg.startswith("--ep=") for arg in sys.argv):
+        sys.argv.extend(("--ep", "16"))
+    if not any(arg == "--tp" or arg.startswith("--tp=") for arg in sys.argv):
+        sys.argv.extend(("--tp", "1"))
+    from .decode_network import DecodeNetwork, DecodeState
+    from .decode_network_weights import DecodeNetworkWeights
+
+    network = DecodeNetwork(devices=args.devices, output=args.output / "decode",
+        progress=lambda event: print(json.dumps(dict(event, phase="decode", at=datetime.now(timezone.utc).isoformat())), flush=True))
+    timings["decode_network_preparation_seconds"] = perf_counter() - stage_begin
+    if args.compile_only:
+        write_json(args.output / "decode-compilation.json", network.compile())
+        print("[generation] Prefill40 + Decode40 + both heads COMPILE PASS; execution=not_run", flush=True)
+        return 0
+    stage_begin = perf_counter()
+    packet = torch.load(args.output / "handoff.pt", map_location="cpu", weights_only=True)
+    if (packet["checkpoint"] != str(args.checkpoint.resolve())
+            or packet["histories"] != [tokens] * 16 or packet["topology"] != TOPOLOGY):
+        raise RuntimeError("Prefill handoff belongs to another checkpoint, prompt or topology")
+    state = DecodeState.from_generation_state(packet)
+    write_json(args.output / "handoff.json", state.handoff)
+    timings["state_load_and_import_seconds"] = perf_counter() - stage_begin
+    stage_begin = perf_counter()
+    logits = torch.load(args.output / "prefill-head.pt", map_location="cpu", weights_only=True)["logits"]
+    timings["prefill_logits_load_seconds"] = perf_counter() - stage_begin
+    generated, phases, positions, events = [], [], [], []
+    eos = model.get("eos_token_id", model["text_config"].get("eos_token_id"))
+    stage_begin = perf_counter()
+    weights = DecodeNetworkWeights(args.checkpoint, 16)
+    timings["decode_weight_reader_preparation_seconds"] = perf_counter() - stage_begin
+    timings["selection_text_and_save_seconds"] = 0.0
+    timings["decode_compilation_seconds"] = 0.0
+    try:
+        for step in range(args.max_new_tokens):
+            stage_begin = perf_counter()
+            current = logits.argmax(-1).tolist()
+            generated.append(current)
+            phases.append("prefill" if step == 0 else "decode")
+            positions.append([len(history) - 1 for history in state.histories])
+            events.append(publish_token(args.output, tokenizer, generated, source=phases[-1],
+                position=positions[-1][0], started=begin))
+            timings["selection_text_and_save_seconds"] += perf_counter() - stage_begin
+            if (not args.ignore_eos and all(token == eos for token in current)) or step + 1 == args.max_new_tokens:
+                break
+            if not network.compiled:
+                stage_begin = perf_counter()
+                write_json(args.output / "decode-compilation.json", network.compile())
+                timings["decode_compilation_seconds"] = perf_counter() - stage_begin
+            stage_begin = perf_counter()
+            logits = network.step(current, weights=weights, state=state)
+            timings["decode_steps"].append(dict(epoch=state.epoch, seconds=perf_counter() - stage_begin,
+                details=network.last_timings))
+            write_json(args.output / "timings-partial.json", timings)
+        stage_begin = perf_counter()
+        weights.close()
+        network.close()
+        timings["decode_cleanup_seconds"] = perf_counter() - stage_begin
+        timings["prefill"] = json.loads((args.output / "prefill-result.json").read_text())["timings"]
+        timings["time_to_first_token_seconds"] = events[0]["available_seconds"]
+        timings["inter_token_seconds"] = [b["available_seconds"] - a["available_seconds"] for a, b in zip(events, events[1:])]
+        timings["total_seconds"] = perf_counter() - begin
+        exclusive = ("prompt_preparation_seconds", "prefill_process_seconds", "decode_network_preparation_seconds",
+            "state_load_and_import_seconds", "prefill_logits_load_seconds", "decode_weight_reader_preparation_seconds",
+            "selection_text_and_save_seconds", "decode_compilation_seconds", "decode_cleanup_seconds")
+        accounted = sum(timings[name] for name in exclusive) + sum(row["seconds"] for row in timings["decode_steps"])
+        timings["other_host_seconds"] = timings["total_seconds"] - accounted
+        timings["scope"] = "One real generation; host wall seconds from main entry, excluding queue, shell environment activation and Python module imports"
+        write_json(args.output / "timings.json", timings)
+        report = dict(status="executed", topology=TOPOLOGY, prompt_ids=tokens, generated_ids=generated,
+            token_sources=phases, logits_positions=positions, prefill_layers=40, decode_layers=40,
+            decode_steps=state.epoch, final_context_lengths=[len(h) for h in state.histories],
+            stop_reason="eos" if not args.ignore_eos and all(token == eos for token in generated[-1]) else "token_limit",
+            handoff=state.handoff, finite=True, accuracy="not_run", seconds=timings["total_seconds"],
+            prompt=args.prompt, chat_template=args.chat, generated_text=events[-1]["text"],
+            raw_generated_text=events[-1]["raw_text"], timings_file=str(args.output / "timings.json"))
+        write_json(args.output / "result.json", report)
+        print("[generated-text] " + events[-1]["text"], flush=True)
+        print("[generation] Prefill40 -> state handoff -> Decode40 RUN PASS; accuracy=not_run; "
+            + json.dumps(report), flush=True)
+    finally:
+        weights.close()
+        network.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

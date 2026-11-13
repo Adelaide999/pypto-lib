@@ -6,13 +6,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Host-only adapter from Aurora safetensors to the PyPTO EP2 weight ABI.
+"""Host-only adapter from Aurora safetensors to the PyPTO Decode weight ABI.
 
 The checkpoint stores logical row-major W8A8 matrices.  The routed-expert
 kernel consumes NZ matrices and an aligned W2 reduction width, while the
 shared-expert kernel consumes logical matrices and performs its own packing.
-This module owns that representation change and is intentionally outside the
-PyPTO product import closure.  It never executes model computation.
+This module owns that representation change in the host weight-loading path.
+It never executes model computation.
 """
 
 from __future__ import annotations
@@ -127,13 +127,16 @@ def iter_routed_experts(
     checkpoint: DecodeSafetensorsCheckpoint,
     layer: int,
     rank: int,
+    *,
+    ep_size: int = 2,
 ) -> Iterator[tuple[int, dict[str, torch.Tensor]]]:
-    """Yield the 192 owner experts without retaining a second full shard."""
+    """Yield one rank's owner experts without retaining a second full shard."""
 
-    if rank not in (0, 1):
-        raise ValueError(f"EP2 rank must be 0 or 1, got {rank}")
-    first = rank * LOCAL_EXPERTS
-    for expert in range(first, first + LOCAL_EXPERTS):
+    if ep_size not in (2, 16) or not 0 <= rank < ep_size:
+        raise ValueError("Require a logical rank in an EP2 or EP16 group")
+    count = EXPERTS // ep_size
+    first = rank * count
+    for expert in range(first, first + count):
         yield expert, pack_routed_expert(checkpoint, layer, expert)
 
 
@@ -141,8 +144,10 @@ def load_routed_shard(
     checkpoint: DecodeSafetensorsCheckpoint,
     layer: int,
     rank: int,
+    *,
+    ep_size: int = 2,
 ) -> dict[str, torch.Tensor]:
-    """Materialize one complete 192-expert EP2 shard in external NZ layout.
+    """Materialize one rank's complete EP2 or EP16 shard in external NZ layout.
 
     The ``pl.NZ`` annotation is logical in the Python signature, but the
     distributed host ABI passes the compiler's physical five-dimensional
@@ -151,20 +156,17 @@ def load_routed_shard(
     validation runner from silently treating packed bytes as row-major data.
     """
 
-    entries = [packed for _, packed in iter_routed_experts(checkpoint, layer, rank)]
-
-    def stack_nz(name: str, rows: int, cols: int) -> torch.Tensor:
-        value = torch.stack([entry[name] for entry in entries])
-        return value.reshape(LOCAL_EXPERTS, cols // 32, rows // 16, 16, 32).contiguous()
-
-    return {
-        "routed_w1": stack_nz("w1", INTERMEDIATE, HIDDEN),
-        "routed_w1_scale": torch.stack([entry["w1_scale"] for entry in entries]),
-        "routed_w3": stack_nz("w3", INTERMEDIATE, HIDDEN),
-        "routed_w3_scale": torch.stack([entry["w3_scale"] for entry in entries]),
-        "routed_w2": stack_nz("w2", HIDDEN, INTERMEDIATE_PADDED),
-        "routed_w2_scale": torch.stack([entry["w2_scale"] for entry in entries]),
-    }
+    result = {}
+    for index, (_, packed) in enumerate(iter_routed_experts(checkpoint, layer, rank, ep_size=ep_size)):
+        for name, value in packed.items():
+            target = "routed_" + name
+            if not name.endswith("_scale"):
+                rows, cols = value.shape
+                value = value.reshape(cols // 32, rows // 16, 16, 32)
+            if target not in result:
+                result[target] = torch.empty((EXPERTS // ep_size, *value.shape), dtype=value.dtype)
+            result[target][index].copy_(value)
+    return result
 
 
 def load_router(checkpoint: DecodeSafetensorsCheckpoint, layer: int) -> dict[str, torch.Tensor]:

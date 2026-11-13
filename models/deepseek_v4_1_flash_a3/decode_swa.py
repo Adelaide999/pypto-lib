@@ -25,6 +25,7 @@ from .config import FLASH
 from .decode_moe import (
     AUX_PAD,
     COUNT_PAD,
+    SIGNAL_PAD,
     D,
     EP_SIZE,
     LANE_ROWS,
@@ -118,9 +119,9 @@ def decode_layer_ep2_rank(
     lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
     lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[EP_SIZE, COUNT_PAD], pl.INT32],
-    lane_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    lane_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     slot_out: pld.DistributedTensor[[T * TOPK, D], pl.FP32],
-    return_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    return_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     logits: pl.InOut[pl.Tensor[[T, N_EXPERTS], pl.FP32]],
     route_ids: pl.InOut[pl.Tensor[[T, TOPK], pl.INT32]],
     route_weights: pl.InOut[pl.Tensor[[T, TOPK], pl.FP32]],
@@ -299,16 +300,16 @@ def decode_layer_ep2(
     lane_x_buf = pld.alloc_window_buffer([LANE_ROWS, D], dtype=pl.INT8)
     lane_aux_buf = pld.alloc_window_buffer([LANE_ROWS, AUX_PAD], dtype=pl.FP32)
     lane_count_buf = pld.alloc_window_buffer([EP_SIZE, COUNT_PAD], dtype=pl.INT32)
-    lane_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    lane_ready_buf = pld.alloc_window_buffer([EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     slot_out_buf = pld.alloc_window_buffer([T * TOPK, D], dtype=pl.FP32)
-    return_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    return_ready_buf = pld.alloc_window_buffer([EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     for rank in pl.range(EP_SIZE):
         lane_x = pld.window(lane_x_buf, [LANE_ROWS, D], dtype=pl.INT8)
         lane_aux = pld.window(lane_aux_buf, [LANE_ROWS, AUX_PAD], dtype=pl.FP32)
         lane_count = pld.window(lane_count_buf, [EP_SIZE, COUNT_PAD], dtype=pl.INT32)
-        lane_ready = pld.window(lane_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
+        lane_ready = pld.window(lane_ready_buf, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
         slot_out = pld.window(slot_out_buf, [T * TOPK, D], dtype=pl.FP32)
-        return_ready = pld.window(return_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
+        return_ready = pld.window(return_ready_buf, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
         decode_layer_ep2_rank(
             x_hc[rank],
             attn_hc_function[rank],

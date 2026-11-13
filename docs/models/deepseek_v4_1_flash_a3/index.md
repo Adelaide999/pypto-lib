@@ -9,15 +9,16 @@ See [Decode](decode.md) for its independent entry points and evidence scope.
 
 ## Development priorities
 
-- Performance target: complete-network correctness and continuous generation
-  with generation-scoped workers, compute weights, caches and communication,
-  retaining Eco-Tech real W8A8, 384 routed experts, Top6 and original Engram state.
-- Deferred performance work: fused device layer scheduling and final throughput
-  tuning. Residency is an active target; elapsed-time improvements require
-  measurements on an allocated device group.
+- Performance target: execute genuine Prefill40, transfer its state, and run
+  continuous Decode40 on a common DP16/TP1/EP16 topology, retaining Eco-Tech real
+  W8A8, 384 routed experts, Top6 and original Engram state.
+- Deferred performance work: full weight residency, fused scheduling, throughput
+  optimization, CP/SP expansion and slot reuse. Numerical and vLLM comparison
+  are deferred for this execution milestone.
 - Compatibility requirements: preserve original layer roles, byte aliases,
   cache/source lifetime, quantization, dtypes, and explicit DP/TP/EP mappings.
-  TP1/TP2 fixed-16 full-network compatibility remains unvalidated.
+  TP2 fixed-16 full-network compatibility remains unvalidated; TP1 execution
+  evidence is scoped to the bounded generation case below.
 
 ## Evidence and scope
 
@@ -28,11 +29,13 @@ See [Decode](decode.md) for its independent entry points and evidence scope.
 | Early four layers | DP4 / TP4 / EP16, PP1 / PCP1 / DCP1 |
 | Late seven layers | DP2 / TP2 / EP4, PP1 / PCP1 / DCP1 |
 | Exported latest network implementation | Full original 40-layer composition, DP4 / TP4 / EP16, capacity 16 |
+| Current 40-layer Decode implementation | Host schedule plus embedding / Engram / LM head, DP16 / TP1 / EP16; two consecutive real-weight tokens completed with finite logits |
 | Full-network accuracy and actual L39 output | Not established at export; original task validation was in progress |
-| Fixed-16 TP1/TP2 full-network compatibility | Not established |
+| Fixed-16 TP1 Prefill and Decode execution | Prefill40 → state handoff → two Decode40 steps and all heads completed; three generated token IDs |
+| Fixed-16 TP2 full-network compatibility | Not established |
 | Full real-weight and both Engram tables in HBM | Not established by code or host weight-byte counts |
-| Dataset score / full-network Decode / serving integration | Not established by this delivery |
-| Relocated package device execution | Not run; HOST checks do not replace NPU validation |
+| Dataset score / serving integration | Not established by this delivery |
+| Relocated package device execution | Complete Prefill-to-Decode generation executed on DP16/TP1/EP16; numerical accuracy remains unvalidated |
 
 Independent alignment uses the same complete-layer inputs and legal source/cache
 state for product and reference. Floating tensors retain the original
@@ -46,6 +49,99 @@ Git blob and SHA256, its identity at independent-layer admission, and normalized
 definition hashes. It distinguishes later network changes from admitted files.
 The original source names in this manifest are intentional provenance.
 
+## Prefill to Decode generation
+
+`generate.py` builds metadata directly from the selected checkpoint and its
+original tokenizer. It runs genuine Prefill operators for the prompt, exports
+completed request state, then feeds greedy tokens through the Decode network.
+Both phases use DP16/TP1/EP16 with PP1/PCP1/DCP1. The initial execution entry
+replicates one prompt across the sixteen DP engines, with one fixed request
+slot per rank. Each phase executes all forty original layers and its LM head.
+
+```bash
+# Submit this command through the site allocator for sixteen devices.
+python -m models.deepseek_v4_1_flash_a3.generate \
+  --checkpoint "$CHECKPOINT" --ep 16 --tp 1 --devices "$TASK_DEVICE" \
+  --tokens 0,1,2 --max-new-tokens 3 --ignore-eos \
+  --output build_output/ds41-generation
+```
+
+Use `--prompt "text"` for raw completion text and add `--chat` to render the
+checkpoint's original single-user chat template in chat mode. Use
+`--chunk-size 1..16` for prompt chunks, or `--compile-only` for device-free compilation. The prompt plus the
+consumed Decode tokens must fit 256 positions. By default generation stops
+when every rank selects EOS; `--ignore-eos` requests a fixed execution count.
+The first generated token comes from the final prompt row; three new tokens
+therefore execute two Decode steps.
+
+Weights stream by layer. Engram rows come from checkpoint file mappings,
+without copying complete tables into shared memory. Prefill owns persistent
+workers and HCCL groups within its process. That process exits before Decode
+workers start. This phase boundary is deliberate because the existing Decode
+runtime forks workers and requires a parent without initialized CANN state.
+
+`handoff.pt` stores forty SWA owners in logical token order, the C2 sources at
+layers 2/8/14, the C1 source at layer 20, index codes/scales, compressor rings,
+selection owners, the candidate pool, and token/Engram history. Import retains
+source aliases, remaps physical pages into dense Decode storage, and checks
+copied tensor bytes. Odd prompt lengths retain the incomplete C2 pair in the
+32-row compressor ring. Route/dispatch/combine scratch is rebuilt after the
+preceding token has fully combined.
+
+`prefill-result.json`, `handoff.json`, `decode/step-*.json` and `result.json`
+record actual phase completion, transferred bytes, next positions, finite
+vocabulary output, and generated token IDs. Execution acceptance does not
+establish numerical accuracy. Host transfer checks cover contexts 1, 3, 127,
+128, 129 and 255, including odd compression boundaries and page crossings.
+
+Each selected token updates `answer.txt`, `raw-answer.txt`, `tokens.json` and
+`token-events.jsonl` using the original tokenizer. Text output represents
+logical rank 0; token events retain all sixteen rank IDs. `timings.json`
+records one generation's host wall time from entry into `main`, including
+compilation, weight streaming, transfers and runtime overhead. It excludes
+the allocator queue, shell activation and Python module imports. Top-level
+phases and Decode step durations partition the total with an explicit host
+remainder. Prefill runtime/chunk/layer/call timings and Decode layer timings
+are nested breakdowns, not additional time to add to their enclosing phases.
+First-token and inter-token times come from the actual selected-token events.
+`timings-partial.json` is saved after each completed Decode step.
+
+### Execution acceptance, 2026-11-12/13
+
+The real `DeepSeek-V4.1-Flash-w8a8` checkpoint completed the complete pipeline
+on allocated physical devices 0 through 15. The run exited with code 0 and
+printed:
+
+```text
+[generation] Prefill40 -> state handoff -> Decode40 RUN PASS; accuracy=not_run
+```
+
+| Check | Observed result |
+| --- | --- |
+| Topology | DP16 / TP1 / EP16, PP1 / PCP1 / DCP1 in both phases |
+| Prompt | `[0, 1, 2]`, replicated across sixteen fixed request slots; one Prefill chunk |
+| Prefill | Layers 0..39, both Engram slots and final LM head completed |
+| Handoff | 9,613,504 cache bytes copied and checked; forty SWA owners and sources 2/8/14/20 |
+| Odd C2 boundary | Residual 1 retained; first Decode consumed position 3 |
+| Decode | Two consecutive complete 40-layer forwards, both Engram slots and both LM heads completed |
+| Generated IDs | `[50388, 777, 777]` on every rank; token sources Prefill / Decode / Decode |
+| Position continuity | Logit positions 2 → 3 → 4; final consumed context length 5 |
+| Vocabulary output | Each phase returned finite logits with shape `[16, 129280]` |
+| Observed elapsed time | Prefill 602.56 s; Decode steps 1220.88 s and 1157.13 s; total 3121.68 s |
+| Numerical/reference acceptance | Not run |
+
+These elapsed times include host scheduling and layer weight streaming.
+The run artifacts are under `build_output/ds41-generation-tp1-r1/`, including
+`verification.json`, `result.json`, `handoff.pt`, `handoff-byte-verification.json`,
+the actual Prefill head and both Decode output tensors. Verification checks
+that each generated ID is the argmax of its saved vocabulary output and that
+the next full forward consumes that generated token at the next position.
+This execution case covers a single prompt chunk and two Decode steps;
+multichunk Prefill device acceptance and contexts beyond this short prompt
+remain outside this run's evidence. Host metadata planning additionally passed
+2048 tokens in 128 chunks, and host transfer fixtures cover the six boundary
+contexts listed above.
+
 ## Code structure and entry points
 
 | Responsibility | Implementation |
@@ -54,8 +150,9 @@ The original source names in this manifest are intentional provenance.
 | Shared-computation L2 regions and exact argument bindings | `prefill_l2.py` |
 | Complete layer | `prefill_layer.make_prefill_layer_entries`, `run_prefill_layer_inmemory` |
 | Original 40-layer composition | `prefill_layer.run_prefill_network_inmemory` |
+| 40-layer Decode schedule and persistent host state | `decode_fwd.py --network`, `decode_network.py` |
 | Actual checkpoint, persistent state, HCCL and L39 head | `prefill_network_runtime.run_network_runtime` |
-| Input embedding / HC and final output kernels | `prefill_embedding.py`, `prefill_network_input.py`, `prefill_output.py` |
+| Input embedding / HC and final output kernels | `embedding.py`, `prefill_network_input.py`, `prefill_output.py`, `decode_head.py` |
 | SWA and C2/C1 attention | `prefill_swa.py`, `prefill_c2a*.py`, `prefill_compressed_reuse.py`, `prefill_sparse_attention.py`, `prefill_c1a.py` |
 | Persistent source/cache ownership | `prefill_network_state.py`, `prefill_network_cache.py`, `prefill_layer_state.py` |
 | Two Engram slots and singleton history | `engram_host.py`, `prefill_network_engram.py`, `prefill_engram_runtime.py`, `engram_storage.py` |
@@ -216,9 +313,10 @@ The CLI, automatic input preparation and `generate` caller perform this step.
 No Engram table is registered with CANN or passed as a device address. Forward
 kernels consume rank-local `[capacity, 6144]` BF16 rows for projection and gating;
 the forward also publishes the existing compressed slot history once per chunk.
-The A3 package currently has no `decode_fwd` entry: single-token feedback uses
-this same ready-row Prefill interface. A future Decode entry can consume the
-same host-prepared rows without moving the table into its graph.
+This Prefill interface can still process single-token feedback. The separate
+[40-layer Decode entry](decode.md#40-layer-network) reads sparse rows from the
+same checkpoint tables and retains its own per-request histories; it does not
+yet consume a Prefill cache state.
 
 `python -m models.deepseek_v4_1_flash_a3.validate_engram_host` checks small real
 safetensors backings, exact group32 row values, chunk history, image masks,
@@ -436,8 +534,10 @@ The original A3 source manifest remains unchanged.
 
 ## A5-style generation-scoped construction
 
-Ordinary `prefill_fwd(..., diagnostics=False)` and `generate.py` now construct
-one resident runtime around the entire lazy chunk/token stream. This follows
+The existing `prefill_fwd(..., diagnostics=False)` residency policy constructs
+one runtime around the complete lazy Prefill chunk stream. The generation entry
+selects `weight_residency="layer_streaming"`; callers that omit this setting
+retain the complete weight preload described below. This follows
 the resource lifetime used by A5 `prefill_fwd.py::generate`, while retaining
 A3 Eco-Tech W8A8, DP4/TP4/EP16 and the existing arithmetic. A3 does not import
 A5 MXFP8/MXFP4 operands or substitute its communication order.
@@ -471,8 +571,8 @@ backbone graph. Reports explicitly set `single_device_graph: false` and retain
 an actual diagnostic consumer rather than a generation performance fallback.
 An allocation, worker or collective failure aborts generation and attempts to
 release the owned resources. A poisoned device can also fail during cleanup;
-the observed second-token failure below includes this case. Generation does
-not silently fall back to checkpoint streaming.
+the observed second-token failure below includes this case. The requested weight residency policy is explicit; allocation failures do not
+change it.
 
 `resident_runtime` records initializations, allocated compute-weight/state
 bytes per rank, actual dispatch/transfer counts and H2D/D2H traffic. Startup

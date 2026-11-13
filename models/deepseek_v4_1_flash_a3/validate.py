@@ -18,6 +18,7 @@ if __package__ in (None, ""):
 import ast
 import json
 from pathlib import Path
+from time import perf_counter
 
 from .config import FLASH
 from .runtime_config import ExpertParallelConfig
@@ -348,6 +349,7 @@ def check_chunk_continuation():
                     yield packet
 
             namespace = dict(__package__=__package__, Mapping=Mapping, ExitStack=ExitStack, Path=Path, json=json,
+                perf_counter=perf_counter,
                 NetworkWeights=Weights, NetworkCacheProvider=Provider, file_sha=sha,
                 prepare_network_provider=prepare_provider, PrefillProgram=Program,
                 attach_network_cache_geometry=lambda provider: None, _network_owner_snapshot=snapshot,

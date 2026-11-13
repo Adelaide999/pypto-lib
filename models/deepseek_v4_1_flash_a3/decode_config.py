@@ -91,10 +91,12 @@ class DecodeParallelConfig:
         }
 
 
+_EP = _parse_parallel_size("ep", 16)
+_TP = _parse_parallel_size("tp", 1 if _EP == 2 else 2)
 DECODE_PARALLEL = DecodeParallelConfig(
-    dp=_parse_parallel_size("dp", 8),
-    tp=_parse_parallel_size("tp", 2),
-    ep=_parse_parallel_size("ep", 16),
+    dp=_parse_parallel_size("dp", _EP // _TP),
+    tp=_TP,
+    ep=_EP,
     pp=_parse_parallel_size("pp", 1),
     pcp=_parse_parallel_size("pcp", 1),
     dcp=_parse_parallel_size("dcp", 1),

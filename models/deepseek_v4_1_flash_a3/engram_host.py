@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 from .engram_hash import HashLayout, hash_ids
-from .engram_storage import SharedEngramArray
+from .engram_storage import MappedEngramArray, SharedEngramArray
 
 
 def lookup_columns(codes, scales, rows):
@@ -86,9 +86,13 @@ class HostEngram:
         if key not in self.arrays:
             suffix, width, dtype = {"codes": ("weight", 256, "I8"), "scales": ("scale", 8, "F32")}[kind]
             shard = self.contracts[layer]["engram_shards"][rank]
-            array = SharedEngramArray(self.checkpoint, f"layers.{layer}.engram.embed.{suffix}",
-                shard["row_range"], width, dtype, shard["host_payload_sha256"][kind],
-                f"{self.namespace}-L{layer}-tp{rank}-{kind}")
+            if self.contracts[layer].get("host_storage") == "checkpoint_file_mapping":
+                array = MappedEngramArray(self.checkpoint, f"layers.{layer}.engram.embed.{suffix}",
+                    shard["row_range"], width, dtype)
+            else:
+                array = SharedEngramArray(self.checkpoint, f"layers.{layer}.engram.embed.{suffix}",
+                    shard["row_range"], width, dtype, shard["host_payload_sha256"][kind],
+                    f"{self.namespace}-L{layer}-tp{rank}-{kind}")
             self._stack.callback(array.close)
             self.arrays[key] = array
         return self.arrays[key]
@@ -176,3 +180,26 @@ class HostEngram:
             checkpoint=self.checkpoint, topology=deepcopy(topology), capacity=capacity, cases={"fresh": records},
             storage={str(key): dict(array.receipt) for key, array in self.arrays.items()},
             hash_constants=self.constants)
+
+
+def load_rotation(checkpoint, hidden_size):
+    """Load and validate repeated block32 checkpoint rotation by byte identity."""
+    from safetensors import safe_open
+
+    from .runtime_utils import file_sha
+
+    path = Path(checkpoint) / "optional/quarot.safetensors"
+    if not path.is_file():
+        raise FileNotFoundError("The physical A3 Engram requires its checkpoint rotation")
+    with safe_open(path, framework="pt", device="cpu") as source:
+        rotation = source.get_tensor("global_rotation")
+    if tuple(rotation.shape) != (hidden_size, hidden_size):
+        raise ValueError("Checkpoint rotation has a different full hidden dimension")
+    block = rotation[:32, :32].contiguous()
+    zero = torch.zeros_like(block)
+    for row in range(0, hidden_size, 32):
+        for col in range(0, hidden_size, 32):
+            expected = block if row == col else zero
+            if not torch.equal(rotation[row:row + 32, col:col + 32], expected):
+                raise ValueError("Checkpoint rotation is not repeated block32")
+    return block.float(), {"path": str(path), "sha256": file_sha(path)}

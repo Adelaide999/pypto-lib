@@ -239,7 +239,7 @@ class ResidentNetworkRuntime:
 
     def load_rotation(self, checkpoint, hidden_size):
         """Retain the validated checkpoint rotation for both slots and subsequent tokens."""
-        from .prefill_engram_runtime import load_rotation
+        from .engram_host import load_rotation
 
         key = str(checkpoint), hidden_size
         if key not in self.rotations:

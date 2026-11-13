@@ -9,10 +9,13 @@ acceptance or an automatic Prefill-to-Decode state handoff.
 
 | Responsibility | Maintained owner |
 | --- | --- |
+| 40-layer schedule, state lifetime and autoregressive loop | `decode_fwd.py --network`, `decode_network.py` |
+| Streaming real checkpoint weights and sparse Engram rows | `decode_network_weights.py`, `decode_weight_abi.py`, `decode_weights.py` |
+| Input embedding / HC and final vocabulary head | `embedding.py`, `decode_head.py` |
 | Bounded single-step SWA Decode and state replay | `decode_fwd.py`, `decode_replay.py` |
 | Physical-layer dispatch | `decode_layer.get_layer_entry(layer_id)` |
 | Complete SWA / Engram / C2A / C1A blocks | `decode_swa.py`, `decode_engram.py`, `decode_c2a.py`, `decode_c1a.py` |
-| EP2 product orchestration | `decode_moe.py` |
+| EP2 / EP16 product orchestration with TP1 | `decode_moe.py` |
 | Routing, dispatch layout and shared-expert variants | `moe.py` |
 | Routed expert kernels | `expert_routed.py`, `decode_expert_routed.py` |
 | Shared model, dtype, Engram and compressor contracts | `config.py`, `operator_config.py`, `engram.py`, `compressor_core.py` |
@@ -23,8 +26,73 @@ The phase-specific implementations retain the exact existing quantization,
 rounding, cache and topology contracts. Shared MoE kernels use explicit
 `make_decode_*` names where their semantics differ from Prefill. Existing
 A2/A3 dtype names, compiler hints and environment option names are ABI and
-provenance, not a claim that the hardware is A2. The bounded Decode forward
-is not a full 40-layer Decode driver.
+provenance, not a claim that the hardware is A2.
+
+## 40-layer network
+
+The network entry connects the existing complete Decode operators in physical
+layer order, carrying each layer's hidden state and HC premix into its successor.
+It runs checkpoint embedding, original-basis Engram at L1/L14, all 40 attention
+and MoE blocks, final HC collapse, RMS normalization and the vocabulary projection.
+The LM head returns `[EP, 129280]` logits for one active request per rank.
+
+The initial execution topology is **DP16 / TP1 / EP16**, with EP2 also admitted
+by the driver. Each rank owns `384 / EP` routed experts; attention and shared
+weights are replicated. Pass `--ep` and `--tp` on the command line because the
+existing distributed entries specialize their tensor shapes during import.
+The DP8/TP2 and DP4/TP4 contracts remain outside this network driver.
+
+From the repository root, after activating the PyPTO environment:
+
+```bash
+PYTHONPATH="$PWD:$PYTHONPATH" python -m models.deepseek_v4_1_flash_a3.decode_fwd \
+  --network --ep 16 --tp 1 --plan-only
+PYTHONPATH="$PWD:$PYTHONPATH" python -m models.deepseek_v4_1_flash_a3.decode_fwd \
+  --network --ep 16 --tp 1 --compile-only \
+  --output build_output/ds41-decode-network
+PYTHONPATH="$PWD:$PYTHONPATH" python -m models.deepseek_v4_1_flash_a3.decode_fwd \
+  --network --ep 16 --tp 1 --devices "$DEVICES" --checkpoint "$CHECKPOINT" \
+  --tokens 0 --decode-steps 2 --output build_output/ds41-decode-device
+```
+
+Set `DEVICES` to the scheduler-allocated comma-separated physical IDs in logical
+rank order and `CHECKPOINT` to the real W8A8 checkpoint directory. On systems
+using `task-submit`, execute the last command inside the allocated job and use
+`TASK_DEVICE` for that mapping. Preserve the activated `PYTHONPATH` so a managed
+toolchain's runtime overlay remains visible.
+
+`--tokens` accepts prompt IDs replayed one at a time from an empty Decode state;
+the CLI sends the same prompt to each rank. `--decode-steps 2` produces two
+greedy output IDs per rank, including a second full forward that consumes the
+first generated ID. The Python `DecodeNetwork.step` interface accepts distinct
+token IDs per rank and a retained `DecodeState` / `DecodeNetworkWeights` pair.
+
+The state owner retains all layers' SWA buffers, C2 source state at L2/L8/L14,
+C1 KV/index state at L20, reindex selections at L24/L28/L32/L36, the L20 candidate
+pool and request token histories for Engram. Source/reuse consumers share the
+correct physical owner. Cache capacity is **256 token positions per request**,
+with a 128-token SWA window, fixed physical row capacity 16 and one active row.
+An interrupted step invalidates its partially updated state.
+
+This is a host-scheduled driver. It uploads and reads back state for each layer,
+streams one physical layer's real weights and creates communication windows per
+invocation. It does not yet provide generation-scoped device residency,
+Prefill-state handoff, request slot reuse, or CP/SP and TP2/TP4 execution.
+It uses PyPTO compute and its distributed put/notify/wait transport; it does not
+add an HCCL runtime driver. Latency and throughput have not been tuned.
+
+The EP16/TP1 structural templates and all input/output stages compile. Host
+checkpoint shape/dtype binding checks cover SWA, C2, C1 source and C1 reindex.
+A real-weight DP16/TP1/EP16 device run has completed all 40 layers, both Engram
+stages and the final head for two consecutive tokens, producing finite
+`[16, 129280]` logits at both steps. The second forward consumes the first
+generated token with the retained session state. This run printed
+`40L+LMhead RUN PASS` and exited successfully.
+These execution checks do not establish numerical accuracy.
+The run writes `compiled.json`, per-step logits/hidden tensors and progress
+records; `result.json` and `40L+LMhead RUN PASS` appear only after every requested
+forward reaches the final head with finite active outputs. Accuracy remains
+`not_run`: this entry does not invoke vLLM or numerical reference comparisons.
 
 ## Acceptance and source provenance
 
@@ -46,8 +114,9 @@ The port includes the L1/L14 Engram observation interfaces, C2A source/reuse
 cache publication, and the C1A source/reindex/reuse candidate state boundary.
 
 The local tree contains bounded PyPTO L0 entries, complete layer composition
-entries for the retained L1/L2/L3/L14/L15/L19/L20/L21/L24/L25 EP2 matrix, and
-the independently compiled EP2 routed/shared MoE entry. The current paired
+entries for every physical layer, and the independently compiled routed/shared
+MoE entry. The retained EP2 acceptance matrix covers
+L1/L2/L3/L14/L15/L19/L20/L21/L24/L25. The current paired
 representative replays pass for L1, L2, L3, L14, L19, L20, L21, L24 and L25.
 L15 reaches the complete replay but remains a precision failure because its
 observable `moe_output` exposes a PyPTO routed/shared split while the vLLM

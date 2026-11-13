@@ -22,9 +22,11 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 
 from .config import FLASH
+from .norm_rope import make_rope_tables
 from .decode_swa import (
     AUX_PAD,
     COUNT_PAD,
+    SIGNAL_PAD,
     D,
     EP_SIZE,
     LANE_ROWS,
@@ -132,6 +134,11 @@ OUTPUT = pl.jit.inline(
         16, HEADS, HEAD_DIM, FLASH.qk_rope_head_dim, FLASH.o_groups, O_RANK, HIDDEN
     )._func
 )
+COMPRESSED_ROPE = pl.jit.inline(make_rope_tables(
+    16, FLASH.qk_rope_head_dim, FLASH.compress_rope_theta,
+    dict(factor=FLASH.rope_factor, beta_fast=FLASH.beta_fast, beta_slow=FLASH.beta_slow,
+         original_max_position_embeddings=FLASH.original_max_position_embeddings),
+)._func)
 HC_PRE = make_hc_pre_inline(16, CONFIG)
 HC_POST = make_hc_post_inline(16, CONFIG)
 EP2_RANK = pl.jit.inline(decode_ep2_rank._func)
@@ -268,9 +275,9 @@ def decode_layer_ep2_sparse_rank(
     lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
     lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[EP_SIZE, COUNT_PAD], pl.INT32],
-    lane_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    lane_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     slot_out: pld.DistributedTensor[[16 * TOPK, D], pl.FP32],
-    return_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    return_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     logits: pl.InOut[pl.Tensor[[16, N_EXPERTS], pl.FP32]],
     route_ids: pl.InOut[pl.Tensor[[16, TOPK], pl.INT32]],
     route_weights: pl.InOut[pl.Tensor[[16, TOPK], pl.FP32]],
@@ -317,6 +324,16 @@ def decode_layer_ep2_sparse_rank(
         prepared_for_attention = prepared_indices_source
 
     if reuse == 0:
+        index_cos = pl.create_tensor([16, ROPE_PAIRS], dtype=pl.FP32)
+        index_sin = pl.create_tensor([16, ROPE_PAIRS], dtype=pl.FP32)
+        COMPRESSED_ROPE(positions, index_cos, index_sin, active)
+        source_positions = pl.create_tensor([16], dtype=pl.INT64)
+        for token in pl.spmd(active, name_hint="decode_c2_source_positions"):
+            position = pl.read(positions, [token])
+            pl.write(source_positions, [token], pl.max(position - 1, 0))
+        source_cos = pl.create_tensor([16, ROPE_PAIRS], dtype=pl.FP32)
+        source_sin = pl.create_tensor([16, ROPE_PAIRS], dtype=pl.FP32)
+        COMPRESSED_ROPE(source_positions, source_cos, source_sin, active)
         compressed_cache_pub = pl.reshape(compressed_cache, [2, 128, 1, HEAD_DIM])
         index_cache_pub = pl.reshape(index_cache, [2, 128, 1, 128])
         index_scale_pub = pl.reshape(index_scale, [2, 128, 1, 1])
@@ -324,7 +341,7 @@ def decode_layer_ep2_sparse_rank(
         index_key = pl.create_tensor([16, 128], dtype=pl.BF16)
         C2_PUBLISH(
             attn_normed, compressor_wkv, compressor_wgate, compressor_norm,
-            index_wk, index_norm, rope_cos, rope_sin, positions32, compressed_slots,
+            index_wk, index_norm, source_cos, source_sin, positions32, compressed_slots,
             index_slots,
             query_start, requests, state_block_table, compressor_state,
             compressed_cache_pub, index_cache_pub, index_scale_pub,
@@ -337,7 +354,7 @@ def decode_layer_ep2_sparse_rank(
         index_weights = pl.create_tensor([16, 32], dtype=pl.FP16)
         INDEXER_PROJECTION(
             attn_normed, query_latent, index_wq_b, index_wq_b_scale,
-            index_weights_proj, rope_cos, rope_sin, index_query, index_weights, active,
+            index_weights_proj, index_cos, index_sin, index_query, index_weights, active,
         )
         INDEXER_QUERY_QUANTIZE(index_query, index_payload, index_query_scale, active)
         index_key_flat = pl.reshape(index_cache_pub, [256, 128])
@@ -504,16 +521,16 @@ def decode_layer_ep2_sparse(
     lane_x_buf = pld.alloc_window_buffer([LANE_ROWS, D], dtype=pl.INT8)
     lane_aux_buf = pld.alloc_window_buffer([LANE_ROWS, AUX_PAD], dtype=pl.FP32)
     lane_count_buf = pld.alloc_window_buffer([EP_SIZE, COUNT_PAD], dtype=pl.INT32)
-    lane_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    lane_ready_buf = pld.alloc_window_buffer([EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     slot_out_buf = pld.alloc_window_buffer([16 * TOPK, D], dtype=pl.FP32)
-    return_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    return_ready_buf = pld.alloc_window_buffer([EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     for rank in pl.range(EP_SIZE):
         lane_x = pld.window(lane_x_buf, [LANE_ROWS, D], dtype=pl.INT8)
         lane_aux = pld.window(lane_aux_buf, [LANE_ROWS, AUX_PAD], dtype=pl.FP32)
         lane_count = pld.window(lane_count_buf, [EP_SIZE, COUNT_PAD], dtype=pl.INT32)
-        lane_ready = pld.window(lane_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
+        lane_ready = pld.window(lane_ready_buf, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
         slot_out = pld.window(slot_out_buf, [16 * TOPK, D], dtype=pl.FP32)
-        return_ready = pld.window(return_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
+        return_ready = pld.window(return_ready_buf, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
         decode_layer_ep2_sparse_rank(
             x_hc[rank], engram_lookup[rank], engram_wkv[rank], engram_channel_weight[rank],
             engram_mask[rank], engram_kv[rank], engram_hidden[rank],

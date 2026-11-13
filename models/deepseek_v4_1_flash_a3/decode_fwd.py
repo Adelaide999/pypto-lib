@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek V4.1 Flash A2/A3 single-step SWA Decode entry."""
+"""DeepSeek V4.1 bounded SWA Decode and complete 40-layer network entry."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "models.deepseek_v4_1_flash_a3"
 
 import pypto.language as pl
 
@@ -287,7 +288,14 @@ def _golden(values: dict[str, torch.Tensor | int]) -> None:
 def main(argv: list[str] | None = None) -> int:
     """Compile or execute the bounded single-step Decode entry."""
 
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if "--network" in arguments:
+        from .decode_network import main as network_main
+
+        return network_main([argument for argument in arguments if argument != "--network"])
+
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--network", action="store_true", help="Run the complete 40-layer network; use --network --help")
     parser.add_argument("-p", "--platform", choices=("a2a3", "a5"), default="a2a3")
     parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)

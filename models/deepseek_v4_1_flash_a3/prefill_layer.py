@@ -479,7 +479,7 @@ def run_prefill_layer(args, layer_id=0):
     """Execute one physical layer with CP/SP attention, Engram and multi-rank EP MoE."""
     from .moe_transport import CANNMemory
     from .prefill_layer_state import fixture_live_state, resolve_layer_role
-    from .prefill_swa import prepare_product_operands
+    from .weights import prepare_product_operands
     from .runtime_config import ExpertParallelConfig
     from .runtime_utils import Executable, communicate, file_sha, loaded_source_files, write_json
     from .weights import CheckpointOperands

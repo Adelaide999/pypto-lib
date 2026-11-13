@@ -11,6 +11,7 @@
 from copy import deepcopy
 import hashlib
 import json
+from pathlib import Path
 
 import torch
 
@@ -152,6 +153,7 @@ class NetworkCacheProvider:
         self._seen_chunks, self._chunk = set(), None
         self._completed_layers, self._batches = [], {}
         self._sequence_tokens, self._pending_sequence_tokens = {}, {}
+        self.selections = {}
         self._input_by_case = _metadata_copy(input_by_case)
         self._abi_by_case = {}
         for case, payloads in abi_by_case.items():
@@ -408,6 +410,9 @@ class NetworkCacheProvider:
                  "Network completion must follow original physical order")
         _require({"hidden", "pre_mix", "states"} <= set(result), "The complete core did not return its required outputs")
         role = resolve_layer_role(layer_id)
+        if role["index_selection_write"]:
+            self.selections[layer_id] = [row["fresh"]["topk_indices"][:self.capacity].clone()
+                for row in self.shared]
         for rank in range(self.topology["ep"]):
             for case in self._batches[layer_id]["cases"]:
                 versions = self.versions[rank][case]
@@ -419,6 +424,68 @@ class NetworkCacheProvider:
         self._completed_layers.append(layer_id)
         if layer_id == 39:
             self._sequence_tokens = self._pending_sequence_tokens
+
+    def export_state(self, path):
+        """Export completed TP1 request caches in logical token order for a phase boundary."""
+        from .generation_state import STATE_SCHEMA, validate_generation_state
+
+        if self.geometry_only or self.topology["tp"] != 1 or self._completed_layers != list(range(40)):
+            raise ValueError("State export requires a completed TP1 forty-layer forward")
+        histories, layers, sources, candidates, hash_history = [], [], {}, [], []
+        for rank in range(self.topology["ep"]):
+            history = self._sequence_tokens.get(("fresh", rank, 0))
+            if history is None or not 1 <= len(history) <= 256:
+                raise ValueError("State export requires one live request per rank within 256 positions")
+            histories.append(list(history))
+            last = len(self._batches[0]["cases"]["fresh"][rank]["positions"]) - 1
+            own_layers = []
+
+            def ordered(name, count):
+                view = self.views[rank]["fresh"][name]
+                native = self._abi_by_case["fresh"][rank]["metadata"][name]["global_metadata"]
+                # Continuations retain the same page reservation as the initial ABI.
+                table = native["block_table"][0].long()
+                rows = view[table].reshape(-1, *view.shape[2:])
+                return rows[:count].squeeze(1).clone()
+
+            for layer in range(40):
+                role = resolve_layer_role(layer)
+                root = f"model.layers.{layer}.self_attn."
+                own = dict(swa=ordered(root + "swa_cache", len(history)))
+                if role["index_source"] is not None:
+                    own["selection"] = self.selections[role["index_source"]][rank][last].clone()
+                own_layers.append(own)
+                if role["mode"] == "full":
+                    count = len(history) // role["ratio"]
+                    code_view, scale_view = self.views[rank]["fresh"][root + "indexer.k_cache"]
+                    native = self._abi_by_case["fresh"][rank]["metadata"][root + "indexer.k_cache"]["global_metadata"]
+                    table = native["block_table"][0].long()
+                    source = dict(ratio=role["ratio"], kv=ordered(root + "long_kv_cache", count),
+                        codes=code_view[table].reshape(-1, 128)[:count].clone(),
+                        scales=scale_view[table].reshape(-1)[:count].clone())
+                    if role["ratio"] == 2:
+                        native = self._abi_by_case["fresh"][rank]["metadata"][root + "compressor.state_cache"]["global_metadata"]
+                        page = int(native["block_table"][0, 0])
+                        source["ring"] = self.views[rank]["fresh"][root + "compressor.state_cache"][page].reshape(32, 1024).clone()
+                    sources.setdefault(layer, []).append(source)
+            layers.append(own_layers)
+            shared = self.shared[rank]["fresh"]
+            count = int(shared["candidate_lengths"][last, 0])
+            candidates.append(dict(ids=shared["candidates"][last, 0, :count].clone(),
+                count=count, topk_length=int(shared["topk_lengths"][last, 0])))
+            root = "model.layers.1.self_attn.swa_cache"
+            pages = self._abi_by_case["fresh"][rank]["metadata"][root]["global_metadata"]["block_table"][0].long()
+            hash_history.append(self.history.caches[rank]["fresh"].reshape(-1, 128)[pages].reshape(-1)[:len(history)].clone())
+        original = self._input_by_case["fresh"]
+        packet = dict(schema=STATE_SCHEMA, topology=deepcopy(self.topology), completed_layers=list(range(40)),
+            checkpoint=original.get("checkpoint"), checkpoint_sha256=original.get("checkpoint_sha256", {}),
+            prefill_chunks=self._chunk[0] + 1, histories=histories, layers=layers, sources=sources,
+            candidates=candidates, engram_history=hash_history, selection_owner_layers=sorted(self.selections),
+            route_dispatch_combine="completed; scratch rebuilt for the next token")
+        validate_generation_state(packet)
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(packet, path)
 
     def hash_constants(self, *, layer_ids, pad_id):
         """Bind captured constants to the separately verified original hash-layout fields."""

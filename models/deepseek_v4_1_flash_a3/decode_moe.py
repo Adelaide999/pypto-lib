@@ -6,12 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek V4.1 A2/A3 W8A8 Decode MoE for the two-rank EP gate.
+"""DeepSeek V4.1 A2/A3 W8A8 Decode MoE for EP2 or EP16 with TP1.
 
-This entry owns the product-side EP2 transport.  It keeps all 384 routed
-experts, assigns 192 experts to each rank, and moves only PyPTO tensors across
-the two rank windows.  The vLLM reference process is intentionally outside
-this module.
+This entry owns the product-side expert-parallel transport. It partitions all
+384 routed experts across the selected rank group and moves PyPTO tensors
+across rank windows. The vLLM reference process is outside this module.
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 
 from .config import FLASH
+from .decode_config import _parse_parallel_size
 from .moe import make_decode_moe_router_inline as make_moe_router_inline
 from .moe import make_decode_shared_moe_w8a8_inline as make_shared_moe_w8a8_inline
 from .decode_quant import make_dynamic_int8_quantize
@@ -44,13 +44,14 @@ from .moe import (
 )
 from .moe import make_decode_moe_router as make_moe_router
 from .moe import make_decode_shared_moe_w8a8 as make_shared_moe_w8a8
-from .decode_expert_routed import expert_routed_inline
 from .moe import make_decode_dispatch_layout as make_dispatch_layout, make_decode_route_restore as make_route_restore
 
 
-# EP2 product topology and Decode capacity.
-EP_SIZE = 2
-N_LOCAL_EXPERTS = 192
+# Expert-parallel topology and Decode capacity.
+EP_SIZE = _parse_parallel_size("ep", 2)
+if EP_SIZE not in (2, 16):
+    raise ValueError("Decode transport supports EP2 or EP16 with TP1")
+N_LOCAL_EXPERTS = 384 // EP_SIZE
 N_EXPERTS = 384
 TOPK = 6
 T = 16
@@ -59,16 +60,17 @@ MOE_INTER = 2304
 N_ROUTES = T * TOPK
 LANE_CAP = N_ROUTES
 LANE_ROWS = EP_SIZE * LANE_CAP
-RECV_MAX = 256
+RECV_MAX = max(256, ((EP_SIZE * T + 63) // 64) * 64)
 AUX_SCALE, AUX_WEIGHT, AUX_ROUTE, AUX_EXPERT = 0, 1, 2, 3
 AUX_PAD = 16
 COUNT_PAD = 16
+# Each Set signal has one source writer and a separate 64-byte cache line.
+SIGNAL_PAD = 16
 
-# The routed leaf is compiled for the complete 192-expert local shard.  These
-# variables are read only while importing that leaf and never change the ABI.
+# The routed leaf reads its complete local shard dimensions during import.
 os.environ["A2_MOE_LOCAL_EXPERTS"] = str(N_LOCAL_EXPERTS)
 os.environ["A2_MOE_RECV_MAX"] = str(RECV_MAX)
-from .decode_expert_routed import expert_routed_tile
+from .decode_expert_routed import expert_routed_inline, expert_routed_tile
 
 
 _ROUTER_CONFIG = asdict(FLASH)
@@ -100,7 +102,7 @@ def decode_ep2_pack(
     lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
     lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[EP_SIZE, COUNT_PAD], pl.INT32],
-    lane_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    lane_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     active: pl.Scalar[pl.INT32],
     rank: pl.Scalar[pl.INT32],
     epoch: pl.Scalar[pl.INT32],
@@ -168,7 +170,7 @@ def decode_ep2_arrive(
     lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
     lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[EP_SIZE, COUNT_PAD], pl.INT32],
-    lane_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    lane_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     route_x: pl.Tensor[[LANE_ROWS, D], pl.INT8],
     route_scale: pl.Tensor[[LANE_ROWS, 1], pl.FP32],
     route_weight: pl.Tensor[[LANE_ROWS, 1], pl.FP32],
@@ -306,7 +308,7 @@ def decode_ep2_return(
 @pl.jit.inline
 def decode_ep2_combine(
     slot_out: pld.DistributedTensor[[N_ROUTES, D], pl.FP32],
-    return_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    return_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     shared_output: pl.Tensor[[T, D], pl.BF16],
     output: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     active: pl.Scalar[pl.INT32],
@@ -378,9 +380,9 @@ def decode_ep2_rank(
     lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
     lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[EP_SIZE, COUNT_PAD], pl.INT32],
-    lane_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    lane_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     slot_out: pld.DistributedTensor[[N_ROUTES, D], pl.FP32],
-    return_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    return_ready: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     logits: pl.InOut[pl.Tensor[[T, N_EXPERTS], pl.FP32]],
     route_ids: pl.InOut[pl.Tensor[[T, TOPK], pl.INT32]],
     route_weights: pl.InOut[pl.Tensor[[T, TOPK], pl.FP32]],
@@ -490,16 +492,16 @@ def decode_ep2(
     lane_x_buf = pld.alloc_window_buffer([LANE_ROWS, D], dtype=pl.INT8)
     lane_aux_buf = pld.alloc_window_buffer([LANE_ROWS, AUX_PAD], dtype=pl.FP32)
     lane_count_buf = pld.alloc_window_buffer([EP_SIZE, COUNT_PAD], dtype=pl.INT32)
-    lane_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    lane_ready_buf = pld.alloc_window_buffer([EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     slot_out_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.FP32)
-    return_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    return_ready_buf = pld.alloc_window_buffer([EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     for rank in pl.range(EP_SIZE):
         lane_x = pld.window(lane_x_buf, [LANE_ROWS, D], dtype=pl.INT8)
         lane_aux = pld.window(lane_aux_buf, [LANE_ROWS, AUX_PAD], dtype=pl.FP32)
         lane_count = pld.window(lane_count_buf, [EP_SIZE, COUNT_PAD], dtype=pl.INT32)
-        lane_ready = pld.window(lane_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
+        lane_ready = pld.window(lane_ready_buf, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
         slot_out = pld.window(slot_out_buf, [N_ROUTES, D], dtype=pl.FP32)
-        return_ready = pld.window(return_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
+        return_ready = pld.window(return_ready_buf, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
         decode_ep2_rank(
             value[rank], router_value[rank], gate_weight[rank], text_bias[rank], vision_bias[rank], input_ids[rank],
             routed_w1[rank], routed_w1_scale[rank], routed_w3[rank], routed_w3_scale[rank],
@@ -512,11 +514,11 @@ def decode_ep2(
 
 
 def product_contract() -> dict[str, object]:
-    """Return the fixed EP2 product ABI without claiming a run."""
+    """Return the selected expert-parallel product ABI without claiming a run."""
 
     return {
         "status": "implementation_ready_not_run",
-        "topology": {"dp": 2, "tp": 1, "ep": 2, "pp": 1, "pcp": 1, "dcp": 1},
+        "topology": {"dp": EP_SIZE, "tp": 1, "ep": EP_SIZE, "pp": 1, "pcp": 1, "dcp": 1},
         "routed_experts": N_EXPERTS,
         "local_experts_per_rank": N_LOCAL_EXPERTS,
         "top_k": TOPK,

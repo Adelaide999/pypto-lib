@@ -14,7 +14,8 @@ import torch
 
 from .engram_hash import update_slot_history
 from .prefill_engram import make_prefill_engram_entries
-from .prefill_engram_runtime import engram_owner, load_rotation
+from .prefill_engram_runtime import engram_owner
+from .engram_host import load_rotation
 from .prefill_layer_state import resolve_layer_role
 from .runtime_utils import Executable
 

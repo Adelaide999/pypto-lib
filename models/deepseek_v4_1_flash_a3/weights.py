@@ -18,6 +18,7 @@ from contextlib import contextmanager
 import torch
 
 from .runtime_utils import tensor_sha
+from .ecotech_linear import prepare_ecotech_dynamic_weight
 
 
 class CheckpointOperands:
@@ -258,3 +259,59 @@ __all__ = [
     "load_tensor_bundle",
     "open_layer0_moe",
 ]
+
+
+def prepare_product_operands(raw, layer_id=0, *, role=None):
+    """Adapt CPU source weights to complete KN and grouped projection layouts."""
+    from .config import FLASH
+
+    resolved = FLASH.layer_config(layer_id)
+    if role is None:
+        role = dict(mode=resolved.mode.value, ratio=resolved.compression_ratio)
+    if (role["mode"], role["ratio"]) != (resolved.mode.value, resolved.compression_ratio):
+        raise ValueError("Layer role differs from the original model schedule")
+    layer = f"layers.{layer_id}"
+    prepared = {}
+    for projection in ("wq_a", "wq_b", "wkv"):
+        prefix = f"{layer}.attn.{projection}."
+        weight, scale = prepare_ecotech_dynamic_weight(
+            raw[prefix + "weight"], raw[prefix + "weight_scale"], raw[prefix + "weight_offset"],
+        )
+        prepared[projection] = weight
+        prepared[projection + "_scale"] = scale
+    wo_a, wo_b = raw[f"{layer}.attn.wo_a.weight"], raw[f"{layer}.attn.wo_b.weight"]
+    if wo_a.dtype != torch.bfloat16 or wo_b.dtype != torch.bfloat16:
+        raise ValueError("Output projections require original BF16 weights")
+    if tuple(wo_a.shape) != (8192, 4096) or tuple(wo_b.shape) != (5120, 8192):
+        raise ValueError("Output projection geometry differs")
+    prepared["wo_a"] = wo_a.reshape(8, 1024, 4096).transpose(1, 2).contiguous()
+    prepared["wo_a_grouped_prefill"] = wo_a.reshape(8, 1024, 4096).contiguous()
+    prepared["wo_b"] = wo_b.T.contiguous()
+    names = dict(
+        attn_norm=f"{layer}.attn_norm.weight", q_norm=f"{layer}.attn.q_norm.weight",
+        kv_norm=f"{layer}.attn.kv_norm.weight", sink=f"{layer}.attn.attn_sink",
+        hc_function=f"{layer}.hc_attn_fn", hc_scale=f"{layer}.hc_attn_scale", hc_base=f"{layer}.hc_attn_base",
+    )
+    for target, source in names.items():
+        prepared[target] = raw[source].contiguous()
+    if role["mode"] == "full":
+        compressor = f"{layer}.attn.compressor"
+        indexer = f"{layer}.attn.indexer"
+        prepared["compressor_wkv"] = raw[compressor + ".wkv.weight"].T.contiguous()
+        if role["ratio"] == 2:
+            prepared["compressor_wgate"] = raw[compressor + ".wgate.weight"].T.contiguous()
+        prepared["compressor_norm"] = raw[compressor + ".norm.weight"].contiguous()
+        prepared["index_wk"] = raw[indexer + ".wk.weight"].T.contiguous()
+        prepared["index_norm"] = raw[indexer + ".k_norm.weight"].contiguous()
+        prepared["index_weights"] = raw[indexer + ".weights_proj.weight"].T.contiguous()
+        prepared["index_wqb"], prepared["index_wqb_scale"] = prepare_ecotech_dynamic_weight(
+            raw[indexer + ".wq_b.weight"], raw[indexer + ".wq_b.weight_scale"], raw[indexer + ".wq_b.weight_offset"],
+        )
+    if role["mode"] == "reindex":
+        indexer = f"{layer}.attn.indexer"
+        prepared["index_weights"] = raw[indexer + ".weights_proj.weight"].T.contiguous()
+        prepared["index_wqb"], prepared["index_wqb_scale"] = prepare_ecotech_dynamic_weight(
+            raw[indexer + ".wq_b.weight"], raw[indexer + ".wq_b.weight_scale"], raw[indexer + ".wq_b.weight_offset"])
+    if any(value.device.type != "cpu" for value in prepared.values()):
+        raise ValueError("Operand preparation requires CPU tensors")
+    return prepared

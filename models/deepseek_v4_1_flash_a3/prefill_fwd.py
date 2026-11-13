@@ -78,8 +78,10 @@ def prefill_fwd(inputs, *, weights, cache, config, devices, output, compiled=Non
     ``engram_lookup`` contains host-gathered BF16 rows for both slots.
     Each prepared continuation supplies its own rows in inputs["engram_lookup"].
     The forward performs only device projection/gating on these ready rows.
-    Ordinary execution preloads all compute weights and retains workers,
-    caches and communication groups until the complete stream ends.
+    Ordinary execution retains workers, caches and communication groups until
+    the complete stream ends. Config weight_residency="layer_streaming" loads
+    one layer at a time; otherwise compute weights are preloaded.
+    Config export_state writes completed TP1 state for a subsequent phase.
     Diagnostics retain the streaming checkpoint path for independent capture.
     """
     from .runtime_config import configure_devices

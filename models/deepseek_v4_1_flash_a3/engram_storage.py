@@ -114,3 +114,30 @@ class SharedEngramArray:
         if self.path is not None:
             self.path.unlink(missing_ok=True)
             self.path = None
+
+
+class MappedEngramArray(SharedEngramArray):
+    """Gather rows from a private virtual mapping of the original checkpoint file."""
+
+    def __init__(self, checkpoint, name, row_range, width, dtype):
+        path, payload, spec = checkpoint_region(checkpoint, name)
+        begin, end = row_range
+        if (spec["dtype"] != dtype or spec["shape"][1:] != [width]
+                or not 0 <= begin < end <= spec["shape"][0]):
+            raise ValueError("Mapped Engram geometry differs from the checkpoint")
+        self.row_start = begin
+        self.shape = (end - begin, width)
+        size = {"I8": 1, "F32": 4}[dtype]
+        self.byte_count = (end - begin) * width * size
+        with path.open("rb") as stream:
+            self.mapping = mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_COPY)
+        self.tensor = torch.frombuffer(self.mapping, dtype={"I8": torch.int8, "F32": torch.float32}[dtype],
+            count=(end - begin) * width, offset=payload + begin * width * size).reshape(self.shape)
+        self.receipt = dict(checkpoint_file=str(path), tensor=name, row_range=list(row_range),
+            shape=list(self.shape), dtype=dtype, bytes=self.byte_count, storage="checkpoint_file_mapping",
+            full_payload_copy=False, full_payload_sha256="not_requested")
+
+    def close(self):
+        """Release the virtual mapping while retaining the checkpoint file."""
+        self.tensor = None
+        self.mapping.close()

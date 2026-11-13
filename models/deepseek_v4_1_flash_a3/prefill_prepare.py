@@ -38,6 +38,48 @@ def tokenize_prompt(inputs, checkpoint, vocabulary):
     return list(inputs)
 
 
+def checkpoint_cache(checkpoint, topology):
+    """Build cache and Engram contracts directly from checkpoint metadata and tokenizer."""
+    from transformers import AutoTokenizer
+
+    from .engram_hash import build_compressed_token_map, make_layout
+    from .engram_storage import checkpoint_region
+
+    checkpoint = Path(checkpoint).resolve()
+    model = json.loads((checkpoint / "config.json").read_text())
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True)
+    mapping, compressed = build_compressed_token_map(tokenizer)
+    text = model["text_config"]
+    if compressed != text["engram_compressed_vocab_size"]:
+        raise ValueError("Checkpoint tokenizer compressed vocabulary differs")
+    hashed = make_layout()
+    constants = dict(token_map=torch.tensor(mapping, dtype=torch.int64), multipliers=hashed.multipliers,
+        primes=hashed.primes, offsets=hashed.offsets)
+    contracts = {}
+    tp, world = topology["tp"], topology["ep"]
+    for slot, layer in enumerate((1, 14)):
+        _, _, spec = checkpoint_region(checkpoint, f"layers.{layer}.engram.embed.weight")
+        primes, offsets = hashed.primes[slot], hashed.offsets[slot]
+        boundaries = [int(offsets[lane * 24 // tp]) for lane in range(tp)] + [spec["shape"][0]]
+        if spec["shape"][0] != int(offsets[-1] + primes[-1]):
+            raise ValueError("Checkpoint Engram rows differ from the original hash layout")
+        shards = [dict(head_range=[lane * 24 // tp, (lane + 1) * 24 // tp],
+            row_range=boundaries[lane:lane + 2], DP_sharing_ranks=list(range(lane, world, tp)))
+            for lane in range(tp)]
+        contracts[layer] = dict(checkpoint=str(checkpoint), model_config=model, topology=deepcopy(topology),
+            capacity=16, physical_layer_id=layer, hash_constants=dict(constants, layer_ids=[1, 14],
+                pad_id=text["engram_pad_token_id"]), engram_shards=shards,
+            host_storage="checkpoint_file_mapping",
+            engram_storage_contract=dict(dtype="INT8", scale_dtype="FP32", group_size=32,
+                cpu_offload=True, dp_shared_memory=True, global_columns=24))
+    cache = dict(cache_ABI=cache_templates(constants, world=world), engram_contracts=contracts)
+    config = dict(topology=deepcopy(topology), checkpoint=str(checkpoint), model_config=model,
+        required_modes=dict(enable_expert_parallel=True, enable_fused_mc2=True, enable_dsa_cp=True,
+            enable_flashcomm1=True, enable_shared_expert_dp=True), capacity=16, scheduler_capacity=8192,
+        fresh_shared_initialization={"topk_indices": -1}, weight_residency="layer_streaming")
+    return cache, config
+
+
 def reserve_cache_layouts(templates, context_length):
     """Resize fresh byte arenas and reserve disjoint group pages for the complete prompt."""
     if len(templates) != 16 or not 1 <= context_length <= MAX_CONTEXT:
@@ -82,13 +124,13 @@ def reserve_cache_layouts(templates, context_length):
     return layouts, group_pages, blocks - 1
 
 
-def build_chunk_metadata(template, layout, allocations, *, tokens, context, tp_rank, active, reserved):
+def build_chunk_metadata(template, layout, allocations, *, tokens, context, tp_rank, active, reserved, tp=4):
     """Build CPU controls for SWA, completed compression pairs and per-request ring state."""
     total = len(tokens) if active else 0
     positions = torch.arange(context, context + total, dtype=torch.int64)
-    physical = (total + 3) // 4
+    physical = (total + tp - 1) // tp
     start, end = tp_rank * physical, (tp_rank + 1) * physical
-    span = [start, end, physical, physical * 4]
+    span = [start, end, physical, physical * tp]
     valid = max(0, min(end, total) - min(start, total))
     lengths = torch.tensor([context + total] if active else [], dtype=torch.int32)
     starts = torch.tensor([0, total] if active else [0], dtype=torch.int32)
@@ -127,10 +169,12 @@ def build_chunk_metadata(template, layout, allocations, *, tokens, context, tp_r
 
 def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_size=16, dp_rank=0, prepare_engram=False):
     """Yield prepared chunks lazily while retaining a complete fixed page reservation."""
-    topology = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
-    if (config["topology"] != topology or type(chunk_size) is not int or not 1 <= chunk_size <= 16
-            or type(dp_rank) is not int or not 0 <= dp_rank < 4):
-        raise ValueError("Automatic chunks require DP4/TP4/EP16, chunk_size 1..16 and dp_rank 0..3")
+    topology = config["topology"]
+    tp, dp = topology["tp"], topology["dp"]
+    if (tp not in (1, 2, 4) or topology != dict(dp=dp, tp=tp, ep=16, pp=1, pcp=1, dcp=1)
+            or dp * tp != 16 or type(chunk_size) is not int or not 1 <= chunk_size <= 16
+            or type(dp_rank) is not int or not 0 <= dp_rank < dp):
+        raise ValueError("Automatic chunks require EP16 with TP1/2/4 and a valid DP rank and chunk size")
     checkpoint, output = Path(checkpoint).resolve(), Path(output).resolve()
     model = json.loads((checkpoint / "config.json").read_text())
     if model != config["model_config"]:
@@ -155,8 +199,8 @@ def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_siz
             current = tokens[begin:begin + chunk_size]
             request = dict(request_slot=0, token_ids=current, position_ids=list(range(begin, begin + len(current))),
                            live_token_mask=[1] * len(current), initial_context_length=begin, history_tokens=tokens[:begin])
-            engines = [dict(dp_rank=rank, active=len(current) if rank == dp_rank else 0,
-                            requests=[request] if rank == dp_rank else []) for rank in range(4)]
+            engines = [dict(dp_rank=rank, active=len(current) if (rank == dp_rank or config.get("replicate_prompt", False)) else 0,
+                            requests=[request] if (rank == dp_rank or config.get("replicate_prompt", False)) else []) for rank in range(dp)]
             actual_input = dict(topology=topology, checkpoint=str(checkpoint), checkpoint_sha256=identities,
                 epoch=epoch, predecessor_input_sha256=predecessor, DP_engines=engines)
             input_path = directory / "input-contract.json"
@@ -165,7 +209,8 @@ def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_siz
             payloads, sources = [], []
             for rank, template in enumerate(cache["cache_ABI"]):
                 payload = build_chunk_metadata(template, layouts[rank], allocations[rank], tokens=current, context=begin,
-                    tp_rank=rank % 4, active=rank // 4 == dp_rank, reserved=reserved)
+                    tp_rank=rank % tp, active=(rank // tp == dp_rank or config.get("replicate_prompt", False)),
+                    reserved=reserved, tp=tp)
                 path = directory / f"rank-{rank}-metadata.pt"
                 torch.save(payload, path)
                 sources.append(dict(rank=rank, path=str(path), sha256=file_sha(path)))
@@ -185,14 +230,8 @@ def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_siz
             predecessor = identity
 
 
-def validate_host():
-    """Check 2048-token planning, all layer coordinates and exact state write boundaries."""
-    from tempfile import TemporaryDirectory
-
-    from .prefill_network_state import NetworkCacheProvider, _check_layout
-    from .prefill_network_cache import network_cache_geometry, owned_cache_pages
-    from .prefill_indexer_runtime import validate_live_refresh_candidates
-
+def cache_templates(hash_constants, *, world=16):
+    """Construct disjoint paged owners with the supported A3 typed-plane geometry."""
     views = {}
     groups = []
     for layer in range(40):
@@ -227,7 +266,21 @@ def validate_host():
     raw = {key: dict(storage_key=key, dtype="torch.int8", shape=[262144], stride=[1],
                     storage_offset_bytes=0, storage_bytes=262144) for key in aliases}
     layout = dict(raw=raw, views=descriptors, aliases=aliases)
-    template = dict(layout=layout, groups=groups, hash_constants={})
+    template = dict(layout=layout, groups=groups, hash_constants=hash_constants)
+    return [deepcopy(template) for _ in range(world)]
+
+
+def validate_host():
+    """Check 2048-token planning, all layer coordinates and exact state write boundaries."""
+    from tempfile import TemporaryDirectory
+
+    from .prefill_network_state import NetworkCacheProvider, _check_layout
+    from .prefill_network_cache import network_cache_geometry, owned_cache_pages
+    from .prefill_indexer_runtime import validate_live_refresh_candidates
+
+    templates = cache_templates({})
+    template = templates[0]
+    layout = template["layout"]
     cache = dict(cache_ABI=[deepcopy(template) for _ in range(16)], engram_contracts={1: {}, 14: {}})
     topology = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
     model = dict(text_config=dict(vocab_size=4096))

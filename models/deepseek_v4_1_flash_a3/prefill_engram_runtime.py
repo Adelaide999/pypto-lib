@@ -9,35 +9,13 @@
 """Run complete shared-host Engram lookup and compose its physical Prefill observations."""
 
 from contextlib import ExitStack
-from pathlib import Path
 
 import torch
 
-from .engram_host import lookup_columns
+from .engram_host import load_rotation, lookup_columns
 from .engram_storage import SharedEngramArray
 from .prefill_engram import make_prefill_engram_entries
-from .runtime_utils import Executable, file_sha
-
-
-def load_rotation(checkpoint, hidden_size):
-    """Load and validate repeated block32 checkpoint rotation by byte identity."""
-    from safetensors import safe_open
-
-    path = Path(checkpoint) / "optional/quarot.safetensors"
-    if not path.is_file():
-        raise FileNotFoundError("The physical A3 Engram requires its checkpoint rotation")
-    with safe_open(path, framework="pt", device="cpu") as source:
-        rotation = source.get_tensor("global_rotation")
-    if tuple(rotation.shape) != (hidden_size, hidden_size):
-        raise ValueError("Checkpoint rotation has a different full hidden dimension")
-    block = rotation[:32, :32].contiguous()
-    zero = torch.zeros_like(block)
-    for row in range(0, hidden_size, 32):
-        for col in range(0, hidden_size, 32):
-            expected = block if row == col else zero
-            if not torch.equal(rotation[row:row + 32, col:col + 32], expected):
-                raise ValueError("Checkpoint rotation is not repeated block32")
-    return block.float(), {"path": str(path), "sha256": file_sha(path)}
+from .runtime_utils import Executable
 
 
 def engram_owner(contract, layer_id, role=None):

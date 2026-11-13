@@ -11,7 +11,7 @@
 from time import perf_counter
 
 from .prefill_layer_state import resolve_layer_role
-from .prefill_swa import prepare_product_operands
+from .weights import prepare_product_operands
 from .runtime_config import ExpertParallelConfig
 from .weights import CheckpointOperands
 
