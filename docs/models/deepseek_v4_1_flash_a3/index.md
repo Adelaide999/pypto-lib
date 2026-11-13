@@ -131,6 +131,12 @@ The streaming-weight diagnostic alternative and task-directory compiler reuse
 manifests are removed. Runtime dtype, shape, rank, alias, write-direction,
 source-version and lifecycle checks remain in force.
 
+If a synchronous device run fails, its transient allocations remain owned by
+the public worker until worker teardown drains or reclaims the failed run.
+Cleanup failures are logged without replacing the original dispatch error.
+After a completed dispatch, cleanup attempts every transient allocation;
+a cleanup error is propagated when there is no earlier failure.
+
 ### Fixed INT8 weight layout
 
 Initialization packs QKV, Indexer query and Prefill shared/routed expert

@@ -8,11 +8,15 @@
 # -----------------------------------------------------------------------------------------------------------
 """Retain A3 workers, typed device allocations and HCCL groups across a complete generation."""
 
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from time import perf_counter
 import torch
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _host_bytes(value):
@@ -83,15 +87,20 @@ class ResidentNetworkRuntime:
                 self.workers.append(worker)
                 self.stats["worker_initializations"] += 1
             self.stats["worker_initialization_seconds"] = perf_counter() - begin
-        except BaseException:
-            self.close()
+        except BaseException as error:
+            self.__exit__(type(error), error, error.__traceback__)
             raise
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *exception):
-        self.close()
+    def __exit__(self, error_type, error, traceback):
+        try:
+            self.close()
+        except BaseException:
+            if error is None:
+                raise
+            _LOGGER.exception("Resident cleanup failed while unwinding %s", error_type.__name__)
 
     def _close_worker(self, rank, worker):
         self._select(rank)
@@ -171,6 +180,7 @@ class ResidentNetworkRuntime:
         local, bound = {}, []
         self._select(rank)
         writable, transient = {}, []
+        error, failed_run = None, False
         try:
             for value, parameter, direction in zip(arguments, abi["params"], abi["effective_directions"]):
                 if parameter["shape"] is None:
@@ -216,16 +226,40 @@ class ResidentNetworkRuntime:
                 bound.append(_device_view(owner["allocation"], value, owner.get("base_offset", 0)))
                 if direction != "In":
                     writable[key] = owner
-            worker.run(compiled, *bound)
+            try:
+                worker.run(compiled, *bound)
+            except BaseException:
+                failed_run = True
+                raise
             self.stats["dispatches"] += 1
             self.stats["staging_dispatches"] += int(staged)
             for owner in writable.values():
                 host, allocation = owner["host"], owner["allocation"]
                 worker.copy_from(host.data_ptr(), allocation.data_ptr, host.numel())
                 self.stats["d2h_bytes"] += host.numel()
+        except BaseException as failure:
+            error = failure
+            raise
         finally:
-            for allocation in reversed(transient):
+            # An unsuccessful wait does not establish that device consumers
+            # have drained. The public worker owns these allocations and its
+            # close journal owns reclamation after a failed run.
+            if not failed_run:
+                self._release_transient(worker, transient, error)
+
+    @staticmethod
+    def _release_transient(worker, allocations, error):
+        """Attempt every completed dispatch allocation and preserve the primary failure."""
+        first_error = None
+        for allocation in reversed(allocations):
+            try:
                 worker.free_tensor(allocation)
+            except BaseException as failure:
+                if first_error is None:
+                    first_error = failure
+                _LOGGER.exception("Resident transient allocation cleanup failed")
+        if error is None and first_error is not None:
+            raise first_error
 
     def _group_ranks(self, group):
         world, tp = self.topology["ep"], self.topology["tp"]
