@@ -266,60 +266,93 @@ def build_chunk_metadata(template, layout, allocations, *, tokens, context, tp_r
                 query_start_loc=starts, hash_constants=template["hash_constants"])
 
 
+class TokenChunkInputs:
+    """Retain request metadata, one page reservation and host lookup tables for a session."""
+
+    def __init__(self, *, checkpoint, cache, config, output, context_capacity, prepare_engram=False):
+        from .engram_host import HostEngram
+
+        self.checkpoint, self.output = Path(checkpoint).resolve(), Path(output).resolve()
+        self.cache, self.config = cache, dict(config)
+        self.topology = config["topology"]
+        tp, dp = self.topology["tp"], self.topology["dp"]
+        if (self.topology != dict(dp=dp, tp=tp, ep=16, pp=1, pcp=1, dcp=1)
+                or tp not in (1, 2, 4) or dp * tp != 16):
+            raise ValueError("Token chunks require EP16 with TP1/2/4")
+        model = json.loads((self.checkpoint / "config.json").read_text())
+        if model != config["model_config"]:
+            raise ValueError("Prepared model configuration differs from the selected checkpoint")
+        self.capacity = context_capacity
+        self.layouts, self.allocations, self.reserved = reserve_cache_layouts(cache["cache_ABI"], context_capacity)
+        self.identities = {name: file_sha(self.checkpoint / name) for name in
+                           ("config.json", "quant_model_weights.safetensors.index.json", "tokenizer.json")
+                           if (self.checkpoint / name).is_file()}
+        self.output.mkdir(parents=True, exist_ok=False)
+        self.host = (HostEngram(self.checkpoint, cache["engram_contracts"], self.output.parent.name)
+                     if prepare_engram else None)
+        self.history, self.epoch, self.predecessor = [], 0, None
+        self.closed = False
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            if self.host is not None:
+                self.host.close()
+
+    def chunk(self, tokens, *, dp_rank=0):
+        """Prepare dynamic rows and coordinates without replacing any cache backing allocation."""
+        tp, dp = self.topology["tp"], self.topology["dp"]
+        if self.closed or not 0 <= dp_rank < dp or not 1 <= len(tokens) <= 16:
+            raise ValueError("Require a live session and 1..16 tokens on one DP engine")
+        context = len(self.history)
+        if context + len(tokens) > self.capacity:
+            raise ValueError("Token chunk exceeds the session's fixed cache reservation")
+        vocabulary = self.config["model_config"]["text_config"]["vocab_size"]
+        tokens = tokenize_prompt(list(tokens), self.checkpoint, vocabulary)
+        directory = self.output / f"chunk-{self.epoch}"
+        directory.mkdir()
+        request = dict(request_slot=0, token_ids=tokens, position_ids=list(range(context, context + len(tokens))),
+                       live_token_mask=[1] * len(tokens), initial_context_length=context,
+                       history_tokens=list(self.history))
+        engines = [dict(dp_rank=rank, active=len(tokens) if rank == dp_rank else 0,
+                        requests=[request] if rank == dp_rank else []) for rank in range(dp)]
+        actual = dict(topology=self.topology, checkpoint=str(self.checkpoint), checkpoint_sha256=self.identities,
+                      epoch=self.epoch, predecessor_input_sha256=self.predecessor, DP_engines=engines)
+        input_path = directory / "input-contract.json"
+        write_json(input_path, actual)
+        identity = file_sha(input_path)
+        payloads, sources = [], []
+        for rank, template in enumerate(self.cache["cache_ABI"]):
+            payload = build_chunk_metadata(template, self.layouts[rank], self.allocations[rank], tokens=tokens,
+                context=context, tp_rank=rank % tp, active=rank // tp == dp_rank, reserved=self.reserved, tp=tp)
+            path = directory / f"rank-{rank}-metadata.pt"
+            torch.save(payload, path)
+            sources.append(dict(rank=rank, path=str(path), sha256=file_sha(path)))
+            payloads.append(payload)
+        contract = dict(self.config, checkpoint=str(self.checkpoint), input_contract_path=str(input_path),
+                        input_contract_sha256=identity)
+        inputs = dict(input_contract=actual, prepare_input_stage=True)
+        cache = dict(self.cache, cache_ABI=payloads,
+                     cache_ABI_sources=[dict(rank=row["rank"], payload_sha256=row["sha256"],
+                                            report_sha256=row["sha256"]) for row in sources])
+        if self.host is not None:
+            inputs["engram_lookup"] = self.host.lookup(inputs, cache=cache, config=contract)
+        self.history.extend(tokens)
+        self.epoch += 1
+        self.predecessor = identity
+        return dict(inputs=inputs, contract=contract, metadata_sources=sources, cache=cache)
+
+
 def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_size=16, dp_rank=0, prepare_engram=False):
-    """Yield prepared chunks lazily while retaining a complete fixed page reservation."""
-    topology = config["topology"]
-    tp, dp = topology["tp"], topology["dp"]
-    if (topology != dict(dp=dp, tp=tp, ep=16, pp=1, pcp=1, dcp=1)
-            or tp not in (1, 2, 4) or dp * tp != 16 or type(chunk_size) is not int
-            or not 1 <= chunk_size <= 16 or type(dp_rank) is not int or not 0 <= dp_rank < dp):
-        raise ValueError("Automatic chunks require EP16 with TP1/2/4 and chunk_size 1..16")
-    checkpoint, output = Path(checkpoint).resolve(), Path(output).resolve()
-    model = json.loads((checkpoint / "config.json").read_text())
-    if model != config["model_config"]:
-        raise ValueError("Prepared model configuration differs from the selected checkpoint")
-    tokens = tokenize_prompt(inputs, checkpoint, model["text_config"]["vocab_size"])
-    layouts, allocations, reserved = reserve_cache_layouts(cache["cache_ABI"], len(tokens))
-    identities = {name: file_sha(checkpoint / name) for name in
-                  ("config.json", "quant_model_weights.safetensors.index.json", "tokenizer.json")
-                  if (checkpoint / name).is_file()}
-    output.mkdir(parents=True, exist_ok=False)
-    from contextlib import ExitStack
-
-    from .engram_host import HostEngram
-
-    with ExitStack() as stack:
-        host = (stack.enter_context(HostEngram(checkpoint, cache["engram_contracts"], output.name))
-                if prepare_engram else None)
-        predecessor = None
-        for epoch, begin in enumerate(range(0, len(tokens), chunk_size)):
-            directory = output / f"chunk-{epoch}"
-            directory.mkdir()
-            current = tokens[begin:begin + chunk_size]
-            request = dict(request_slot=0, token_ids=current, position_ids=list(range(begin, begin + len(current))),
-                           live_token_mask=[1] * len(current), initial_context_length=begin, history_tokens=tokens[:begin])
-            engines = [dict(dp_rank=rank, active=len(current) if rank == dp_rank else 0,
-                            requests=[request] if rank == dp_rank else []) for rank in range(dp)]
-            actual_input = dict(topology=topology, checkpoint=str(checkpoint), checkpoint_sha256=identities,
-                epoch=epoch, predecessor_input_sha256=predecessor, DP_engines=engines)
-            input_path = directory / "input-contract.json"
-            write_json(input_path, actual_input)
-            identity = file_sha(input_path)
-            payloads, sources = [], []
-            for rank, template in enumerate(cache["cache_ABI"]):
-                payload = build_chunk_metadata(template, layouts[rank], allocations[rank], tokens=current, context=begin,
-                    tp_rank=rank % tp, active=rank // tp == dp_rank, reserved=reserved, tp=tp)
-                path = directory / f"rank-{rank}-metadata.pt"
-                torch.save(payload, path)
-                sources.append(dict(rank=rank, path=str(path), sha256=file_sha(path)))
-                payloads.append(payload)
-            contract = dict(config, checkpoint=str(checkpoint), input_contract_path=str(input_path),
-                input_contract_sha256=identity)
-            prepared_inputs = dict(input_contract=actual_input, prepare_input_stage=True)
-            prepared_cache = dict(cache, cache_ABI=payloads,
-                cache_ABI_sources=[dict(rank=row["rank"], payload_sha256=row["sha256"], report_sha256=row["sha256"])
-                                   for row in sources])
-            if host is not None:
-                prepared_inputs["engram_lookup"] = host.lookup(prepared_inputs, cache=prepared_cache, config=contract)
-            yield dict(inputs=prepared_inputs, contract=contract, metadata_sources=sources, cache=prepared_cache)
-            predecessor = identity
+    """Yield bounded request chunks using one metadata and host-table owner."""
+    if type(chunk_size) is not int or not 1 <= chunk_size <= 16:
+        raise ValueError("Chunk size must be in 1..16")
+    tokens = tokenize_prompt(inputs, checkpoint, config["model_config"]["text_config"]["vocab_size"])
+    request = TokenChunkInputs(checkpoint=checkpoint, cache=cache, config=config, output=output,
+                               context_capacity=config.get("context_capacity", len(tokens)),
+                               prepare_engram=prepare_engram)
+    try:
+        for begin in range(0, len(tokens), chunk_size):
+            yield request.chunk(tokens[begin:begin + chunk_size], dp_rank=dp_rank)
+    finally:
+        request.close()

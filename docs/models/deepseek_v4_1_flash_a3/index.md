@@ -1,8 +1,8 @@
 # DeepSeek V4.1 Flash A3 Prefill and Decode
 
 A3 Eco-Tech W8A8 operators, the original 40-layer Prefill composition and
-persistent runtime, bounded Decode operators, and a host-scheduled 40-layer
-Decode network. See [Decode](decode.md) for its implementation scope and
+persistent generation session, bounded Decode operators, and a shared TP4
+40-layer network for Prefill and one-token Decode. See [Decode](decode.md) for its implementation scope and
 remaining work.
 
 ## Development priorities
@@ -21,7 +21,8 @@ remaining work.
 
 | Responsibility | Owner |
 | --- | --- |
-| Whole-network Prefill, compilation reuse and runtime | `prefill_fwd.py` |
+| Shared network compilation, execution and session | `network.py` |
+| Whole-network Prefill and request preparation | `prefill_fwd.py` |
 | 40-layer Decode schedule, resident weights and state | `decode_fwd.py --network`, `decode_network.py` |
 | Generic layer composition and L2 bindings | `prefill_layer.py`, `prefill_layer_plan.json` |
 | Bounded SWA Decode | `decode_fwd.py` |
@@ -130,8 +131,8 @@ scheduling and HCCL boundaries; it is not a single fused 40-layer device graph.
 No loading, compilation or token-latency guarantee follows from this organization.
 
 Execution uses persistent ChipWorkers, preloaded compute weights, cache
-allocations and HCCL groups for the complete stream. Input/output staging
-workers keep registration slots separate from resident expert operands.
+allocations and HCCL groups for the complete stream. Input/output entries and both generation phases share the same worker
+registry and allocation owners.
 The streaming-weight diagnostic alternative and task-directory compiler reuse
 manifests are removed. Runtime dtype, shape, rank, alias, write-direction,
 source-version and lifecycle checks remain in force.
@@ -145,8 +146,7 @@ a cleanup error is propagated when there is no earlier failure.
 ### Fixed INT8 weight layout
 
 Initialization packs QKV, Indexer query and Prefill shared/routed expert
-weights on the CPU before uploading their final compute operands. Decode
-shared-expert and packed-QKV builders accept the same blocked operands.
+weights on the CPU before uploading their final compute operands. The shared Prefill/Decode network accepts the same blocked operands.
 For logical `[K, N]` INT8 weights, the layout is `[N/64, K, 64]`, flattened
 to `[K*(N/64), 64]`. `utils.pack_blocked_weight` performs only a byte reorder.
 `prepare_ecotech_dynamic_weight` and the expert loaders return this packed
@@ -167,8 +167,9 @@ their separate NZ or blocked device operands are not interchangeable.
 Layer and chunk calls reuse the pinned projection tensors and each EP owner's
 resident expert handles, without repacking or uploading the fixed weights.
 Activation quantization and routed-token dispatch packing still run per call.
-Decode routed experts retain their separate FRACTAL_NZ format, including down
-projection padding. The bounded `decode_fwd` direct-tile GEMMs retain logical
+The generation network reuses the blocked routed-expert representation in
+both phases. Bounded legacy Decode operators retain their FRACTAL_NZ contract,
+including down projection padding. The bounded `decode_fwd` direct-tile GEMMs retain logical
 `[K, N]` weights and do not perform a whole-weight pack. A5 FP8/FP4 layouts are
 not used by these A3 W8A8 kernels.
 
@@ -224,23 +225,23 @@ python -m models.deepseek_v4_1_flash_a3.prefill_fwd --config prefill.json -p a2a
 does not execute NPU work. Output includes final logits, compilation accounting,
 execution progress and failures, without per-layer reference-comparison captures.
 
-`generate.py` provides greedy feedback through the same complete Prefill path:
+`generate.py` runs Prefill and one-token Decode in one DP4/TP4/EP16
+session with one static weight bank and the original cache allocations:
 
 ```bash
 python -m models.deepseek_v4_1_flash_a3.generate \
-  --checkpoint weights/deepseek-v4.1-flash-w8a8 \
-  --assets inputs/generation-templates --prompt inputs/prompt.json \
+  --checkpoint weights/deepseek-v4.1-flash-w8a8 --prompt "Hello" \
   --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
-  --output build_output/ds41-generation --result build_output/ds41-answer
+  --max-new-tokens 3 --ignore-eos --output build_output/ds41-generation
 ```
 
-Assets contain `input-contract.json`, `cache-ABI.pt` and `engram-contracts.pt`.
-The prompt JSON supplies messages, thinking mode, rendered text, token IDs,
-EOS and checkpoint/tokenizer identities. Generation verifies these identities,
-feeds each actual last-row greedy token into the next chunk and stops at EOS
-or its 256-token bound. It runs a complete Prefill forward per generated token;
-it does not yet hand Prefill state to the 40-layer Decode network; that phase
-boundary remains a separate integration path.
+The command derives its cache and Engram contracts from checkpoint metadata,
+reserves prompt and output pages once, and feeds each predicted token into a
+single-token Decode step. It retains the same workers, static handles, cache
+pools and request history until the session closes. Engram projection/gating
+and the vocabulary head run on A3; dynamic Engram lookup rows are prepared
+from the persistent host tables. See [Decode](decode.md) for standalone
+commands and the read/upload/cache-alias audit fields.
 
 ## Correctness scope
 
@@ -248,5 +249,5 @@ Operator arithmetic, quantization, rounding and cache layouts remain unchanged.
 Operator-local checks use the [Golden Harness](../../run-and-validate/golden-harness.md).
 CPU goldens, imports and IR specialization do not establish NPU accuracy.
 Complete-network accuracy, dataset scores, full-model HBM residency and
-performance still require device evidence. Prefill-to-Decode state handoff
-and serving scheduler integration remain unimplemented.
+performance still require device evidence. Serving scheduler integration and independent full-network accuracy
+acceptance remain outside this generation entry.

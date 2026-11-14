@@ -11,7 +11,10 @@ MXFP8/MXFP4 kernels or topology.
 
 | Responsibility | Modules |
 | --- | --- |
-| Whole-network Prefill and reusable compilation | `prefill_fwd.py` |
+| Shared TP4 programs, network execution and generation session | `network.py` |
+| Whole-network Prefill preparation | `prefill_fwd.py` |
+| One-token Decode and token feedback | `decode_network.py`, `generate.py` |
+| Session weight bank and Decode ABI binding | `resident_weights.py`, `decode_network_weights.py` |
 | Generic layer and L2 composition | `prefill_layer.py`, `prefill_layer_plan.json` |
 | Bounded Decode forward | `decode_fwd.py` |
 | Phase attention compositions | `prefill_swa.py`, `prefill_c2a.py`, `prefill_compressed_reuse.py`, `decode_swa.py`, `decode_network_swa.py` |
@@ -22,7 +25,7 @@ MXFP8/MXFP4 kernels or topology.
 | Host Engram tables, rows, rotation and slot ownership | `engram_host.py` |
 | Prefill routing, dispatch, shared expert and combination | `prefill_moe.py` |
 | Bounded Decode routing, dispatch and shared expert | `decode_moe.py` |
-| Full Decode routing and layer composition | `decode_network_moe.py`, `decode_network_decode_*.py` |
+| Bounded full-width Decode routing and layer composition | `decode_network_moe.py`, `decode_network_decode_*.py` |
 | Routed expert computation | `expert_routed.py` |
 | Linear, quantization, Norm, RoPE, QKV and attention leaves | `gemm.py`, `quant.py`, `rmsnorm.py`, `rope.py`, `qkv_proj_rope.py`, `o_proj.py`, `swa.py`, `sparse_attention.py` |
 | Checkpoint readers and phase weight layouts | `weights.py` |
@@ -38,7 +41,8 @@ native reference-capture workers, state replay and identity manifests are
 removed. Historical code and provenance remain in Git history. Production
 request/cache checks and operator-local golden entries remain.
 
-Network input preparation and executable lifetime live in `prefill_fwd.py`.
+Network request preparation lives in `prefill_prepare.py`; shared program
+and generation lifetime live in `network.py`.
 Indexer dispatch lives in `prefill_indexer.py`; live candidate ownership checks
 live in `cache.py`. Decode projection definitions live in their Linear, Norm,
 RoPE, activation, Indexer, attention or output-projection owner. There is no
@@ -72,12 +76,12 @@ there is no compatibility `moe.py` facade.
 L2 regions inline existing children between host communication boundaries.
 They do not change operation order, BF16 buffers or source/cache ownership.
 `decode_sparse_attention.py` stays TP-specialized and separate from Prefill
-configuration. EP2 product orchestration is removed. The full EP16 weight
-loader owns 24 experts per rank, and `decode_network.py` schedules all forty
-physical layers plus embedding, Engram and the vocabulary head. Device
-accuracy and Prefill-to-Decode state handoff remain separate validation work.
+configuration. EP2 product orchestration is removed. The generation weight owner assigns 24 experts per EP rank.
+`decode_network.py` advances the shared TP4 schedule by one token over the
+original Prefill cache aliases. Both phases execute device embedding, Engram
+and the vocabulary head; independent device accuracy remains separate validation work.
 
 Compute weights, workers and communication groups persist across Prefill
-chunks. Engram tables stay on the host; device kernels consume prepared rows.
+chunks and one-token Decode steps. Engram tables stay on the host; device kernels consume prepared rows.
 Runtime shape, dtype, alias, version and lifecycle checks are production
 interface requirements and remain in place.

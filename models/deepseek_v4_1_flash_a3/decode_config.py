@@ -31,8 +31,8 @@ TP_SIZE = _parse_parallel_size("tp", 1)
 class DecodeParallelConfig:
     """Decode topology contract; device allocation remains the caller's job."""
 
-    dp: int = 8
-    tp: int = 2
+    dp: int = 4
+    tp: int = 4
     ep: int = 16
     pp: int = 1
     pcp: int = 1
@@ -94,8 +94,8 @@ class DecodeParallelConfig:
 
 
 DECODE_PARALLEL = DecodeParallelConfig(
-    dp=_parse_parallel_size("dp", 8),
-    tp=_parse_parallel_size("tp", 2),
+    dp=_parse_parallel_size("dp", 4),
+    tp=_parse_parallel_size("tp", 4),
     ep=_parse_parallel_size("ep", 16),
     pp=_parse_parallel_size("pp", 1),
     pcp=_parse_parallel_size("pcp", 1),

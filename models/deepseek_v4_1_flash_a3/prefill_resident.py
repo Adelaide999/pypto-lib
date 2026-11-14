@@ -41,7 +41,7 @@ def _device_view(allocation, value, base_offset=0):
 
 
 class ResidentNetworkRuntime:
-    """Own resident compute workers and independent CPU-staged IO workers per logical rank."""
+    """Own one worker, program registry and allocation bank per logical rank."""
 
     def __init__(self, devices, topology, *, worker_factory=None):
         begin = perf_counter()
@@ -52,13 +52,21 @@ class ResidentNetworkRuntime:
             raise ValueError("Resident runtime requires the exact complete distinct device mapping")
         self.workers, self.pinned, self.channels = [], {}, {}
         self.device_owners = {}
+        self.device_readonly = {}
         self.rotations = {}
+        self.programs = {}
+        self.static_parameters = {}
+        self.dynamic = {}
+        self.allocations = [[] for _ in devices]
+        self.failed_ranks = set()
         self._stack = ExitStack()
         self._closed = False
         self._select = lambda rank: None
         self.stats = dict(worker_initializations=0, dispatches=0, h2d_bytes=0, d2h_bytes=0,
                           weight_bytes=[0] * len(devices), state_bytes=[0] * len(devices),
-                          transport_calls=0, transport_seconds=0.0)
+                          transport_calls=0, transport_seconds=0.0, device_weight_upload_calls=0,
+                          device_weight_upload_seconds=0.0,
+                          dynamic_allocations=0, cache_h2d_bytes=0)
         try:
             if worker_factory is None:
                 from pypto.backend import BackendType
@@ -84,6 +92,7 @@ class ResidentNetworkRuntime:
                 self._stack.callback(self._close_worker, rank, worker)
                 self.workers.append(worker)
                 self.stats["worker_initializations"] += 1
+            self._stack.callback(self._close_allocations)
             self.stats["worker_initialization_seconds"] = perf_counter() - begin
         except BaseException as error:
             self.__exit__(type(error), error, error.__traceback__)
@@ -104,15 +113,39 @@ class ResidentNetworkRuntime:
         self._select(rank)
         worker.close()
 
+    def _close_allocations(self):
+        """Free all completed session allocations before closing their workers."""
+        first_error = None
+        for rank, allocations in enumerate(self.allocations):
+            self._select(rank)
+            if rank in self.failed_ranks:
+                allocations.clear()
+                continue
+            for allocation in reversed(allocations):
+                try:
+                    self.workers[rank].free_tensor(allocation)
+                except BaseException as error:
+                    first_error = first_error or error
+                    _LOGGER.exception("Session allocation cleanup failed on rank %s", rank)
+            allocations.clear()
+        if first_error is not None:
+            raise first_error
+
     def close(self):
         """Drain every communicator and worker, including partial initialization."""
         if not self._closed:
             self._closed = True
-            self._stack.close()
-            self.channels.clear()
-            self.pinned.clear()
-            self.device_owners.clear()
-            self.rotations.clear()
+            try:
+                self._stack.close()
+            finally:
+                self.channels.clear()
+                self.pinned.clear()
+                self.device_owners.clear()
+                self.device_readonly.clear()
+                self.rotations.clear()
+                self.programs.clear()
+                self.static_parameters.clear()
+                self.dynamic.clear()
 
     def pin(self, value, ranks, *, readonly, name):
         """Upload one owning allocation per rank and retain all typed aliases."""
@@ -134,25 +167,63 @@ class ResidentNetworkRuntime:
             offset = value.storage_offset() * value.element_size() if readonly else 0
             extent = value.numel() * value.element_size() if readonly else full_host.numel()
             host = full_host.narrow(0, offset, extent)
+            upload_begin = perf_counter()
             allocation = self.workers[rank].alloc_tensor(host.shape, host.dtype, init=host)
+            self.allocations[rank].append(allocation)
+            self.device_owners[id(allocation.buffer)] = rank
+            self.device_readonly[id(allocation.buffer)] = readonly
             self.pinned[key] = dict(host=host, source=value, allocation=allocation, readonly=readonly,
                                     base_offset=offset,
                                     name=name, versions={id(value): (value, value._version)})
             kind = "weight_bytes" if readonly else "state_bytes"
             self.stats[kind][rank] += allocation.nbytes
             self.stats["h2d_bytes"] += allocation.nbytes
+            if readonly:
+                self.stats["device_weight_upload_calls"] += 1
+                self.stats["device_weight_upload_seconds"] += perf_counter() - upload_begin
+            elif name.startswith("raw/"):
+                self.stats["cache_h2d_bytes"] += allocation.nbytes
+
+    def handle(self, value, rank):
+        """Return a typed alias of an already uploaded host allocation."""
+        if self._closed:
+            raise RuntimeError("Resident runtime is closed")
+        owner = self.pinned[rank, value.untyped_storage()._cdata]
+        return _device_view(owner["allocation"], value, owner["base_offset"])
+
+    def register(self, program):
+        """Admit every phase and boundary entry to the same worker registry."""
+        static_names = {
+            "weight", "hc_function", "hc_fn", "hc_scale", "hc_base", "norm_weight",
+            "wq_a", "wq_a_scale", "q_norm", "wq_b", "wq_b_scale", "wkv", "wkv_scale", "kv_norm",
+            "sink", "weight_a", "weight_b", "ffn_norm", "bias", "bias_vl",
+            "gate_up_weight", "gate_up_scale", "down_weight", "down_scale",
+            "wgate", "gamma", "channel_scale", "q_weight", "k_weight", "rotation",
+        }
+        for entries in program.stages.values():
+            for name, entry in entries.items():
+                self.programs[id(entry.compiled)] = entry.compiled
+                names = static_names | {"gate"} if name == "ffn_dispatch_l2" else static_names
+                self.static_parameters[id(entry.compiled)] = names.intersection(entry.compiled.param_names)
+        if len(self.programs) > 64:
+            raise ValueError("The shared network exceeds the worker's 64 program slots")
 
     def weight(self, value, rank):
         """Upload a complete immutable owned expert operand without retaining host payloads."""
         self._select(rank)
         value = value.contiguous()
+        upload_begin = perf_counter()
         result = self.workers[rank].alloc_tensor(value.shape, value.dtype, init=value)
+        self.allocations[rank].append(result)
         self.device_owners[id(result.buffer)] = rank
+        self.device_readonly[id(result.buffer)] = True
         self.stats["weight_bytes"][rank] += result.nbytes
         self.stats["h2d_bytes"] += result.nbytes
+        self.stats["device_weight_upload_calls"] += 1
+        self.stats["device_weight_upload_seconds"] += perf_counter() - upload_begin
         return result
 
-    def execute(self, compiled, rank, arguments, abi, *, staged=False):
+    def execute(self, compiled, rank, arguments, abi):
         """Dispatch existing arithmetic with resident constants on the session worker."""
         from pypto.runtime import DeviceTensor
 
@@ -160,9 +231,7 @@ class ResidentNetworkRuntime:
             raise RuntimeError("Resident runtime is closed")
         if len(arguments) != len(abi["params"]):
             raise ValueError("Resident dispatch requires the complete compiled parameter ABI")
-        # Boundary IO and backbone entries share the same worker.  Keeping a
-        # single registration/control map per rank is required by the A3
-        # runtime and also makes resident aliases valid across both phases.
+        # Boundary and backbone entries share one worker and registration map.
         worker = self.workers[rank]
         local, bound = {}, []
         self._select(rank)
@@ -176,23 +245,28 @@ class ResidentNetworkRuntime:
                     bound.append(value)
                     continue
                 if isinstance(value, DeviceTensor):
-                    if direction != "In":
-                        raise ValueError("Owned expert operands must remain read-only")
                     if self.device_owners.get(id(value.buffer)) != rank:
                         raise ValueError("Resident device operand belongs to another rank or runtime")
+                    if direction != "In" and self.device_readonly[id(value.buffer)]:
+                        raise ValueError("A compiled entry writes an immutable resident weight")
                     bound.append(value)
                     continue
                 host = _host_bytes(value)
                 key = (rank, value.untyped_storage()._cdata)
                 resident_owner = self.pinned.get(key)
+                if (resident_owner is None and parameter.get("name")
+                        in self.static_parameters.get(id(compiled), ())):
+                    raise RuntimeError("Static operand is missing its resident handle: " + parameter["name"])
                 owner = resident_owner
                 if owner is not None:
                     if owner["readonly"] and direction != "In":
                         raise ValueError("A compiled entry writes an immutable resident weight")
                     changed = any(tensor._version != version for tensor, version in owner["versions"].values())
-                    if changed or (not owner["readonly"] and id(value) not in owner["versions"]):
+                    if changed:
                         if owner["readonly"]:
                             raise ValueError("Immutable resident weight changed on the host")
+                        if owner["name"].startswith("raw/"):
+                            raise ValueError("Device cache bytes cannot be replaced from a host mirror")
                         copy = owner["host"]
                         worker.copy_to(owner["allocation"].data_ptr, copy.data_ptr(), copy.numel())
                         self.stats["h2d_bytes"] += copy.numel()
@@ -202,10 +276,19 @@ class ResidentNetworkRuntime:
                 elif key in local:
                     owner = local[key]
                 else:
-                    allocation = worker.alloc_tensor(host.shape, host.dtype, init=host)
-                    transient.append(allocation)
+                    slot = rank, id(compiled), len(bound)
+                    allocation = self.dynamic.get(slot)
+                    if allocation is None:
+                        allocation = worker.alloc_tensor(host.shape, host.dtype, init=host)
+                        self.allocations[rank].append(allocation)
+                        self.dynamic[slot] = allocation
+                        self.stats["dynamic_allocations"] += 1
+                    else:
+                        if allocation.nbytes != host.numel():
+                            raise ValueError("Reusable dynamic operand changed its allocation extent")
+                        worker.copy_to(allocation.data_ptr, host.data_ptr(), host.numel())
                     owner = local[key] = dict(host=host, allocation=allocation, readonly=False)
-                    self.stats["h2d_bytes"] += allocation.nbytes
+                    self.stats["h2d_bytes"] += host.numel()
                 bound.append(_device_view(owner["allocation"], value, owner.get("base_offset", 0)))
                 if direction != "In":
                     writable[key] = owner
@@ -213,12 +296,16 @@ class ResidentNetworkRuntime:
                 worker.run(compiled, *bound)
             except BaseException:
                 failed_run = True
+                self.failed_ranks.add(rank)
                 raise
             self.stats["dispatches"] += 1
             for owner in writable.values():
                 host, allocation = owner["host"], owner["allocation"]
                 worker.copy_from(host.data_ptr(), allocation.data_ptr, host.numel())
                 self.stats["d2h_bytes"] += host.numel()
+                if "versions" in owner:
+                    owner["versions"] = {key: (tensor, tensor._version)
+                                         for key, (tensor, _) in owner["versions"].items()}
         except BaseException as failure:
             error = failure
             raise
@@ -333,6 +420,8 @@ class ResidentNetworkRuntime:
     def summary(self):
         """Report actual allocations and dispatches separately from numerical acceptance."""
         return dict(self.stats, assigned_devices=list(self.devices),
+                    runtime_identity=id(self), worker_identities=[id(worker) for worker in self.workers],
+                    registered_programs=len(self.programs), closed=self._closed,
                     execution_model="persistent_A3_ChipWorkers_with_host_layer_scheduler",
                     single_device_graph=False, cache_readback="retained for current host consumers",
                     numerical_acceptance="not_established_by_residency")

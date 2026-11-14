@@ -9,6 +9,7 @@
 """Cache layouts, source ownership, geometry and legal state lifetimes."""
 
 import json
+import math
 from copy import deepcopy
 from functools import lru_cache
 from pathlib import Path
@@ -60,7 +61,8 @@ def decode_cache_views(prefill_handles, source_map=None):
         if shape is None:
             shape = source.shape
         shape = tuple(shape)
-        if not shape or source.nbytes < torch.empty(shape, dtype=source.dtype).numel() * source.dtype.itemsize:
+        if (not shape or any(type(size) is not int or size <= 0 for size in shape)
+                or source.nbytes < math.prod(shape) * source.dtype.itemsize):
             raise ValueError(f"Decode cache view {decode_name} exceeds {source_name} allocation")
         result[decode_name] = DeviceTensor(
             source.data_ptr,

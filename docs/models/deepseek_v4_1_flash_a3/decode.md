@@ -1,73 +1,94 @@
 # DeepSeek V4.1 Flash A3 Decode
 
-Decode and Prefill share the A3 package and small computation primitives.
-The bounded SWA entry and a host-scheduled 40-layer EP16 Decode network are
-implemented. The network composes the existing physical-layer entries, keeps
-Decode weights resident across steps, and exposes embedding, Engram and the
-vocabulary head. Device accuracy and automatic Prefill-to-Decode generation
-remain separate validation work.
+The 40-layer network uses DP4/TP4/EP16 and one persistent generation session.
+Prefill and one-token Decode use the same TP4 layer ABI, compiled program
+registry, static weight handles, HCCL groups and paged cache allocations.
+The scheduler remains on the host; model arithmetic runs on A3.
 
 ## Owners
 
 | Responsibility | Module |
 | --- | --- |
-| 40-layer schedule, state lifetime and autoregressive loop | `decode_fwd.py --network`, `decode_network.py` |
-| Resident checkpoint weights and sparse Engram rows | `decode_network_weights.py`, `decode_network_decode_weight_abi.py`, `decode_network_decode_weights.py` |
-| Bounded single-step SWA forward and local golden | `decode_fwd.py` |
-| Bounded attention and mHC composition | `decode_swa.py` |
-| Full Decode SWA and Engram composition | `decode_network_swa.py`, `decode_network_engram.py` |
-| Routing, dispatch and shared-expert variants | `decode_moe.py` |
-| Routed expert computation | `expert_routed.py` |
-| Compression, Indexer and Engram | `compressor.py`, `indexer.py`, `engram.py` |
-| Linear, quantization, Norm, RoPE and cache operations | Shared child operators |
-| Checkpoint loading and EP16 MoE layout | `weights.py` |
+| Shared programs, layer schedule and generation session | `network.py` |
+| Prefill request preparation and public forward | `prefill_fwd.py` |
+| One-token Decode and standalone Decode command | `decode_network.py` |
+| Session static weight ownership and read/upload audit | `resident_weights.py` |
+| Decode binding to existing canonical operands | `decode_network_weights.py` |
+| Checkpoint reading, packing and expert ownership | `weights.py` |
+| Original paged cache geometry and aliases | `cache.py`, `state.py` |
+| Persistent workers, dynamic buffers and HCCL channels | `prefill_resident.py` |
+| Request metadata, cache reservation and host lookup lifetime | `prefill_prepare.py` |
+| Device Engram projection and gating | `engram.py`, `prefill_network_engram.py` |
+| Device final collapse, normalization and vocabulary shards | `lm_head.py` |
 
-The complete network currently specializes to DP16/TP1/EP16. Its Decode MoE
-loader assigns 24 routed experts to each rank; the bounded single-step entry
-retains its existing topology matrix and validation contract.
+`A3ResidentWeights.preload_once()` prepares the complete static bank before
+executing any tokens. Each logical checkpoint tensor is read once, including
+shared experts. Each checkpoint shard is opened once during preload and its
+initialization handle is closed before token execution. Every EP rank owns 24 contiguous routed experts. Identical
+Prefill/Decode representations use the same pointer and owning buffer;
+Decode's ABI adapter cannot create a reader or preload another bank.
 
-`decode_network_weights.DecodeNetworkWeights` loads one physical layer at a
-time, adapts the target Prefill-packed QKV/Indexer matrices back to the
-canonical Decode layout, and retains the complete bank on the device. Routed
-experts are streamed by owner rank, so ranks 0..15 cover all 384 experts once.
-Per-expert NZ packing, scale handling and offset checks are preserved.
+The network retains the original blocked W8A8 operands for both phases. The
+legacy full-width TP1 network and its independent FRACTAL_NZ weight bank are
+replaced by this shared ABI. Bounded operator validation entries retain their
+separate operator interfaces.
 
-## 40-layer network
-
-The network runs embedding, the L1/L14 Engram stages, all forty physical
-layers, and the final vocabulary head. `DecodeState` owns SWA pages, compressed
-source state, Indexer selections, the candidate pool and request histories.
-The public `DecodeNetwork` and `DecodeNetworkWeights` objects can be retained
-for multiple Decode steps.
-
-After activating the PyPTO environment, the following checks do not allocate
-or execute an NPU device:
+## Generation
 
 ```bash
-python -m models.deepseek_v4_1_flash_a3.decode_fwd --network --ep 16 --dp 16 --tp 1 --plan-only
-python -m models.deepseek_v4_1_flash_a3.decode_fwd --network --ep 16 --dp 16 --tp 1 --compile-only
+python -m models.deepseek_v4_1_flash_a3.generate \
+  --checkpoint weights/deepseek-v4.1-flash-w8a8 \
+  --prompt "Hello" --max-new-tokens 3 --ignore-eos \
+  --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+  --output build_output/ds41-generation
 ```
 
-The plan reports all 40 layers and the compile-only command compiles the four
-layer variants plus embedding, initial HC, Engram, RoPE and the vocabulary
-head. It does not establish numerical accuracy or device performance.
+Use the site's allocator and its assigned device list for execution. The
+first predicted token comes from Prefill; a three-token limit exercises two
+Decode steps. Prompt chunks honor `--chunk-size`. Cache pages are reserved
+for the prompt and all requested output tokens before initialization.
+History is preserved in full up to the 2048-position context bound.
 
-The bounded entry retains its own Torch golden and standard
-[Golden Harness](../../run-and-validate/golden-harness.md) command:
+Decode updates token IDs, positions, masks and lookup rows through reusable
+dynamic device buffers. It advances the original cache provider without a
+state file, cache copy, new worker or second cache pool. Cache aliases keep
+the original buffer, pointer and byte offset. A failed step invalidates the
+session and cannot be replayed in place.
+
+Engram projection, rotation and gating run on A3 in both phases. As in
+Prefill, the complete INT8/FP32 lookup tables remain mapped on the host;
+hashing and gathering the small dynamic lookup rows remain CPU input
+preparation. This mode does not claim that the complete tables reside in HBM.
+The LM head, normalization and vocabulary shard assembly run on A3.
+
+`generation/result.json` records both runtime identities, checkpoint and
+static upload counts, per-step zero-load checks, expert ownership, cache
+pointer aliases and cleanup status. `prefill/network/weight-audit.json`
+records per-logical-weight reads and host preparation groups. Each Decode
+step writes `decode/step-N/decode.json` and the full execution receipt.
+`generation/answer.txt` and `generation/tokens.json` are updated after each
+generated token. Execution success does not establish independent accuracy.
+
+## Standalone Decode
+
+Standalone Decode initializes the same shared ABI once and consumes the
+supplied history on the device before autoregressive steps. A history string
+alone does not fabricate a populated cache.
 
 ```bash
-python -m models.deepseek_v4_1_flash_a3.decode_fwd -p a2a3 --sim --compile-only
+python -m models.deepseek_v4_1_flash_a3.decode_fwd --network \
+  --dp 4 --tp 4 --ep 16 --plan-only
+python -m models.deepseek_v4_1_flash_a3.decode_network \
+  --checkpoint weights/deepseek-v4.1-flash-w8a8 \
+  --dp 4 --tp 4 --ep 16 --tokens 1 --decode-steps 3 --compile-only \
+  --output build_output/ds41-decode-compiled
 ```
 
-This compiles an operator case; it is not a full-network accuracy result.
-`decode_moe.py` additionally owns bounded router/shared-expert validation:
+Plan-only reads no weights and initializes no device. Compile-only requires
+checkpoint metadata to derive the shared cache and Engram contracts; it
+compiles the complete network and its device boundaries without executing
+kernels. Omit `--compile-only` and supply allocated `--devices` to execute.
 
-```bash
-python -m models.deepseek_v4_1_flash_a3.decode_moe -p a2a3 --compile-only
-```
-
-Its local Torch goldens retain the FP32 router input and both standalone BF16
-and fused FP32 activation boundaries, including empty and partial token slabs.
-Remaining work includes Prefill state handoff, request slot reuse and device
-accuracy/memory/performance verification. Continuous generation still uses
-the existing Prefill feedback path described in the [model documentation](index.md).
+The bounded SWA and MoE operator commands retain their Torch goldens and the
+[Golden Harness](../../run-and-validate/golden-harness.md). Complete-network
+accuracy and throughput require separate device comparison and measurement.

@@ -6,45 +6,33 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Generation-scoped A3 Prefill/Decode weight ownership.
-
-The phase-specific readers retain their numerical ABI adapters, while this
-owner controls their lifetime and the accounting shared by a complete
-generation.  A Decode reader may therefore be attached to an already prepared
-Prefill session instead of being constructed for every token.
-"""
-
-from __future__ import annotations
+"""One static checkpoint, host preparation and device bank per A3 generation."""
 
 from time import perf_counter
 
 from .cache import decode_cache_views
+from .decode_network_weights import DecodeNetworkWeights
+from .weights import ResidentNetworkWeights
 
 
 class A3ResidentWeights:
-    """Own all static A3 operands for one Prefill/Decode generation session."""
+    """Own canonical operands and identical Prefill/Decode allocation mappings."""
 
     def __init__(self, checkpoint, topology, model_config, runtime):
-        from .decode_network_weights import DecodeNetworkWeights
-        from .weights import ResidentNetworkWeights
-
-        self.checkpoint = str(checkpoint)
-        self.topology = dict(topology)
-        self.world = int(self.topology["ep"])
-        self.runtime = runtime
+        self.checkpoint, self.topology = str(checkpoint), dict(topology)
+        self.world, self.runtime = int(topology["ep"]), runtime
         self.prefill = ResidentNetworkWeights(checkpoint, topology, model_config, runtime)
-        self.decode = DecodeNetworkWeights(checkpoint, topology["ep"])
-        self.prefill_handles = [dict() for _ in range(topology["ep"])]
-        self.decode_handles = [dict() for _ in range(topology["ep"])]
-        self.cache_handles = [dict() for _ in range(topology["ep"])]
+        self.decode = DecodeNetworkWeights(self)
+        self.prefill_handles = [dict() for _ in range(self.world)]
+        self.decode_handles = [dict() for _ in range(self.world)]
+        self.cache_handles = [dict() for _ in range(self.world)]
+        self.cache_alias_receipts = []
         self.initialization_timings = {}
-        self._prefill_ready = False
-        self._decode_ready = False
-        self._closed = False
+        self.ready, self._closed = False, False
+        self._frozen_counters = None
 
     @property
     def reader(self):
-        """Expose the canonical checkpoint reader for Prefill diagnostics."""
         return self.prefill.reader
 
     @property
@@ -61,84 +49,66 @@ class A3ResidentWeights:
 
     @property
     def layer_receipts(self):
-        """Expose Prefill's per-layer checkpoint accounting to runtime reports."""
         return self.prefill.layer_receipts
 
     @property
-    def static_names(self):
-        return self.decode.static_names
-
-    @property
     def device_upload_calls(self):
-        """Expose Decode's one-time device upload accounting to its driver."""
-        return self.decode.device_upload_calls
+        return self.runtime.stats["device_weight_upload_calls"]
 
-    @property
-    def image_ids(self):
-        return self.decode.image_ids
+    def counters(self):
+        return dict(checkpoint_read_calls=self.reader.read_calls,
+                    checkpoint_file_open_calls=self.reader.file_open_calls + int(self.ready),
+                    host_weight_preparation_calls=sum(self.reader.preparations.values()),
+                    device_weight_upload_calls=self.device_upload_calls)
 
-    @property
-    def token_map(self):
-        return self.decode.token_map
-
-    @token_map.setter
-    def token_map(self, value):
-        self.decode.token_map = value
-
-    def preload_prefill(self, progress=None):
-        """Upload Prefill operands once and keep their runtime allocations alive."""
+    def preload_once(self, progress=None):
+        """Read and prepare each logical weight once for both phases' common ABI."""
         if self._closed:
             raise RuntimeError("A3 resident weights are closed")
-        if self._prefill_ready:
+        if self.ready:
+            self.assert_static_unchanged()
             return dict(self.initialization_timings)
         begin = perf_counter()
         self.prefill.preload(progress)
-        self._prefill_ready = True
-        self.initialization_timings.update(
-            checkpoint_read_seconds=self.prefill.reader.read_seconds,
-            checkpoint_read_calls=self.prefill.reader.read_calls,
-            host_weight_preparation_seconds=self.prefill.load_seconds,
-            prefill_weight_initialization_seconds=perf_counter() - begin,
+        rotation_begin = perf_counter()
+        rotation, _ = self.runtime.load_rotation(self.checkpoint, 5120)
+        self.reader.read_calls += 1
+        self.reader.read_seconds += perf_counter() - rotation_begin
+        self.reader.consumed["optional/global_rotation"] = dict(
+            file="optional/quarot.safetensors", read_calls=1, prepared_shape=[32, 32],
+            prepared_dtype=str(rotation.dtype), selected_rows=None,
+        )
+        self.reader.preparations["engram.rotation"] = 1
+        self.runtime.pin(rotation, range(self.world), readonly=True, name="engram.rotation")
+        for rank in range(self.world):
+            handles = self.prefill_handles[rank]
+            for (owner_rank, _), owner in self.runtime.pinned.items():
+                if owner_rank == rank and owner["readonly"]:
+                    handles[owner["name"]] = self.runtime.handle(owner["source"], rank)
+            for (layer, owner_rank, expert), values in self.prefill.experts.items():
+                if owner_rank == rank:
+                    prefix = f"layers.{layer}.ffn.{expert if expert is not None else 'shared'}"
+                    for name, handle in zip(("gate_up", "gate_scale", "down", "down_scale"), values):
+                        handles[prefix + "." + name] = handle
+            self.decode_handles[rank].update(handles)
+        self.reader.seal()
+        self.ready = True
+        self._frozen_counters = self.counters()
+        initialization_seconds = perf_counter() - begin
+        upload_seconds = self.runtime.stats["device_weight_upload_seconds"]
+        self.initialization_timings = dict(
+            **self._frozen_counters,
+            checkpoint_read_seconds=self.reader.read_seconds,
+            host_weight_preparation_seconds=initialization_seconds - self.reader.read_seconds - upload_seconds,
+            device_weight_upload_seconds=upload_seconds,
+            static_initialization_seconds=initialization_seconds,
         )
         return dict(self.initialization_timings)
 
-    def preload_decode(self, runtime=None):
-        """Prepare Decode's ABI adapter once for the same generation owner.
-
-        ``runtime`` is accepted for compatibility with the existing Decode
-        network.  A caller may provide the session runtime when its compiled
-        entries support direct resident aliases; otherwise the Decode network
-        owns only the execution wrapper while this object still guarantees a
-        single Decode preload across all steps.
-        """
-        if self._closed:
-            raise RuntimeError("A3 resident weights are closed")
-        if self._decode_ready:
-            return dict(self.initialization_timings)
-        if not self._prefill_ready:
-            self.preload_prefill()
-        begin = perf_counter()
-        timings = self.decode.preload(runtime) if runtime is not None else None
-        if timings:
-            self.initialization_timings.update(timings)
-        self.initialization_timings["decode_weight_initialization_seconds"] = perf_counter() - begin
-        self._decode_ready = True
-        return dict(self.initialization_timings)
-
-    def preload(self, runtime=None):
-        """Compatibility entry point used by the standalone Decode network.
-
-        The generation path owns both phases from one resident bank.  Keep the
-        method name accepted by the older Decode driver, but always route it
-        through the generation-scoped Decode preload so repeated Decode steps
-        cannot allocate or upload another bank.
-        """
-        return self.preload_decode(runtime)
-
-    def layer(self, layer):
-        if not self._decode_ready:
-            raise RuntimeError("Decode weights were not preloaded for this session")
-        return self.decode.layer(layer)
+    def assert_static_unchanged(self):
+        """Reject checkpoint reads, host packing or static uploads in a token step."""
+        if not self.ready or self.counters() != self._frozen_counters:
+            raise RuntimeError("Static weights changed after generation session preload")
 
     def for_layer(self, layer):
         return self.prefill.for_layer(layer)
@@ -152,57 +122,54 @@ class A3ResidentWeights:
     def head_for_rank(self, rank):
         return self.prefill.head_for_rank(rank)
 
-    def embedding(self):
-        return self.decode.embedding()
-
-    def head(self):
-        return self.decode.head()
-
-    def engram(self, layer):
-        return self.decode.engram(layer)
-
-    def engram_rows(self, tokens, histories):
-        return self.decode.engram_rows(tokens, histories)
-
     def release_current(self):
-        """Keep every static operand alive until the session closes."""
+        """Keep the complete bank alive across physical layers and tokens."""
 
     def bind_cache_views(self, rank, prefill_handles, source_map=None):
-        """Bind Decode cache names to the Prefill rank-local allocation."""
-        if not 0 <= rank < len(self.cache_handles):
-            raise ValueError("cache rank is outside the resident world")
+        """Retain exact aliases of the source pools, including byte offsets and owners."""
+        if not 0 <= rank < self.world:
+            raise ValueError("Cache rank is outside the resident world")
         views = decode_cache_views(prefill_handles, source_map)
         self.cache_handles[rank].update(views)
+        mapping = source_map if source_map is not None else {}
+        for name, view in views.items():
+            descriptor = mapping.get(name, name)
+            source_name = descriptor[0] if isinstance(descriptor, tuple) else descriptor
+            source = prefill_handles[source_name]
+            self.cache_alias_receipts.append(dict(
+                rank=rank, name=name, source_pointer=source.data_ptr, view_pointer=view.data_ptr,
+                same_buffer=source.buffer is view.buffer, byte_offset=view.byte_offset,
+                view_bytes=view.nbytes, source_bytes=source.nbytes,
+            ))
         return views
 
     def summary(self):
-        checkpoint_reads = self.prefill.reader.read_calls + self.decode.reader.read_calls
+        counts = self.counters()
+        shared = [all(handle.data_ptr == self.decode_handles[rank][name].data_ptr
+                      and handle.buffer is self.decode_handles[rank][name].buffer
+                      for name, handle in handles.items())
+                  for rank, handles in enumerate(self.prefill_handles)]
         return dict(
-            owner="A3ResidentWeights",
-            checkpoint=self.checkpoint,
-            topology=self.topology,
-            prefill_ready=self._prefill_ready,
-            decode_ready=self._decode_ready,
-            cache_aliases=[sorted(row) for row in self.cache_handles],
-            checkpoint_read_calls=checkpoint_reads,
-            device_weight_upload_calls=self.prefill.runtime.stats.get("weight_bytes", []),
-            device_weight_upload_call_count=self.decode.device_upload_calls,
+            owner="A3ResidentWeights", checkpoint=self.checkpoint, topology=self.topology,
+            prefill_ready=self.ready, decode_ready=self.ready, **counts,
+            device_weight_upload_call_count=self.device_upload_calls,
+            device_weight_bytes=list(self.runtime.stats["weight_bytes"]),
+            initialization_timings=self.initialization_timings,
+            logical_checkpoint_tensors=len(self.reader.consumed),
+            max_logical_tensor_read_calls=max((v["read_calls"] for v in self.reader.consumed.values()), default=0),
+            host_preparation_groups=len(self.reader.preparations),
+            shared_weight_allocation_identity=shared,
+            prefill_handle_count=[len(row) for row in self.prefill_handles],
+            decode_handle_count=[len(row) for row in self.decode_handles],
+            cache_aliases=list(self.cache_alias_receipts),
+            routed_expert_ownership=[self.layout.ownership(rank) for rank in range(self.world)],
+            extra_device_representations=0, closed=self._closed,
         )
 
     def close(self):
         if self._closed:
             return
         self._closed = True
-        self.decode.close()
         self.prefill.close()
         for handles in self.prefill_handles + self.decode_handles + self.cache_handles:
             handles.clear()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        self.close()
-
-
-__all__ = ["A3ResidentWeights"]

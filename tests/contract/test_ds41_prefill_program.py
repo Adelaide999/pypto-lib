@@ -18,7 +18,7 @@ pypto = pytest.importorskip("pypto")
 if getattr(pypto, "__pypto_stub__", False):
     pytest.skip("Real PyPTO IR is required", allow_module_level=True)
 
-from models.deepseek_v4_1_flash_a3 import prefill_fwd as pool
+from models.deepseek_v4_1_flash_a3 import network as pool
 from models.deepseek_v4_1_flash_a3.config import FLASH
 from models.deepseek_v4_1_flash_a3.input_pack import make_vocab_embedding
 from models.deepseek_v4_1_flash_a3.lm_head import make_output_entries

@@ -15,7 +15,7 @@ import re
 import struct
 from collections import Counter
 from collections.abc import Iterator as decode_Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Iterator, Mapping
@@ -249,13 +249,16 @@ class CheckpointOperands:
         self.consumed = {}
         self.read_seconds, self.read_calls = 0.0, 0
 
-    def load(self, name):
-        """Load complete logical checkpoint bytes before any layout or dtype conversion."""
+    def _source(self, path):
         from safetensors import safe_open
 
+        return safe_open(path, framework="pt", device="cpu")
+
+    def load(self, name):
+        """Load complete logical checkpoint bytes before any layout or dtype conversion."""
         begin = perf_counter()
         path = self.root / self.index[name]
-        with safe_open(path, framework="pt", device="cpu") as source:
+        with self._source(path) as source:
             value = source.get_tensor(name)
         self.consumed[name] = {
             "file": path.name,
@@ -1042,14 +1045,44 @@ class ResidentCheckpointOperands(CheckpointOperands):
     def __init__(self, root):
         super().__init__(root)
         self.boundaries = {}
+        self.frozen = False
+        self.preparations = {}
+        self._sources = {}
+        self._source_stack = ExitStack()
+        self.file_open_calls = 0
+
+    def _source(self, path):
+        if path not in self._sources:
+            self._sources[path] = self._source_stack.enter_context(super()._source(path))
+            self.file_open_calls += 1
+        return nullcontext(self._sources[path])
+
+    def seal(self):
+        """Close initialization file handles and prohibit further static reads."""
+        self.frozen = True
+        self._source_stack.close()
+        self._sources.clear()
+
+    def close(self):
+        self.seal()
+        self.boundaries.clear()
 
     def load(self, name):
         if name in self.boundaries:
             return self.boundaries[name]
+        if self.frozen:
+            raise RuntimeError("Static checkpoint reads are disabled after session preload: " + name)
+        if name in self.consumed:
+            raise RuntimeError("Logical checkpoint tensor was already read: " + name)
         value = super().load(name)
+        self.consumed[name]["read_calls"] = 1
         if name in ("embed.weight", "norm.weight", "head.weight"):
             self.boundaries[name] = value
         return value
+
+    def expert(self, prefix):
+        self.preparations[prefix] = self.preparations.get(prefix, 0) + 1
+        return super().expert(prefix)
 
 
 class ResidentNetworkWeights:
@@ -1078,10 +1111,12 @@ class ResidentNetworkWeights:
             names = [
                 name
                 for name in self.reader.index
-                if name.startswith(prefix) and ".ffn.experts." not in name and ".engram.embed." not in name
+                if name.startswith(prefix) and ".ffn.experts." not in name
+                and ".ffn.shared_experts." not in name and ".engram.embed." not in name
             ]
             raw = {name: self.reader.load(name) for name in names}
             operands = prepare_product_operands(raw, layer, role=resolve_layer_role(layer))
+            self.reader.preparations[prefix + "projections"] = 1
             raw[prefix + "ffn.gate.weight"] = raw[prefix + "ffn.gate.weight"].float()
             for name in (
                 "hc_ffn_fn",
@@ -1182,7 +1217,7 @@ class ResidentNetworkWeights:
         self.layers.clear()
         self.experts.clear()
         self.heads.clear()
-        self.reader.boundaries.clear()
+        self.reader.close()
 
 
 def prepare_product_operands(raw, layer_id=0, *, role=None):
