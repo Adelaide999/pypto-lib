@@ -52,15 +52,13 @@ class ResidentNetworkRuntime:
             raise ValueError("Resident runtime requires the exact complete distinct device mapping")
         self.workers, self.pinned, self.channels = [], {}, {}
         self.device_owners = {}
-        self.staging_workers = {}
         self.rotations = {}
         self._stack = ExitStack()
         self._closed = False
         self._select = lambda rank: None
         self.stats = dict(worker_initializations=0, dispatches=0, h2d_bytes=0, d2h_bytes=0,
                           weight_bytes=[0] * len(devices), state_bytes=[0] * len(devices),
-                          transport_calls=0, transport_seconds=0.0,
-                          staging_worker_initializations=0, staging_dispatches=0)
+                          transport_calls=0, transport_seconds=0.0)
         try:
             if worker_factory is None:
                 from pypto.backend import BackendType
@@ -68,7 +66,7 @@ class ResidentNetworkRuntime:
 
                 def worker_factory(rank):
                     config = RunConfig(arch=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD,
-                                       device_id=rank)
+                                       device_id=self.devices[rank])
                     return ChipWorker(config=config)
 
                 from .moe_transport import CANNMemory
@@ -115,7 +113,6 @@ class ResidentNetworkRuntime:
             self.pinned.clear()
             self.device_owners.clear()
             self.rotations.clear()
-            self.staging_workers.clear()
 
     def pin(self, value, ranks, *, readonly, name):
         """Upload one owning allocation per rank and retain all typed aliases."""
@@ -155,28 +152,18 @@ class ResidentNetworkRuntime:
         self.stats["h2d_bytes"] += result.nbytes
         return result
 
-    def staging_worker(self, rank):
-        """Create a separate public worker whose buffers never alias resident allocations."""
-        if self._closed:
-            raise RuntimeError("Resident runtime is closed")
-        self._select(rank)
-        if rank not in self.staging_workers:
-            worker = self._worker_factory(rank)
-            self._stack.callback(self._close_worker, rank, worker)
-            self.staging_workers[rank] = worker
-            self.stats["worker_initializations"] += 1
-            self.stats["staging_worker_initializations"] += 1
-        return self.staging_workers[rank]
-
     def execute(self, compiled, rank, arguments, abi, *, staged=False):
-        """Dispatch existing arithmetic with resident constants and exact aliased staging."""
+        """Dispatch existing arithmetic with resident constants on the session worker."""
         from pypto.runtime import DeviceTensor
 
         if self._closed:
             raise RuntimeError("Resident runtime is closed")
         if len(arguments) != len(abi["params"]):
             raise ValueError("Resident dispatch requires the complete compiled parameter ABI")
-        worker = self.staging_worker(rank) if staged else self.workers[rank]
+        # Boundary IO and backbone entries share the same worker.  Keeping a
+        # single registration/control map per rank is required by the A3
+        # runtime and also makes resident aliases valid across both phases.
+        worker = self.workers[rank]
         local, bound = {}, []
         self._select(rank)
         writable, transient = {}, []
@@ -189,8 +176,6 @@ class ResidentNetworkRuntime:
                     bound.append(value)
                     continue
                 if isinstance(value, DeviceTensor):
-                    if staged:
-                        raise ValueError("Staged IO requires CPU tensors, not resident device operands")
                     if direction != "In":
                         raise ValueError("Owned expert operands must remain read-only")
                     if self.device_owners.get(id(value.buffer)) != rank:
@@ -200,9 +185,7 @@ class ResidentNetworkRuntime:
                 host = _host_bytes(value)
                 key = (rank, value.untyped_storage()._cdata)
                 resident_owner = self.pinned.get(key)
-                if staged and resident_owner is not None and direction != "In":
-                    raise ValueError("Staged IO may not write resident state or immutable weights")
-                owner = None if staged else resident_owner
+                owner = resident_owner
                 if owner is not None:
                     if owner["readonly"] and direction != "In":
                         raise ValueError("A compiled entry writes an immutable resident weight")
@@ -232,7 +215,6 @@ class ResidentNetworkRuntime:
                 failed_run = True
                 raise
             self.stats["dispatches"] += 1
-            self.stats["staging_dispatches"] += int(staged)
             for owner in writable.values():
                 host, allocation = owner["host"], owner["allocation"]
                 worker.copy_from(host.data_ptr(), allocation.data_ptr, host.numel())

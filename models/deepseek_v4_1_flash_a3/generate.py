@@ -11,6 +11,8 @@
 import argparse
 import json
 import math
+import subprocess
+import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,11 +21,11 @@ import torch
 from tokenizers import Tokenizer
 from torch.utils._python_dispatch import _disable_current_modes
 from .prefill_fwd import prefill_fwd
-from .prefill_prepare import build_chunk_metadata, reserve_cache_layouts
+from .prefill_prepare import build_chunk_metadata, checkpoint_cache, reserve_cache_layouts, tokenize_prompt
 from .utils import file_sha, write_json
 
 
-TOPOLOGY = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
+TOPOLOGY = dict(dp=16, tp=1, ep=16, pp=1, pcp=1, dcp=1)
 
 
 def atomic_json(path, value):
@@ -115,122 +117,118 @@ def load_prompt(path, checkpoint):
     return prompt, tokenizer
 
 
-def main():
-    """Run greedy generation on explicitly assigned devices and persistent network caches."""
+def main(argv=None):
+    """Run Prefill followed by Decode in one generation-scoped session."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--assets", type=Path, required=True)
-    parser.add_argument("--prompt", type=Path, required=True)
+    parser.add_argument("--assets", type=Path, help="Deprecated; cache contracts are derived from checkpoint")
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--prompt")
+    inputs.add_argument("--tokens")
     parser.add_argument("--devices", type=lambda value: [int(item) for item in value.split(",")], required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--result", type=Path, required=True)
-    args = parser.parse_args()
+    parser.add_argument("--result", type=Path)
+    parser.add_argument("--max-new-tokens", type=int, default=3)
+    parser.add_argument("--chunk-size", type=int, default=16)
+    parser.add_argument("--ignore-eos", action="store_true")
+    args = parser.parse_args(argv)
+    if (not 1 <= args.chunk_size <= 16 or not 1 <= args.max_new_tokens <= 256):
+        parser.error("Require chunk size 1..16 and a new-token limit in 1..256")
+    args.output = args.output.resolve()
+    result_dir = (args.result or args.output / "generation").resolve()
     args.output.mkdir(parents=True, exist_ok=False)
-    args.result.mkdir(parents=True, exist_ok=True)
-    prompt, tokenizer = load_prompt(args.prompt, args.checkpoint)
-    report = dict(at=datetime.now(timezone.utc).isoformat(), status="preparing", prompt=prompt["prompt"],
-        checkpoint=str(args.checkpoint), tokenizer=prompt["assets"],
-        rendered_prompt=prompt["rendered_prompt"], input_token_ids=prompt["input_token_ids"],
-        eos_token_id=prompt["eos_token_id"], topology=TOPOLOGY,
-        initial_max_new_tokens=128, maximum_new_tokens=256, active_token_limit=128,
-        generated_token_ids=[], raw_decoded_answer="", steps=[], eos=False, truncated=False,
-        complete_answer_observed=False, accuracy="not_run", exit_code=None, device_computation="PyPTO only",
-        algorithm="Persistent-cache sequential Prefill feedback; one complete 40-layer forward per new token")
-    start = monotonic()
-    generated, steps = report["generated_token_ids"], report["steps"]
-
-    def publish(event):
-        report.update(event)
-        report.update(updated_at=datetime.now(timezone.utc).isoformat(), elapsed_seconds=monotonic() - start)
-        atomic_json(args.result / "generation-result.json", report)
-        atomic_json(args.result / "status.json", dict(
-            at=report["updated_at"], stage=report.get("stage"), epoch=report.get("epoch"), layer=report.get("layer"),
-            actual_devices=report.get("actual_devices"),
-            status=report["status"], generated_tokens=len(generated), generated_token_ids=list(generated),
-            eos=report["eos"], truncated=report["truncated"], complete_answer_observed=report["complete_answer_observed"],
-            elapsed_seconds=report["elapsed_seconds"], result=str(args.result / "generation-result.json")))
-        print(json.dumps(event, ensure_ascii=False), flush=True)
-
-    (args.result / "answer.txt").write_text("")
-    publish(dict(stage="preparing_metadata"))
+    result_dir.mkdir(parents=True, exist_ok=True)
+    model = json.loads((args.checkpoint / "config.json").read_text())
+    tokenizer = Tokenizer.from_file(str(args.checkpoint / "tokenizer.json"))
+    raw = args.prompt if args.prompt is not None else [int(item) for item in args.tokens.split(",")]
+    tokens = tokenize_prompt(raw, args.checkpoint, model["text_config"]["vocab_size"])
+    eos = model.get("eos_token_id", model["text_config"].get("eos_token_id"))
+    if len(tokens) + args.max_new_tokens > 2048:
+        parser.error("Prompt plus generation exceeds the A3 cache context bound")
+    from .runtime_config import configure_devices
+    devices = configure_devices(args.devices, world=TOPOLOGY["ep"])
+    cache, config = checkpoint_cache(args.checkpoint, TOPOLOGY)
+    report = dict(status="executing", checkpoint=str(args.checkpoint), topology=TOPOLOGY,
+                  devices=devices, prompt_token_ids=tokens, generated_token_ids=[], phases=[],
+                  accuracy="not_run", static_checkpoint_reads=0, static_device_uploads=0)
+    (result_dir / "prompt.json").write_text(json.dumps(report, indent=2) + "\n")
+    session = None
+    network = None
+    weights = None
     try:
-        builder = FeedbackInputs(args.checkpoint, args.assets, args.output / "prepared", prompt, 256)
-        history, current = [], list(prompt["input_token_ids"])
-        chunk = builder.chunk(0, current, history, None)
-        from .runtime_config import configure_devices
+        prefill = prefill_fwd(tokens, weights=args.checkpoint, cache=cache, config=config, devices=devices,
+                              output=args.output / "prefill", keep_runtime=True,
+                              progress=lambda event: print(json.dumps(dict(event, phase="prefill")), flush=True))
+        session = prefill.pop("session")
+        logits = prefill["logits"][0]["fresh"][-1]
+        current = int(logits.argmax())
+        # Capture the Prefill accounting before closing its workers. A3's
+        # standalone Decode DistributedWorker must start after those workers
+        # have released the physical devices.
+        prefill_runtime = session.summary()
+        session.release_runtime()
+        generated = [current]
+        report["generated_token_ids"] = list(generated)
+        report["phases"].append("prefill")
+        text = tokenizer.decode(generated, skip_special_tokens=False)
+        (result_dir / "answer.txt").write_text(text, encoding="utf-8")
+        (result_dir / "tokens.json").write_text(json.dumps(generated) + "\n")
+        print("[generation-token] " + json.dumps(
+            dict(step=0, token_id=current, text=text), ensure_ascii=False), flush=True)
 
-        devices = configure_devices(args.devices, world=TOPOLOGY["ep"])
-        report.update(actual_devices=devices, logical_rank_mapping=list(range(16)), status="executing")
-
-        from .engram_host import HostEngram
-
-        host = HostEngram(args.checkpoint, chunk["cache"]["engram_contracts"], args.output.name)
-
-        def feedback():
-            nonlocal chunk, current, history
-            for epoch in range(256):
-                network = args.output / "network"
-                chunk_output = network if epoch == 0 else network / f"continuation-chunk{epoch}"
-                execution = json.loads((chunk_output / "execution.json").read_text())
-                runtime = json.loads((chunk_output / "runtime_config.json").read_text())
-                if runtime["completed_layers"] != list(range(40)):
-                    raise RuntimeError("Greedy feedback requires an actual completed full40 forward")
-                logits_path = chunk_output / "actual-layer39-output/rank-0-fresh-network-logits.pt"
-                result = torch.load(logits_path, map_location="cpu", weights_only=True)
-                positions = list(range(len(history), len(history) + len(current)))
-                actual_positions = result["positions"]
-                if isinstance(actual_positions, torch.Tensor):
-                    actual_positions = actual_positions.tolist()
-                if (result["active"] != len(current) or actual_positions != positions
-                        or result["DP_rank"] != 0):
-                    raise RuntimeError("Final logits do not cover the actual request's last valid row")
-                row = result["logits"][len(current) - 1].tolist()
-                if len(row) != builder.model["text_config"]["vocab_size"] or not all(map(math.isfinite, row)):
-                    raise RuntimeError("Final valid vocabulary logits are incomplete or nonfinite")
-                token = max(range(len(row)), key=row.__getitem__)
-                generated.append(token)
-                steps.append(dict(step=epoch, input_contract=chunk["contract"]["input_contract_path"],
-                    input_sha256=chunk["contract"]["input_contract_sha256"], input_token_ids=list(current),
-                    positions=positions, context_length=len(history), valid_length=len(current),
-                    logits_path=str(logits_path), logits_sha256=file_sha(logits_path),
-                    last_valid_row=len(current) - 1, token_id=token, greedy_logit=row[token],
-                    timing=execution["timings"]))
-                report["raw_decoded_answer"] = tokenizer.decode(generated, skip_special_tokens=False)
-                (args.result / "answer.txt").write_text(report["raw_decoded_answer"])
-                atomic_json(args.result / "tokens.json", generated)
-                publish(dict(stage="generated_real_product_token", epoch=epoch, layer=None, token_id=token,
-                             raw_decoded_answer=report["raw_decoded_answer"]))
-                if token == prompt["eos_token_id"]:
-                    publish(dict(status="completed_eos", stage="generation_complete", eos=True,
-                                 stop_reason="eos", complete_answer_observed=True))
-                    return
-                if len(generated) == 128:
-                    publish(dict(stage="extending_token_limit", active_token_limit=256))
-                if len(generated) == 256:
-                    publish(dict(status="completed_token_limit", stage="generation_complete",
-                                 truncated=True, stop_reason="token_limit"))
-                    return
-                history += current
-                current = [token]
-                chunk = builder.chunk(epoch + 1, current, history, chunk["contract"]["input_contract_sha256"])
-                chunk["inputs"]["engram_lookup"] = host.lookup(chunk["inputs"], cache=chunk["cache"], config=chunk["contract"])
-                yield {name: chunk[name] for name in ("inputs", "contract", "metadata_sources")}
-
-        try:
-            chunk["inputs"]["engram_lookup"] = host.lookup(chunk["inputs"], cache=chunk["cache"], config=chunk["contract"])
-            result = prefill_fwd(chunk["inputs"], weights=args.checkpoint, cache=chunk["cache"],
-                config=chunk["contract"], devices=devices, output=args.output / "network",
-                continuation=feedback(), progress=publish)
-        finally:
-            host.close()
-        report["compilation"] = result["compilation"]
-        report["resident_runtime"] = result["resident_runtime"]
-        publish(dict(stage="generation_terminal", exit_code=0))
+        decode_result = None
+        remaining = args.max_new_tokens - 1
+        if remaining and (args.ignore_eos or current != eos):
+            # Decode's bounded state can retain only 256 positions. Keep the
+            # latest history rows when a longer Prefill prompt is supplied.
+            history = tokens[-(256 - remaining):]
+            decode_output = args.output / "decode"
+            command = [
+                sys.executable, "-m", "models.deepseek_v4_1_flash_a3.decode_network",
+                "--checkpoint", str(args.checkpoint),
+                "--devices", ",".join(str(device) for device in devices),
+                "--tokens", str(current),
+                "--history-tokens", ",".join(str(token) for token in history),
+                "--decode-steps", str(remaining),
+                "--output", str(decode_output),
+            ]
+            print("[generation-decode-process] " + json.dumps(command), flush=True)
+            subprocess.run(command, check=True)
+            decode_result = json.loads((decode_output / "result.json").read_text())
+            for row in decode_result["generated_ids"]:
+                next_token = int(row[0])
+                if not args.ignore_eos and next_token == eos:
+                    break
+                generated.append(next_token)
+                report["generated_token_ids"] = list(generated)
+                report["phases"].append("decode")
+                text = tokenizer.decode(generated, skip_special_tokens=False)
+                (result_dir / "answer.txt").write_text(text, encoding="utf-8")
+                (result_dir / "tokens.json").write_text(json.dumps(generated) + "\n")
+                print("[generation-token] " + json.dumps(
+                    dict(step=len(generated) - 1, token_id=next_token, text=text),
+                    ensure_ascii=False), flush=True)
+        resident_weights = prefill_runtime["resident_weights"]
+        decode_init = (decode_result or {}).get("resident_weight_initialization", {})
+        report.update(status="executed", generated_text=tokenizer.decode(generated, skip_special_tokens=False),
+                      prefill_layers=40, decode_layers=40 if decode_result else 0,
+                      decode_steps=max(0, len(generated) - 1),
+                      static_checkpoint_reads=resident_weights["checkpoint_read_calls"] + decode_init.get("checkpoint_read_calls", 0),
+                      static_device_uploads=resident_weights["device_weight_upload_call_count"] + decode_init.get("device_weight_upload_calls", 0),
+                      prefill_runtime=prefill_runtime, decode_runtime=decode_result)
+        (result_dir / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+        print("[generation] Prefill40 -> Decode40 RUN PASS; " + json.dumps(report), flush=True)
     except BaseException as error:
         failure = dict(error_type=type(error).__name__, error=str(error), traceback=traceback.format_exc())
-        atomic_json(args.result / "failure.json", failure)
-        publish(dict(status="failed", stage="functional_failure", exit_code=1, **failure))
+        (result_dir / "failure.json").write_text(json.dumps(failure, indent=2) + "\n")
         raise
+    finally:
+        if weights is not None and (session is None or weights is not session.weights):
+            weights.close()
+        if network is not None:
+            network.close()
+        if session is not None:
+            session.close()
 
 
 if __name__ == "__main__":

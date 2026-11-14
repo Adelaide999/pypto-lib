@@ -180,6 +180,7 @@ def prefill_fwd(
     continuation=None,
     progress=None,
     engram_lookup=None,
+    keep_runtime=False,
 ):
     """Execute the existing network using explicit checkpoint and cache-state providers.
 
@@ -237,6 +238,7 @@ def prefill_fwd(
             compiled=compiled,
             continuation=continuation,
             progress=progress,
+            keep_runtime=keep_runtime,
         )
     finally:
         if chunks is not None:
@@ -904,8 +906,10 @@ def _network_owner_snapshot(provider):
 def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=False):
     """Allocate canonical cache owners and validate the complete original network ABI."""
     topology = contract["topology"]
-    if topology != dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1):
-        raise ValueError("The current network runtime requires DP4/TP4/EP16/PP1/PCP1/DCP1")
+    if (topology.get("ep") != 16 or topology.get("tp") not in (1, 2, 4)
+            or topology.get("dp") * topology.get("tp") != 16
+            or any(topology.get(name) != 1 for name in ("pp", "pcp", "dcp"))):
+        raise ValueError("The network runtime requires EP16 with TP1/2/4 and PP1/PCP1/DCP1")
     if (
         not all(contract["required_modes"].values())
         or contract["capacity"] != 16
@@ -916,10 +920,10 @@ def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=F
         raise ValueError("Freeze the same deterministic initial TopK storage as the independent reference")
     engram_contracts = inputs.get("engram_contracts")
     if not isinstance(engram_contracts, dict) or set(engram_contracts) != {1, 14}:
-        raise ValueError("Real independent TP4 complete-table Engram slot contracts are still required")
+        raise ValueError("Real complete-table Engram slot contracts are required")
     for item in engram_contracts.values():
-        if item["topology"] != topology or len(item["engram_shards"]) != 4:
-            raise ValueError("A TP2 or diagnostic Engram contract cannot be reused as TP4")
+        if item["topology"] != topology or len(item["engram_shards"]) != topology["tp"]:
+            raise ValueError("Engram contract topology differs from the shared network")
 
     model_config = contract["model_config"]
     provider = NetworkCacheProvider(
@@ -941,6 +945,50 @@ def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=F
     return provider
 
 
+class PrefillDecodeSession:
+    """Keep Prefill workers, resident weights and cache owners alive for Decode."""
+
+    def __init__(self, stack, *, resident, weights, provider, program):
+        self._stack = stack
+        self.resident = resident
+        self.weights = weights
+        self.provider = provider
+        self.program = program
+        self.closed = False
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self._stack.close()
+
+    def release_runtime(self):
+        """Close Prefill ChipWorkers before Decode creates its distributed worker.
+
+        A3's standalone Decode specialization uses a DistributedWorker whose
+        child processes cannot coexist with the Prefill ChipWorkers on the
+        same physical devices.  The resident weight owner remains alive so
+        Decode can finish its one-time ABI preload before the session closes.
+        """
+        if self.closed:
+            raise RuntimeError("Prefill/Decode session is already closed")
+        self.resident.close()
+
+    def summary(self):
+        """Return the persistent runtime and weight accounting for generation."""
+        return dict(
+            resident_runtime=self.resident.summary(),
+            resident_weights=self.weights.summary(),
+            provider_allocation_id=self.provider.allocation_id,
+            program=self.program.summary(),
+        )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
 def run_network_runtime(
     inputs,
     *,
@@ -951,6 +999,7 @@ def run_network_runtime(
     continuation=None,
     compiled=None,
     progress=None,
+    keep_runtime=False,
 ):
     """Execute a fresh chunk and a lazy stream of continuations with shared live state.
 
@@ -972,8 +1021,10 @@ def run_network_runtime(
         except TypeError as error:
             raise ValueError("Continuation must be a chunk mapping or iterable") from error
     topology = contract["topology"]
-    if topology != dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1):
-        raise ValueError("The current network runtime requires DP4/TP4/EP16/PP1/PCP1/DCP1")
+    if (topology.get("ep") != 16 or topology.get("tp") not in (1, 2, 4)
+            or topology.get("dp") * topology.get("tp") != 16
+            or any(topology.get(name) != 1 for name in ("pp", "pcp", "dcp"))):
+        raise ValueError("The network runtime requires EP16 with TP1/2/4 and PP1/PCP1/DCP1")
     from .runtime_config import configure_devices
 
     assigned = configure_devices(devices, world=topology["ep"])
@@ -994,14 +1045,15 @@ def run_network_runtime(
     provider = prepare_network_provider(inputs, contract, output.name)
     with ExitStack() as stack:
         from .prefill_resident import ResidentNetworkRuntime
-        from .weights import ResidentNetworkWeights
+        from .resident_weights import A3ResidentWeights
 
         resident = stack.enter_context(ResidentNetworkRuntime(assigned, topology))
-        weights = ResidentNetworkWeights(
+        resident_weights = A3ResidentWeights(
             contract["checkpoint"], topology, contract["model_config"], resident
         )
-        stack.callback(weights.close)
-        weights.preload(progress)
+        stack.callback(resident_weights.close)
+        weights = resident_weights
+        resident_weights.preload_prefill(progress)
         for family, values in (("raw", provider.arenas), ("shared", provider.shared)):
             for rank, cases in enumerate(values):
                 for case, tensors in cases.items():
@@ -1009,7 +1061,7 @@ def run_network_runtime(
                     for name, value in items:
                         resident.pin(value, [rank], readonly=False, name=f"{family}/{rank}/{case}/{name}")
         memory = CANNMemory(diagnostics=False)
-        ownership = [weights.layout.ownership(rank) for rank in range(16)]
+        ownership = [weights.layout.ownership(rank) for rank in range(topology["ep"])]
         first = _run_network_chunk(
             inputs,
             contract=contract,
@@ -1026,6 +1078,10 @@ def run_network_runtime(
             resident=resident,
         )
         if continuation is None:
+            if keep_runtime:
+                return dict(first, session=PrefillDecodeSession(
+                    stack.pop_all(), resident=resident, weights=weights, provider=provider, program=program
+                ))
             return first
         completed = [first]
         previous_contract = contract
@@ -1128,8 +1184,14 @@ def run_network_runtime(
             completed.append(result)
             previous_contract = next_contract
         if len(completed) == 1:
-            return first
-        return dict(completed[-1], completed_prefill_chunks=completed, complete_network_acceptance="not_run")
+            result = first
+        else:
+            result = dict(completed[-1], completed_prefill_chunks=completed, complete_network_acceptance="not_run")
+        if keep_runtime:
+            result["session"] = PrefillDecodeSession(
+                stack.pop_all(), resident=resident, weights=weights, provider=provider, program=program
+            )
+        return result
 
 
 def _run_network_chunk(
@@ -1161,13 +1223,15 @@ def _run_network_chunk(
     runtime = dict(
         topology=topology,
         assigned_devices=assigned,
-        logical_rank_mapping=list(range(16)),
+        logical_rank_mapping=list(range(topology["ep"])),
         source_root=str(Path(__file__).resolve().parents[2]),
         source_files={},
         groups=dict(
-            ep=[list(range(16))],
-            tp=[list(range(dp * 4, dp * 4 + 4)) for dp in range(4)],
-            dp=[[dp * 4 + lane for dp in range(4)] for lane in range(4)],
+            ep=[list(range(topology["ep"]))],
+            tp=[list(range(dp * topology["tp"], dp * topology["tp"] + topology["tp"]))
+                for dp in range(topology["dp"])],
+            dp=[[dp * topology["tp"] + lane for dp in range(topology["dp"])]
+                for lane in range(topology["tp"])],
         ),
         status="executing_not_compared",
         epoch=epoch,
@@ -1178,7 +1242,7 @@ def _run_network_chunk(
     )
     loaded_source_files(runtime)
     write_json(runtime_path, runtime)
-    reports = [dict(rank=rank, communication=[]) for rank in range(16)]
+    reports = [dict(rank=rank, communication=[]) for rank in range(topology["ep"])]
     executor = NetworkExecutor(
         topology,
         provider,
@@ -1201,12 +1265,12 @@ def _run_network_chunk(
     for item in engram_contracts.values():
         for name in ("token_map", "multipliers", "primes", "offsets"):
             if not torch.equal(item["hash_constants"][name], captured_constants[name]):
-                raise ValueError("TP4 Engram contract differs from actual captured hash constants")
+                raise ValueError("Engram contract differs from actual captured hash constants")
         if (
             tuple(item["hash_constants"]["layer_ids"]) != (1, 14)
             or item["hash_constants"]["pad_id"] != captured_constants["pad_id"]
         ):
-            raise ValueError("TP4 Engram contract differs from the original slot/pad layout")
+            raise ValueError("Engram contract differs from the original slot/pad layout")
     eng_runtime = dict(
         topology=topology,
         assigned_devices=assigned,

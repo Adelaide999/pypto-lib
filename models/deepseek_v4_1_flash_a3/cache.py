@@ -22,6 +22,56 @@ from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY
 COPY_TILE = 128
 
 
+# Logical Decode pools are views over the Prefill allocation.  The map is
+# deliberately explicit because compressed, SWA, index and state planes do
+# not share the same page geometry on A3.
+A3_DECODE_CACHE_SOURCES = {
+    "window_cache_pool": "swa_cache",
+    "compressed_cache_pool": "long_kv_cache",
+    "index_cache_pool": "indexer.k_cache",
+    "compressor_state_pool": "compressor.state_cache",
+}
+
+
+def decode_cache_views(prefill_handles, source_map=None):
+    """Create Decode ``DeviceTensor`` aliases for Prefill cache allocations.
+
+    ``prefill_handles`` is a rank-local mapping of logical cache names to
+    ``DeviceTensor`` objects.  The returned tensors keep the source data
+    pointer and owning buffer; no H2D copy or second allocation is performed.
+    A caller with a phase-specific ABI may provide ``source_map`` whose values
+    are either source names or ``(source_name, shape)`` pairs.
+    """
+    from pypto.runtime import DeviceTensor
+
+    mapping = A3_DECODE_CACHE_SOURCES if source_map is None else source_map
+    result = {}
+    for decode_name, descriptor in mapping.items():
+        if isinstance(descriptor, tuple):
+            source_name, shape = descriptor
+        else:
+            source_name, shape = descriptor, None
+        try:
+            source = prefill_handles[source_name]
+        except KeyError as error:
+            raise KeyError(f"Prefill cache handle is missing for {source_name}: {decode_name}") from error
+        if type(source) is not DeviceTensor:
+            raise TypeError(f"Prefill cache {source_name} must be a DeviceTensor")
+        if shape is None:
+            shape = source.shape
+        shape = tuple(shape)
+        if not shape or source.nbytes < torch.empty(shape, dtype=source.dtype).numel() * source.dtype.itemsize:
+            raise ValueError(f"Decode cache view {decode_name} exceeds {source_name} allocation")
+        result[decode_name] = DeviceTensor(
+            source.data_ptr,
+            shape,
+            source.dtype,
+            buffer=source.buffer,
+            byte_offset=source.byte_offset,
+        )
+    return result
+
+
 def make_paged_cache_copy(
     blocks,
     payload,

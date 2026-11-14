@@ -9,6 +9,8 @@
 """Prepare single-request chunk inputs and persistent paged-cache coordinates."""
 
 import json
+import hashlib
+import os
 from copy import deepcopy
 from pathlib import Path
 import torch
@@ -18,6 +20,106 @@ from .utils import file_sha, write_json
 
 MAX_CONTEXT = 2048
 PAGE_ROWS = 128
+
+
+def checkpoint_cache(checkpoint, topology):
+    """Build cache and host Engram contracts directly from checkpoint metadata."""
+    from .engram_host import build_compressed_token_map, checkpoint_region, make_layout
+    checkpoint = Path(checkpoint).resolve()
+    model = json.loads((checkpoint / "config.json").read_text())
+    from tokenizers import Tokenizer
+
+    tokenizer = Tokenizer.from_file(str(checkpoint / "tokenizer.json"))
+    mapping, compressed = build_compressed_token_map(tokenizer)
+    text = model["text_config"]
+    if compressed != text["engram_compressed_vocab_size"]:
+        raise ValueError("Checkpoint tokenizer compressed vocabulary differs")
+    hashed = make_layout()
+    constants = dict(token_map=torch.tensor(mapping, dtype=torch.int64), multipliers=hashed.multipliers,
+                     primes=hashed.primes, offsets=hashed.offsets)
+    contracts = {}
+    tp, world = topology["tp"], topology["ep"]
+    cache_root = Path(os.environ.get("PYPTO_A3_STATE_DIR", Path.home() / ".cache")) / "engram-contracts"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    identity = hashlib.sha256()
+    for metadata_name in ("config.json", "quant_model_weights.safetensors.index.json", "tokenizer.json"):
+        metadata_path = checkpoint / metadata_name
+        identity.update(metadata_name.encode())
+        identity.update(metadata_path.read_bytes())
+    digest_cache_path = cache_root / (hashlib.sha256(str(checkpoint).encode()).hexdigest() + ".json")
+    try:
+        digest_cache = json.loads(digest_cache_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        digest_cache = {}
+    if digest_cache.get("identity") != identity.hexdigest():
+        digest_cache = {"identity": identity.hexdigest(), "payloads": {}}
+
+    def payload_sha256(name, row_range, *, width, element_bytes):
+        """Hash exactly one original Engram shard without materializing the table."""
+        path, payload, spec = checkpoint_region(checkpoint, name)
+        begin, end = row_range
+        if spec["shape"][1] != width:
+            raise ValueError(f"Unexpected Engram width for {name}")
+        cache_key = f"{name}:{row_range[0]}:{row_range[1]}:{width}:{element_bytes}"
+        cached = digest_cache["payloads"].get(cache_key)
+        if cached:
+            return cached
+        digest = hashlib.sha256()
+        byte_offset = payload + begin * width * element_bytes
+        byte_count = (end - begin) * width * element_bytes
+        with path.open("rb", buffering=0) as stream:
+            stream.seek(byte_offset)
+            remaining = byte_count
+            while remaining:
+                chunk = stream.read(min(8 * 1024 * 1024, remaining))
+                if not chunk:
+                    raise EOFError(f"Incomplete Engram payload while hashing {name}")
+                digest.update(chunk)
+                remaining -= len(chunk)
+        value = digest.hexdigest()
+        digest_cache["payloads"][cache_key] = value
+        return value
+
+    for slot, layer in enumerate((1, 14)):
+        _, _, spec = checkpoint_region(checkpoint, f"layers.{layer}.engram.embed.weight")
+        primes, offsets = hashed.primes[slot], hashed.offsets[slot]
+        boundaries = [int(offsets[lane * 24 // tp]) for lane in range(tp)] + [spec["shape"][0]]
+        if spec["shape"][0] != int(offsets[-1] + primes[-1]):
+            raise ValueError("Checkpoint Engram rows differ from the original hash layout")
+        shards = []
+        for lane in range(tp):
+            row_range = boundaries[lane:lane + 2]
+            shards.append(dict(
+                head_range=[lane * 24 // tp, (lane + 1) * 24 // tp],
+                row_range=row_range,
+                DP_sharing_ranks=list(range(lane, world, tp)),
+                host_payload_sha256=dict(
+                    codes=payload_sha256(
+                        f"layers.{layer}.engram.embed.weight", row_range, width=256, element_bytes=1
+                    ),
+                    scales=payload_sha256(
+                        f"layers.{layer}.engram.embed.scale", row_range, width=8, element_bytes=4
+                    ),
+                ),
+            ))
+        contracts[layer] = dict(
+            checkpoint=str(checkpoint), model_config=model, topology=deepcopy(topology), capacity=16,
+            physical_layer_id=layer,
+            hash_constants=dict(constants, layer_ids=[1, 14], pad_id=text["engram_pad_token_id"]),
+            engram_shards=shards, host_storage="checkpoint_file_mapping",
+            engram_storage_contract=dict(dtype="INT8", scale_dtype="FP32", group_size=32,
+                                         cpu_offload=True, dp_shared_memory=True, global_columns=24),
+        )
+    cache = dict(cache_ABI=cache_templates(constants, world=world), engram_contracts=contracts)
+    config = dict(
+        topology=deepcopy(topology), checkpoint=str(checkpoint), model_config=model,
+        required_modes=dict(enable_expert_parallel=True, enable_fused_mc2=True,
+                            enable_dsa_cp=True, enable_flashcomm1=True, enable_shared_expert_dp=True),
+        capacity=16, scheduler_capacity=8192, fresh_shared_initialization={"topk_indices": -1},
+        weight_residency="session",
+    )
+    digest_cache_path.write_text(json.dumps(digest_cache, indent=2) + "\n")
+    return cache, config
 
 
 def tokenize_prompt(inputs, checkpoint, vocabulary):
@@ -79,13 +181,55 @@ def reserve_cache_layouts(templates, context_length):
     return layouts, group_pages, blocks - 1
 
 
-def build_chunk_metadata(template, layout, allocations, *, tokens, context, tp_rank, active, reserved):
+def cache_templates(hash_constants, *, world=16):
+    """Construct the A3 typed cache planes shared by Prefill and Decode."""
+    views, groups = {}, []
+    for layer in range(40):
+        root = f"model.layers.{layer}.self_attn."
+        groups.append(dict(group_id=len(groups), names=[root + "swa_cache"]))
+        views[root + "swa_cache"] = (128, 512, "torch.bfloat16")
+        role = resolve_layer_role(layer)
+        if role["mode"] == "full":
+            compressed = [root + "long_kv_cache", root + "indexer.k_cache"]
+            groups.append(dict(group_id=len(groups), names=compressed))
+            views[compressed[0]] = (128 // role["ratio"], 512, "torch.bfloat16")
+            views[compressed[1]] = [(128 // role["ratio"], 128, "torch.int8"),
+                                    (128 // role["ratio"], 1, "torch.float16")]
+            if role["ratio"] == 2:
+                groups.append(dict(group_id=len(groups), names=[root + "compressor.state_cache"]))
+                views[root + "compressor.state_cache"] = (32, 1024, "torch.float32")
+    descriptors, aliases = {}, {"shared": [], "index": []}
+    for name, dimensions in views.items():
+        planes = dimensions if isinstance(dimensions, list) else [dimensions]
+        items = []
+        for plane_id, (rows, width, dtype) in enumerate(planes):
+            size = torch.empty((), dtype=getattr(torch, dtype.split(".")[-1])).element_size()
+            key = "index" if name.endswith("indexer.k_cache") and rows == 128 else "shared"
+            offset = (65536 + (8192 if plane_id else 0)) if name.endswith("indexer.k_cache") and rows == 64 else 0
+            if key == "index" and plane_id:
+                offset = 16384
+            items.append(dict(storage_key=key, dtype=dtype, shape=[2, rows, 1, width],
+                              stride=[131072 // size, width, width, 1],
+                              storage_offset_bytes=offset, storage_bytes=262144))
+            if name not in aliases[key]:
+                aliases[key].append(name)
+        descriptors[name] = items if isinstance(dimensions, list) else items[0]
+    raw = {key: dict(storage_key=key, dtype="torch.int8", shape=[262144], stride=[1],
+                      storage_offset_bytes=0, storage_bytes=262144) for key in aliases}
+    layout = dict(raw=raw, views=descriptors, aliases=aliases)
+    template = dict(layout=layout, groups=groups, hash_constants=hash_constants)
+    return [deepcopy(template) for _ in range(world)]
+
+
+def build_chunk_metadata(template, layout, allocations, *, tokens, context, tp_rank, active, reserved, tp=4):
     """Build CPU controls for SWA, completed compression pairs and per-request ring state."""
     total = len(tokens) if active else 0
     positions = torch.arange(context, context + total, dtype=torch.int64)
-    physical = (total + 3) // 4
+    if tp not in (1, 2, 4):
+        raise ValueError("Prefill TP must be 1, 2 or 4")
+    physical = (total + tp - 1) // tp
     start, end = tp_rank * physical, (tp_rank + 1) * physical
-    span = [start, end, physical, physical * 4]
+    span = [start, end, physical, physical * tp]
     valid = max(0, min(end, total) - min(start, total))
     lengths = torch.tensor([context + total] if active else [], dtype=torch.int32)
     starts = torch.tensor([0, total] if active else [0], dtype=torch.int32)
@@ -124,10 +268,12 @@ def build_chunk_metadata(template, layout, allocations, *, tokens, context, tp_r
 
 def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_size=16, dp_rank=0, prepare_engram=False):
     """Yield prepared chunks lazily while retaining a complete fixed page reservation."""
-    topology = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
-    if (config["topology"] != topology or type(chunk_size) is not int or not 1 <= chunk_size <= 16
-            or type(dp_rank) is not int or not 0 <= dp_rank < 4):
-        raise ValueError("Automatic chunks require DP4/TP4/EP16, chunk_size 1..16 and dp_rank 0..3")
+    topology = config["topology"]
+    tp, dp = topology["tp"], topology["dp"]
+    if (topology != dict(dp=dp, tp=tp, ep=16, pp=1, pcp=1, dcp=1)
+            or tp not in (1, 2, 4) or dp * tp != 16 or type(chunk_size) is not int
+            or not 1 <= chunk_size <= 16 or type(dp_rank) is not int or not 0 <= dp_rank < dp):
+        raise ValueError("Automatic chunks require EP16 with TP1/2/4 and chunk_size 1..16")
     checkpoint, output = Path(checkpoint).resolve(), Path(output).resolve()
     model = json.loads((checkpoint / "config.json").read_text())
     if model != config["model_config"]:
@@ -153,7 +299,7 @@ def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_siz
             request = dict(request_slot=0, token_ids=current, position_ids=list(range(begin, begin + len(current))),
                            live_token_mask=[1] * len(current), initial_context_length=begin, history_tokens=tokens[:begin])
             engines = [dict(dp_rank=rank, active=len(current) if rank == dp_rank else 0,
-                            requests=[request] if rank == dp_rank else []) for rank in range(4)]
+                            requests=[request] if rank == dp_rank else []) for rank in range(dp)]
             actual_input = dict(topology=topology, checkpoint=str(checkpoint), checkpoint_sha256=identities,
                 epoch=epoch, predecessor_input_sha256=predecessor, DP_engines=engines)
             input_path = directory / "input-contract.json"
@@ -162,7 +308,7 @@ def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_siz
             payloads, sources = [], []
             for rank, template in enumerate(cache["cache_ABI"]):
                 payload = build_chunk_metadata(template, layouts[rank], allocations[rank], tokens=current, context=begin,
-                    tp_rank=rank % 4, active=rank // 4 == dp_rank, reserved=reserved)
+                    tp_rank=rank % tp, active=rank // tp == dp_rank, reserved=reserved, tp=tp)
                 path = directory / f"rank-{rank}-metadata.pt"
                 torch.save(payload, path)
                 sources.append(dict(rank=rank, path=str(path), sha256=file_sha(path)))

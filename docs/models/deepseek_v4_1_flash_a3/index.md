@@ -1,8 +1,9 @@
 # DeepSeek V4.1 Flash A3 Prefill and Decode
 
 A3 Eco-Tech W8A8 operators, the original 40-layer Prefill composition and
-persistent runtime, and bounded Decode operators. See [Decode](decode.md)
-for the implemented Decode scope and remaining work.
+persistent runtime, bounded Decode operators, and a host-scheduled 40-layer
+Decode network. See [Decode](decode.md) for its implementation scope and
+remaining work.
 
 ## Development priorities
 
@@ -21,11 +22,13 @@ for the implemented Decode scope and remaining work.
 | Responsibility | Owner |
 | --- | --- |
 | Whole-network Prefill, compilation reuse and runtime | `prefill_fwd.py` |
+| 40-layer Decode schedule, resident weights and state | `decode_fwd.py --network`, `decode_network.py` |
 | Generic layer composition and L2 bindings | `prefill_layer.py`, `prefill_layer_plan.json` |
 | Bounded SWA Decode | `decode_fwd.py` |
 | Vocabulary embedding, initial HC and output head | `input_pack.py`, `prefill_fwd.py`, `lm_head.py` |
 | Attention, compression and Indexer | `swa.py`, `sparse_attention.py`, `compressor.py`, `indexer.py`, phase compositions |
 | Phase MoE routing, dispatch and shared experts | `prefill_moe.py`, `decode_moe.py` |
+| Full Decode layer leaves and network orchestration | `decode_network_*.py` |
 | Grouped routed-expert computation | `expert_routed.py` |
 | Linear, quantization, Norm, RoPE and HC | `gemm.py`, `quant.py`, `rmsnorm.py`, `rope.py`, `hc.py` |
 | Checkpoint operands and phase layouts | `weights.py` |
@@ -34,7 +37,9 @@ for the implemented Decode scope and remaining work.
 | Host Engram tables and row preparation | `engram_host.py` |
 | Device Engram projection and gating | `engram.py`, `prefill_network_engram.py` |
 
-The package has 45 Python modules. The
+The package keeps Prefill and bounded Decode owners flat. Full Decode network
+leaves and orchestration helpers use the `decode_` prefix alongside those
+owners; there is no nested Decode implementation package. The
 [ownership map](../../../models/deepseek_v4_1_flash_a3/MODULE_ALIGNMENT.md)
 describes shared primitives and phase-specific numerical variants.
 Historical audits, independent-layer runners, reference-capture workers,
@@ -234,7 +239,8 @@ The prompt JSON supplies messages, thinking mode, rendered text, token IDs,
 EOS and checkpoint/tokenizer identities. Generation verifies these identities,
 feeds each actual last-row greedy token into the next chunk and stops at EOS
 or its 256-token bound. It runs a complete Prefill forward per generated token;
-it does not use the bounded Decode kernel as an integrated Decode network.
+it does not yet hand Prefill state to the 40-layer Decode network; that phase
+boundary remains a separate integration path.
 
 ## Correctness scope
 
@@ -242,5 +248,5 @@ Operator arithmetic, quantization, rounding and cache layouts remain unchanged.
 Operator-local checks use the [Golden Harness](../../run-and-validate/golden-harness.md).
 CPU goldens, imports and IR specialization do not establish NPU accuracy.
 Complete-network accuracy, dataset scores, full-model HBM residency and
-performance still require device evidence. A complete EP16 Decode network,
-Prefill-to-Decode state handoff and serving scheduler remain unimplemented.
+performance still require device evidence. Prefill-to-Decode state handoff
+and serving scheduler integration remain unimplemented.

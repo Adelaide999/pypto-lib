@@ -326,10 +326,15 @@ def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
             normalizers.Replace(sentinel, " "),
         ]
     )
-    backend = tokenizer.backend_tokenizer
+    # ``transformers.PreTrainedTokenizerFast`` exposes the Rust tokenizer as
+    # ``backend_tokenizer`` while the checkpoint preparation path uses the
+    # native ``tokenizers.Tokenizer`` directly.  Both provide the same decode
+    # and id-to-token operations needed here.
+    backend = getattr(tokenizer, "backend_tokenizer", tokenizer)
+    vocabulary_size = len(tokenizer) if hasattr(tokenizer, "__len__") else tokenizer.get_vocab_size()
     key_to_new: dict[str, int] = {}
-    lookup = [0] * len(tokenizer)
-    for token_id in range(len(tokenizer)):
+    lookup = [0] * vocabulary_size
+    for token_id in range(vocabulary_size):
         text = backend.decode([token_id], skip_special_tokens=False)
         if "\ufffd" in text:
             key = backend.id_to_token(token_id)

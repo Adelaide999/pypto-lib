@@ -285,7 +285,14 @@ def _golden(values: dict[str, torch.Tensor | int]) -> None:
 def main(argv: list[str] | None = None) -> int:
     """Compile or execute the bounded single-step Decode entry."""
 
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if "--network" in arguments:
+        from .decode_network import main as network_main
+
+        return network_main([argument for argument in arguments if argument != "--network"])
+
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--network", action="store_true", help="Run the complete 40-layer network")
     parser.add_argument("-p", "--platform", choices=("a2a3", "a5"), default="a2a3")
     parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)

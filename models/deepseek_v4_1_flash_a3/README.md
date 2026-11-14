@@ -1,13 +1,16 @@
 # DeepSeek V4.1 Flash A3
 
 A3 Eco-Tech W8A8 operators, the complete 40-layer Prefill composition and
-persistent runtime, plus bounded Decode operators. The package has 45 Python
-modules organized by computation responsibility.
+persistent runtime, plus bounded and full 40-layer Decode paths. The Decode
+network helpers live alongside the existing model files and use the
+`decode_` prefix; there is no nested Decode implementation package.
 
 - `prefill_fwd.prefill_fwd`: embedding, all 40 layers and vocabulary head.
 - `prefill_fwd.compile_prefill`: reusable compilation from request/cache geometry.
 - `prefill_layer.py`: generic layer composition and L2 compute regions.
-- `decode_fwd.py`: bounded single-step SWA; the full EP16 driver remains unimplemented.
+- `decode_fwd.py --network` / `decode_network.py`: host-scheduled 40-layer
+  EP16 Decode with resident weights, persistent state, Engram stages and the
+  vocabulary head.
 - `prefill_moe.py` / `decode_moe.py`: phase routing, dispatch, shared experts,
   Torch goldens and standalone validation; `expert_routed.py` owns grouped experts.
 
