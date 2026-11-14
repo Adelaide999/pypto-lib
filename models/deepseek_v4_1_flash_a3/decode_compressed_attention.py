@@ -12,7 +12,7 @@ import torch
 import pypto.language as pl
 from .config import FLASH as M
 from .operator_config import T_DYN
-from .decode_network_decode_config import TP_SIZE
+from .decode_layer_config import TP_SIZE
 
 
 SELECTED_ROWS = pl.dynamic("SPARSE_SELECTED_ROWS")

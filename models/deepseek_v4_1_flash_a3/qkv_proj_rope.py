@@ -27,6 +27,8 @@ from .rmsnorm import decode_rms_norm_reference, make_blocked_rmsnorm as make_nor
 from .rope import decode_rope_reference, make_adjacent_rope as qkv_w8a8_make_rope, make_decode_adjacent_rope as decode_make_rope, make_decode_rope as decode_qkv_make_rope, make_rope as qkv_make_rope, rope_reference
 from .runtime_config import validate_tp
 from .utils import unpack_blocked_weight
+from .gemm import N_TILE as DECODE_QKV_N_TILE
+from .gemm import make_blocked_weight_pack
 
 
 # model config
@@ -1100,6 +1102,134 @@ def validate_bf16_projection(*, device=0, compile_only=False, platform="a2a3", s
         )
         if not result.passed:
             raise RuntimeError(f"{name}: {result.error}")
+
+
+def make_decode_qkv_w8a8_kn_inline(capacity, config):
+    """Build shared inline QKV compute with canonical [K,N] INT8 weights."""
+    hidden = config["hidden_size"]
+    latent = config["q_lora_rank"]
+    heads = config["num_attention_heads"]
+    head_dim = config["head_dim"]
+    rope_dim = config["qk_rope_head_dim"]
+    query_width = heads * head_dim
+    pair_width = rope_dim // 2
+    eps = config["rms_norm_eps"]
+    qa_packed_rows = hidden * (latent // DECODE_QKV_N_TILE)
+    qb_packed_rows = latent * (query_width // DECODE_QKV_N_TILE)
+    kv_packed_rows = hidden * (head_dim // DECODE_QKV_N_TILE)
+
+    quant_x = decode_make_quantize(capacity, hidden)
+    quant_q = decode_make_quantize(capacity, latent)
+    pack_qa = make_blocked_weight_pack(hidden, latent)
+    pack_qb = make_blocked_weight_pack(latent, query_width)
+    pack_kv = make_blocked_weight_pack(hidden, head_dim)
+    dot_qa = make_dot(capacity, hidden, latent)
+    dot_qb = make_dot(capacity, latent, query_width)
+    dot_kv = make_dot(capacity, hidden, head_dim)
+    dequant_qa = decode_make_dequantize(capacity, latent)
+    dequant_qb = decode_make_dequantize(capacity, query_width, combine_scales=True)
+    dequant_kv = decode_make_dequantize(capacity, head_dim)
+    norm_q = decode_make_norm(capacity, latent, eps)
+    norm_kv = decode_make_norm(capacity, head_dim, eps)
+    rope_q = decode_make_rope(capacity, heads, head_dim, rope_dim)
+    rope_kv = decode_make_rope(capacity, 1, head_dim, rope_dim)
+
+    @pl.jit.inline
+    def qkv_w8a8_inline(
+        x: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, query_width], pl.INT8],
+        wq_b_scale: pl.Tensor[[query_width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        rope_cos: pl.Tensor[[capacity, pair_width], pl.FP32],
+        rope_sin: pl.Tensor[[capacity, pair_width], pl.FP32],
+        positions: pl.Tensor[[capacity], pl.INT64],
+        query_latent: pl.Tensor[[capacity, latent], pl.BF16],
+        query: pl.Tensor[[capacity, query_width], pl.BF16],
+        window_kv: pl.Tensor[[capacity, head_dim], pl.BF16],
+        cache: pl.Tensor[[2, 128, head_dim], pl.BF16],
+        cache_lens: pl.Tensor[[2], pl.INT32],
+        active: pl.Scalar[pl.INT32],
+    ):
+        x_i8 = pl.create_tensor([capacity, hidden], dtype=pl.INT8)
+        x_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
+        quant_x(x, x_i8, x_scale, active)
+
+        qa_packed = pl.create_tensor([qa_packed_rows, DECODE_QKV_N_TILE], dtype=pl.INT8)
+        pack_qa(wq_a, qa_packed)
+        qa_int = pl.create_tensor([capacity, latent], dtype=pl.INT32)
+        dot_qa(x_i8, qa_packed, qa_int, active)
+        qa_bf16 = pl.create_tensor([capacity, latent], dtype=pl.BF16)
+        dequant_qa(qa_int, wq_a_scale, x_scale, qa_bf16, active)
+        norm_q(qa_bf16, q_norm_weight, query_latent, active)
+
+        q_i8 = pl.create_tensor([capacity, latent], dtype=pl.INT8)
+        q_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
+        quant_q(query_latent, q_i8, q_scale, active)
+        qb_packed = pl.create_tensor([qb_packed_rows, DECODE_QKV_N_TILE], dtype=pl.INT8)
+        pack_qb(wq_b, qb_packed)
+        qb_int = pl.create_tensor([capacity, query_width], dtype=pl.INT32)
+        dot_qb(q_i8, qb_packed, qb_int, active)
+        qb_bf16 = pl.create_tensor([capacity, query_width], dtype=pl.BF16)
+        dequant_qb(qb_int, wq_b_scale, q_scale, qb_bf16, active)
+        rope_q(qb_bf16, rope_cos, rope_sin, query, active)
+
+        kv_packed = pl.create_tensor([kv_packed_rows, DECODE_QKV_N_TILE], dtype=pl.INT8)
+        pack_kv(wkv, kv_packed)
+        kv_int = pl.create_tensor([capacity, head_dim], dtype=pl.INT32)
+        dot_kv(x_i8, kv_packed, kv_int, active)
+        kv_bf16 = pl.create_tensor([capacity, head_dim], dtype=pl.BF16)
+        dequant_kv(kv_int, wkv_scale, x_scale, kv_bf16, active)
+        kv_normalized = pl.create_tensor([capacity, head_dim], dtype=pl.BF16)
+        norm_kv(kv_bf16, kv_norm_weight, kv_normalized, active)
+        rope_kv(kv_normalized, rope_cos, rope_sin, window_kv, active)
+        return positions, query_latent, query, window_kv, cache, cache_lens
+
+    return qkv_w8a8_inline
+
+
+def make_decode_qkv_w8a8_kn(capacity, config):
+    """Build the standalone JIT wrapper for shared inline QKV compute."""
+    hidden = config["hidden_size"]
+    latent = config["q_lora_rank"]
+    head_dim = config["head_dim"]
+    width = config["num_attention_heads"] * head_dim
+    pairs = config["qk_rope_head_dim"] // 2
+    compute = make_decode_qkv_w8a8_kn_inline(capacity, config)
+
+    @pl.jit
+    def qkv_w8a8(
+        x: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, width], pl.INT8],
+        wq_b_scale: pl.Tensor[[width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        rope_cos: pl.Tensor[[capacity, pairs], pl.FP32],
+        rope_sin: pl.Tensor[[capacity, pairs], pl.FP32],
+        positions: pl.InOut[pl.Tensor[[capacity], pl.INT64]],
+        query_latent: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        query: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        window_kv: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        cache: pl.InOut[pl.Tensor[[2, 128, head_dim], pl.BF16]],
+        cache_lens: pl.InOut[pl.Tensor[[2], pl.INT32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        compute(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
+            kv_norm_weight, rope_cos, rope_sin,
+            positions, query_latent, query, window_kv, cache, cache_lens, active,
+        )
+        return positions, query_latent, query, window_kv, cache, cache_lens
+
+    return qkv_w8a8
 
 
 if __name__ == "__main__":

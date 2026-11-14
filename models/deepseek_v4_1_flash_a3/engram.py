@@ -17,6 +17,7 @@ if __package__ in (None, ""):
 import pypto.language as pl
 import torch
 from .qkv_proj_rope import make_bf16_projection_staged
+from .config import FLASH
 
 D, HC, COLS, ROW_WIDTH = 5120, 4, 24, 256
 K, N = COLS * ROW_WIDTH, (HC + 1) * D
@@ -41,6 +42,10 @@ RESTORE_M_TILE = 16
 
 # tiling
 ENGRAM_D_TILE = 256
+
+
+DECODE_ATTENTION_WIDTH = FLASH.num_attention_heads * FLASH.head_dim
+DECODE_CAPACITY = 16
 
 
 def make_engram(capacity, table_rows):
@@ -1170,6 +1175,207 @@ def validate_prefill_engram(*, device=0, compile_only=False, platform="a2a3", si
         )
         if not result.passed:
             raise RuntimeError(f"{name}: {result.error}")
+
+
+
+def make_decode_resident_int8_lookup(capacity, table_rows, columns=COLS, head_start=0, row_start=0):
+    """Fuse guarded INT8 lookup and group32 BF16 RNE in token-column SPMD tasks."""
+
+    @pl.jit
+    def lookup_rows(
+        staging_ids: pl.Tensor[[capacity, COLS], pl.INT32],
+        table: pl.Tensor[[table_rows, DECODE_ATTENTION_WIDTH], pl.INT8],
+        table_scales: pl.Tensor[[table_rows, 8], pl.FP32],
+        lookup: pl.InOut[pl.Tensor[[capacity, columns * DECODE_ATTENTION_WIDTH], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for task in pl.spmd(active * columns, name_hint="engram_ecotech_i8_lookup"):
+            token = task // columns
+            column = task % columns
+            global_row = pl.cast(pl.read(staging_ids, [token, head_start + column]), pl.INT64)
+            local_row = global_row - row_start
+            row = pl.cast(local_row, pl.INDEX)
+            for group in pl.range(8):
+                decoded = pl.full([1, 32], dtype=pl.BF16, value=0.)
+                if local_row >= 0:
+                    if local_row < table_rows:
+                        code_half = pl.cast(table[row:row + 1, group * 32:group * 32 + 32], pl.FP16)
+                        code_fp32 = pl.cast(code_half, pl.FP32)
+                        scale = pl.read(table_scales, [row, group])
+                        decoded = pl.cast(pl.mul(code_fp32, scale), pl.BF16, mode="rint")
+                start = column * DECODE_ATTENTION_WIDTH + group * 32
+                lookup[token:token + 1, start:start + 32] = decoded
+        return lookup
+
+    return lookup_rows
+
+
+def make_decode_engram_ecotech(capacity, table_rows, rms_norm_eps=1e-20):
+    """Compose resident lookup, shared BF16 projection and rotated-residual gating."""
+    if capacity < 1 or capacity % 16 or table_rows < 1 or rms_norm_eps <= 0:
+        raise ValueError("Use a positive padded capacity, resident row count and source norm epsilon")
+    gather = pl.jit.inline(make_decode_resident_int8_lookup(capacity, table_rows)._func)
+    project = pl.jit.inline(make_bf16_projection_staged(K, N)._func)
+    restore = make_original_basis_hidden(capacity)
+    gate = make_original_basis_gate(capacity, rms_norm_eps)
+
+    @pl.jit
+    def engram_ecotech(
+        staging_ids: pl.Tensor[[capacity, COLS], pl.INT32],
+        table: pl.Tensor[[table_rows, DECODE_ATTENTION_WIDTH], pl.INT8],
+        table_scales: pl.Tensor[[table_rows, 8], pl.FP32],
+        wkv: pl.Tensor[[K, N], pl.BF16],
+        channel_weight: pl.Tensor[[HC, D], pl.FP32],
+        hidden: pl.Tensor[[capacity, HC, D], pl.BF16],
+        rotation_block: pl.Tensor[[ROTATION_TILE, ROTATION_TILE], pl.FP32],
+        token_mask: pl.Tensor[[capacity], pl.INT32],
+        lookup: pl.InOut[pl.Tensor[[capacity, K], pl.BF16]],
+        kv: pl.InOut[pl.Tensor[[capacity, N], pl.BF16]],
+        original: pl.InOut[pl.Tensor[[capacity, HC, D], pl.FP32]],
+        output: pl.InOut[pl.Tensor[[capacity, HC, D], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        gather(staging_ids, table, table_scales, lookup, active)
+        project(lookup, wkv, kv, active)
+        restore(hidden, rotation_block, original, active)
+        probabilities = pl.create_tensor([capacity, HC], dtype=pl.FP32)
+        gate(hidden, original, kv, channel_weight, token_mask, probabilities, output, active)
+        return lookup, kv, original, output
+
+    return engram_ecotech
+
+
+def golden_decode_int8_lookup(tensors, *, head_start=0, row_start=0):
+    """Evaluate guarded shard selection, group32 scaling and inactive rows."""
+    active = int(tensors["active"])
+    width = tensors["lookup"].shape[1]
+    columns = width // DECODE_ATTENTION_WIDTH
+    ids = tensors["staging_ids"][:active, head_start:head_start + columns]
+    codes, scales = reference_int8_rows(ids, tensors["table"], tensors["table_scales"], row_start=row_start)
+    values = codes.float().reshape(active, columns, 8, 32) * scales.reshape(active, columns, 8, 1)
+    tensors["lookup"][:active] = values.reshape(active, width).to(tensors["lookup"].dtype)
+
+
+def golden_decode_engram_ecotech(tensors, *, eps=1e-20):
+    """Compose independent INT8, projection, original and gate references."""
+    import torch
+    from .qkv_proj_rope import golden_bf16_projection
+
+    active = int(tensors["active"])
+    ids = tensors["staging_ids"][:active]
+    codes, scales = reference_int8_rows(ids, tensors["table"], tensors["table_scales"])
+    decoded = codes.float().reshape(active, COLS, 8, 32) * scales.reshape(active, COLS, 8, 1)
+    tensors["lookup"][:active] = decoded.reshape(active, K).to(tensors["lookup"].dtype)
+    projection = dict(source=tensors["lookup"], weight=tensors["wkv"], output=tensors["kv"], num_tokens=active)
+    golden_bf16_projection(projection)
+    golden_original_basis_hidden(tensors)
+    values = dict(tensors)
+    if "probabilities" not in values:
+        values["probabilities"] = torch.empty((tensors["hidden"].shape[0], HC), dtype=torch.float32)
+    golden_original_basis_gate(values, eps=eps)
+
+
+def decode_engram_int8_golden_cases():
+    """Bound full signed INT8, group32 ties, row guards and TP shard offsets."""
+    from functools import partial
+    import torch
+    from golden import ScalarSpec, TensorSpec
+    from .qkv_proj_rope import golden_prefix_compare
+
+    capacity, rows, row_start = 16, 19, 1_000_000_000
+    table = (torch.arange(rows * DECODE_ATTENTION_WIDTH).reshape(rows, DECODE_ATTENTION_WIDTH) % 256 - 128).to(torch.int8)
+    table[:, :8] = torch.tensor([-128, -1, 1, 127, 2, -2, 64, -64], dtype=torch.int8)
+    group_scales = torch.tensor([1.00390625, 0.007843137, 0.33333334, 1e-4, 2.5, 0.0, 1.99609375, 0.03125])
+    table_scales = group_scales.repeat(rows, 1)
+    table_scales[1::2, 0] = 1.01171875
+    choices = torch.tensor([-1, 0, rows - 1, rows, 1], dtype=torch.int32) + row_start
+    ids = choices[torch.arange(capacity * COLS).reshape(capacity, COLS) % choices.numel()]
+    for tp, active in ((1, 0), (1, 7), (2, 7), (4, 1), (4, 16)):
+        columns = COLS // tp
+        head_start = COLS - columns
+        specs = [
+            TensorSpec("staging_ids", [capacity, COLS], torch.int32, init_value=ids),
+            TensorSpec("table", [rows, DECODE_ATTENTION_WIDTH], torch.int8, init_value=table),
+            TensorSpec("table_scales", [rows, 8], torch.float32, init_value=table_scales),
+            TensorSpec("lookup", [capacity, columns * DECODE_ATTENTION_WIDTH], torch.bfloat16, init_value=-12.5),
+            ScalarSpec("active", torch.int32, active, compile_runtime=True),
+        ]
+        reference = partial(golden_decode_int8_lookup, head_start=head_start, row_start=row_start)
+        exact_lookup = golden_prefix_compare(active, rtol=0.0, atol=0.0)
+        yield dict(name=f"int8-fused-tp{tp}-{active}",
+                   fn=make_decode_resident_int8_lookup(capacity, rows, columns, head_start, row_start),
+                   specs=specs, golden_fn=reference,
+                   compare_fn={"lookup": exact_lookup})
+
+
+def validate_decode_engram_int8(*, device=0, compile_only=False, platform="a2a3", sim=False):
+    """Run the owning fused lookup and group32 Golden cases."""
+    from golden import run
+
+    for case in decode_engram_int8_golden_cases():
+        name = case.pop("name")
+        result = run(
+            **case,
+            config={"backend_type": platform, "execution_mode": sim, "device_id": device},
+            compile_only=compile_only,
+        )
+        if not result.passed:
+            raise RuntimeError(f"{name}: {result.error}")
+
+
+@pl.jit.inline
+def _decode_engram_linear(
+    value: pl.Tensor[[DECODE_CAPACITY, K], pl.BF16],
+    weight: pl.Tensor[[K, N], pl.BF16],
+    output: pl.InOut[pl.Tensor[[DECODE_CAPACITY, N], pl.BF16]],
+    active: pl.Scalar[pl.INT32],
+):
+    """Project frozen Engram lookup rows in the checkpoint BF16 basis."""
+
+    n_tile = 64
+    blocks = N // n_tile
+    output_2d = pl.reshape(output, [DECODE_CAPACITY, N])
+    for block in pl.spmd(((active + 15) // 16) * blocks, name_hint="dsv41_a2a3_engram_bf16_linear"):
+        t0 = (block // blocks) * 16
+        n0 = (block % blocks) * n_tile
+        rows = pl.min(16, active - t0)
+        acc = pl.create_tensor([16, n_tile], dtype=pl.FP32)
+        for k0 in pl.pipeline(0, K, 256, stage=2):
+            lhs = pl.slice(value, [16, 256], [t0, k0], valid_shape=[rows, 256])
+            lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), 16, 256)
+            rhs = pl.slice(weight, [256, n_tile], [k0, n0])
+            acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
+        output_2d[t0:t0 + 16, n0:n0 + n_tile] = pl.set_validshape(
+            pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
+        )
+
+
+def make_decode_engram():
+    """Apply checkpoint Engram projection and the original-basis residual gate."""
+
+    restore = make_original_basis_hidden(DECODE_CAPACITY)
+    gate = make_original_basis_gate(DECODE_CAPACITY, 1e-20)
+
+    @pl.jit
+    def decode_engram(
+        hidden: pl.Tensor[[DECODE_CAPACITY, HC, HIDDEN], pl.BF16],
+        lookup: pl.Tensor[[DECODE_CAPACITY, K], pl.BF16],
+        weight: pl.Tensor[[K, N], pl.BF16],
+        channel_weight: pl.Tensor[[HC, HIDDEN], pl.FP32],
+        rotation: pl.Tensor[[32, 32], pl.FP32],
+        mask: pl.Tensor[[DECODE_CAPACITY], pl.INT32],
+        output: pl.InOut[pl.Tensor[[DECODE_CAPACITY, HC, HIDDEN], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        projected = pl.create_tensor([DECODE_CAPACITY, N], dtype=pl.BF16)
+        _decode_engram_linear(lookup, weight, projected, active)
+        original = pl.create_tensor([DECODE_CAPACITY, HC, HIDDEN], dtype=pl.FP32)
+        restore(hidden, rotation, original, active)
+        probabilities = pl.create_tensor([DECODE_CAPACITY, HC], dtype=pl.FP32)
+        gate(hidden, original, projected, channel_weight, mask, probabilities, output, active)
+        return output
+
+    return decode_engram
 
 
 if __name__ == "__main__":

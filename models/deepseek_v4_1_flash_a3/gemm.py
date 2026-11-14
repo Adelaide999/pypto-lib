@@ -609,3 +609,183 @@ def make_decode_bf16_linear(capacity: int, width: int, output_width: int):
         return output
 
     return linear
+
+
+def make_decode_linear(capacity: int, width: int, output_width: int):
+    """Expose the direct canonical-weight W8A8 kernel."""
+
+    return make_decode_int8_linear_direct(capacity, width, output_width)
+
+
+def make_decode_fp32_linear(capacity: int, width: int, output_width: int):
+    """BF16-input/FP32-weight linear used by the ratio-2 compressor."""
+
+    if capacity % 16 or width % 256 or output_width % 32:
+        raise ValueError("FP32 linear dimensions are not A2/A3 aligned")
+    n_tile = 64 if output_width % 64 == 0 else 32
+    blocks = output_width // n_tile
+
+    @pl.jit
+    def linear(
+        value: pl.Tensor[[capacity, width], pl.BF16],
+        weight: pl.Tensor[[width, output_width], pl.FP32],
+        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for block in pl.spmd(((active + 15) // 16) * blocks,
+                             name_hint="dsv41_a2a3_fp32_linear"):
+            t0 = (block // blocks) * 16
+            n0 = (block % blocks) * n_tile
+            rows = pl.min(16, active - t0)
+            acc = pl.create_tensor([16, n_tile], dtype=pl.FP32)
+            for k0 in pl.pipeline(0, width, 256, stage=2):
+                lhs = pl.slice(value, [16, 256], [t0, k0], valid_shape=[rows, 256])
+                lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), 16, 256)
+                rhs = pl.slice(weight, [256, n_tile], [k0, n0])
+                lhs = pl.cast(lhs, pl.FP32, mode="rint")
+                rhs = pl.cast(rhs, pl.FP32, mode="rint")
+                acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
+            output[t0:t0 + 16, n0:n0 + n_tile] = pl.set_validshape(
+                pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
+            )
+        return output
+
+    return linear
+
+
+def prepare_ecotech_dynamic_weight_kn(weight_nk, source_scale, source_offset):
+    """Preprocess CPU checkpoint operands into KN INT8 and effective FP32 scales."""
+    values = (weight_nk, source_scale, source_offset)
+    if any(value.device.type != "cpu" for value in values):
+        raise ValueError("Checkpoint preprocessing requires CPU source tensors")
+    if weight_nk.ndim != 2 or weight_nk.dtype != torch.int8:
+        raise ValueError("The source weight must be a complete NK INT8 tensor")
+    output_width, input_width = weight_nk.shape
+    if input_width % 256 or output_width % 64:
+        raise ValueError("The current A2 projection requires K/256 and N/64 alignment")
+    for value in (source_scale, source_offset):
+        if value.shape != (output_width, 1) or value.dtype != torch.float32:
+            raise ValueError("Source per-channel scale and offset require FP32 [N,1]")
+        if any(not math.isfinite(item) for item in value.flatten().tolist()):
+            raise ValueError("Source scale and offset must be finite")
+    if any(item != 0 for item in source_offset.flatten().tolist()):
+        raise ValueError("The symmetric native INT8 path requires zero checkpoint offsets")
+    native_scale = source_scale.to(torch.bfloat16)
+    if any(not math.isfinite(item) or item <= 0 for item in native_scale.flatten().tolist()):
+        raise ValueError("Effective BF16 channel scales must remain finite and positive")
+    weight_kn = weight_nk.T.contiguous()
+    channel_scale = native_scale.to(torch.float32).flatten()
+    return weight_kn, channel_scale
+
+
+def make_ecotech_dynamic_linear_kn(capacity, input_width, output_width, combine_scales=False):
+    """Compose existing INT8 quantization, full matmul and FP32 scale operators."""
+    if capacity <= 0 or capacity % 16 or input_width % 256 or output_width % 64:
+        raise ValueError("Use a positive capacity/16, K/256 and N/64")
+    packed_rows = input_width * (output_width // 64)
+    pack = make_blocked_weight_pack(input_width, output_width)
+    quantize = make_quantize(capacity, input_width)
+    dot = make_dot(capacity, input_width, output_width)
+    dequantize = make_dequantize(capacity, output_width, combine_scales=combine_scales)
+
+    @pl.jit
+    def linear(
+        x: pl.Tensor[[capacity, input_width], pl.BF16],
+        weight: pl.Tensor[[input_width, output_width], pl.INT8],
+        channel_scale: pl.Tensor[[output_width], pl.FP32],
+        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        packed = pl.create_tensor([packed_rows, 64], dtype=pl.INT8)
+        pack(weight, packed)
+        payload = pl.create_tensor([capacity, input_width], dtype=pl.INT8)
+        token_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
+        quantize(x, payload, token_scale, active)
+        accumulator = pl.create_tensor([capacity, output_width], dtype=pl.INT32)
+        dot(payload, packed, accumulator, active)
+        dequantize(accumulator, channel_scale, token_scale, output, active)
+        return output
+
+    return linear
+
+
+def prepare_ecotech_tail_weight_kn(weight_nk, source_scale, source_offset):
+    values = (weight_nk, source_scale, source_offset)
+    if any(value.device.type != "cpu" for value in values):
+        raise ValueError("Checkpoint preprocessing requires CPU operands")
+    if weight_nk.ndim != 2 or weight_nk.dtype != torch.int8:
+        raise ValueError("Require source NK INT8 bytes")
+    output_width, input_width = weight_nk.shape
+    padded_k, padded_n = padded_dimensions(input_width, output_width)
+    for value in (source_scale, source_offset):
+        if value.shape != (output_width, 1) or value.dtype != torch.float32:
+            raise ValueError("Require original F32 [N,1] scale/offset")
+    padded_weight = torch.zeros((padded_n, padded_k), dtype=torch.int8)
+    padded_weight[:output_width, :input_width].copy_(weight_nk)
+    padded_scale = torch.ones((padded_n, 1), dtype=torch.float32)
+    padded_scale[:output_width].copy_(source_scale)
+    padded_offset = torch.zeros((padded_n, 1), dtype=torch.float32)
+    padded_offset[:output_width].copy_(source_offset)
+    return prepare_ecotech_dynamic_weight_kn(padded_weight, padded_scale, padded_offset)
+
+
+def make_ecotech_tail_linear_kn(capacity, input_width, output_width):
+    if capacity <= 0 or capacity % 16:
+        raise ValueError("Require a positive capacity/16")
+    padded_k, padded_n = padded_dimensions(input_width, output_width)
+    standalone = make_ecotech_dynamic_linear_kn(capacity, padded_k, padded_n)
+    aligned = pl.jit.inline(standalone._func)
+
+    pad_input = _make_pad_input(capacity, input_width, padded_k, pl.BF16)
+    crop_output = _make_crop_output(capacity, output_width, padded_n)
+
+    @pl.jit
+    def linear(
+        x: pl.Tensor[[capacity, input_width], pl.BF16],
+        weight: pl.Tensor[[padded_k, padded_n], pl.INT8],
+        channel_scale: pl.Tensor[[padded_n], pl.FP32],
+        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        padded_x = pl.create_tensor([capacity, padded_k], dtype=pl.BF16)
+        pad_input(x, padded_x, active)
+        padded_output = pl.create_tensor([capacity, padded_n], dtype=pl.BF16)
+        aligned(padded_x, weight, channel_scale, padded_output, active)
+        crop_output(padded_output, output, active)
+        return output
+
+    return linear
+
+
+def make_ecotech_int8_tail_linear_kn(capacity, input_width, output_width, *, combine_scales=False):
+    if capacity <= 0 or capacity % 16:
+        raise ValueError("Require a positive capacity/16")
+    padded_k, padded_n = padded_dimensions(input_width, output_width)
+    packed_rows = padded_k * (padded_n // 64)
+    pack = make_blocked_weight_pack(padded_k, padded_n)
+    dot = make_dot(capacity, padded_k, padded_n)
+    dequantize = make_dequantize(capacity, padded_n, combine_scales=combine_scales)
+    pad_input = _make_pad_input(capacity, input_width, padded_k, pl.INT8)
+    crop_output = _make_crop_output(capacity, output_width, padded_n)
+
+    @pl.jit
+    def linear(
+        payload: pl.Tensor[[capacity, input_width], pl.INT8],
+        token_scale: pl.Tensor[[capacity, 8], pl.FP32],
+        weight: pl.Tensor[[padded_k, padded_n], pl.INT8],
+        channel_scale: pl.Tensor[[padded_n], pl.FP32],
+        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        padded_payload = pl.create_tensor([capacity, padded_k], dtype=pl.INT8)
+        pad_input(payload, padded_payload, active)
+        packed = pl.create_tensor([packed_rows, 64], dtype=pl.INT8)
+        pack(weight, packed)
+        accumulator = pl.create_tensor([capacity, padded_n], dtype=pl.INT32)
+        dot(padded_payload, packed, accumulator, active)
+        padded_output = pl.create_tensor([capacity, padded_n], dtype=pl.BF16)
+        dequantize(accumulator, channel_scale, token_scale, padded_output, active)
+        crop_output(padded_output, output, active)
+        return output
+
+    return linear

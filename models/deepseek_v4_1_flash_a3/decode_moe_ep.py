@@ -19,15 +19,35 @@ import torch
 import pypto.language as pl
 
 
-from .decode_network_ecotech_linear import prepare_ecotech_dynamic_weight as _ecotech_shared_prepare_ecotech_dynamic_weight
-from .decode_network_ecotech_linear import prepare_ecotech_tail_weight as _ecotech_shared_prepare_ecotech_tail_weight
-from .decode_network_linear_primitives import make_dequantize as _ecotech_shared_make_dequantize, make_dot as _ecotech_shared_make_dot, make_pack_weight as _ecotech_shared_make_pack_weight, make_quantize as _ecotech_shared_make_quantize
+from .gemm import prepare_ecotech_dynamic_weight_kn as _ecotech_shared_prepare_ecotech_dynamic_weight
+from .gemm import prepare_ecotech_tail_weight_kn as _ecotech_shared_prepare_ecotech_tail_weight
+from .quant import (
+    make_dequantize as _ecotech_shared_make_dequantize,
+    make_quantize as _ecotech_shared_make_quantize,
+)
+from .gemm import (
+    make_dot as _ecotech_shared_make_dot,
+    make_blocked_weight_pack as _ecotech_shared_make_pack_weight,
+)
 
-from .decode_network_gemm import make_fp32_dequantize as _decode_moe_make_fp32_dequantize, make_int8_gemm as _decode_moe_make_int8_gemm, make_pack_weight as _decode_moe_make_pack_weight
-from .decode_network_quant import make_dynamic_int8_quantize as _decode_moe_make_dynamic_int8_quantize
-from .decode_network_quant import w8a8_linear as _decode_moe_w8a8_linear
+from .gemm import (
+    make_fp32_dequantize as _decode_moe_make_fp32_dequantize,
+    make_int8_gemm as _decode_moe_make_int8_gemm,
+    make_pack_weight as _decode_moe_make_pack_weight,
+)
+from .quant import make_decode_dynamic_int8_quantize as _decode_moe_make_dynamic_int8_quantize
+from .quant import w8a8_linear as _decode_moe_w8a8_linear
 
-from .decode_network_decode_primitives import N_TILE as DECODE_SHARED_N_TILE, VEC_M_TILE as DECODE_SHARED_VEC_M_TILE, make_dequantize as _decode_shared_make_dequantize, make_dot as _decode_shared_make_dot, make_pack_weight as _decode_shared_make_pack_weight, make_quantize as _decode_shared_make_quantize
+from .gemm import (
+    N_TILE as DECODE_SHARED_N_TILE,
+    VEC_M_TILE as DECODE_SHARED_VEC_M_TILE,
+    make_dot as _decode_shared_make_dot,
+    make_blocked_weight_pack as _decode_shared_make_pack_weight,
+)
+from .quant import (
+    make_decode_dequantize as _decode_shared_make_dequantize,
+    make_decode_quantize as _decode_shared_make_quantize,
+)
 
 
 MOE_VEC_M_TILE = 8
@@ -1417,8 +1437,8 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 
 from .config import FLASH
-from .decode_network_decode_config import _parse_parallel_size
-from .decode_network_quant import make_dynamic_int8_quantize
+from .decode_layer_config import _parse_parallel_size
+from .quant import make_decode_dynamic_int8_quantize as make_dynamic_int8_quantize
 
 
 # Expert-parallel topology and Decode capacity.

@@ -14,6 +14,7 @@ from .o_proj import make_decode_output_projection_bf16 as make_output_projection
 from .qkv_proj_rope import make_decode_qkv_w8a8_inline as make_qkv_w8a8_inline
 from .rmsnorm import DECODE_D as D, DECODE_EPS as EPS, NORM_T_TILE, rms_norm_tiled
 from .swa import make_decode_swa_inline as make_swa_inline
+from .qkv_proj_rope import make_decode_qkv_w8a8_kn_inline
 
 
 def make_attention_block(capacity, config):
@@ -290,3 +291,204 @@ def make_attention(capacity, config):
         return positions, query_latent, query, window_kv, cache, cache_lens, output
 
     return attention
+
+
+def make_attention_kn_inline(capacity, config):
+    """Build QKV, paged SWA, inverse RoPE and both output projections."""
+    hidden = config["hidden_size"]
+    latent = config["q_lora_rank"]
+    head_dim = config["head_dim"]
+    heads = config["num_attention_heads"]
+    width = heads * head_dim
+    pairs = config["qk_rope_head_dim"] // 2
+    window = config["sliding_window"]
+    groups = config["o_groups"]
+    group_input = width // groups
+    rank = config["o_lora_rank"]
+    qkv = make_decode_qkv_w8a8_kn_inline(capacity, config)
+    swa = make_swa_inline(capacity, 2, config)
+    project = make_output_projection_bf16(
+        capacity,
+        heads,
+        head_dim,
+        config["qk_rope_head_dim"],
+        groups,
+        rank,
+        hidden,
+    )
+
+    @pl.jit.inline
+    def attention_inline(
+        x: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, width], pl.INT8],
+        wq_b_scale: pl.Tensor[[width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        wo_a: pl.Tensor[[groups, group_input, rank], pl.BF16],
+        wo_b: pl.Tensor[[groups * rank, hidden], pl.BF16],
+        rope_cos: pl.Tensor[[capacity, pairs], pl.FP32],
+        rope_sin: pl.Tensor[[capacity, pairs], pl.FP32],
+        slots: pl.Tensor[[capacity, 2], pl.INT64],
+        indices: pl.Tensor[[capacity, window], pl.INT32],
+        sink: pl.Tensor[[heads], pl.FP32],
+        positions: pl.Tensor[[capacity], pl.INT64],
+        query_latent: pl.Tensor[[capacity, latent], pl.BF16],
+        query: pl.Tensor[[capacity, width], pl.BF16],
+        window_kv: pl.Tensor[[capacity, head_dim], pl.BF16],
+        cache: pl.Tensor[[2, 128, 1, head_dim], pl.BF16],
+        cache_lens: pl.Tensor[[2], pl.INT32],
+        output: pl.Tensor[[capacity, hidden], pl.BF16],
+        active: pl.Scalar[pl.INT32],
+    ):
+        flat_cache = pl.reshape(cache, [2, 128, head_dim])
+        qkv(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
+            kv_norm_weight, rope_cos, rope_sin,
+            positions, query_latent, query, window_kv, flat_cache, cache_lens, active,
+        )
+        attended = pl.create_tensor([capacity, width], dtype=pl.BF16)
+        swa(query, window_kv, slots, indices, sink, cache, attended, active)
+        rotated = pl.create_tensor([capacity, width], dtype=pl.BF16)
+        grouped = pl.create_tensor([capacity, groups * rank], dtype=pl.BF16)
+        project(attended, wo_a, wo_b, rope_cos, rope_sin, rotated, grouped, output, active)
+        return positions, query_latent, query, window_kv, cache, cache_lens, output
+
+    return attention_inline
+
+
+def make_attention_kn(capacity, config):
+    """Build the standalone JIT wrapper for shared inline attention."""
+    hidden = config["hidden_size"]
+    latent = config["q_lora_rank"]
+    head_dim = config["head_dim"]
+    heads = config["num_attention_heads"]
+    width = heads * head_dim
+    pairs = config["qk_rope_head_dim"] // 2
+    window = config["sliding_window"]
+    groups = config["o_groups"]
+    group_input = width // groups
+    rank = config["o_lora_rank"]
+    compute = make_attention_kn_inline(capacity, config)
+
+    @pl.jit
+    def attention(
+        x: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, width], pl.INT8],
+        wq_b_scale: pl.Tensor[[width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        wo_a: pl.Tensor[[groups, group_input, rank], pl.BF16],
+        wo_b: pl.Tensor[[groups * rank, hidden], pl.BF16],
+        rope_cos: pl.Tensor[[capacity, pairs], pl.FP32],
+        rope_sin: pl.Tensor[[capacity, pairs], pl.FP32],
+        slots: pl.Tensor[[capacity, 2], pl.INT64],
+        indices: pl.Tensor[[capacity, window], pl.INT32],
+        sink: pl.Tensor[[heads], pl.FP32],
+        positions: pl.InOut[pl.Tensor[[capacity], pl.INT64]],
+        query_latent: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        query: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        window_kv: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        cache: pl.InOut[pl.Tensor[[2, 128, 1, head_dim], pl.BF16]],
+        cache_lens: pl.InOut[pl.Tensor[[2], pl.INT32]],
+        output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+
+        compute(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
+            kv_norm_weight, wo_a, wo_b,
+            rope_cos, rope_sin, slots, indices, sink,
+            positions, query_latent, query, window_kv, cache, cache_lens, output, active,
+        )
+        return positions, query_latent, query, window_kv, cache, cache_lens, output
+
+    return attention
+
+
+def make_attention_kn_block(capacity, config):
+    """Build the layer-zero attention block with delayed HC coefficients."""
+    hidden = config["hidden_size"]
+    latent = config["q_lora_rank"]
+    head_dim = config["head_dim"]
+    heads = config["num_attention_heads"]
+    width = heads * head_dim
+    pairs = config["qk_rope_head_dim"] // 2
+    window = config["sliding_window"]
+    groups = config["o_groups"]
+    group_input = width // groups
+    rank = config["o_lora_rank"]
+    hc = config["hc_mult"]
+    channels = (hc + 2) * hc
+    if hidden != D or config["rms_norm_eps"] != EPS:
+        raise ValueError("The shared model RMSNorm configuration must match this block")
+    pre = make_hc_pre_inline(capacity, config)
+    attention = make_attention_kn_inline(capacity, config)
+    post_fn = make_hc_post_inline(capacity, config)
+
+    @pl.jit
+    def attention_block(
+        x_hc: pl.Tensor[[capacity, hc, hidden], pl.BF16],
+        hc_function: pl.Tensor[[channels, hc * hidden], pl.FP32],
+        hc_scale: pl.Tensor[[3], pl.FP32],
+        hc_base: pl.Tensor[[channels], pl.FP32],
+        incoming: pl.Tensor[[capacity, hc], pl.FP32],
+        norm_weight: pl.Tensor[[hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent], pl.BF16],
+        wq_b: pl.Tensor[[latent, width], pl.INT8],
+        wq_b_scale: pl.Tensor[[width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        wo_a: pl.Tensor[[groups, group_input, rank], pl.BF16],
+        wo_b: pl.Tensor[[groups * rank, hidden], pl.BF16],
+        rope_cos: pl.Tensor[[capacity, pairs], pl.FP32],
+        rope_sin: pl.Tensor[[capacity, pairs], pl.FP32],
+        slots: pl.Tensor[[capacity, 2], pl.INT64],
+        indices: pl.Tensor[[capacity, window], pl.INT32],
+        sink: pl.Tensor[[heads], pl.FP32],
+        positions: pl.InOut[pl.Tensor[[capacity], pl.INT64]],
+        query_latent: pl.InOut[pl.Tensor[[capacity, latent], pl.BF16]],
+        query: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        window_kv: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        cache: pl.InOut[pl.Tensor[[2, 128, 1, head_dim], pl.BF16]],
+        cache_lens: pl.InOut[pl.Tensor[[2], pl.INT32]],
+        output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
+        next_pre: pl.InOut[pl.Tensor[[capacity, hc], pl.FP32]],
+        post: pl.InOut[pl.Tensor[[capacity, hc], pl.FP32]],
+        comb: pl.InOut[pl.Tensor[[capacity, hc, hc], pl.FP32]],
+        collapsed: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
+        normed: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
+        hidden_output: pl.InOut[pl.Tensor[[capacity, hc, hidden], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+
+        collapsed_fp32 = pl.create_tensor([capacity, hidden], dtype=pl.FP32)
+        pre(
+            x_hc, hc_function, hc_scale, hc_base, incoming, next_pre, post, comb,
+            collapsed, collapsed_fp32, active,
+        )
+        for block in pl.spmd((active + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="a2_block_norm"):
+            rms_norm_tiled(collapsed, norm_weight, normed, block, active)
+        attention(
+            normed, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
+            kv_norm_weight, wo_a, wo_b,
+            rope_cos, rope_sin, slots, indices, sink,
+            positions, query_latent, query, window_kv, cache, cache_lens, output, active,
+        )
+        post_fn(output, x_hc, post, comb, hidden_output, active)
+        return (
+            positions, query_latent, query, window_kv, cache, cache_lens, output,
+            next_pre, post, comb, collapsed, normed, hidden_output,
+        )
+
+    return attention_block

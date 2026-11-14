@@ -74,7 +74,7 @@ class ResidentNetworkRuntime:
 
                 def worker_factory(rank):
                     config = RunConfig(arch=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD,
-                                       device_id=self.devices[rank])
+                                       device_id=rank)
                     return ChipWorker(config=config)
 
                 from .moe_transport import CANNMemory

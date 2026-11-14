@@ -11,7 +11,7 @@
 from time import perf_counter
 
 from .cache import decode_cache_views
-from .decode_network_weights import DecodeNetworkWeights
+
 from .weights import ResidentNetworkWeights
 
 
@@ -173,3 +173,24 @@ class A3ResidentWeights:
         self.prefill.close()
         for handles in self.prefill_handles + self.decode_handles + self.cache_handles:
             handles.clear()
+
+
+class DecodeNetworkWeights:
+    """Bind the shared network ABI to the generation owner's existing device handles."""
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.world = owner.world
+
+    def layer(self, layer):
+        if not self.owner.ready:
+            raise RuntimeError("Decode operands require the session's completed preload")
+        return self.owner.for_layer(layer)
+
+    def handles(self, rank):
+        if not 0 <= rank < self.world:
+            raise ValueError("Decode rank is outside the session topology")
+        return self.owner.decode_handles[rank]
+
+    def preload(self, runtime):
+        raise RuntimeError("Decode ABI adapters cannot read or upload a second weight bank")

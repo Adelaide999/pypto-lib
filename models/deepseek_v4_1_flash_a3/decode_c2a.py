@@ -22,8 +22,8 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 
 from .config import FLASH
-from .decode_network_norm_rope import make_rope_tables
-from .decode_network_swa import (
+from .rope import make_rope_tables
+from .decode_moe_ep import (
     AUX_PAD,
     COUNT_PAD,
     SIGNAL_PAD,
@@ -36,20 +36,23 @@ from .decode_network_swa import (
     TOPK,
     decode_ep2_rank,
 )
-from .decode_network_engram import K as ENGRAM_K, N as ENGRAM_N, make_gate
-from .decode_network_decode_hc import make_hc_post_inline, make_hc_pre_inline
-from .decode_network_indexer import (
+from .engram import K as ENGRAM_K, N as ENGRAM_N, make_gate
+from .hc import (
+    make_decode_hc_post_inline as make_hc_post_inline,
+    make_decode_hc_pre_inline as make_hc_pre_inline,
+)
+from .indexer import (
     make_indexer_prepare,
-    make_indexer_projection,
-    make_indexer_query_quantize,
+    make_decode_indexer_projection_kn as make_indexer_projection,
+    make_indexer_query_quantize_fp16_scale as make_indexer_query_quantize,
     make_indexer_select,
 )
-from .decode_network_compressor import make_c2_index_publish_inline
-from .decode_network_decode_output_proj import make_output_projection_bf16
-from .decode_network_decode_qkv_w8a8 import make_qkv_w8a8_inline
-from .decode_network_decode_rmsnorm import NORM_T_TILE, rms_norm_tiled, rms_norm_tiled_with_fp32
-from .decode_network_decode_sparse_attention import make_sparse_attention
-from .decode_network_swa import make_swa_cache_publish
+from .compressor import make_decode_c2_index_publish_inline as make_c2_index_publish_inline
+from .o_proj import make_decode_output_projection_bf16 as make_output_projection_bf16
+from .qkv_proj_rope import make_decode_qkv_w8a8_kn_inline as make_qkv_w8a8_inline
+from .rmsnorm import NORM_T_TILE, rms_norm_tiled, rms_norm_tiled_with_fp32
+from .decode_compressed_attention import make_sparse_attention
+from .swa import make_decode_swa_cache_publish as make_swa_cache_publish
 
 
 CONFIG = asdict(FLASH)

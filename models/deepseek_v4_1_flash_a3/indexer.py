@@ -21,6 +21,8 @@ from .operator_config import CONTRACT
 from .qkv_proj_rope import make_decode_bf16_projection_staged as make_bf16_projection_staged
 from .quant import make_decode_dequantize as make_dequantize, make_decode_dynamic_int8_quantize as decode_make_dynamic_int8_quantize, make_decode_quantize as make_quantize, make_dynamic_int8_quantize, w8a8_linear
 from .rope import decode_rope_reference, make_decode_adjacent_rope as decode_indexer_projection_make_rope, make_decode_rope as decode_make_rope, make_rope, rope_reference
+from .gemm import N_TILE
+from .gemm import make_blocked_weight_pack
 
 
 # ``npu_dynamic_quant`` is nearest rounding for ordinary values, but an exact
@@ -1825,6 +1827,62 @@ def indexer_select_golden_cases(*, build=True, key_capacity=INDEXER_SELECT_KEY_C
             if build:
                 case["fn"] = make_prefill_indexer_select(capacity, key_capacity, compress_ratio=ratio)
             yield case
+
+
+def make_decode_indexer_projection_kn(capacity, config):
+    """Project and rotate index queries and emit scaled FP16 head weights."""
+    hidden = config["hidden_size"]
+    latent = config["q_lora_rank"]
+    rope_width = config["qk_rope_head_dim"]
+    pairs = rope_width // 2
+    index_width = INDEX_HEADS * INDEX_WIDTH
+    packed_rows = latent * (index_width // N_TILE)
+    weights_scale = INDEX_WIDTH ** -0.5 * INDEX_HEADS ** -0.5
+    quantize = make_quantize(capacity, latent)
+    pack = make_blocked_weight_pack(latent, index_width)
+    dot = make_dot(capacity, latent, index_width)
+    dequantize = make_dequantize(capacity, index_width)
+    rotate = decode_indexer_projection_make_rope(capacity, INDEX_HEADS, INDEX_WIDTH, rope_width)
+    project_weights = make_bf16_projection_staged(hidden, INDEX_HEADS)
+
+    @pl.jit
+    def indexer_projection(
+        x: pl.Tensor[[capacity, hidden], pl.BF16],
+        query_latent: pl.Tensor[[capacity, latent], pl.BF16],
+        index_wq_b: pl.Tensor[[latent, index_width], pl.INT8],
+        index_wq_b_scale: pl.Tensor[[index_width], pl.FP32],
+        weights_proj: pl.Tensor[[hidden, INDEX_HEADS], pl.BF16],
+        cosine: pl.Tensor[[capacity, pairs], pl.FP32],
+        sine: pl.Tensor[[capacity, pairs], pl.FP32],
+        query: pl.InOut[pl.Tensor[[capacity, INDEX_HEADS, INDEX_WIDTH], pl.BF16]],
+        weights: pl.InOut[pl.Tensor[[capacity, INDEX_HEADS], pl.FP16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        latent_i8 = pl.create_tensor([capacity, latent], dtype=pl.INT8)
+        latent_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
+        quantize(query_latent, latent_i8, latent_scale, active)
+        packed = pl.create_tensor([packed_rows, N_TILE], dtype=pl.INT8)
+        pack(index_wq_b, packed)
+        accumulator = pl.create_tensor([capacity, index_width], dtype=pl.INT32)
+        dot(latent_i8, packed, accumulator, active)
+        projected = pl.create_tensor([capacity, index_width], dtype=pl.BF16)
+        dequantize(accumulator, index_wq_b_scale, latent_scale, projected, active)
+        query_flat = pl.reshape(query, [capacity, index_width])
+        rotate(projected, cosine, sine, query_flat, active)
+
+        projected_weights = pl.create_tensor([capacity, INDEX_HEADS], dtype=pl.BF16)
+        project_weights(x, weights_proj, projected_weights, active)
+        with pl.spmd((active + WEIGHT_ROWS_TILE - 1) // WEIGHT_ROWS_TILE, name_hint="a2_index_weights"):
+            block = pl.tile.get_block_idx()
+            row = block * WEIGHT_ROWS_TILE
+            rows = pl.min(WEIGHT_ROWS_TILE, active - row)
+            value = pl.slice(projected_weights, [WEIGHT_ROWS_TILE, INDEX_HEADS], [row, 0], valid_shape=[rows, INDEX_HEADS])
+            scaled = pl.mul(pl.cast(value, pl.FP32), weights_scale)
+            narrowed = pl.cast(scaled, pl.FP16, mode="rint")
+            weights[row:row + WEIGHT_ROWS_TILE, :] = pl.set_validshape(narrowed, rows, INDEX_HEADS)
+        return query, weights
+
+    return indexer_projection
 
 
 if __name__ == "__main__":

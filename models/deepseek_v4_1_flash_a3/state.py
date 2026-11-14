@@ -20,6 +20,9 @@ from .prefill_network_engram import NetworkEngramHistory
 DTYPE_BYTES = {"torch.int8": 1, "torch.float16": 2, "torch.bfloat16": 2, "torch.float32": 4}
 
 
+GENERATION_STATE_SCHEMA = 'deepseek-v4.1-flash-generation-state-v1'
+
+
 def _require(condition, message):
     if not condition:
         raise ValueError(message)
@@ -693,3 +696,47 @@ class NetworkCacheProvider:
                         "Native hash constants differ across rank/case captures",
                     )
         return dict(baseline, layer_ids=list(layer_ids), pad_id=pad_id)
+
+
+def validate_generation_state(packet):
+    """Reject incomplete owners, invalid coordinates and unsupported request layouts."""
+    topology = packet["topology"]
+    world = topology["ep"]
+    if (packet["schema"] != GENERATION_STATE_SCHEMA or topology != dict(dp=world, tp=1, ep=world, pp=1, pcp=1, dcp=1)
+            or world not in (2, 16) or packet["completed_layers"] != list(range(40))
+            or set(packet["sources"]) != {2, 8, 14, 20}):
+        raise ValueError("State requires complete source ownership and a shared DP/EP topology")
+    if any(len(packet[name]) != world for name in ("histories", "layers", "candidates", "engram_history")):
+        raise ValueError("State must cover every logical rank")
+
+    def tensor(value, shape, dtype):
+        if (not isinstance(value, torch.Tensor) or value.device.type != "cpu"
+                or list(value.shape) != list(shape) or value.dtype != dtype):
+            raise ValueError(f"State tensor must have shape {shape} and dtype {dtype}")
+
+    for rank, history in enumerate(packet["histories"]):
+        count = len(history)
+        if not 1 <= count <= 256 or any(type(token) is not int or not 0 <= token < 129280 for token in history):
+            raise ValueError("State history exceeds the bounded Decode request ABI")
+        if len(packet["layers"][rank]) != 40:
+            raise ValueError("State must contain all forty independent SWA owners")
+        for layer in packet["layers"][rank]:
+            tensor(layer["swa"], (count, 512), torch.bfloat16)
+            if "selection" in layer:
+                tensor(layer["selection"], (512,), torch.int32)
+        tensor(packet["engram_history"][rank], (count,), torch.int32)
+        for owner, rows in packet["sources"].items():
+            if len(rows) != world or rows[rank]["ratio"] != (1 if owner == 20 else 2):
+                raise ValueError("State source rank or compression ratio differs")
+            source = rows[rank]
+            visible = count // source["ratio"]
+            tensor(source["kv"], (visible, 512), torch.bfloat16)
+            tensor(source["codes"], (visible, 128), torch.int8)
+            tensor(source["scales"], (visible,), torch.float16)
+            if source["ratio"] == 2:
+                tensor(source["ring"], (32, 1024), torch.float32)
+        candidate = packet["candidates"][rank]
+        if not 0 <= candidate["count"] <= 64 or not 0 <= candidate["topk_length"] <= 512:
+            raise ValueError("State candidate pool exceeds the bounded Decode capacity")
+        tensor(candidate["ids"], (candidate["count"],), torch.int32)
+    return packet

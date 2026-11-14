@@ -8,11 +8,15 @@
 # -----------------------------------------------------------------------------------------------------------
 """Final HC collapse, normalization, vocabulary projection and output unpacking."""
 
+from dataclasses import asdict
+
 import pypto.language as pl
-from .gemm import make_bf16_linear
+
+from .config import FLASH
+from .gemm import make_bf16_linear, make_decode_bf16_linear
 from .hc import make_hc_collapse_inline
 from .input_pack import make_sp_gather_unpack
-from .rmsnorm import D, EPS, make_prefill_norm
+from .rmsnorm import D, EPS, NORM_T_TILE, make_prefill_norm, rms_norm_tiled
 
 
 def make_output_entries(capacity, config, tp):
@@ -56,3 +60,29 @@ def make_output_vocab_unpack(capacity, vocabulary, tp):
         return output
 
     return vocab_unpack
+
+
+def make_decode_head(capacity=16):
+    """Compose the existing output operators after the final physical layer."""
+    hidden, hc, vocabulary = FLASH.hidden_size, FLASH.hc_mult, FLASH.vocab_size
+    collapse = make_hc_collapse_inline(capacity, asdict(FLASH))
+    project = pl.jit.inline(make_decode_bf16_linear(capacity, hidden, vocabulary)._func)
+
+    @pl.jit
+    def decode_head(
+        streams: pl.Tensor[[capacity, hc, hidden], pl.BF16],
+        premix: pl.Tensor[[capacity, hc], pl.FP32],
+        norm_weight: pl.Tensor[[hidden], pl.BF16],
+        head_weight: pl.Tensor[[hidden, vocabulary], pl.BF16],
+        logits: pl.InOut[pl.Tensor[[capacity, vocabulary], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        collapsed = pl.create_tensor([capacity, hidden], dtype=pl.BF16)
+        collapse(streams, premix, collapsed, active)
+        normalized = pl.create_tensor([capacity, hidden], dtype=pl.BF16)
+        for block in pl.spmd((active + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="decode_final_norm"):
+            rms_norm_tiled(collapsed, norm_weight, normalized, block, active)
+        project(normalized, head_weight, logits, active)
+        return logits
+
+    return decode_head

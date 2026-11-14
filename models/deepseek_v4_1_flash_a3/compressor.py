@@ -16,6 +16,7 @@ from .qkv_proj_rope import make_bf16_projection_staged, make_decode_bf16_project
 from .quant import make_decode_quantize as decode_make_quantize, make_quantize
 from .rmsnorm import make_blocked_rmsnorm as make_norm, make_decode_blocked_rmsnorm as decode_make_norm
 from .rope import make_adjacent_rope as make_rope, make_decode_adjacent_rope as decode_make_rope
+from .qkv_proj_rope import make_decode_qkv_w8a8_kn_inline
 
 
 STATE_WIDTH = 2 * M.head_dim
@@ -1324,3 +1325,72 @@ def make_ratio1_compress_publish(capacity, config, cache_blocks=2, request_count
         return compressed, long_cache, index_key, key_cache, key_scale, source_positions, cache_lengths
 
     return ratio1_compress_publish
+
+
+def make_decode_layer2_c1c2_kn(capacity, config):
+    """Build QKV, ratio-2 C2 pooling and C1 index-key publication."""
+    hidden = config["hidden_size"]
+    latent_width = config["q_lora_rank"]
+    heads = config["num_attention_heads"]
+    head_dim = config["head_dim"]
+    query_width = heads * head_dim
+    pair_width = config["qk_rope_head_dim"] // 2
+    qkv = make_decode_qkv_w8a8_kn_inline(capacity, config)
+    publish_c2 = make_decode_c2_index_publish_inline(capacity, config)
+
+    @pl.jit
+    def layer2_c1c2(
+        x: pl.Tensor[[capacity, hidden], pl.BF16],
+        wq_a: pl.Tensor[[hidden, latent_width], pl.INT8],
+        wq_a_scale: pl.Tensor[[latent_width], pl.FP32],
+        q_norm_weight: pl.Tensor[[latent_width], pl.BF16],
+        wq_b: pl.Tensor[[latent_width, query_width], pl.INT8],
+        wq_b_scale: pl.Tensor[[query_width], pl.FP32],
+        wkv: pl.Tensor[[hidden, head_dim], pl.INT8],
+        wkv_scale: pl.Tensor[[head_dim], pl.FP32],
+        kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
+        rope_cos: pl.Tensor[[capacity, pair_width], pl.FP32],
+        rope_sin: pl.Tensor[[capacity, pair_width], pl.FP32],
+        positions: pl.InOut[pl.Tensor[[capacity], pl.INT64]],
+        positions32: pl.Tensor[[capacity], pl.INT32],
+        query_latent: pl.InOut[pl.Tensor[[capacity, latent_width], pl.BF16]],
+        query: pl.InOut[pl.Tensor[[capacity, query_width], pl.BF16]],
+        window_kv: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        qkv_cache: pl.InOut[pl.Tensor[[2, 128, head_dim], pl.BF16]],
+        cache_lens: pl.InOut[pl.Tensor[[2], pl.INT32]],
+        compressor_wkv: pl.Tensor[[hidden, HEAD_DIM], pl.BF16],
+        compressor_wgate: pl.Tensor[[hidden, HEAD_DIM], pl.BF16],
+        compressor_norm: pl.Tensor[[HEAD_DIM], pl.BF16],
+        index_wk: pl.Tensor[[HEAD_DIM, INDEX_WIDTH], pl.BF16],
+        index_norm: pl.Tensor[[INDEX_WIDTH], pl.BF16],
+        compressed_slots: pl.Tensor[[capacity], pl.INT64],
+        index_slots: pl.Tensor[[capacity], pl.INT64],
+        query_start: pl.Tensor[[Q_START_DYN], pl.INT32],
+        requests: pl.Tensor[[capacity], pl.INT32],
+        state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
+        state: pl.InOut[pl.Tensor[[STATE_BLOCKS_DYN, RING_ROWS_DYN, 2 * HEAD_DIM], pl.FP32]],
+        compressed_cache: pl.InOut[pl.Tensor[[2, 128, 1, HEAD_DIM], pl.BF16]],
+        index_cache: pl.InOut[pl.Tensor[[2, 128, 1, INDEX_WIDTH], pl.INT8]],
+        index_scale: pl.InOut[pl.Tensor[[2, 128, 1, 1], pl.FP16]],
+        compressed: pl.InOut[pl.Tensor[[capacity, HEAD_DIM], pl.BF16]],
+        index_key: pl.InOut[pl.Tensor[[capacity, INDEX_WIDTH], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        qkv(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+            wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, positions,
+            query_latent, query, window_kv, qkv_cache, cache_lens, active,
+        )
+
+        publish_c2(
+            x, compressor_wkv, compressor_wgate, compressor_norm, index_wk, index_norm,
+            rope_cos, rope_sin, positions32, compressed_slots, index_slots, query_start, requests,
+            state_block_table, state, compressed_cache, index_cache, index_scale,
+            compressed, index_key, active,
+        )
+        return (
+            positions, query_latent, query, window_kv, qkv_cache, cache_lens,
+            state, compressed, compressed_cache, index_key, index_cache, index_scale,
+        )
+
+    return layer2_c1c2

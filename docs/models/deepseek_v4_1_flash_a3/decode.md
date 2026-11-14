@@ -13,13 +13,26 @@ The scheduler remains on the host; model arithmetic runs on A3.
 | Prefill request preparation and public forward | `prefill_fwd.py` |
 | One-token Decode and standalone Decode command | `decode_network.py` |
 | Session static weight ownership and read/upload audit | `resident_weights.py` |
-| Decode binding to existing canonical operands | `decode_network_weights.py` |
+| Decode binding to existing canonical operands | `resident_weights.py` (`DecodeNetworkWeights`) |
 | Checkpoint reading, packing and expert ownership | `weights.py` |
 | Original paged cache geometry and aliases | `cache.py`, `state.py` |
 | Persistent workers, dynamic buffers and HCCL channels | `prefill_resident.py` |
 | Request metadata, cache reservation and host lookup lifetime | `prefill_prepare.py` |
 | Device Engram projection and gating | `engram.py`, `prefill_network_engram.py` |
 | Device final collapse, normalization and vocabulary shards | `lm_head.py` |
+| Full-width Decode layer dispatch and SWA/Engram block composition | `decode_layer.py` |
+| SWA and compressed-attention compositions | `decode_swa.py`, `decode_c1a.py`, `decode_c2a.py` |
+| Full-width EP dispatch, experts and rank composition | `decode_moe_ep.py` |
+
+Decode uses the same operator owners as Prefill: `gemm.py`, `quant.py`,
+`rmsnorm.py`, `rope.py`, `qkv_proj_rope.py`, `o_proj.py`, `hc.py`, `indexer.py`
+and `compressor.py`. Distinct Decode rounding and weight-layout variants keep
+separate function names in those owners. The `_kn` suffix identifies entries
+that consume unpacked `[K, N]` INT8 weights; existing entries for blocked
+weights retain their interfaces. `decode_compressed_attention.py` retains the
+full-width compressed-attention specialization and its original configuration
+checks. `decode_config.py` and `decode_layer_config.py` retain their separate
+topology defaults and validation rules.
 
 `A3ResidentWeights.preload_once()` prepares the complete static bank before
 executing any tokens. Each logical checkpoint tensor is read once, including

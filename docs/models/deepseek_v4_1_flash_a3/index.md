@@ -29,7 +29,8 @@ remaining work.
 | Vocabulary embedding, initial HC and output head | `input_pack.py`, `prefill_fwd.py`, `lm_head.py` |
 | Attention, compression and Indexer | `swa.py`, `sparse_attention.py`, `compressor.py`, `indexer.py`, phase compositions |
 | Phase MoE routing, dispatch and shared experts | `prefill_moe.py`, `decode_moe.py` |
-| Full Decode layer leaves and network orchestration | `decode_network_*.py` |
+| Full-width Decode layer dispatch and attention | `decode_layer.py`, `decode_swa.py`, `decode_c1a.py`, `decode_c2a.py` |
+| Full-width Decode expert-parallel composition | `decode_moe_ep.py` |
 | Grouped routed-expert computation | `expert_routed.py` |
 | Linear, quantization, Norm, RoPE and HC | `gemm.py`, `quant.py`, `rmsnorm.py`, `rope.py`, `hc.py` |
 | Checkpoint operands and phase layouts | `weights.py` |
