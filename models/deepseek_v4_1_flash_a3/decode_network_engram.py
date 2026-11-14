@@ -215,8 +215,6 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
 
-import pypto.language as pl
-
 from .decode_network_qkv_proj_rope import make_bf16_projection_staged
 
 
@@ -555,7 +553,6 @@ operations in this product entry.
 """
 
 
-import pypto.language as pl
 import pypto.language.distributed as pld
 
 from .decode_network_swa import (
@@ -570,7 +567,6 @@ from .decode_network_swa import (
     FFN_POST,
     FFN_PRE,
     HC,
-    HIDDEN,
     LATENT,
     LANE_ROWS,
     MOE_INTER,

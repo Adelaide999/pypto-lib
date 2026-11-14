@@ -146,7 +146,6 @@ def make_attention(capacity, config):
 # -----------------------------------------------------------------------------------------------------------
 """BF16 paged SWA cache publication, window gather and sink attention."""
 
-import pypto.language as pl
 
 
 # tiling
@@ -322,7 +321,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
-import pypto.language as pl
 
 from .operator_config import CONTRACT
 
@@ -501,7 +499,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
-import pypto.language as pl
 
 
 def swa_attention_reference(
@@ -673,10 +670,9 @@ __all__ = [
 # -----------------------------------------------------------------------------------------------------------
 """Delayed HC, RMSNorm, A2 W8A8 attention and BF16 residual expansion."""
 
-import pypto.language as pl
 
 from .decode_network_decode_hc import make_hc_pre_inline, make_hc_post_inline
-from .decode_network_decode_rmsnorm import D, EPS, NORM_T_TILE, rms_norm_tiled
+from .decode_network_decode_rmsnorm import EPS, NORM_T_TILE, rms_norm_tiled
 
 
 def make_attention_block(capacity, config):
@@ -778,7 +774,6 @@ entry is a product path: all model computation is emitted through PyPTO.
 
 from dataclasses import asdict
 
-import pypto.language as pl
 import pypto.language.distributed as pld
 
 from .config import FLASH
@@ -796,8 +791,7 @@ from .decode_network_moe import (
     TOPK,
     decode_ep2_rank,
 )
-from .decode_network_decode_hc import make_hc_post_inline, make_hc_pre_inline
-from .decode_network_decode_rmsnorm import NORM_T_TILE, rms_norm_tiled_with_fp32
+from .decode_network_decode_rmsnorm import rms_norm_tiled_with_fp32
 
 
 CONFIG = asdict(FLASH)

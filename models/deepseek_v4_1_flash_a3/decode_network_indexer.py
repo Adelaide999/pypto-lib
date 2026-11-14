@@ -18,7 +18,6 @@ from .decode_network_decode_primitives import (
     N_TILE,
     make_dequantize,
     make_dot,
-    make_norm,
     make_pack_weight,
     make_quantize,
     make_rope,
