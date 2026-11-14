@@ -47,6 +47,7 @@ class CANNMemory:
         _bind(self.library, "aclrtMalloc", [ctypes.POINTER(pointer), size, integer])
         _bind(self.library, "aclrtFree", [pointer])
         _bind(self.library, "aclrtMemcpy", [pointer, size, pointer, size, integer])
+        _bind(self.library, "aclrtMemset", [pointer, size, integer, size])
         _bind(self.library, "aclrtGetMemInfo", [integer, ctypes.POINTER(size), ctypes.POINTER(size)])
         status = self.library.aclInit(None)
         # A persistent ChipWorker can already own this process's ACL initialization.
@@ -71,6 +72,10 @@ class CANNMemory:
 
     def select(self, rank):
         _check(self.library.aclrtSetDevice(rank), "aclrtSetDevice")
+
+    def fill(self, pointer, nbytes, byte):
+        """Fill one validated device allocation range synchronously."""
+        _check(self.library.aclrtMemset(pointer, nbytes, byte, nbytes), "aclrtMemset")
 
     def sample(self, rank, stage):
         self.select(rank)

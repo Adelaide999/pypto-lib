@@ -62,6 +62,7 @@ class ResidentNetworkRuntime:
         self._stack = ExitStack()
         self._closed = False
         self._select = lambda rank: None
+        self.memory = None
         self.stats = dict(worker_initializations=0, dispatches=0, h2d_bytes=0, d2h_bytes=0,
                           weight_bytes=[0] * len(devices), state_bytes=[0] * len(devices),
                           transport_calls=0, transport_seconds=0.0, device_weight_upload_calls=0,
@@ -83,6 +84,7 @@ class ResidentNetworkRuntime:
                 # several workers leaves that thread on the last initialized
                 # device; every later allocation/copy must select its owner.
                 memory = CANNMemory(diagnostics=False)
+                self.memory = memory
                 self._select = memory.select
 
             self._worker_factory = worker_factory
@@ -190,6 +192,24 @@ class ResidentNetworkRuntime:
             raise RuntimeError("Resident runtime is closed")
         owner = self.pinned[rank, value.untyped_storage()._cdata]
         return _device_view(owner["allocation"], value, owner["base_offset"])
+
+    def clear_ranges(self, value, rank, intervals, *, byte=0):
+        """Clear bounded mutable cache ranges in both HOST and device storage."""
+        if self._closed or self.memory is None or byte not in (0, 255):
+            raise ValueError("Require an open device runtime and a supported reset byte")
+        owner = self.pinned[rank, value.untyped_storage()._cdata]
+        if owner["readonly"]:
+            raise ValueError("Request cleanup cannot mutate static weights")
+        for offset, count in intervals:
+            if type(offset) is not int or type(count) is not int or offset < 0 or count <= 0:
+                raise ValueError("Invalid request cache reset extent")
+            if offset + count > owner["allocation"].nbytes:
+                raise ValueError("Request cache reset exceeds its owning allocation")
+        self._select(rank)
+        for offset, count in intervals:
+            self.memory.fill(owner["allocation"].data_ptr + offset, count, byte)
+            owner["host"][offset:offset + count].fill_(byte)
+            self.stats["request_reset_bytes"] = self.stats.get("request_reset_bytes", 0) + count
 
     def register(self, program):
         """Admit every phase and boundary entry to the same worker registry."""

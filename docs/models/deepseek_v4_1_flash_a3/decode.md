@@ -82,6 +82,31 @@ step writes `decode/step-N/decode.json` and the full execution receipt.
 `generation/answer.txt` and `generation/tokens.json` are updated after each
 generated token. Execution success does not establish independent accuracy.
 
+## Serving request pool
+
+A prepared forward may set `max_requests_per_partition` to 1..32 in its
+session contract. Each request then carries an explicit positive `generation`
+with its DP rank and request slot. The provider retains inactive requests
+across bounded dispatches and reserves a fixed request-control specialization
+of `min(capacity, max_requests_per_partition)` rows. The per-dispatch token
+capacity remains 16; this setting does not enlarge the kernel token budget.
+
+Prepared Prefill uses the normal `prefill_fwd` entry. After the first forward,
+`GenerationSession.advance` consumes fresh Prefill chunks. The borrowed
+`DecodeNetwork.step(chunk=prepared_chunk)` consumes one token per active
+request and returns the full network result for serving to map back to request
+order. The scalar `step(token)` interface retains its standalone behavior.
+Both paths use the same complete network and static weight bank.
+
+After a completed dispatch, `GenerationSession.release_request(dp, slot,
+generation)` clears only that request's physical pages and Engram history,
+resets the DP's completed-dispatch selection workspace, and retires its
+generation. Static weights and cache allocation identities remain intact.
+Pages cannot overlap another live request, live page mappings can only grow,
+and a retired slot requires a newer generation. Cleanup failure invalidates
+the session. These interfaces require serving lifecycle and device validation;
+they do not establish multi-request capacity or numerical acceptance.
+
 ## Standalone Decode
 
 Standalone Decode initializes the same shared ABI once and consumes the
