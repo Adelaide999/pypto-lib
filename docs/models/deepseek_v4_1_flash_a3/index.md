@@ -34,7 +34,8 @@ TP4/DP4/EP16 prompt/Decode traces, full-vocabulary captures and CPU metrics.
 | Phase MoE routing, dispatch and shared experts | `prefill_moe.py`, `decode_moe.py` |
 | Full-width Decode layer dispatch and attention | `decode_layer.py`, `decode_swa.py`, `decode_c1a.py`, `decode_c2a.py` |
 | Full-width Decode expert-parallel composition | `decode_moe_ep.py` |
-| Grouped routed-expert computation | `expert_routed.py` |
+| Resident blocked-INT8 grouped experts | `grouped_moe.py` |
+| Bounded Decode NZ routed experts | `expert_routed.py` |
 | Linear, quantization, Norm, RoPE and HC | `gemm.py`, `quant.py`, `rmsnorm.py`, `rope.py`, `hc.py` |
 | Checkpoint operands and phase layouts | `weights.py` |
 | Cache ownership and device lifetime | `cache.py`, `state.py`, `prefill_resident.py` |
@@ -224,6 +225,10 @@ their separate NZ or blocked device operands are not interchangeable.
 `ResidentNetworkWeights.preload` prepares these operands once per generation.
 Layer and chunk calls reuse the pinned projection tensors and each EP owner's
 resident expert handles, without repacking or uploading the fixed weights.
+Each rank retains four expert-major weight owners and per-expert borrowed
+views of those same bytes. After each dispatch slab is unpacked,
+`grouped_moe.py` computes all nonempty local experts in one invocation.
+Empty ranks skip the routed invocation and its weight lookup.
 Activation quantization and routed-token dispatch packing still run per call.
 The generation network reuses the blocked routed-expert representation in
 both phases. Bounded legacy Decode operators retain their FRACTAL_NZ contract,

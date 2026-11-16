@@ -27,7 +27,8 @@ MXFP8/MXFP4 kernels or topology.
 | Bounded Decode routing, dispatch and shared expert | `decode_moe.py` |
 | Full-width Decode routing and layer composition | `decode_moe_ep.py`, `decode_layer.py` |
 | Decode compressed-attention specialization | `decode_compressed_attention.py` |
-| Routed expert computation | `expert_routed.py` |
+| Resident blocked-INT8 routed experts | `grouped_moe.py` |
+| Bounded Decode NZ routed experts | `expert_routed.py` |
 | Linear, quantization, Norm, RoPE, QKV and attention leaves | `gemm.py`, `quant.py`, `rmsnorm.py`, `rope.py`, `qkv_proj_rope.py`, `o_proj.py`, `swa.py`, `sparse_attention.py` |
 | Checkpoint readers and phase weight layouts | `weights.py` |
 | Cache and request lifetime | `cache.py`, `state.py` |
@@ -61,7 +62,7 @@ their casts and cache-publication boundaries are unchanged.
 | --- | --- |
 | Model configuration | `config.py` |
 | Primitive computation | `gemm.py`, `quant.py`, `rmsnorm.py`, `rope.py`, `qkv_proj_rope.py`, `o_proj.py`, `hc.py`, `swa.py`, `sparse_attention.py`, `activation.py`, `input_pack.py`, `engram.py`, `lm_head.py` |
-| Functional modules | `indexer.py`, `compressor.py`, `prefill_moe.py`, `decode_moe.py`, `decode_moe_ep.py`, `expert_routed.py` |
+| Functional modules | `indexer.py`, `compressor.py`, `prefill_moe.py`, `decode_moe.py`, `decode_moe_ep.py`, `grouped_moe.py`, `expert_routed.py` |
 | Attention variants | `prefill_swa.py`, `prefill_c2a.py`, `prefill_compressed_reuse.py`, `decode_swa.py`, `decode_c1a.py`, `decode_c2a.py` |
 | Layer composition | `prefill_layer.py`, `decode_layer.py` |
 | Network and generation | `prefill_fwd.py`, `decode_fwd.py`, `decode_network.py`, `network.py`, `generate.py` |
@@ -106,8 +107,10 @@ separate names within their computation owner when numerical semantics differ:
   and its separate activation/quantization boundaries. Neither imports the other.
   Both use independent `gemm.py` and `quant.py` primitives.
 
-`expert_routed.py` owns grouped expert computation, and `moe_transport.py`
-owns CANN/HCCL resources. The unused native dispatch adapter is removed;
+`grouped_moe.py` owns blocked-INT8 grouped experts in the shared generation
+network. `expert_routed.py` retains the separate NZ experts used by bounded
+Decode compositions. `moe_transport.py` owns CANN/HCCL resources.
+The unused native dispatch adapter is removed;
 there is no compatibility `moe.py` facade.
 
 L2 regions inline existing children between host communication boundaries.

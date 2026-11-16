@@ -69,6 +69,7 @@ def make_prefill_layer_entries(
     from .prefill_moe import make_ep_dispatch_pack, make_ep_dispatch_unpack, make_ep_return_pack
     from .prefill_moe import make_moe_router
     from .prefill_moe import make_shared_moe_w8a8
+    from .grouped_moe import make_grouped_routed_experts
     from .rope import make_rope_tables
     from .input_pack import make_head_pack, make_sp_gather_unpack, make_sp_masked_zero, make_sp_reduce_pack
     from .rmsnorm import make_prefill_norm_cast
@@ -96,10 +97,7 @@ def make_prefill_layer_entries(
         shared=make_shared_moe_w8a8(
             capacity, config, fused_activation=True, fused_channel_dtype=pl.FP32, partitions=tp,
         ),
-        routed=make_shared_moe_w8a8(
-            expert_capacity, config, fused_activation=True, fused_channel_dtype=pl.FP32,
-            token_first=True, fused_requantize=True,
-        ),
+        routed=make_grouped_routed_experts(expert_capacity, config, 384 // ep),
         dispatch_pack=make_ep_dispatch_pack(slab, 5120, 384, 6, ep),
         dispatch_unpack=make_ep_dispatch_unpack(slab, 5120, 384, 6, ep, expert_capacity),
         return_pack=make_ep_return_pack(slab, 5120, 384, 6, ep, expert_capacity),
@@ -591,16 +589,19 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 execute("dispatch_unpack", rank, case, unpack_args, {}, "dispatch_unpack")
                 if int(read_runtime_control(runtime, work["total"], rank)[0]) != expected_total:
                     raise RuntimeError("Dispatch unpack lost received routes")
-                for local, count in enumerate(read_runtime_control(runtime, work["expert_counts"], rank).tolist()):
-                    if not 0 <= count <= expert_capacity:
-                        raise RuntimeError("Expert slab exceeded its proven per-round bound")
-                    if count:
-                        expert, begin = rank * local_experts + local, local * expert_capacity
-                        expert_operands = expert_weights(rank, expert)
-                        x = work["expert_x"][begin:begin + expert_capacity]
-                        y = work["expert_y"][begin:begin + expert_capacity]
-                        execute("routed", rank, case + f"-expert-{expert}", [x, *expert_operands, y, count],
-                                {"expert_output": y}, "routed")
+                counts = read_runtime_control(runtime, work["expert_counts"], rank)
+                if bool(((counts < 0) | (counts > expert_capacity)).any()):
+                    raise RuntimeError("Expert slab exceeded its proven per-round bound")
+                if expected_total > 0:
+                    with memory.interval(rank, "load", "grouped-experts"):
+                        if "grouped_expert" in weight_provider:
+                            expert_operands = weight_provider["grouped_expert"](rank)
+                        else:
+                            local_values = [expert_weights(rank, rank * local_experts + local)
+                                            for local in range(local_experts)]
+                            expert_operands = tuple(torch.cat([values[i] for values in local_values]) for i in range(4))
+                    arguments = [work["expert_x"], *expert_operands, work["expert_counts"], work["expert_y"]]
+                    execute("routed", rank, case, arguments, {"expert_output": work["expert_y"]}, "routed")
                 arguments = [work["expert_y"], packet["counts"], work["packet_map"], work["sent"]]
                 execute("return_pack", rank, case, arguments, {"return_hidden": work["sent"]}, "return_pack")
                 returns[rank][case] = dict(routes=packet["routes"], hidden=work["sent"], counts=packet["counts"])

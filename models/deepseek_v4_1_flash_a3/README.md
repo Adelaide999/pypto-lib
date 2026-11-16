@@ -19,7 +19,9 @@ owners for linear algebra, quantization, normalization, RoPE and cache operation
   DP4/TP4/EP16 Decode with resident weights, persistent state, Engram stages and the
   vocabulary head.
 - `prefill_moe.py` / `decode_moe.py`: phase routing, dispatch, shared experts,
-  Torch goldens and standalone validation; `expert_routed.py` owns grouped experts.
+  Torch goldens and standalone validation.
+- `grouped_moe.py`: blocked-INT8 grouped experts for the resident generation network.
+- `expert_routed.py`: legacy NZ experts for bounded Decode compositions.
 
 Historical regression runners, replay/capture paths and task admission tooling
 are removed. Operator files retain Torch goldens and standard validation

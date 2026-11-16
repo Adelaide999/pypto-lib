@@ -11,6 +11,7 @@
 import argparse
 import hashlib
 import json
+import math
 import re
 import struct
 from collections import Counter
@@ -1113,6 +1114,7 @@ class ResidentNetworkWeights:
         self.layout = ExpertParallelConfig(topology["dp"], topology["tp"], topology["ep"], 384)
         self.model_config, self.runtime = model_config, runtime
         self.layers, self.experts, self.heads = {}, {}, {}
+        self.grouped_experts = {}
         self.layer_receipts = {}
         self.load_seconds, self.load_calls = 0.0, 0
         self.ready = False
@@ -1172,17 +1174,14 @@ class ResidentNetworkWeights:
                 raw=raw,
                 operands=operands,
                 expert=lambda rank, expert, layer=layer: self.expert(layer, rank, expert),
+                grouped_expert=lambda rank, layer=layer: self.grouped_experts[layer, rank],
             )
             shared = self.reader.expert(prefix + "ffn.shared_experts", partitions=tp)
             for rank in ranks:
                 self.experts[layer, rank, None] = tuple(self.runtime.weight(value, rank) for value in shared)
             del shared
             for rank in ranks:
-                for expert, _ in self.layout.ownership(rank):
-                    values = self.reader.expert(prefix + f"ffn.experts.{expert}")
-                    self.experts[layer, rank, expert] = tuple(
-                        self.runtime.weight(value, rank) for value in values
-                    )
+                self._preload_routed(layer, rank)
             self.layer_receipts[layer] = dict(
                 original_names=names,
                 policy="generation-scoped resident compute weights",
@@ -1211,6 +1210,31 @@ class ResidentNetworkWeights:
             checkpoint_preload_read_seconds=self.reader.read_seconds,
         )
 
+    def _preload_routed(self, layer, rank):
+        """Upload four common owners and retain contiguous per-expert borrowed views."""
+        grouped = None
+        shapes = None
+        ownership = self.layout.ownership(rank)
+        for expert, local in ownership:
+            values = self.reader.expert(f"layers.{layer}.ffn.experts.{expert}")
+            if grouped is None:
+                shapes = [tuple(value.shape) for value in values]
+                grouped = [torch.empty((len(ownership) * value.shape[0], *value.shape[1:]),
+                                       dtype=value.dtype) for value in values]
+            for full, value in zip(grouped, values):
+                full.narrow(0, local * value.shape[0], value.shape[0]).copy_(value)
+            del values
+        owners = tuple(self.runtime.weight(value, rank) for value in grouped)
+        self.grouped_experts[layer, rank] = owners
+        for expert, local in ownership:
+            aliases = tuple(
+                self.runtime.workers[rank].view_tensor(
+                    owner, shape, byte_offset=local * math.prod(shape) * owner.dtype.itemsize,
+                ) for owner, shape in zip(owners, shapes)
+            )
+            self.runtime.alias_leases.update((id(value), value) for value in aliases)
+            self.experts[layer, rank, expert] = aliases
+
     def for_layer(self, layer):
         if not self.ready or layer not in self.layers:
             raise ValueError("Every resident layer must be loaded before execution")
@@ -1236,6 +1260,7 @@ class ResidentNetworkWeights:
     def close(self):
         self.layers.clear()
         self.experts.clear()
+        self.grouped_experts.clear()
         self.heads.clear()
         self.reader.close()
 
