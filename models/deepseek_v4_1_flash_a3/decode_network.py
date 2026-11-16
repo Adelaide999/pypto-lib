@@ -57,7 +57,7 @@ class DecodeNetwork:
     def _bind(self, session):
         if session.closed or session.failed or session.contract["topology"] != TOPOLOGY:
             raise ValueError("Decode requires a live DP4/TP4/EP16 generation session")
-        if session.request_inputs is None and session.provider.max_requests_per_partition is None:
+        if session.request_inputs is None:
             raise ValueError("Decode requires the session's original request metadata owner")
         if self.devices is not None and list(map(int, self.devices)) != list(map(int, session.runtime.devices)):
             raise ValueError("Decode devices differ from the existing session worker mapping")
@@ -67,34 +67,25 @@ class DecodeNetwork:
                 raise ValueError("Decode cannot replace the session runtime, weights or cache allocations")
         self.session, self.runtime, self.weights = session, session.runtime, session.weights
         self.cache_views = session.cache_views
-        self.dp_rank = session.request_inputs.config.get("dp_rank", 0) if session.request_inputs is not None else 0
+        self.dp_rank = session.request_inputs.config.get("dp_rank", 0)
         self.initialization_timings = dict(session.weights.initialization_timings)
         self.weights.assert_static_unchanged()
 
-    def step(self, token=None, *, chunk=None):
-        """Execute one token per request; a prepared service chunk returns all network rows."""
+    def step(self, token):
+        """Execute all forty layers, Engram and the TP-sharded vocabulary head on A3."""
         if self._closed or self.session is None:
             raise RuntimeError("Decode requires an open initialized generation session")
-        prepared = chunk is not None
-        if prepared:
-            if token is not None or self.session.provider.max_requests_per_partition is None:
-                raise ValueError("Prepared Decode requires the live service request pool")
-            if any(len(request["token_ids"]) != 1 for engine in chunk["inputs"]["input_contract"]["DP_engines"]
-                   for request in engine["requests"]):
-                raise ValueError("Prepared Decode requires one token per request")
-        elif self.session.request_inputs is None or type(token) is not int or not 0 <= token < FLASH.vocab_size:
-            raise ValueError("Decode requires one vocabulary token ID and its original metadata owner")
+        if type(token) is not int or not 0 <= token < FLASH.vocab_size:
+            raise ValueError("Decode requires one vocabulary token ID")
         begin = perf_counter()
         self.weights.assert_static_unchanged()
         before = self.weights.counters()
         cache_h2d = self.runtime.stats["cache_h2d_bytes"]
-        if not prepared:
-            chunk = self.session.request_inputs.chunk([token], dp_rank=self.dp_rank)
+        chunk = self.session.request_inputs.chunk([token], dp_rank=self.dp_rank)
         result = self.session.advance(chunk, output=self.output / f"step-{self._steps + 1}",
                                       progress=self.progress, phase="decode")
-        logits = result["logits"] if prepared else result["logits"][self.dp_rank * TOPOLOGY["tp"]]["fresh"][-1]
-        values = [value for rank in logits for value in rank.values()] if prepared else [logits]
-        if any(not torch.isfinite(value).all() for value in values):
+        logits = result["logits"][self.dp_rank * TOPOLOGY["tp"]]["fresh"][-1]
+        if not torch.isfinite(logits).all():
             self.session.failed = True
             raise RuntimeError("Non-finite Decode vocabulary logits")
         self.weights.assert_static_unchanged()
@@ -108,7 +99,7 @@ class DecodeNetwork:
             runtime_identity=id(self.runtime), head_backend="a3", engram_compute_backend="a3",
             engram_lookup="dynamic_host_rows")
         write_json(self.output / f"step-{self._steps}" / "decode.json", self.last_timings)
-        return result if prepared else logits
+        return logits
 
     def close(self):
         """Detach this driver; the generation owner closes its shared resources."""

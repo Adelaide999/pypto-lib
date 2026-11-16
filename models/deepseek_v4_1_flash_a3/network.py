@@ -800,7 +800,6 @@ def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=F
         allocation_id=allocation_id,
         sources_by_case={"fresh": inputs["cache_ABI_sources"]},
         geometry_only=geometry_only,
-        max_requests_per_partition=contract.get("max_requests_per_partition"),
     )
     attach_network_cache_geometry(provider)
     provider.require_network_geometry()
@@ -842,39 +841,6 @@ class GenerationSession:
         """End the session explicitly; generation never releases a worker between phases."""
         self.close()
 
-    def release_request(self, dp_rank, request_slot, generation, *, case="fresh"):
-        """Clear owned physical pages and retire one service request generation."""
-        if self.closed or self.failed:
-            raise RuntimeError("A closed or failed session cannot release individual requests")
-        groups = self.provider.request_pages(dp_rank, request_slot, generation, case=case)
-        tp = self.contract["topology"]["tp"]
-        try:
-            for rank in range(dp_rank * tp, (dp_rank + 1) * tp):
-                layout = self.provider.layouts[rank][case]
-                ranges, history_pages = {}, set()
-                for group in groups.values():
-                    if "model.layers.1.self_attn.swa_cache" in group["names"]:
-                        history_pages.update(group["pages"])
-                    for name in group["names"]:
-                        descriptors = layout["views"][name]
-                        for plane in descriptors if isinstance(descriptors, list) else [descriptors]:
-                            size = torch.empty((), dtype=getattr(torch, plane["dtype"].split(".")[-1])).element_size()
-                            stride = plane["stride"][0] * size
-                            ranges.setdefault(plane["storage_key"], set()).update(
-                                (page * stride, stride) for page in group["pages"])
-                for storage, intervals in ranges.items():
-                    self.runtime.clear_ranges(self.provider.arenas[rank][case][storage], rank, sorted(intervals))
-                for page in history_pages:
-                    self.provider.history.caches[rank][case][page * 128:(page + 1) * 128].zero_()
-                for name, value in self.provider.shared[rank][case].items():
-                    byte = 255 if name in ("topk_indices", "candidates") else 0
-                    self.runtime.clear_ranges(value, rank, [(0, value.numel() * value.element_size())], byte=byte)
-                self.provider.versions[rank][case].clear()
-            self.provider.release_request(dp_rank, request_slot, generation, case=case)
-        except BaseException:
-            self.failed = True
-            raise
-
     def advance(self, chunk, *, output, progress=None, phase="prefill"):
         """Admit fresh controls and run the next chunk over the existing weights and caches."""
         if self.closed or self.failed:
@@ -883,8 +849,6 @@ class GenerationSession:
         fixed = ("topology", "checkpoint", "model_config", "required_modes", "capacity", "scheduler_capacity")
         if any(contract[name] != self.contract[name] for name in fixed):
             raise ValueError("Continuation cannot change the session's model or topology")
-        if contract.get("max_requests_per_partition") != self.contract.get("max_requests_per_partition"):
-            raise ValueError("Continuation cannot change the service request-pool capacity")
         actual, epoch = following["input_contract"], self.epoch + 1
         input_path = Path(contract["input_contract_path"])
         if (actual["epoch"] != epoch or type(actual["epoch"]) is not int

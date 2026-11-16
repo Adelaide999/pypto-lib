@@ -154,7 +154,6 @@ class NetworkCacheProvider:
         allocation_id,
         sources_by_case,
         geometry_only=False,
-        max_requests_per_partition=None,
     ):
         _require(
             topology["tp"] in (1, 2, 4)
@@ -200,10 +199,6 @@ class NetworkCacheProvider:
         self._seen_chunks, self._chunk = set(), None
         self._completed_layers, self._batches = [], {}
         self._sequence_tokens, self._pending_sequence_tokens = {}, {}
-        _require(max_requests_per_partition is None or type(max_requests_per_partition) is int
-                 and 1 <= max_requests_per_partition <= 32, "Invalid service request-pool capacity")
-        self.max_requests_per_partition = max_requests_per_partition
-        self._request_pool, self._retired_generations = {}, {}
         self._input_by_case = _metadata_copy(input_by_case)
         self._abi_by_case = {}
         for case, payloads in abi_by_case.items():
@@ -500,9 +495,7 @@ class NetworkCacheProvider:
             "Chunk cases cannot replace allocation ownership",
         )
         batches = {layer: dict(cases={}, epoch=epoch, token_map_id=token_map_id) for layer in range(40)}
-        token_maps = {}
-        pending_sequences = dict(self._sequence_tokens) if self.max_requests_per_partition is not None else {}
-        pending_pool = deepcopy(self._request_pool)
+        token_maps, pending_sequences = {}, {}
         for case, records in payloads.items():
             _require(
                 len(records) == self.topology["ep"], "Every chunk must retain empty as well as active ranks"
@@ -517,34 +510,11 @@ class NetworkCacheProvider:
                 }
                 current_slots = {request["request_slot"] for request in engine["requests"]}
                 _require(
-                    self.max_requests_per_partition is not None or previous_slots <= current_slots,
+                    previous_slots <= current_slots,
                     "Request eviction or page reuse needs explicit product-state recovery",
                 )
                 for request in engine["requests"]:
                     key = (case, dp_rank, request["request_slot"])
-                    if self.max_requests_per_partition is not None:
-                        slot, generation = request["request_slot"], request.get("generation")
-                        _require(type(slot) is int and 0 <= slot < self.max_requests_per_partition
-                                 and type(generation) is int and generation > 0, "Invalid request generation")
-                        owned = pending_pool.get(key)
-                        _require(owned is None and generation > self._retired_generations.get(key, 0)
-                                 or owned is not None and owned["generation"] == generation,
-                                 "Release the prior request generation before slot reuse")
-                        payload = records[dp_rank * self.topology["tp"]]
-                        row = engine["requests"].index(request)
-                        groups = {}
-                        for group in payload["groups"]:
-                            pages = tuple(int(page) for page in group["block_table"][row].tolist() if page >= 0)
-                            _require(len(pages) == len(set(pages)), "A request repeats a physical cache page")
-                            groups[group["group_id"]] = dict(names=list(group["names"]), pages=pages)
-                        if owned is not None:
-                            _require(set(groups) == set(owned["groups"]), "Live request cache groups changed")
-                            for group_id, old in owned["groups"].items():
-                                fresh = groups[group_id]
-                                _require(fresh["names"] == old["names"]
-                                         and fresh["pages"][:len(old["pages"])] == tuple(old["pages"]),
-                                         "A live request replaced or shortened its physical page ownership")
-                        pending_pool[key] = dict(generation=generation, groups=groups)
                     previous = self._sequence_tokens.get(key, [])
                     _require(
                         request["initial_context_length"] == len(previous)
@@ -567,19 +537,6 @@ class NetworkCacheProvider:
                         positions=record["positions"].tolist(),
                     )
                 )
-        page_owners = {}
-        for owner, entry in pending_pool.items():
-            case, dp_rank, _ = owner
-            for group in entry["groups"].values():
-                layout = self.layouts[dp_rank * self.topology["tp"]][case]
-                keys = {plane["storage_key"] for name in group["names"]
-                        for plane in _descriptor_planes(layout["views"][name])}
-                for storage in keys:
-                    for page in group["pages"]:
-                        key = (case, dp_rank, storage, page)
-                        _require(key not in page_owners or page_owners[key] == owner,
-                                 "A physical page belongs to another live request")
-                        page_owners[key] = owner
         digest = hashlib.sha256(
             json.dumps(token_maps, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
@@ -593,7 +550,6 @@ class NetworkCacheProvider:
         self._seen_chunks.add(identity)
         self._chunk, self._completed_layers, self._batches = identity, [], batches
         self._pending_sequence_tokens = pending_sequences
-        self._request_pool = pending_pool
         self._metadata_sources = (
             deepcopy(metadata_sources_by_case) if metadata_sources_by_case is not None else self.sources
         )
@@ -629,8 +585,6 @@ class NetworkCacheProvider:
         _require(len(blocks) == 1, "The existing core requires one uniform physical page count")
         records = [record for rows in self._batches[0]["cases"].values() for record in rows]
         requests = max(1, max(len(record["metadata"]["seq_lens"]) for record in records))
-        if self.max_requests_per_partition is not None:
-            requests = min(self.capacity, self.max_requests_per_partition)
         pages = max(
             group["block_table"].shape[1]
             for rows in self._batches.values()
@@ -645,34 +599,6 @@ class NetworkCacheProvider:
             table_pages=pages,
             scheduler_capacity=self.scheduler_capacity,
         )
-
-    def request_pages(self, dp_rank, request_slot, generation, *, case="fresh"):
-        """Return the completed generation's physical cache ownership."""
-        _require(self.max_requests_per_partition is not None and self._completed_layers == list(range(40)),
-                 "Request release requires a completed service dispatch")
-        key = (case, dp_rank, request_slot)
-        owned = self._request_pool.get(key)
-        _require(owned is not None and owned["generation"] == generation, "Stale request release")
-        return deepcopy(owned["groups"])
-
-    def request_pool_summary(self):
-        """Report live generations and committed history without exposing tensor payloads."""
-        owners, per_dp = [], [0] * self.topology["dp"]
-        for key, owned in sorted(self._request_pool.items()):
-            case, dp_rank, slot = key
-            per_dp[dp_rank] += 1
-            owners.append(dict(case=case, dp_rank=dp_rank, request_slot=slot, generation=owned["generation"],
-                               committed_tokens=len(self._sequence_tokens.get(key, []))))
-        return dict(max_requests_per_partition=self.max_requests_per_partition, live_per_dp=per_dp, owners=owners)
-
-    def release_request(self, dp_rank, request_slot, generation, *, case="fresh"):
-        """Retire a generation after its physical pages and history have been cleared."""
-        self.request_pages(dp_rank, request_slot, generation, case=case)
-        key = (case, dp_rank, request_slot)
-        del self._request_pool[key]
-        self._retired_generations[key] = generation
-        self._sequence_tokens.pop(key, None)
-        self._pending_sequence_tokens.pop(key, None)
 
     def state_handles_for_layer(self, layer_id):
         """Expose original typed cache handles for a future reviewed separate-buffer adapter."""
