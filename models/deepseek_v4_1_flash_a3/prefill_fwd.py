@@ -79,7 +79,7 @@ def prefill_fwd(
 
     ``inputs`` accepts raw completion text, 1..2048 token IDs, or prepared
     backbone tensors and their input contract. Automatic inputs use one DP
-    engine and chunks of up to 16 tokens; config may set chunk_size/dp_rank.
+    engine and chunks of up to 128 tokens; config may set chunk_size/dp_rank.
     Embedding and initial HC execute inside this forward unless explicit
     prepared backbone tensors are supplied.
     ``cache`` supplies the canonical all-rank cache ABI, source descriptors and
@@ -108,8 +108,9 @@ def prefill_fwd(
                 )
             tokens = tokenize_prompt(inputs, weights, config["model_config"]["text_config"]["vocab_size"])
             chunk_size = config.get("chunk_size", 16)
-            if type(chunk_size) is not int or not 1 <= chunk_size <= 16:
-                raise ValueError("Chunk size must be in 1..16")
+            from .runtime_config import prefill_execution_capacity
+
+            prefill_execution_capacity(chunk_size)
             request_inputs = TokenChunkInputs(
                 checkpoint=weights,
                 cache=cache,
@@ -169,7 +170,7 @@ def load_configuration(path):
             raise ValueError("token_ids must contain 1..2048 nonnegative integers")
         if settings.get("continuations"):
             raise ValueError("Automatic Prefill owns its continuation descriptors")
-        for name, default, lower, upper in (("chunk_size", 16, 1, 16), ("dp_rank", 0, 0, 3)):
+        for name, default, lower, upper in (("chunk_size", 16, 1, 128), ("dp_rank", 0, 0, 3)):
             value = settings.get(name, default)
             if type(value) is not int or not lower <= value <= upper:
                 raise ValueError(f"{name} must be an integer in {lower}..{upper}")

@@ -81,7 +81,7 @@ class DecodeNetwork:
         self.weights.assert_static_unchanged()
         before = self.weights.counters()
         cache_h2d = self.runtime.stats["cache_h2d_bytes"]
-        chunk = self.session.request_inputs.chunk([token], dp_rank=self.dp_rank)
+        chunk = self.session.request_inputs.chunk([token], dp_rank=self.dp_rank, phase="decode")
         result = self.session.advance(chunk, output=self.output / f"step-{self._steps + 1}",
                                       progress=self.progress, phase="decode")
         logits = result["logits"][self.dp_rank * TOPOLOGY["tp"]]["fresh"][-1]

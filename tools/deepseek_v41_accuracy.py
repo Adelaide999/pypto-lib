@@ -181,6 +181,7 @@ def capture_pypto(spec, cases_path, output, *, chunk_size=16):
     from models.deepseek_v4_1_flash_a3.decode_network import DecodeNetwork
     from models.deepseek_v4_1_flash_a3.prefill_fwd import prefill_fwd
     from models.deepseek_v4_1_flash_a3.prefill_prepare import checkpoint_cache
+    from models.deepseek_v4_1_flash_a3.runtime_config import prefill_execution_capacity
     from models.deepseek_v4_1_flash_a3.runtime_config import configure_devices
 
     devices = configure_devices(allocated_devices(), world=TOPOLOGY["ep"])
@@ -190,7 +191,7 @@ def capture_pypto(spec, cases_path, output, *, chunk_size=16):
     report.update(devices=devices, chunk_size=chunk_size)
     write_json(output / "manifest.json", report)
     try:
-        cache, config = checkpoint_cache(spec["checkpoint"], TOPOLOGY)
+        cache, config = checkpoint_cache(spec["checkpoint"], TOPOLOGY, capacity=prefill_execution_capacity(chunk_size))
         for case in spec["cases"]:
             session, network = None, None
             try:
@@ -357,7 +358,7 @@ def main(argv=None):
     pypto = commands.add_parser("pypto", help="Capture existing Prefill/Decode with one persistent session per case")
     pypto.add_argument("--cases", type=Path, required=True)
     pypto.add_argument("--output", type=Path, required=True)
-    pypto.add_argument("--chunk-size", type=int, choices=range(1, 17), default=16)
+    pypto.add_argument("--chunk-size", type=int, choices=range(1, 129), default=16)
     pypto.add_argument("--check-config", action="store_true",
                        help="Validate cases without loading weights or using NPU")
     compare = commands.add_parser("compare", help="Compare raw full-vocabulary logits on CPU")

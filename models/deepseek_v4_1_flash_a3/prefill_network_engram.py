@@ -100,7 +100,8 @@ class PreparedNetworkEngram:
         if projection.dtype != torch.bfloat16 or tuple(projection.shape) != (6144, 25600):
             raise ValueError("Require the actual complete BF16 Engram projection")
         result = [{} for _ in self.history.caches]
-        for rank, records in enumerate(self.states[layer_id]):
+        def apply_rank_0(rank):
+            records = self.states[layer_id][rank]
             for case, prepared in records.items():
                 original, source = batch["cases"][case][rank], self.batch["cases"][case][rank]
                 if cache_state[rank][case].get("network_engram") is not prepared:
@@ -155,6 +156,7 @@ class PreparedNetworkEngram:
                     network_history_owner=1,
                     network_hash_slot=role["engram_slot"],
                 )
+        runtime["map_ranks"](apply_rank_0)
         self.applied.add(layer_id)
         return result
 

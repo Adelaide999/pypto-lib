@@ -15,6 +15,7 @@ from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY
 from .qkv_proj_rope import make_bf16_projection_staged
 from .quant import make_dequantize, make_quantize
 from .rope import make_adjacent_rope as make_rope
+from .utils import copy_runtime_tensor
 
 
 # Model configuration.
@@ -558,7 +559,7 @@ def run_index_query_selection(state, q_input, latent, cosine, sine, operands,
 
     def pad(value, rows=capacity, fill=0):
         result = torch.full((rows, *value.shape[1:]), fill, dtype=value.dtype)
-        result[:len(value)].copy_(value)
+        copy_runtime_tensor(state.get("runtime", {}), result[:len(value)], value, rank)
         return result
 
     def table(name):
@@ -610,8 +611,8 @@ def run_index_query_selection(state, q_input, latent, cosine, sine, operands,
                           pad(q_positions[offset:offset + count]).to(torch.int32), scores, picked, count]
         execute("index_select", rank, case + f"-request-{request}", selection_args,
                 dict(scores=scores, selected=picked), "index_select")
-        raw_selected[offset:offset + count].copy_(picked[:count])
-        candidate_scores[offset:offset + count].copy_(scores[:count])
+        copy_runtime_tensor(state.get("runtime", {}), raw_selected[offset:offset + count], picked[:count], rank)
+        copy_runtime_tensor(state.get("runtime", {}), candidate_scores[offset:offset + count], scores[:count], rank)
     if not query_rows:
         # Empty CP ranks retain a recorded index-selection boundary.
         execute("index_weights_scale", rank, case + "-empty-selection", [weights_proj, weights, 0],

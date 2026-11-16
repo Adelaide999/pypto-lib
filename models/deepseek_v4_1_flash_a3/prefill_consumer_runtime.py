@@ -10,6 +10,7 @@
 
 import torch
 from .prefill_compressed_runtime import physical_cache_views
+from .utils import copy_runtime_tensor, read_runtime_control
 
 
 def run_consumer_attention(state, query, operands, execute, rank, case,
@@ -69,7 +70,7 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
 
     def pad(value, fill=0):
         result = torch.full((capacity, *value.shape[1:]), fill, dtype=value.dtype)
-        result[:len(value)].copy_(value)
+        copy_runtime_tensor(state.get("runtime", {}), result[:len(value)], value, rank)
         return result
 
     def table(name):
@@ -132,7 +133,8 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
             dict(indices=indices), "compressed_attention")
     context = torch.zeros((capacity, 32768), dtype=torch.bfloat16)
     if network is not None:
-        validate_network_sparse_indices(indices, original, network, query_rows)
+        controls = read_runtime_control(state.get("runtime", {}), indices[:query_rows], rank)
+        validate_network_sparse_indices(controls, original, network, query_rows)
         execute("network_compressed_attention", rank, case,
                 [query, indices, operands["sink"], source_cache, cache, context, query_rows],
                 dict(context=context), ("swa", "compressed_attention"))

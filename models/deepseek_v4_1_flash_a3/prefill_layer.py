@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Complete-layer composition and L2 regions between HOST communication boundaries."""
+"""Complete-layer composition and L2 regions over device activation descriptors."""
 
 import keyword
 import linecache
@@ -19,8 +19,9 @@ if __package__ in (None, ""):
     __package__ = "models.deepseek_v4_1_flash_a3"
 import pypto.language as pl
 import torch
-from pypto import ir
+from pypto import ir, passes
 from pypto.ir.compiled_program import extract_param_infos
+from .utils import copy_runtime_tensor, read_runtime_control
 
 
 def validate_prefill_ownership(layout, ownership):
@@ -60,6 +61,7 @@ def make_prefill_layer_entries(
     cache_layout=None,
     role=None,
     network_cache=False,
+    moe_slab_rows=None,
 ):
     """Construct shared physical-layer attention, HC and MoE computations."""
     from .hc import make_hc_post_inline, make_hc_pre_inline
@@ -78,6 +80,7 @@ def make_prefill_layer_entries(
     tp = validate_tp(tp)
     if tp not in (1, 2, 4) or capacity % 16 or not 2 <= ep <= 16 or ep % tp or 384 % ep:
         raise ValueError("Require TP1/2/4 and an aligned complete Prefill layer")
+    slab = capacity if moe_slab_rows is None else moe_slab_rows
     entries = make_builders(capacity, cache_blocks=cache_blocks, tp=tp)
     del entries["swa"]
     entries.update(
@@ -89,8 +92,6 @@ def make_prefill_layer_entries(
         head_unpack=make_sp_gather_unpack(capacity, 32768 // tp, tp),
         sp_unpack=make_sp_gather_unpack(capacity, 5120, tp),
         reduce_pack=make_sp_reduce_pack(capacity, 5120, tp),
-        final_unpack=make_sp_gather_unpack(capacity, 20480, tp),
-        pre_unpack=make_sp_gather_unpack(capacity, 4, tp, pl.FP32, 4),
         router=make_moe_router(capacity, config, pl.FP32),
         shared=make_shared_moe_w8a8(
             capacity, config, fused_activation=True, fused_channel_dtype=pl.FP32, partitions=tp,
@@ -99,10 +100,10 @@ def make_prefill_layer_entries(
             expert_capacity, config, fused_activation=True, fused_channel_dtype=pl.FP32,
             token_first=True, fused_requantize=True,
         ),
-        dispatch_pack=make_ep_dispatch_pack(capacity, 5120, 384, 6, ep),
-        dispatch_unpack=make_ep_dispatch_unpack(capacity, 5120, 384, 6, ep, expert_capacity),
-        return_pack=make_ep_return_pack(capacity, 5120, 384, 6, ep, expert_capacity),
-        combine=make_moe_combine(capacity, 5120, 6, ep, weight_dtype=pl.BF16),
+        dispatch_pack=make_ep_dispatch_pack(slab, 5120, 384, 6, ep),
+        dispatch_unpack=make_ep_dispatch_unpack(slab, 5120, 384, 6, ep, expert_capacity),
+        return_pack=make_ep_return_pack(slab, 5120, 384, 6, ep, expert_capacity),
+        combine=make_moe_combine(slab, 5120, 6, ep, weight_dtype=pl.BF16),
         mask_moe=make_sp_masked_zero(capacity, 5120),
         mask_output=make_sp_masked_zero(capacity, 20480),
     )
@@ -163,6 +164,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     topology = runtime["topology"]
     layout = ExpertParallelConfig(topology["dp"], topology["tp"], topology["ep"], 384)
     tp, world = layout.tp, layout.ep
+    map_ranks = runtime.get("map_ranks", lambda function: [function(rank) for rank in range(world)])
     if tp not in (1, 2, 4) or not 2 <= world <= 16:
         raise ValueError("Require matching TP1/2/4 with real multi-rank EP before building the layer")
     if any(topology[name] != 1 for name in ("pp", "pcp", "dcp")):
@@ -181,7 +183,8 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     if epoch != runtime["epoch"] or token_map_id != runtime["token_map_id"]:
         raise ValueError("Layer runtime and batch must identify the same chunk and token map")
     for case, records in batch["cases"].items():
-        for rank, original in enumerate(records):
+        def validate_rank_state(rank):
+            original = records[rank]
             physical, valid = original["SP_physical_rows"], original["SP_valid_rows"]
             if not 0 <= valid <= physical <= capacity or len(original["positions"]) > capacity:
                 raise ValueError("Invalid actual physical/valid row bounds")
@@ -191,8 +194,15 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             if tuple(pre.shape) != (capacity, 4) or pre.dtype != torch.float32:
                 raise ValueError("Require local delayed FP32 HC pre [capacity,4]")
             if hidden.device.type != "cpu" or pre.device.type != "cpu":
-                raise ValueError("The current PyPTO executor uses explicit CPU staging")
-            validate_live_state(role, original, cache_state[rank][case], epoch, token_map_id)
+                raise ValueError("Layer descriptors require CPU shape and storage metadata")
+            live = cache_state[rank][case]
+            checked_live = live
+            if role["candidate_filter"]:
+                active = original["actual_local_query_rows"]
+                candidates = read_runtime_control(runtime, live["shared"]["candidates"][:active], rank)
+                checked_live = dict(live, shared=dict(live["shared"], candidates=candidates))
+            validate_live_state(role, original, checked_live, epoch, token_map_id)
+        map_ranks(validate_rank_state)
     raw, operands, expert_weights = (
         weight_provider["raw"],
         weight_provider["operands"],
@@ -211,17 +221,18 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     def zeros(*shape, dtype=torch.bfloat16):
         return torch.zeros(shape, dtype=dtype)
 
-    def pad(value):
+    def pad(value, rank):
         target = zeros(capacity, *value.shape[1:], dtype=value.dtype)
-        target[: len(value)].copy_(value)
+        copy_runtime_tensor(runtime, target[:len(value)], value, rank)
         return target
 
     local_experts, head_width, output_width = 384 // world, 32768 // tp, 8192 // tp
     local_groups = 8 // tp
     states = [{} for _ in range(world)]
-    for rank in range(world):
+    def invalidate_rank_state(rank):
         for case in batch["cases"]:
             invalidate_live_versions(role, cache_state[rank][case])
+    map_ranks(invalidate_rank_state)
     engram_states = None
     if role["engram_slot"] is not None:
         if not callable(runtime.get("engram")):
@@ -232,7 +243,8 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     # SP physical observations and gathered normalized attention inputs.
     norm_packets = [{} for _ in range(world)]
     for case, originals in batch["cases"].items():
-        for rank, original in enumerate(originals):
+        def normalize_rank(rank):
+            original = originals[rank]
             physical, valid = original["SP_physical_rows"], original["SP_valid_rows"]
             total = len(original["positions"])
             if not 0 <= valid <= physical <= capacity or total > capacity:
@@ -275,12 +287,15 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 comb=comb,
                 role=role,
                 live=cache_state[rank][case],
+                runtime=runtime,
             )
             norm_packets[rank][case] = normed
+        map_ranks(normalize_rank)
     gathered = exchange("attention-input-gather", norm_packets, "all_gather", "tp")
     head_packets = [{} for _ in range(world)]
     for case, originals in batch["cases"].items():
-        for rank, original in enumerate(originals):
+        def attend_rank(rank):
+            original = originals[rank]
             state = states[rank][case]
             physical, total = state["physical"], state["total"]
             full_norm = zeros(capacity, 5120)
@@ -294,8 +309,8 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             )
             start, end, per_rank, _padded = original["cp_token_range"]
             query_rows = max(0, min(end, total) - min(start, total))
-            q_input = pad(full_norm[start : start + query_rows])
-            positions = pad(original["positions"])
+            q_input = pad(full_norm[start : start + query_rows], rank)
+            positions = pad(original["positions"], rank)
             cosine, sine = zeros(capacity, 32, dtype=torch.float32), zeros(capacity, 32, dtype=torch.float32)
             execute(
                 "rope_tables",
@@ -305,7 +320,8 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 dict(cosine=cosine, sine=sine),
                 "rope",
             )
-            q_cos, q_sin = pad(cosine[start : start + query_rows]), pad(sine[start : start + query_rows])
+            q_cos = pad(cosine[start:start + query_rows], rank)
+            q_sin = pad(sine[start:start + query_rows], rank)
             wqa, latent, qb, query = (
                 zeros(capacity, 1280),
                 zeros(capacity, 1280),
@@ -435,10 +451,11 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             )
             state.update(cache=cache, per_rank=per_rank, positions=positions)
             head_packets[rank][case] = packet
+        map_ranks(attend_rank)
     exchanged = exchange("attention-head-exchange", head_packets, "all_to_all", "tp")
     reduction = [{} for _ in range(world)]
     for case in batch["cases"]:
-        for rank in range(world):
+        def project_rank(rank):
             state, tp_rank = states[rank][case], rank % tp
             total, physical = state["total"], state["physical"]
             heads, woa, wob = (
@@ -469,232 +486,159 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 ],
             )
             reduction[rank][case] = packed
+        map_ranks(project_rank)
     reduced = exchange("attention-output-reduce", reduction, "all_reduce", "tp")
     scattered = [{} for _ in range(world)]
-    for rank in range(world):
+    def select_rank_output(rank):
         begin = (rank % tp) * capacity
         for case, value in reduced[rank].items():
             scattered[rank][case] = value[begin : begin + capacity].contiguous()
-    dispatch_packets = [{} for _ in range(world)]
-    routes, packet_rows = capacity * 6, world * capacity * 6
+    map_ranks(select_rank_output)
+    slab = runtime.get("moe_slab_rows", capacity)
+    routes, packet_rows = slab * 6, world * slab * 6
     for case in batch["cases"]:
         routing_rows = max(original["SP_physical_rows"] for original in batch["cases"][case])
-        for rank in range(world):
+        def route_rank(rank):
             state = states[rank][case]
             physical = state["physical"]
             changed = zeros(capacity, 4, 5120)
-            pre, post = zeros(capacity, 4, dtype=torch.float32), zeros(capacity, 4, dtype=torch.float32)
+            buffers = runtime.get("layer_buffers")
+            if buffers is None:
+                output = torch.full((capacity, 4, 5120), runtime["output_sentinel"], dtype=torch.bfloat16)
+                pre = zeros(capacity, 4, dtype=torch.float32)
+            else:
+                output, pre = buffers(rank, case)
+            post = zeros(capacity, 4, dtype=torch.float32)
             comb, collapsed = zeros(capacity, 4, 4, dtype=torch.float32), zeros(capacity, 5120)
-            hc_args = [
-                changed,
-                raw[f"{prefix}.hc_ffn_fn"],
-                raw[f"{prefix}.hc_ffn_scale"],
-                raw[f"{prefix}.hc_ffn_base"],
-                state["pre"],
-                pre,
-                post,
-                comb,
-                collapsed,
-                physical,
-            ]
             normed, router_input = zeros(capacity, 5120), zeros(capacity, 5120, dtype=torch.float32)
-            logits, weights = (
-                zeros(capacity, 384, dtype=torch.float32),
-                zeros(capacity, 6, dtype=torch.float32),
-            )
+            logits = zeros(capacity, 384, dtype=torch.float32)
+            weights = zeros(capacity, 6, dtype=torch.float32)
             ids = torch.zeros((capacity, 6), dtype=torch.int32)
+            token_ids = pad(state["original"]["input_ids"], rank)
             gate = raw[f"{prefix}.ffn.gate.weight"].float()
-            token_ids = pad(state["original"]["input_ids"])
-            router_args = [
-                router_input,
-                gate,
-                raw[f"{prefix}.ffn.gate.bias"],
-                raw[f"{prefix}.ffn.gate.bias_vl"],
-                token_ids,
-                logits,
-                ids,
-                weights,
-                routing_rows,
-            ]
-            shared = zeros(capacity, 5120)
-            with memory.interval(rank, "load", "shared_expert"):
-                shared_operands = expert_weights(rank, None)
-            packet = {
-                "routes": torch.full((packet_rows, 4), -1, dtype=torch.int64),
-                "hidden": zeros(packet_rows, 5120),
-                "counts": torch.zeros((world, MAP_PAD), dtype=torch.int32),
-            }
-            args_pack = [
-                normed,
-                ids,
-                packet["routes"],
-                packet["hidden"],
-                packet["counts"],
-                state["valid"],
-                rank,
-            ]
-            execute_region(
-                runtime,
-                "ffn_dispatch_l2",
-                rank,
-                case,
-                [
-                    (
-                        "hc_post",
-                        [
-                            scattered[rank][case],
-                            state["hidden"],
-                            state["post"],
-                            state["comb"],
-                            changed,
-                            physical,
-                        ],
-                        {"changed": changed},
-                        "hc_post",
-                    ),
-                    ("hc_pre", hc_args, dict(pre=pre, post=post, comb=comb, collapsed=collapsed), "hc_pre"),
-                    (
-                        "norm_cast",
-                        [collapsed, raw[f"{prefix}.ffn_norm.weight"], normed, router_input, physical],
-                        dict(normed=normed, router_input=router_input),
-                        "ffn_norm",
-                    ),
-                    (
-                        "router",
-                        router_args,
-                        dict(logits=logits, route_ids=ids, route_weights=weights),
-                        "router",
-                    ),
-                    ("shared", [normed, *shared_operands, shared, physical], {"shared": shared}, "shared"),
-                    ("dispatch_pack", args_pack, packet, "dispatch_pack"),
-                ],
+            execute_region(runtime, "ffn_dispatch_l2", rank, case, [
+                ("hc_post", [scattered[rank][case], state["hidden"], state["post"], state["comb"],
+                             changed, physical], {"changed": changed}, "hc_post"),
+                ("hc_pre", [changed, raw[f"{prefix}.hc_ffn_fn"], raw[f"{prefix}.hc_ffn_scale"],
+                            raw[f"{prefix}.hc_ffn_base"], state["pre"], pre, post, comb, collapsed, physical],
+                 dict(pre=pre, post=post, comb=comb, collapsed=collapsed), "hc_pre"),
+                ("norm_cast", [collapsed, raw[f"{prefix}.ffn_norm.weight"], normed, router_input, physical],
+                 dict(normed=normed, router_input=router_input), "ffn_norm"),
+                ("router", [router_input, gate, raw[f"{prefix}.ffn.gate.bias"], raw[f"{prefix}.ffn.gate.bias_vl"],
+                            token_ids, logits, ids, weights, routing_rows],
+                 dict(logits=logits, route_ids=ids, route_weights=weights), "router"),
+            ])
+            state.update(changed=changed, ffn_pre=pre, ffn_post=post, ffn_comb=comb, weights=weights,
+                         route_ids=ids, normed=normed, shared=zeros(capacity, 5120), output_hidden=output,
+                         combined=zeros(capacity, 5120))
+        map_ranks(route_rank)
+    slab_work = [{} for _ in range(world)]
+    def allocate_rank_slab(rank):
+        for case in batch["cases"]:
+            slab_work[rank][case] = dict(
+                routes=torch.full((packet_rows, 4), -1, dtype=torch.int64), hidden=zeros(packet_rows, 5120),
+                counts=torch.zeros((world, MAP_PAD), dtype=torch.int32),
+                recv_routes=torch.full((packet_rows, 4), -1, dtype=torch.int64), recv_hidden=zeros(packet_rows, 5120),
+                expert_x=zeros(local_experts * expert_capacity, 5120), expert_y=zeros(local_experts * expert_capacity, 5120),
+                expert_counts=torch.zeros(local_experts, dtype=torch.int64),
+                packet_map=torch.full((packet_rows, MAP_PAD), -1, dtype=torch.int32),
+                total=torch.zeros(MAP_PAD, dtype=torch.int32), sent=zeros(packet_rows, 5120), routed=zeros(slab, 5120),
+                returned_routes=torch.full((routes, 4), -1, dtype=torch.int64),
             )
-            state.update(
-                changed=changed,
-                ffn_pre=pre,
-                ffn_post=post,
-                ffn_comb=comb,
-                weights=weights,
-                route_ids=ids,
-                shared=shared,
-                routing_rows=routing_rows,
-                token_ids=token_ids,
-            )
-            dispatch_packets[rank][case] = packet
-    received = exchange("expert-dispatch", dispatch_packets, "all_to_all", "ep", packets=True)
-    returns = [{} for _ in range(world)]
-    for rank in range(world):
-        for case, packet in received[rank].items():
-            state = states[rank][case]
-            valid_by_rank = [states[source][case]["valid"] for source in range(world)]
-            expected_total = validate_received_routes(packet, rank, layout, routes, valid_by_rank)
-            recv_routes = torch.full((packet_rows, 4), -1, dtype=torch.int64)
-            recv_hidden, expert_x = zeros(packet_rows, 5120), zeros(local_experts * expert_capacity, 5120)
-            counts = torch.zeros(local_experts, dtype=torch.int64)
-            packet_map = torch.full((packet_rows, MAP_PAD), -1, dtype=torch.int32)
-            received_total = torch.zeros(MAP_PAD, dtype=torch.int32)
-            unpack_args = [
-                packet["routes"],
-                packet["hidden"],
-                packet["counts"],
-                recv_routes,
-                recv_hidden,
-                expert_x,
-                counts,
-                packet_map,
-                received_total,
-                rank,
-            ]
-            unpack_out = dict(
-                received_routes=recv_routes,
-                received_hidden=recv_hidden,
-                expert_counts=counts,
-                packet_map=packet_map,
-                received_total=received_total,
-            )
-            execute("dispatch_unpack", rank, case, unpack_args, unpack_out, "dispatch_unpack")
-            total = int(received_total[0])
-            if total != expected_total:
-                raise RuntimeError("Dispatch unpack lost received routes")
-            expert_y = zeros(local_experts * expert_capacity, 5120)
-            for local, count in enumerate(counts.tolist()):
-                if not 0 <= count <= expert_capacity:
-                    raise RuntimeError("Expert slab exceeded its input-derived bound")
-                if count:
-                    expert, begin = rank * local_experts + local, local * expert_capacity
-                    with memory.interval(rank, "load", f"expert-{expert}"):
+    map_ranks(allocate_rank_slab)
+    rounds = (max(1, (capacity + tp - 1) // tp) + slab - 1) // slab
+    for round_id in range(rounds):
+        base = round_id * slab
+        dispatch_packets = [{} for _ in range(world)]
+        def pack_rank_slab(rank):
+            for case in batch["cases"]:
+                state, work = states[rank][case], slab_work[rank][case]
+                packet = {name: work[name] for name in ("routes", "hidden", "counts")}
+                valid = max(0, min(slab, state["valid"] - base))
+                arguments = [state["normed"][base:base + slab], state["route_ids"][base:base + slab],
+                             packet["routes"], packet["hidden"], packet["counts"], valid, rank]
+                execute("dispatch_pack", rank, case, arguments, packet, "dispatch_pack")
+                dispatch_packets[rank][case] = packet
+        map_ranks(pack_rank_slab)
+        pending = None
+        if round_id == 0 and "exchange_async" in runtime:
+            stage = namespace + f"-expert-dispatch-r{round_id}"
+            pending = runtime["exchange_async"](stage, dispatch_packets, "all_to_all", "ep", packets=True)
+        else:
+            received = exchange(f"expert-dispatch-r{round_id}", dispatch_packets, "all_to_all", "ep", packets=True)
+        if round_id == 0:
+            try:
+                def execute_rank_shared(rank):
+                    for case in batch["cases"]:
+                        state = states[rank][case]
+                        shared_operands = expert_weights(rank, None)
+                        arguments = [state["normed"], *shared_operands, state["shared"], state["physical"]]
+                        execute("shared", rank, case, arguments, {"shared": state["shared"]}, "shared")
+                map_ranks(execute_rank_shared)
+            finally:
+                if pending is not None:
+                    received = pending.result()
+        returns = [{} for _ in range(world)]
+        def execute_rank_experts(rank):
+            for case, packet in received[rank].items():
+                state, work = states[rank][case], slab_work[rank][case]
+                valid_by_rank = [max(0, min(slab, states[source][case]["valid"] - base)) for source in range(world)]
+                controls = {name: read_runtime_control(runtime, packet[name], rank) for name in ("routes", "counts")}
+                expected_total = validate_received_routes(controls, rank, layout, routes, valid_by_rank)
+                unpack_args = [packet["routes"], packet["hidden"], packet["counts"], work["recv_routes"],
+                               work["recv_hidden"], work["expert_x"], work["expert_counts"], work["packet_map"],
+                               work["total"], rank]
+                execute("dispatch_unpack", rank, case, unpack_args, {}, "dispatch_unpack")
+                if int(read_runtime_control(runtime, work["total"], rank)[0]) != expected_total:
+                    raise RuntimeError("Dispatch unpack lost received routes")
+                for local, count in enumerate(read_runtime_control(runtime, work["expert_counts"], rank).tolist()):
+                    if not 0 <= count <= expert_capacity:
+                        raise RuntimeError("Expert slab exceeded its proven per-round bound")
+                    if count:
+                        expert, begin = rank * local_experts + local, local * expert_capacity
                         expert_operands = expert_weights(rank, expert)
-                    x = expert_x[begin : begin + expert_capacity]
-                    y = expert_y[begin : begin + expert_capacity]
-                    execute(
-                        "routed",
-                        rank,
-                        case + f"-expert-{expert}",
-                        [x, *expert_operands, y, count],
-                        {"expert_output": y},
-                        "routed",
-                    )
-            sent = zeros(packet_rows, 5120)
-            execute(
-                "return_pack",
-                rank,
-                case,
-                [expert_y, packet["counts"], packet_map, sent],
-                {"hidden": sent},
-                "dispatch_pack",
-            )
-            returns[rank][case] = dict(routes=packet["routes"], counts=packet["counts"], hidden=sent)
-    returned = exchange("expert-return", returns, "all_to_all", "ep", packets=True)
+                        x = work["expert_x"][begin:begin + expert_capacity]
+                        y = work["expert_y"][begin:begin + expert_capacity]
+                        execute("routed", rank, case + f"-expert-{expert}", [x, *expert_operands, y, count],
+                                {"expert_output": y}, "routed")
+                arguments = [work["expert_y"], packet["counts"], work["packet_map"], work["sent"]]
+                execute("return_pack", rank, case, arguments, {"return_hidden": work["sent"]}, "return_pack")
+                returns[rank][case] = dict(routes=packet["routes"], hidden=work["sent"], counts=packet["counts"])
+        map_ranks(execute_rank_experts)
+        returned = exchange(f"expert-return-r{round_id}", returns, "all_to_all", "ep", packets=True)
+        def combine_rank_slab(rank):
+            for case, packet in returned[rank].items():
+                state, work = states[rank][case], slab_work[rank][case]
+                valid = max(0, min(slab, state["valid"] - base))
+                physical = max(0, min(slab, state["physical"] - base))
+                controls = {name: read_runtime_control(runtime, packet[name], rank) for name in ("routes", "counts")}
+                route_ids = read_runtime_control(runtime, state["route_ids"][base:base + slab], rank)
+                validate_returned_routes(controls, rank, routes, route_ids, valid)
+                arguments = [packet["routes"], packet["hidden"], packet["counts"],
+                             state["weights"][base:base + slab], state["shared"][base:base + slab], work["routed"],
+                             state["combined"][base:base + slab], work["returned_routes"], physical]
+                execute("combine", rank, case, arguments, {}, "combine")
+        map_ranks(combine_rank_slab)
     final_hidden, final_pre = [{} for _ in range(world)], [{} for _ in range(world)]
-    for rank in range(world):
-        for case, packet in returned[rank].items():
+    def finish_rank_moe(rank):
+        for case in batch["cases"]:
             state = states[rank][case]
-            validate_returned_routes(packet, rank, routes, state["route_ids"], state["valid"])
-            routed, combined = zeros(capacity, 5120), zeros(capacity, 5120)
-            returned_routes = torch.full((routes, 4), -1, dtype=torch.int64)
-            combine_args = [
-                packet["routes"],
-                packet["hidden"],
-                packet["counts"],
-                state["weights"],
-                state["shared"],
-                routed,
-                combined,
-                returned_routes,
-                state["physical"],
-            ]
             valid, physical = state["valid"], state["physical"]
-            output = torch.full((capacity, 4, 5120), runtime["output_sentinel"], dtype=torch.bfloat16)
-            execute_region(
-                runtime,
-                "moe_finish_l2",
-                rank,
-                case,
-                [
-                    (
-                        "combine",
-                        combine_args,
-                        dict(routed=routed, combined=combined, returned_routes=returned_routes),
-                        "combine",
-                    ),
-                    ("mask_moe", [combined, valid, physical], {"combined": combined}, "combine"),
-                    (
-                        "hc_post",
-                        [combined, state["changed"], state["ffn_post"], state["ffn_comb"], output, physical],
-                        {"hidden": output},
-                        "hc_post",
-                        case + "-ffn",
-                    ),
-                ],
-            )
+            combined, output = state["combined"], state["output_hidden"]
+            execute_region(runtime, "moe_finish_l2", rank, case, [
+                ("mask_moe", [combined, valid, physical], {"combined": combined}, "combine"),
+                ("hc_post", [combined, state["changed"], state["ffn_post"], state["ffn_comb"], output, physical],
+                 {"hidden": output}, "hc_post", case + "-ffn"),
+            ])
             output_flat = output.reshape(capacity, 20480)
             execute("mask_output", rank, case, [output_flat, valid, physical], {"hidden": output}, "hc_post")
             state.update(padded_hidden=output)
-            final_hidden[rank][case] = output
-            final_pre[rank][case] = state["ffn_pre"]
-    for rank in range(world):
+            final_hidden[rank][case], final_pre[rank][case] = output, state["ffn_pre"]
+    map_ranks(finish_rank_moe)
+    def publish_rank_state(rank):
         for case in batch["cases"]:
             publish_live_versions(role, cache_state[rank][case], epoch, token_map_id)
+    map_ranks(publish_rank_state)
     return {"hidden": final_hidden, "pre_mix": final_pre, "states": states}
 
 
@@ -760,27 +704,8 @@ REGIONS = {
                 "routing_rows",
             ),
         ),
-        (
-            "shared",
-            ("normed", "gate_up_weight", "gate_up_scale", "down_weight", "down_scale", "shared", "physical"),
-        ),
-        ("dispatch_pack", ("normed", "ids", "routes", "packet_hidden", "counts", "valid", "rank")),
     ),
     "moe_finish_l2": (
-        (
-            "combine",
-            (
-                "routes",
-                "packet_hidden",
-                "counts",
-                "weights",
-                "shared",
-                "routed",
-                "combined",
-                "returned_routes",
-                "physical",
-            ),
-        ),
         ("mask_moe", ("combined", "valid", "physical")),
         ("hc_post", ("combined", "changed", "post", "comb", "output", "physical")),
     ),
@@ -856,12 +781,13 @@ def compose_l2(name, definitions, steps, capacity):
         infos, _, returns = extract_param_infos(program)
         if len(infos) != len(arguments):
             raise ValueError("L2 child arity differs: " + child_name)
+        alias_program = passes.convert_to_ssa()(program)
         functions = [
-            item for item in program.functions.values() if item.func_type == ir.FunctionType.Orchestration
+            item for item in alias_program.functions.values() if item.func_type == ir.FunctionType.Orchestration
         ]
         if len(functions) != 1:
             raise ValueError("L2 children require one unambiguous orchestration entry")
-        aliases = ir.returned_param_indices(functions[0], program)
+        aliases = ir.returned_param_indices(functions[0], alias_program)
         if len(aliases) != len(returns) or any(
             type(slot) is not int or not 0 <= slot < len(infos) for slot in aliases
         ):

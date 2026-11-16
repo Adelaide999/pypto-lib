@@ -119,6 +119,7 @@ class HCCLBytes:
         _bind(library, "HcclAllReduce", [pointer, pointer, u64, integer, integer, pointer, pointer])
         _bind(library, "HcclReduceScatter", [pointer, pointer, u64, integer, integer, pointer, pointer])
         devices, comms = (ctypes.c_int32 * len(ranks))(*ranks), (pointer * len(ranks))()
+        memory.select(ranks[0])
         _check(initialize(len(ranks), devices, comms), "HcclCommInitAll")
         channels = {}
         try:
@@ -159,6 +160,94 @@ class HCCLBytes:
         self._host_spare_buffers = []
         self.buffers_peak = 0
         self.transfers = []
+
+    def _enqueue_collective(self, send_buffer, recv_buffer, byte_count, output_count, dtype, collective):
+        """Enqueue one byte exchange or typed sum on the owned channel stream."""
+        peer_bytes = byte_count // self.world
+        self._pending = True
+        if collective == "all_to_all":
+            arguments = [send_buffer, peer_bytes, 7, recv_buffer, peer_bytes, 7, self.comm, self.stream]
+            status = self.library.HcclAlltoAll(*arguments)
+        elif collective == "all_gather":
+            status = self.library.HcclAllGather(send_buffer, recv_buffer, byte_count, 7, self.comm, self.stream)
+        elif collective == "reduce_scatter":
+            hccl_dtype = 11 if dtype == torch.bfloat16 else 4
+            arguments = [send_buffer, recv_buffer, output_count, hccl_dtype, 0, self.comm, self.stream]
+            status = self.library.HcclReduceScatter(*arguments)
+        elif collective == "all_reduce":
+            hccl_dtype = 11 if dtype == torch.bfloat16 else 4
+            arguments = [send_buffer, recv_buffer, output_count, hccl_dtype, 0, self.comm, self.stream]
+            status = self.library.HcclAllReduce(*arguments)
+        else:
+            raise ValueError("Unsupported basic collective: " + collective)
+        _check(status, "HCCL/" + collective)
+
+    def exchange_device(self, value, received, stage, collective="all_to_all"):
+        """Serialize device transfers with channel reuse and shutdown."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("HCCL transport is closed")
+            if self._pending:
+                raise RuntimeError("HCCL transport has undrained work; close it before reuse")
+            return self._exchange_device(value, received, stage, collective)
+
+    def _exchange_device(self, value, received, stage, collective="all_to_all"):
+        """Exchange caller-owned device allocations after their producer completes.
+
+        The caller validates rank ownership and retains both allocations through
+        this synchronous call. This method does not allocate or copy host data.
+        """
+        from pypto.runtime import DeviceTensor
+
+        if not isinstance(value, DeviceTensor) or not isinstance(received, DeviceTensor):
+            raise ValueError("Device collectives require DeviceTensor input and output handles")
+        if value.buffer is None or received.buffer is None:
+            raise ValueError("Device collectives require owning allocation buffers")
+        if not value.shape or value.nbytes <= 0 or value.data_ptr <= 0 or received.data_ptr <= 0:
+            raise ValueError("Device collectives require nonempty tensor allocations")
+        if value.dtype != received.dtype:
+            raise ValueError("Device collective input and output dtypes differ")
+        shape = tuple(value.shape)
+        if collective == "all_gather":
+            expected_shape = (self.world * shape[0], *shape[1:])
+            expected_bytes = value.nbytes * self.world
+        elif collective == "reduce_scatter":
+            if value.dtype not in (torch.bfloat16, torch.float32) or shape[0] % self.world:
+                raise ValueError("Reduce-scatter requires equal BF16/FP32 row buckets")
+            expected_shape = (shape[0] // self.world, *shape[1:])
+            expected_bytes = value.nbytes // self.world
+        elif collective in ("all_to_all", "all_reduce"):
+            expected_shape, expected_bytes = shape, value.nbytes
+            if collective == "all_to_all" and value.nbytes % self.world:
+                raise ValueError("All-to-all bytes must divide into equal peer blocks")
+            if collective == "all_reduce" and value.dtype not in (torch.bfloat16, torch.float32):
+                raise ValueError("All-reduce requires BF16/FP32 values")
+        else:
+            raise ValueError("Unsupported basic collective: " + collective)
+        if tuple(received.shape) != expected_shape or received.nbytes != expected_bytes:
+            raise ValueError("Device collective output allocation has the wrong shape or byte extent")
+        if max(value.data_ptr, received.data_ptr) < min(value.data_ptr + value.nbytes, received.data_ptr + received.nbytes):
+            raise ValueError("Device collective input and output allocations overlap")
+        self.memory.select(self.rank)
+        self.buffers_peak = max(self.buffers_peak, value.nbytes + received.nbytes)
+        self.memory.sample(self.rank, stage + "/device")
+        send_buffer = ctypes.c_void_p(value.data_ptr)
+        recv_buffer = ctypes.c_void_p(received.data_ptr)
+        output_count = received.nbytes // (2 if value.dtype == torch.bfloat16 else 4)
+        try:
+            with self.memory.interval(self.rank, "communication", stage):
+                self._enqueue_collective(send_buffer, recv_buffer, value.nbytes, output_count, value.dtype, collective)
+                _check(self.memory.library.aclrtSynchronizeStream(self.stream), "aclrtSynchronizeStream")
+                self._pending = False
+        finally:
+            if self._pending:
+                _check(self.memory.library.aclrtSynchronizeStream(self.stream), "aclrtSynchronizeStream/failure")
+                self._pending = False
+        self.transfers.append({"stage": stage, "bytes_per_peer": value.nbytes // self.world, "world": self.world,
+                               "shape": list(value.shape), "dtype": str(value.dtype), "collective": collective,
+                               "transport_type": "BF16/FP32 SUM" if collective in ("reduce_scatter", "all_reduce") else "UINT8",
+                               "host_staging": False})
+        return received
 
     def exchange(self, value, stage, collective="all_to_all"):
         with self._lock:
@@ -241,23 +330,7 @@ class HCCLBytes:
                 _check(acl.aclrtMemcpyAsync(*arguments), "aclrtMemcpyAsync/H2D")
             peer_bytes = byte_count // self.world
             with self.memory.interval(self.rank, "communication", stage):
-                self._pending = True
-                if collective == "all_to_all":
-                    arguments = [send_buffer, peer_bytes, 7, recv_buffer, peer_bytes, 7, self.comm, self.stream]
-                    status = self.library.HcclAlltoAll(*arguments)
-                elif collective == "all_gather":
-                    status = self.library.HcclAllGather(send_buffer, recv_buffer, byte_count, 7, self.comm, self.stream)
-                elif collective == "reduce_scatter":
-                    dtype = 11 if value.dtype == torch.bfloat16 else 4
-                    count = received.numel()
-                    arguments = [send_buffer, recv_buffer, count, dtype, 0, self.comm, self.stream]
-                    status = self.library.HcclReduceScatter(*arguments)
-                else:
-                    dtype = 11 if value.dtype == torch.bfloat16 else 4
-                    count = received.numel()
-                    arguments = [send_buffer, recv_buffer, count, dtype, 0, self.comm, self.stream]
-                    status = self.library.HcclAllReduce(*arguments)
-                _check(status, "HCCL/" + collective)
+                self._enqueue_collective(send_buffer, recv_buffer, byte_count, received.numel(), value.dtype, collective)
                 arguments = [host_receive, received_bytes, recv_buffer, received_bytes, 2, self.stream]
                 _check(acl.aclrtMemcpyAsync(*arguments), "aclrtMemcpyAsync/D2H")
                 _check(acl.aclrtSynchronizeStream(self.stream), "aclrtSynchronizeStream")
@@ -267,7 +340,8 @@ class HCCLBytes:
             reduction = collective in ("reduce_scatter", "all_reduce")
             self.transfers.append({"stage": stage, "bytes_per_peer": peer_bytes, "world": self.world,
                                    "shape": list(value.shape), "dtype": str(value.dtype), "collective": collective,
-                                   "transport_type": "BF16/FP32 SUM" if reduction else "UINT8"})
+                                   "transport_type": "BF16/FP32 SUM" if reduction else "UINT8",
+                                   "host_staging": True})
         finally:
             if self._pending:
                 _check(acl.aclrtSynchronizeStream(self.stream), "aclrtSynchronizeStream/failure")
