@@ -24,6 +24,7 @@ import torch
 from pypto import ir
 from pypto.backend import BackendType
 from pypto.runtime import ExecutionMode, RunConfig
+from .activation import make_finite_check
 from .cache import attach_network_cache_geometry, network_cache_geometry, resolve_layer_role
 from .engram import make_prefill_engram_entries
 from .input_pack import make_input_entries
@@ -64,7 +65,7 @@ def loaded_source_files(runtime):
                 runtime["source_files"][str(path.relative_to(root))] = file_sha(path)
 
 
-def run_input_boundary(settings, *, config, capacity, reader, execute, exchange, execute_l2=None):
+def run_input_boundary(settings, *, config, capacity, reader, execute, exchange, execute_l2=None, map_ranks=None):
     """Embed the actual request tokens and return rank-local HC inputs in memory."""
     topology = settings["topology"]
     dp, tp, world = topology["dp"], topology["tp"], topology["ep"]
@@ -76,8 +77,9 @@ def run_input_boundary(settings, *, config, capacity, reader, execute, exchange,
     weight = reader.load("embed.weight")
     if tuple(weight.shape) != (vocabulary, hidden) or weight.dtype != torch.bfloat16:
         raise ValueError("Actual checkpoint embedding shape or dtype differs")
-    packets, rows_by_rank = [], []
-    for rank in range(world):
+    map_ranks = map_ranks or (lambda function: [function(rank) for rank in range(world)])
+    packets, rows_by_rank = [None] * world, [0] * world
+    def run_input_boundary_rank_0(rank):
         engine = settings["DP_engines"][rank // tp]
         tokens = [token for request in engine["requests"] for token in request["token_ids"]]
         masks = [value for request in engine["requests"] for value in request["live_token_mask"]]
@@ -92,11 +94,12 @@ def run_input_boundary(settings, *, config, capacity, reader, execute, exchange,
         start, count = rank % tp * (vocabulary // tp), vocabulary // tp
         local_weight = weight.narrow(0, start, count).contiguous()
         execute("lookup", rank, [ids, live, local_weight, output, start, len(tokens)], dict(lookup=output))
-        packets.append({"network-input": {"value": output}})
-        rows_by_rank.append(len(tokens))
+        packets[rank] = {"network-input": {"value": output}}
+        rows_by_rank[rank] = len(tokens)
+    map_ranks(run_input_boundary_rank_0)
     gathered = exchange("input-vocabulary-TP-gather", packets)
-    result = []
-    for rank in range(world):
+    result = [None] * world
+    def run_input_boundary_rank_1(rank):
         active = rows_by_rank[rank]
         physical = max(1, (active + tp - 1) // tp)
         embedding = torch.zeros((capacity, hidden), dtype=torch.bfloat16)
@@ -114,10 +117,10 @@ def run_input_boundary(settings, *, config, capacity, reader, execute, exchange,
             arguments, outputs, _ = region_arguments("input_l2", operations)
             execute_l2("input_l2", rank, arguments, outputs)
         valid = max(0, min(physical, active - rank % tp * physical))
-        result.append(dict(hidden=streams[:(active + tp - 1) // tp].clone(),
-            pre_mix=premix[:(active + tp - 1) // tp].clone(),
+        result[rank] = dict(hidden=streams, pre_mix=premix,
             SP_physical_rows=(active + tp - 1) // tp, SP_kernel_rows=physical, SP_valid_rows=valid, DP_rank=rank // tp, TP_rank=rank % tp,
-            global_token_start=rank % tp * physical))
+            global_token_start=rank % tp * physical)
+    map_ranks(run_input_boundary_rank_1)
     return result
 
 
@@ -137,7 +140,7 @@ def network_layer_geometry(provider, topology, layer_id):
     bound = geometry["capacity"] * topology["dp"]
     if total > bound:
         raise ValueError("Actual routed token rows exceed the compiled per-DP chunk capacity")
-    expert_capacity = max(16, (bound + 15) // 16 * 16)
+    expert_capacity = min(bound, topology["ep"] * 16)
     return geometry, expert_capacity
 
 
@@ -176,6 +179,7 @@ def make_network_layer_entries(provider, config, topology, layer_id, definitions
         cache_layout=layout,
         role=role,
         network_cache=True,
+        moe_slab_rows=16,
     )
     definitions = make_network_l2_entries(entries, geometry["capacity"])
     if definitions_cache is not None:
@@ -295,6 +299,7 @@ class NetworkProgram:
                     "embedding",
                 ),
             )
+            self.bind("validation", {"finite": make_finite_check(geometry["capacity"])})
             for layer in range(40):
                 definitions, _, _ = make_network_layer_entries(
                     provider, text, topology, layer, self._layer_definitions
@@ -509,6 +514,7 @@ class NetworkExecutor:
         program,
         namespace="chunk0",
         resident=None,
+        phase="prefill",
     ):
         self.topology = topology
         self.provider, self.ownership, self.memory = provider, ownership, memory
@@ -518,7 +524,14 @@ class NetworkExecutor:
         self.resident = resident
         self.current_layer, self.current_entries = None, None
         self.compiled = {}
-        self.resident_abis = {}
+        compiled_entries = {id(entry.compiled): entry.compiled
+                            for entries in program.stages.values() for entry in entries.values()}
+        for key, compiled in compiled_entries.items():
+            if key not in resident.parameter_abis:
+                resident.parameter_abis[key] = network_parameter_abi(compiled)
+        self.resident_abis = resident.parameter_abis
+        self.phase = phase
+        self.activation_banks = {}
 
     def execute_entry(self, entry, rank, arguments):
         """Bind one existing compiled entry to the generation's persistent worker."""
@@ -529,25 +542,29 @@ class NetworkExecutor:
             self.resident_abis[key] = network_parameter_abi(entry.compiled)
         self.resident.execute(entry.compiled, rank, arguments, self.resident_abis[key])
 
-    def exchange(self, stage, values, collective, group, *, packets=False):
+    def exchange(self, stage, values, collective, group, *, packets=False, host_control=False):
         if not stage or "/" in stage or ".." in stage:
             raise ValueError("HCCL stages require distinct safe chunk/layer identities")
         transport = (
             values if packets else [{case: {"value": value} for case, value in row.items()} for row in values]
         )
-        result, receipts = self.resident.exchange(stage, transport, collective, group)
+        result, receipts = self.resident.exchange(stage, transport, collective, group, host_control=host_control)
         for rank, receipt in enumerate(receipts):
             self.reports[rank]["communication"].append(receipt)
         if packets:
             return result
         return [{case: packet["value"] for case, packet in row.items()} for row in result]
 
+    def exchange_async(self, stage, values, collective, group, *, packets=False):
+        """Retain packet owners until the dedicated communication completion future resolves."""
+        return self.resident.collective_queue.submit(self.exchange, stage, values, collective, group, packets=packets)
+
     def precheck(self):
         world = self.topology["ep"]
         values = [{"precheck": torch.tensor([[rank]], dtype=torch.int32)} for rank in range(world)]
         for group in ("ep", "tp", "dp"):
             observed = self.exchange(
-                self.namespace + "-network-startup-" + group, values, "all_gather", group
+                self.namespace + "-network-startup-" + group, values, "all_gather", group, host_control=True
             )
             for rank in range(world):
                 tp = self.topology["tp"]
@@ -560,6 +577,24 @@ class NetworkExecutor:
                     expected = list(range(rank % tp, world, tp))
                 if observed[rank]["precheck"].flatten().tolist() != expected:
                     raise RuntimeError("Actual network HCCL group precheck failed: " + group)
+
+    def layer_buffers(self, rank, case):
+        """Reuse one Decode boundary or alternating Prefill boundaries on each rank."""
+        slot = 0 if self.phase == "decode" else self.current_layer % 2
+        key = rank, case, slot
+        if key not in self.activation_banks:
+            capacity = self.provider.capacity
+            hidden = torch.full((capacity, 4, 5120), -37, dtype=torch.bfloat16)
+            premix = torch.zeros((capacity, 4), dtype=torch.float32)
+            self.activation_banks[key] = hidden, premix
+        return self.activation_banks[key]
+
+    def retain_boundaries(self, hidden, premix):
+        """Retire completed scratch and preserve the current device boundary buffers."""
+        keep = [(rank, value) for rows in (hidden, premix)
+                for rank, cases in enumerate(rows) for value in cases.values()]
+        keep.extend((rank, value) for (rank, _, _), pair in self.activation_banks.items() for value in pair)
+        self.resident.release_values(keep)
 
     def for_layer(self, layer_id):
         geometry, expert_capacity = network_layer_geometry(self.provider, self.topology, layer_id)
@@ -579,6 +614,7 @@ class NetworkExecutor:
             enable_expert_parallel=True,
             capacity=geometry["capacity"],
             expert_capacity=expert_capacity,
+            moe_slab_rows=16,
             cache_blocks=geometry["cache_blocks"],
             requests=geometry["requests"],
             table_pages=geometry["table_pages"],
@@ -586,9 +622,14 @@ class NetworkExecutor:
             execute=execute,
             execute_l2=execute,
             exchange=self.exchange,
+            exchange_async=self.exchange_async,
+            map_ranks=self.resident.map_ranks,
             epoch=batch["epoch"],
             token_map_id=batch["token_map_id"],
             output_sentinel=-37.0,
+            read_control=self.resident.read_control,
+            copy_tensor=self.resident.copy_tensor,
+            layer_buffers=self.layer_buffers,
             stage_namespace=f"{self.namespace}-layer{layer_id}",
         )
 
@@ -614,6 +655,7 @@ def embed_network_input(input_contract, weights, executor, config, output):
         execute=execute,
         exchange=exchange,
         execute_l2=execute,
+        map_ranks=executor.resident.map_ranks,
     )
     write_json(
         directory / "execution.json",
@@ -629,15 +671,8 @@ def embed_network_input(input_contract, weights, executor, config, output):
         record = executor.provider.batch_for_layer(0)["cases"]["fresh"][rank]
         if any(original[name] != record[name] for name in ("SP_physical_rows", "SP_valid_rows")):
             raise ValueError("Embedding and cache metadata disagree on rank-local token ownership")
-        local_hidden = torch.zeros(
-            (executor.provider.capacity, config["hc_mult"], config["hidden_size"]), dtype=torch.bfloat16
-        )
-        local_pre = torch.zeros((executor.provider.capacity, config["hc_mult"]), dtype=torch.float32)
-        physical = original["SP_physical_rows"]
-        local_hidden[:physical].copy_(original["hidden"])
-        local_pre[:physical].copy_(original["pre_mix"])
-        hidden.append(dict(fresh=local_hidden))
-        premix.append(dict(fresh=local_pre))
+        hidden.append(dict(fresh=original["hidden"]))
+        premix.append(dict(fresh=original["pre_mix"]))
     return hidden, premix
 
 
@@ -661,7 +696,8 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
 
     packets = [{} for _ in range(world)]
     for case, records in batch["cases"].items():
-        for rank, record in enumerate(records):
+        def run_output_boundary_rank_0(rank):
+            record = records[rank]
             physical = record["SP_physical_rows"]
             collapsed = torch.full((capacity, 5120), -17, dtype=torch.bfloat16)
             execute(
@@ -672,10 +708,12 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
                 dict(local_collapsed=collapsed),
             )
             packets[rank][case] = collapsed
+        executor.resident.map_ranks(run_output_boundary_rank_0)
     gathered = executor.exchange(executor.namespace + "-output-SP-gather", packets, "all_gather", "tp")
     logits_packets = [{} for _ in range(world)]
     for case, records in batch["cases"].items():
-        for rank, record in enumerate(records):
+        def run_output_boundary_rank_1(rank):
+            record = records[rank]
             physical, active = record["SP_physical_rows"], len(record["positions"])
             collapsed = torch.full((capacity, 5120), -17, dtype=torch.bfloat16)
             normalized = torch.full((capacity, 5120), -19, dtype=torch.bfloat16)
@@ -706,12 +744,14 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
                 ),
             )
             logits_packets[rank][case] = local_logits
+        executor.resident.map_ranks(run_output_boundary_rank_1)
     gathered_logits = executor.exchange(
         executor.namespace + "-output-vocabulary-gather", logits_packets, "all_gather", "tp"
     )
     files, actual_logits = {}, [{} for _ in range(world)]
     for case, records in batch["cases"].items():
-        for rank, record in enumerate(records):
+        def run_output_boundary_rank_2(rank):
+            record = records[rank]
             logits = torch.full((capacity, config["vocab_size"]), -29, dtype=torch.bfloat16)
             execute(
                 "vocab_unpack",
@@ -720,6 +760,7 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
                 [gathered_logits[rank][case], logits, len(record["positions"])],
                 dict(logits=logits),
             )
+            logits = executor.resident.read_output(logits, rank)
             path = directory / f"rank-{rank}-{case}-network-logits.pt"
             torch.save(
                 dict(
@@ -732,6 +773,7 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
             )
             files[str(path)] = file_sha(path)
             actual_logits[rank][case] = logits[: len(record["positions"])].clone()
+        executor.resident.map_ranks(run_output_boundary_rank_2)
     write_json(
         directory / "execution.json",
         dict(
@@ -776,7 +818,7 @@ def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=F
         raise ValueError("The network runtime requires EP16 with TP1/2/4 and PP1/PCP1/DCP1")
     if (
         not all(contract["required_modes"].values())
-        or contract["capacity"] != 16
+        or contract["capacity"] not in (16, 128)
         or contract["scheduler_capacity"] != 8192
     ):
         raise ValueError("Retain the original model modes and bounded actual scheduler ABI")
@@ -795,7 +837,7 @@ def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=F
         {"fresh": inputs["input_contract"]},
         topology=topology,
         model_config=model_config,
-        capacity=16,
+        capacity=contract["capacity"],
         scheduler_capacity=8192,
         allocation_id=allocation_id,
         sources_by_case={"fresh": inputs["cache_ABI_sources"]},
@@ -820,6 +862,7 @@ class GenerationSession:
         self.contract, self.engram_contracts = contract, engram_contracts
         self.memory, self.assigned, self.output = memory, assigned, output
         self.request_inputs = request_inputs
+        self.phase_programs = {contract["capacity"]: program}
         self.ownership = [weights.layout.ownership(rank) for rank in range(weights.world)]
         self.epoch, self.closed, self.failed = 0, False, False
         self.cache_views = weights.cache_handles
@@ -846,9 +889,12 @@ class GenerationSession:
         if self.closed or self.failed:
             raise RuntimeError("A closed or failed generation session cannot advance")
         following, contract = chunk["inputs"], chunk["contract"]
-        fixed = ("topology", "checkpoint", "model_config", "required_modes", "capacity", "scheduler_capacity")
+        fixed = ("topology", "checkpoint", "model_config", "required_modes", "scheduler_capacity")
         if any(contract[name] != self.contract[name] for name in fixed):
             raise ValueError("Continuation cannot change the session's model or topology")
+        capacity = contract["capacity"]
+        if capacity not in self.phase_programs or (phase == "decode" and capacity != 16):
+            raise ValueError("Continuation requires a precompiled phase execution capacity")
         actual, epoch = following["input_contract"], self.epoch + 1
         input_path = Path(contract["input_contract_path"])
         if (actual["epoch"] != epoch or type(actual["epoch"]) is not int
@@ -872,6 +918,10 @@ class GenerationSession:
         cache_uploads = self.runtime.stats["cache_h2d_bytes"]
         before = _network_owner_snapshot(self.provider)
         try:
+            self.provider.set_execution_capacity(capacity)
+            self.engram_contracts = {slot: dict(item, capacity=capacity)
+                                     for slot, item in self.engram_contracts.items()}
+            self.program = self.phase_programs[capacity]
             self.provider.begin_chunk(epoch=epoch, token_map_id=contract["input_contract_sha256"],
                 input_by_case={"fresh": actual}, metadata_by_case={"fresh": metadata},
                 metadata_sources_by_case={"fresh": receipts})
@@ -930,10 +980,32 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
     validate_host_lookup(inputs["engram_lookup"], inputs["engram_contracts"][1], provider.hash_batch())
     program = compiled if compiled is not None else NetworkProgram(output / "compiled")
     program.compile(provider, contract["model_config"], topology, inputs["engram_contracts"])
+    phase_programs = {contract["capacity"]: program}
+    if contract["capacity"] != 16 and request_inputs is not None:
+        from tempfile import TemporaryDirectory
+        from .prefill_prepare import TokenChunkInputs
+
+        decode_config = dict(request_inputs.config, capacity=16, chunk_size=16)
+        with TemporaryDirectory(prefix="ds41-decode-shape-") as temporary:
+            request = TokenChunkInputs(checkpoint=contract["checkpoint"], cache=request_inputs.cache,
+                config=decode_config, output=Path(temporary) / "inputs", context_capacity=request_inputs.capacity)
+            try:
+                decode_chunk = request.chunk([0], phase="decode")
+                decode_inputs = _merge_inputs(decode_chunk["inputs"], decode_chunk["cache"])
+                decode_provider = prepare_network_provider(decode_inputs, decode_chunk["contract"],
+                                                           "decode-shape", geometry_only=True)
+                decode_program = NetworkProgram(output / "compiled-decode")
+                decode_program._buckets = program._buckets
+                decode_program.compile(decode_provider, contract["model_config"], topology,
+                                       decode_chunk["cache"]["engram_contracts"])
+                phase_programs[16] = decode_program
+            finally:
+                request.close()
     provider = prepare_network_provider(inputs, contract, output.name)
     with ExitStack() as stack:
         resident = stack.enter_context(ResidentNetworkRuntime(assigned, topology))
-        resident.register(program)
+        for phase_program in phase_programs.values():
+            resident.register(phase_program)
         weights = A3ResidentWeights(contract["checkpoint"], topology, contract["model_config"], resident)
         stack.callback(weights.close)
         weights.preload_once(progress)
@@ -948,6 +1020,7 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
         session = GenerationSession(stack, resident=resident, weights=weights, provider=provider, program=program,
             contract=contract, engram_contracts=inputs["engram_contracts"], memory=CANNMemory(diagnostics=False),
             assigned=assigned, output=output, request_inputs=request_inputs)
+        session.phase_programs = phase_programs
         first = run_network_chunk(inputs, contract=contract, output=output, provider=provider, weights=weights,
             memory=session.memory, ownership=session.ownership, assigned=assigned,
             engram_contracts=session.engram_contracts, program=program, epoch=0, progress=progress, resident=resident)
@@ -1028,6 +1101,7 @@ def run_network_chunk(
         program,
         namespace,
         resident=resident,
+        phase=phase,
     )
     executor.precheck()
     hidden, premix = embed_network_input(
@@ -1050,17 +1124,20 @@ def run_network_chunk(
     eng_runtime = dict(
         topology=topology,
         assigned_devices=assigned,
-        capacity=16,
+        capacity=contract["capacity"],
         stage_namespace=namespace + "-engram",
         output=output / "engram",
         reports=reports,
         memory=memory,
         exchange=executor.exchange,
+        map_ranks=resident.map_ranks,
         entries_for_stage=program.entries_for_stage,
         execute_entry=executor.execute_entry,
         projection_for_layer=weights.projection_for_layer,
     )
     eng_runtime["load_rotation"] = resident.load_rotation
+    eng_runtime["read_control"] = resident.read_control
+    eng_runtime["copy_tensor"] = resident.copy_tensor
     prepared_engram = prepare_network_engram(
         common_engram,
         hash_batch,
@@ -1089,9 +1166,12 @@ def run_network_chunk(
         for case, records in provider.batch_for_layer(layer)["cases"].items():
             for rank, record in enumerate(records):
                 valid = record["SP_valid_rows"]
-                if (not torch.isfinite(result["hidden"][rank][case][:valid]).all()
-                        or not torch.isfinite(result["pre_mix"][rank][case][:valid]).all()):
+                status = torch.empty(provider.capacity, dtype=torch.int32)
+                arguments = [result["hidden"][rank][case], result["pre_mix"][rank][case], status, valid]
+                executor.execute_entry(program.entries_for_stage("validation")["finite"], rank, arguments)
+                if not bool(resident.read_control(status, rank).all()):
                     raise RuntimeError(f"Non-finite {phase} state after layer {layer} on rank {rank}")
+        executor.retain_boundaries(result["hidden"], result["pre_mix"])
         provider.observe_layer(layer, result)
         completed_layers.append(layer)
         layer_timings.append(dict(layer=layer, weight_load_seconds=0.0,
@@ -1132,8 +1212,12 @@ def run_network_chunk(
             final_output_files=output_result["files"],
             formal_accuracy="not_run",
         )
+        resident.release_values()
         runtime["resident_runtime"] = resident.summary()
         write_json(runtime_path, runtime)
+        chunk_seconds = perf_counter() - begin
+        write_json(output / "host-trace.json", resident.trace)
+        resident.trace.clear()
         write_json(
             output / "execution.json",
             dict(
@@ -1144,7 +1228,7 @@ def run_network_chunk(
                 compilation=program.summary(),
                 timings=dict(
                     layers=layer_timings,
-                    chunk_seconds=perf_counter() - begin,
+                    chunk_seconds=chunk_seconds,
                     weight_load_seconds=weights.load_seconds - initial_load_seconds,
                     weight_load_calls=weights.load_calls - initial_load_calls,
                     checkpoint_read_seconds=weights.reader.read_seconds - initial_read_seconds,
@@ -1160,7 +1244,8 @@ def run_network_chunk(
             ),
         )
         return dict(runtime, logits=output_result["logits"], compilation=program.summary(),
-                    timings=dict(layers=layer_timings, weight_load_seconds=weights.load_seconds - initial_load_seconds,
+                    timings=dict(layers=layer_timings, chunk_seconds=chunk_seconds,
+                                 weight_load_seconds=weights.load_seconds - initial_load_seconds,
                                  checkpoint_read_calls=weights.reader.read_calls - initial_read_calls))
     except BaseException as error:
         write_json(

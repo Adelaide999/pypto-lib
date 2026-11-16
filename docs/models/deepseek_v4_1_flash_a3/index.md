@@ -72,7 +72,7 @@ Omit `--compile-only` on an allocated A3 device to run operator comparisons.
 `prefill_fwd.prefill_fwd` executes embedding, initial HC, layers 0 through 39,
 final HC collapse, RMSNorm and the vocabulary head. Each layer consumes the
 previous layer's actual activations. The implemented topology is
-DP4/TP4/EP16, PP1/PCP1/DCP1, with capacity 16. Physical devices are explicit
+DP4/TP4/EP16, PP1/PCP1/DCP1, with Prefill capacity 16 or 128 and Decode capacity 16. Physical devices are explicit
 and ordered by logical rank. Duplicate IDs, rank-count mismatches and a
 conflicting `ASCEND_RT_VISIBLE_DEVICES` mapping are rejected before initialization.
 
@@ -92,8 +92,8 @@ logits = result["logits"][0]["fresh"]
 
 For automatic inputs, `inputs` is raw completion text or 1..2048 token IDs.
 The entry tokenizes with the checkpoint tokenizer, reserves pages for the
-complete prompt and processes chunks of up to 16 tokens. `chunk_size` can
-select 1..16 and `dp_rank` can select 0..3. Other DP engines remain empty.
+complete prompt and processes chunks of up to 128 tokens. `chunk_size` can
+select 1..128 and `dp_rank` can select 0..3. Other DP engines remain empty.
 Positions, sequence lengths, page tables, slot mappings, C2 cross-chunk state
 and Engram history persist across chunks. Indexer searches up to 2048
 positions, keeps TopK 512 and excludes future positions. This automatic path
@@ -126,8 +126,9 @@ Omitting `compiled` compiles inside the forward.
 | QKV | Q/KV projection, normalization and RoPE |
 | Attention packing | Inverse RoPE and head packet packing |
 | Output projection | Head unpack, grouped projection and reduction packing |
-| FFN dispatch | HC, normalization, router, shared expert and EP packing |
-| MoE finish | Combine, valid-row masking and FFN HC post |
+| FFN dispatch | HC, normalization and router |
+| MoE slabs | 16 source rows per rank, EP dispatch, routed experts, return and combine |
+| MoE finish | Valid-row masking and FFN HC post |
 | Head | SP unpack, RMSNorm and vocabulary projection |
 
 L2 denotes PyPTO orchestration, not physical layer 2. The network retains host
@@ -148,6 +149,54 @@ the public worker until worker teardown drains or reclaims the failed run.
 Cleanup failures are logged without replacing the original dispatch error.
 After a completed dispatch, cleanup attempts every transient allocation;
 a cleanup error is propagated when there is no earlier failure.
+
+### Concurrent execution and bounded MoE storage
+
+The generation command defaults to `--chunk-size 128`. Requests with chunk
+sizes 1..16 use capacity 16; sizes 17..128 use capacity 128, including their
+partial final chunk. Decode always uses capacity 16. Both shapes are compiled
+before execution and share static weights, cache backing storage, workers,
+and Engram history. The scheduler and context bounds remain 8192 and 2048.
+Shared index and candidate publication buffers retain their 8192-row ABI
+when execution capacity switches from 128 to 16.
+The 256/512 shapes are not enabled by this change.
+
+Each rank has one persistent compute queue. Independent ranks are submitted
+before the stage joins; owned experts execute in order within their rank.
+Communication uses separate persistent threads. The first EP slab dispatch
+runs alongside the shared expert, and its completion future is joined before
+unpack. All ranks execute the same number of slab collectives, including
+empty ranks. Slab token IDs are local to the current slice; combine writes
+into the original SP slice at the corresponding slab offset.
+
+Each source contributes at most 16 rows per MoE round. The per-peer bucket
+holds `16 * TopK` rows, and each hidden packet is 15 MiB per rank and direction.
+The per-expert bound is `min(DP * capacity, EP * 16)`: 64 rows at capacity 16
+and 256 rows at capacity 128. Shared computation retains the phase capacity.
+This is a communication workspace bound, not a total HBM measurement.
+
+Intermediate CPU tensors describe device-owned storage. Activations and HCCL
+payloads stay on device; integer controls and final logits are explicitly read
+back. Completed layer allocations return to a size-based pool. Host descriptors
+must not be mutated after the device becomes authoritative.
+
+The pinned PyPTO worker retains at most 64 callable registrations. Completed
+registrations are retired through the underlying simpler worker before a slot
+is reused; compiled artifacts, weights and cache allocations remain live.
+This integration uses the pinned wrapper's `_cid_cache` and `_impl` fields;
+recheck it when updating PyPTO. A device smoke verifies retirement followed by
+another dispatch on the same workers and allocations.
+
+`generation/result.json` records initialization, complete Prefill forward,
+each Decode step, and time to first token. These are host wall times, including
+dispatch, communication and execution receipt I/O. The first-token interval
+starts after argument parsing and includes contracts, host table preparation,
+compilation and weight initialization. Per-chunk `host-trace.json` records
+rank stages, synchronous worker calls and collective completion intervals.
+Host intervals are not a substitute for aligned device swimlanes.
+
+This change is a performance experiment. Numerical comparison, boundary-matrix
+validation and full-network vLLM acceptance are not established by execution.
 
 ### Fixed INT8 weight layout
 

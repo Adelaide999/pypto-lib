@@ -10,7 +10,8 @@ owners for linear algebra, quantization, normalization, RoPE and cache operation
 - `network.py`: shared TP4 program registry, layer execution and generation session.
 - `resident_weights.py`: one static weight owner and per-logical-weight audit.
 - `generate.py`: DP4/TP4/EP16 Prefill followed by one-token Decode on the same workers.
-- `prefill_layer.py`: generic layer composition and L2 compute regions.
+- `prefill_layer.py`: concurrent rank stages and bounded 16-row MoE slabs.
+- `prefill_resident.py`: persistent compute queues, device activations and HCCL transfers.
 - `decode_layer.py`: full-width Decode layer dispatch and SWA/Engram layer bodies.
 - `decode_swa.py`, `decode_c1a.py`, `decode_c2a.py`: Decode attention compositions.
 - `decode_moe_ep.py`: full-width expert-parallel dispatch and rank composition.
@@ -31,3 +32,7 @@ See the [model documentation](../../docs/models/deepseek_v4_1_flash_a3/index.md)
 The [native vLLM-Ascend accuracy workflow](../../docs/models/deepseek_v4_1_flash_a3/accuracy.md)
 uses fixed TP4/DP4/EP16 prompt/Decode traces and compares full-vocabulary logits,
 Top1 and TopK through the repository's `tools/` entries.
+
+Generation defaults to 128-token Prefill chunks; Decode retains capacity 16.
+Timing reports separate weight initialization, Prefill, Decode and first-token
+wall time. Execution-only performance runs do not establish numerical accuracy.

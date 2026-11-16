@@ -11,6 +11,13 @@
 from dataclasses import dataclass
 
 
+def prefill_execution_capacity(chunk_size):
+    """Select the bounded Prefill shape while retaining the 16-row Decode ABI."""
+    if type(chunk_size) is not int or not 1 <= chunk_size <= 128:
+        raise ValueError("Chunk size must be in 1..128")
+    return 16 if chunk_size <= 16 else 128
+
+
 def validate_tp(tp):
     """Validate a caller-supplied tensor-parallel specialization."""
     if type(tp) is not int or tp not in (1, 2, 4):

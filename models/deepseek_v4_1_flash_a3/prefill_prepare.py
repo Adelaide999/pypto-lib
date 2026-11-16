@@ -16,13 +16,14 @@ from pathlib import Path
 import torch
 from .cache import resolve_layer_role
 from .utils import file_sha, write_json
+from .runtime_config import prefill_execution_capacity
 
 
 MAX_CONTEXT = 2048
 PAGE_ROWS = 128
 
 
-def checkpoint_cache(checkpoint, topology):
+def checkpoint_cache(checkpoint, topology, *, capacity=16):
     """Build cache and host Engram contracts directly from checkpoint metadata."""
     from .engram_host import build_compressed_token_map, checkpoint_region, make_layout
     checkpoint = Path(checkpoint).resolve()
@@ -103,7 +104,7 @@ def checkpoint_cache(checkpoint, topology):
                 ),
             ))
         contracts[layer] = dict(
-            checkpoint=str(checkpoint), model_config=model, topology=deepcopy(topology), capacity=16,
+            checkpoint=str(checkpoint), model_config=model, topology=deepcopy(topology), capacity=capacity,
             physical_layer_id=layer,
             hash_constants=dict(constants, layer_ids=[1, 14], pad_id=text["engram_pad_token_id"]),
             engram_shards=shards, host_storage="checkpoint_file_mapping",
@@ -115,7 +116,7 @@ def checkpoint_cache(checkpoint, topology):
         topology=deepcopy(topology), checkpoint=str(checkpoint), model_config=model,
         required_modes=dict(enable_expert_parallel=True, enable_fused_mc2=True,
                             enable_dsa_cp=True, enable_flashcomm1=True, enable_shared_expert_dp=True),
-        capacity=16, scheduler_capacity=8192, fresh_shared_initialization={"topk_indices": -1},
+        capacity=capacity, scheduler_capacity=8192, fresh_shared_initialization={"topk_indices": -1},
         weight_residency="session",
     )
     digest_cache_path.write_text(json.dumps(digest_cache, indent=2) + "\n")
@@ -273,7 +274,10 @@ class TokenChunkInputs:
         from .engram_host import HostEngram
 
         self.checkpoint, self.output = Path(checkpoint).resolve(), Path(output).resolve()
-        self.cache, self.config = cache, dict(config)
+        capacity = prefill_execution_capacity(config.get("chunk_size", config.get("capacity", 16)))
+        self.cache = dict(cache, engram_contracts={slot: dict(item, capacity=capacity)
+                          for slot, item in cache["engram_contracts"].items()})
+        self.config = dict(config, capacity=capacity)
         self.topology = config["topology"]
         tp, dp = self.topology["tp"], self.topology["dp"]
         if (self.topology != dict(dp=dp, tp=tp, ep=16, pp=1, pcp=1, dcp=1)
@@ -288,7 +292,7 @@ class TokenChunkInputs:
                            ("config.json", "quant_model_weights.safetensors.index.json", "tokenizer.json")
                            if (self.checkpoint / name).is_file()}
         self.output.mkdir(parents=True, exist_ok=False)
-        self.host = (HostEngram(self.checkpoint, cache["engram_contracts"], self.output.parent.name)
+        self.host = (HostEngram(self.checkpoint, self.cache["engram_contracts"], self.output.parent.name)
                      if prepare_engram else None)
         self.history, self.epoch, self.predecessor = [], 0, None
         self.closed = False
@@ -299,11 +303,14 @@ class TokenChunkInputs:
             if self.host is not None:
                 self.host.close()
 
-    def chunk(self, tokens, *, dp_rank=0):
+    def chunk(self, tokens, *, dp_rank=0, phase="prefill"):
         """Prepare dynamic rows and coordinates without replacing any cache backing allocation."""
         tp, dp = self.topology["tp"], self.topology["dp"]
-        if self.closed or not 0 <= dp_rank < dp or not 1 <= len(tokens) <= 16:
-            raise ValueError("Require a live session and 1..16 tokens on one DP engine")
+        capacity = 16 if phase == "decode" else self.config["capacity"]
+        if phase not in ("prefill", "decode") or (phase == "decode" and len(tokens) != 1):
+            raise ValueError("Decode chunks contain exactly one token")
+        if self.closed or not 0 <= dp_rank < dp or not 1 <= len(tokens) <= capacity:
+            raise ValueError("Require a live session and tokens within its execution capacity")
         context = len(self.history)
         if context + len(tokens) > self.capacity:
             raise ValueError("Token chunk exceeds the session's fixed cache reservation")
@@ -329,10 +336,11 @@ class TokenChunkInputs:
             torch.save(payload, path)
             sources.append(dict(rank=rank, path=str(path), sha256=file_sha(path)))
             payloads.append(payload)
-        contract = dict(self.config, checkpoint=str(self.checkpoint), input_contract_path=str(input_path),
+        contract = dict(self.config, capacity=capacity, checkpoint=str(self.checkpoint), input_contract_path=str(input_path),
                         input_contract_sha256=identity)
         inputs = dict(input_contract=actual, prepare_input_stage=True)
-        cache = dict(self.cache, cache_ABI=payloads,
+        cache = dict(self.cache, engram_contracts={slot: dict(item, capacity=capacity)
+                         for slot, item in self.cache["engram_contracts"].items()}, cache_ABI=payloads,
                      cache_ABI_sources=[dict(rank=row["rank"], payload_sha256=row["sha256"],
                                             report_sha256=row["sha256"]) for row in sources])
         if self.host is not None:
@@ -345,10 +353,9 @@ class TokenChunkInputs:
 
 def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_size=16, dp_rank=0, prepare_engram=False):
     """Yield bounded request chunks using one metadata and host-table owner."""
-    if type(chunk_size) is not int or not 1 <= chunk_size <= 16:
-        raise ValueError("Chunk size must be in 1..16")
+    prefill_execution_capacity(chunk_size)
     tokens = tokenize_prompt(inputs, checkpoint, config["model_config"]["text_config"]["vocab_size"])
-    request = TokenChunkInputs(checkpoint=checkpoint, cache=cache, config=config, output=output,
+    request = TokenChunkInputs(checkpoint=checkpoint, cache=cache, config=dict(config, chunk_size=chunk_size), output=output,
                                context_capacity=config.get("context_capacity", len(tokens)),
                                prepare_engram=prepare_engram)
     try:

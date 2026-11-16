@@ -49,14 +49,15 @@ def make_output_vocab_unpack(capacity, vocabulary, tp):
         output: pl.InOut[pl.Tensor[[capacity, vocabulary], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(active * (vocabulary // 64), name_hint="prefill_output_vocab_unpack"):
-            token = block // (vocabulary // 64)
+        for block in pl.spmd(((active + 15) // 16) * (vocabulary // 64), name_hint="prefill_output_vocab_unpack"):
+            token = block // (vocabulary // 64) * 16
             column = block % (vocabulary // 64) * 64
             peer = column // local_width
             source = peer * capacity + token
             local_column = column % local_width
-            value = packet[source : source + 1, local_column : local_column + 64]
-            output[token : token + 1, column : column + 64] = value
+            rows = pl.min(16, active - token)
+            value = packet[source:source + 16, local_column:local_column + 64]
+            output[token:token + 16, column:column + 64] = pl.set_validshape(value, rows, 64)
         return output
 
     return vocab_unpack

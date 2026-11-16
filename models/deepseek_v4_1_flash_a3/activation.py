@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""BF16 SwiGLU with explicit sigmoid and SiLU rounding boundaries."""
+"""BF16 SwiGLU rounding and device activation finite checks."""
 
 import pypto.language as pl
 
@@ -47,3 +47,43 @@ def make_swiglu(capacity: int, intermediate: int, clamp_limit: float = 10.0):
         return output
 
     return activation
+
+
+def make_finite_check(capacity: int, hidden: int = 5120, hc_mult: int = 4):
+    """Flag nonfinite active residual/pre-mix rows without copying activations."""
+    width = hc_mult * hidden
+    if capacity <= 0 or hidden <= 0 or hc_mult <= 0 or width % 256:
+        raise ValueError("Finite checks require positive dimensions and a 256-aligned residual width")
+    expected_count = float(width)
+
+    @pl.jit
+    def finite_check(
+        hidden_state: pl.Tensor[[capacity, hc_mult, hidden], pl.BF16],
+        pre_mix: pl.Tensor[[capacity, hc_mult], pl.FP32],
+        status: pl.Out[pl.Tensor[[capacity], pl.INT32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        flattened = pl.reshape(hidden_state, [capacity, width])
+        for worker in pl.spmd(1, name_hint="dsv41_activation_finite_check"):
+            for token in pl.range(capacity):
+                valid = pl.cast(1, pl.INT32)
+                if token < active:
+                    finite_count = pl.cast(0.0, pl.FP32)
+                    for column in pl.range(0, width, 256):
+                        values = pl.cast(flattened[token:token + 1, column:column + 256], pl.FP32)
+                        grouped = pl.reshape(values, [8, 32])
+                        magnitude = pl.abs(grouped)
+                        finite = pl.cmp(magnitude, 3.4028234663852886e38, cmp_type=3)
+                        counts = pl.row_sum(finite)
+                        for group in pl.unroll(8):
+                            finite_count = finite_count + pl.read(counts, [group, 0])
+                    if finite_count != expected_count:
+                        valid = pl.cast(0, pl.INT32)
+                    for lane in pl.range(hc_mult):
+                        value = pl.read(pre_mix, [token, lane])
+                        if not (value <= 3.4028234663852886e38 and value >= -3.4028234663852886e38):
+                            valid = pl.cast(0, pl.INT32)
+                pl.write(status, [token], valid)
+        return status
+
+    return finite_check

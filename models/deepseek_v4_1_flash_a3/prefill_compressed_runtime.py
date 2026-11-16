@@ -9,6 +9,7 @@
 """Schedule physical compressed Prefill with aliased raw caches and shared index state."""
 
 import torch
+from .utils import copy_runtime_tensor, read_runtime_control
 
 
 DTYPES = {str(dtype): dtype for dtype in (torch.int8, torch.float16, torch.float32, torch.bfloat16)}
@@ -110,7 +111,7 @@ def run_compressed_attention(
 
     def pad(value, rows=capacity, fill=0):
         result = torch.full((rows, *value.shape[1:]), fill, dtype=value.dtype)
-        result[: len(value)].copy_(value)
+        copy_runtime_tensor(state.get("runtime", {}), result[:len(value)], value, rank)
         return result
 
     def table(name):
@@ -335,7 +336,8 @@ def run_compressed_attention(
     )
     context = zeros(capacity, 32768)
     if network is not None:
-        validate_network_sparse_indices(indices, original, network, query_rows)
+        controls = read_runtime_control(state.get("runtime", {}), indices[:query_rows], rank)
+        validate_network_sparse_indices(controls, original, network, query_rows)
         execute(
             "network_compressed_attention",
             rank,

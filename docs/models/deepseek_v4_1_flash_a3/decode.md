@@ -1,8 +1,9 @@
 # DeepSeek V4.1 Flash A3 Decode
 
 The 40-layer network uses DP4/TP4/EP16 and one persistent generation session.
-Prefill and one-token Decode use the same TP4 layer ABI, compiled program
-registry, static weight handles, HCCL groups and paged cache allocations.
+Prefill and one-token Decode share TP4 operators, a compiled program registry,
+static weight handles, HCCL groups and paged cache allocations. Prefill uses
+capacity 16 or 128; one-token Decode retains capacity 16.
 The scheduler remains on the host; model arithmetic runs on A3.
 
 ## Owners
@@ -51,13 +52,13 @@ separate operator interfaces.
 ```bash
 python -m models.deepseek_v4_1_flash_a3.generate \
   --checkpoint weights/deepseek-v4.1-flash-w8a8 \
-  --prompt "Hello" --max-new-tokens 3 --ignore-eos \
+  --prompt "Hello" --chunk-size 128 --max-new-tokens 4 --ignore-eos \
   --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
   --output build_output/ds41-generation
 ```
 
 Use the site's allocator and its assigned device list for execution. The
-first predicted token comes from Prefill; a three-token limit exercises two
+first predicted token comes from Prefill; a four-token limit exercises three
 Decode steps. Prompt chunks honor `--chunk-size`. Cache pages are reserved
 for the prompt and all requested output tokens before initialization.
 History is preserved in full up to the 2048-position context bound.
@@ -76,7 +77,9 @@ The LM head, normalization and vocabulary shard assembly run on A3.
 
 `generation/result.json` records both runtime identities, checkpoint and
 static upload counts, per-step zero-load checks, expert ownership, cache
-pointer aliases and cleanup status. `prefill/network/weight-audit.json`
+pointer aliases, cleanup status and measured host wall times.
+The `timings` object separates static weight initialization, Prefill forward,
+each Decode call, and time to first token including initialization. `prefill/network/weight-audit.json`
 records per-logical-weight reads and host preparation groups. Each Decode
 step writes `decode/step-N/decode.json` and the full execution receipt.
 `generation/answer.txt` and `generation/tokens.json` are updated after each

@@ -178,7 +178,7 @@ def main(argv=None):
     parser.add_argument("--tensor-parallel", type=int, choices=(4,), default=4)
     parser.add_argument("--data-parallel", type=int, choices=(4,), default=4)
     parser.add_argument("--expert-parallel", type=int, choices=(16,), default=16)
-    parser.add_argument("--chunk-size", type=int, choices=range(1, 17), default=16)
+    parser.add_argument("--chunk-size", type=int, choices=range(1, 129), default=16)
     parser.add_argument("--check-config", action="store_true",
                         help="Inspect native config without loading weights or NPU")
     args = parser.parse_args(argv)

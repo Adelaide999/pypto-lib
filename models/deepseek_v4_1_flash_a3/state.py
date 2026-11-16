@@ -572,6 +572,11 @@ class NetworkCacheProvider:
         """Provide the original first-SWA request mapping for one model-level hash preparation."""
         return dict(self.batch_for_layer(1), engram_metadata_owner_layer=1)
 
+    def set_execution_capacity(self, capacity):
+        """Switch execution geometry while retaining scheduler publication views."""
+        _require(capacity in (16, 128), "Require a registered 16- or 128-row execution shape")
+        self.capacity = capacity
+
     def runtime_geometry(self):
         """Derive compile-time buffer extents from all actual rank/request metadata."""
         self.batch_for_layer(0)

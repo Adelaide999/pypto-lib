@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Host weight layouts, integer window scheduling and file utilities."""
+"""Host weight layouts, device descriptor transfers, scheduling and file utilities."""
 
 import hashlib
 import json
@@ -31,6 +31,22 @@ WINDOW_HEADS = 64
 WINDOW_HEAD_DIM = 512
 WINDOW_PAGE_ROWS = WINDOW_SIZE = 128
 SCHEDULE_INT32_MAX = (1 << 31) - 1
+
+
+def copy_runtime_tensor(runtime, destination, source, rank):
+    """Copy an activation view through its execution owner's transfer callback."""
+    copy = runtime.get("copy_tensor")
+    if copy is None:
+        destination.copy_(source)
+    else:
+        copy(destination, source, rank)
+    return destination
+
+
+def read_runtime_control(runtime, value, rank):
+    """Materialize integer execution controls for host validation and scheduling."""
+    read = runtime.get("read_control")
+    return value if read is None or not value.numel() else read(value, rank)
 
 
 def pack_blocked_weight(weight_kn: torch.Tensor) -> torch.Tensor:
