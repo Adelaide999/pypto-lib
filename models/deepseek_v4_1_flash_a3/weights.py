@@ -270,7 +270,7 @@ class CheckpointOperands:
         self.read_calls += 1
         return value
 
-    def expert(self, prefix):
+    def expert(self, prefix, *, partitions=1):
         """Pack gate/up and down once while retaining the true channel scales."""
         operands = {}
         for stem in ("w1", "w2", "w3"):
@@ -285,6 +285,26 @@ class CheckpointOperands:
         down_scale = operands["w2.weight_scale"].flatten().float()
         if gate_up.dtype != torch.int8 or down.dtype != torch.int8:
             raise TypeError("Expert checkpoint weights must remain INT8")
+        if partitions != 1:
+            if partitions not in (2, 4) or w1.shape[0] % partitions:
+                raise ValueError("Expert partitions must divide the checkpoint intermediate width")
+            width = w1.shape[0] // partitions
+            padded = (width + 255) // 256 * 256
+            gates, scales, downs = [], [], []
+            for peer in range(partitions):
+                begin, end = peer * width, (peer + 1) * width
+                local_gate = torch.zeros((gate_up.shape[0], 2 * padded), dtype=torch.int8)
+                local_gate[:, :width] = gate_up[:, begin:end]
+                local_gate[:, padded:padded + width] = gate_up[:, w1.shape[0] + begin:w1.shape[0] + end]
+                local_scale = torch.zeros(2 * padded, dtype=torch.float32)
+                local_scale[:width] = gate_scale[begin:end]
+                local_scale[padded:padded + width] = gate_scale[w1.shape[0] + begin:w1.shape[0] + end]
+                local_down = torch.zeros((padded, down.shape[1]), dtype=torch.int8)
+                local_down[:width] = down[begin:end]
+                gates.append(pack_blocked_weight(local_gate))
+                scales.append(local_scale)
+                downs.append(pack_blocked_weight(local_down))
+            return torch.cat(gates), torch.cat(scales), torch.cat(downs), down_scale
         return pack_blocked_weight(gate_up), gate_scale, pack_blocked_weight(down), down_scale
 
 
@@ -1080,9 +1100,9 @@ class ResidentCheckpointOperands(CheckpointOperands):
             self.boundaries[name] = value
         return value
 
-    def expert(self, prefix):
+    def expert(self, prefix, *, partitions=1):
         self.preparations[prefix] = self.preparations.get(prefix, 0) + 1
-        return super().expert(prefix)
+        return super().expert(prefix, partitions=partitions)
 
 
 class ResidentNetworkWeights:
@@ -1153,7 +1173,7 @@ class ResidentNetworkWeights:
                 operands=operands,
                 expert=lambda rank, expert, layer=layer: self.expert(layer, rank, expert),
             )
-            shared = self.reader.expert(prefix + "ffn.shared_experts")
+            shared = self.reader.expert(prefix + "ffn.shared_experts", partitions=tp)
             for rank in ranks:
                 self.experts[layer, rank, None] = tuple(self.runtime.weight(value, rank) for value in shared)
             del shared

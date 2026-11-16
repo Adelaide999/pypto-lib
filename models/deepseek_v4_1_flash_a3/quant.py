@@ -163,7 +163,7 @@ def make_decode_cast_tile(rows, width, input_dtype, output_dtype):
     raise ValueError(f"unsupported cast tile dtypes: {input_dtype} -> {output_dtype}")
 
 
-def make_quantize(capacity, width, input_dtype=pl.BF16, *, rows_tile=VEC_M_TILE):
+def make_quantize(capacity, width, input_dtype=pl.BF16, *, rows_tile=VEC_M_TILE, fused_requantize=False):
     """Specialize symmetric per-token INT8 quantization."""
     width_tile = min(K_TILE, width)
     widen = make_cast_tile(rows_tile, width_tile, input_dtype, pl.FP32)
@@ -188,10 +188,17 @@ def make_quantize(capacity, width, input_dtype=pl.BF16, *, rows_tile=VEC_M_TILE)
                 chunk_maximum = pl.reshape(pl.row_max(pl.abs(value)), [1, rows_tile])
                 maximum_row = pl.maximum(maximum_row, chunk_maximum)
             maximum = pl.reshape(maximum_row, [rows_tile, 1])
-            scale = pl.mul(maximum, 1.0 / 127.0)
+            if fused_requantize:
+                scale = pl.div(maximum, 127.0)
+            else:
+                scale = pl.mul(maximum, 1.0 / 127.0)
             numerator = pl.full([1, rows_tile], dtype=pl.FP32, value=127.0)
             safe_maximum_row = pl.maximum(maximum_row, 1e-30)
-            inverse_row = pl.div(numerator, safe_maximum_row)
+            if fused_requantize:
+                safe_scale_row = pl.maximum(pl.reshape(scale, [1, rows_tile]), 1e-30)
+                inverse_row = pl.recip(safe_scale_row)
+            else:
+                inverse_row = pl.div(numerator, safe_maximum_row)
             inverse = pl.reshape(inverse_row, [rows_tile, 1])
             scale_rows = pl.full([rows_tile, 8], dtype=pl.FP32, value=1.0)
             expanded_scale = pl.row_expand_mul(scale_rows, scale)
@@ -203,6 +210,9 @@ def make_quantize(capacity, width, input_dtype=pl.BF16, *, rows_tile=VEC_M_TILE)
                     pl.fillpad(widened, pad_value=pl.PadValue.zero), rows_tile, width_tile
                 )
                 normalized = pl.row_expand_mul(value, inverse)
+                if fused_requantize:
+                    normalized_half = pl.cast(normalized, pl.FP16, mode="rint")
+                    normalized = pl.cast(normalized_half, pl.FP32)
                 bounded = pl.minimum(pl.maximum(normalized, -127.0), 127.0)
                 rounded = pl.cast(bounded, pl.INT32, mode="rint")
                 exact_half = pl.cast(rounded, pl.FP16, mode="rint")

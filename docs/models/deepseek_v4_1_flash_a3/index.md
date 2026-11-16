@@ -5,6 +5,9 @@ persistent generation session, bounded Decode operators, and a shared TP4
 40-layer network for Prefill and one-token Decode. See [Decode](decode.md) for its implementation scope and
 remaining work.
 
+See [Native vLLM-Ascend accuracy comparison](accuracy.md) for fixed
+TP4/DP4/EP16 prompt/Decode traces, full-vocabulary captures and CPU metrics.
+
 ## Development priorities
 
 - Performance target: complete-network correctness and continuous generation
@@ -134,6 +137,8 @@ No loading, compilation or token-latency guarantee follows from this organizatio
 Execution uses persistent ChipWorkers, preloaded compute weights, cache
 allocations and HCCL groups for the complete stream. Input/output entries and both generation phases share the same worker
 registry and allocation owners.
+The single-process runtime creates EP, TP and DP communication domains with
+`HcclCommInitAll`, preserving logical-device order within each group.
 The streaming-weight diagnostic alternative and task-directory compiler reuse
 manifests are removed. Runtime dtype, shape, rank, alias, write-direction,
 source-version and lifecycle checks remain in force.
@@ -153,14 +158,17 @@ to `[K*(N/64), 64]`. `utils.pack_blocked_weight` performs only a byte reorder.
 `prepare_ecotech_dynamic_weight` and the expert loaders return this packed
 shape; callers must not pass the original `[K, N]` matrix to these builders.
 QKV channel scales retain the existing BF16-to-FP32 conversion, while expert
-loaders retain their original FP32 scales. Tail padding and scale multiplication
-order remain unchanged.
+loaders retain their original FP32 scales. At TP4, the shared expert prepares
+four independently padded 576-channel groups. Routed experts apply token-first
+FP32 Gate-Up scaling and FP16 activation requantization. See
+[numerical boundaries](accuracy.md#numerical-boundaries) for the generation
+network's shared and routed quantization rules.
 
 The QKV and shared-expert Torch reference interfaces accept these loader
 outputs directly and unpack only for reference computation. The QKV references
 also accept explicit `weight_layout="kn"` for the bounded Decode direct-tile
-entry. Shared-expert references restore the logical intermediate extent from
-the packed down operand without changing activation rounding. Routed-expert
+entry. Shared-expert references reconstruct each intermediate group from
+the packed down operand and apply its configured activation rounding. Routed-expert
 references continue to take the documented output-major checkpoint tensors;
 their separate NZ or blocked device operands are not interchangeable.
 
@@ -246,7 +254,10 @@ commands and the read/upload/cache-alias audit fields.
 
 ## Correctness scope
 
-Operator arithmetic, quantization, rounding and cache layouts remain unchanged.
+The generation network shares its Prefill and Decode numerical boundaries,
+including native TP shared-expert partitions and routed-expert rounding;
+see [accuracy comparison](accuracy.md#numerical-boundaries). Cache layouts and
+ownership remain unchanged.
 Operator-local checks use the [Golden Harness](../../run-and-validate/golden-harness.md).
 CPU goldens, imports and IR specialization do not establish NPU accuracy.
 Complete-network accuracy, dataset scores, full-model HBM residency and

@@ -9,6 +9,7 @@
 """Transport contiguous PyPTO route buckets through CANN memory and HCCL bytes."""
 
 import ctypes
+import logging
 import sys
 import time
 from contextlib import contextmanager
@@ -87,40 +88,47 @@ class CANNMemory:
 class HCCLBytes:
     """Exchange equal contiguous peer blocks without interpreting model tensors."""
 
-    @staticmethod
-    def root_info(memory):
-        """Create communicator bootstrap bytes in the coordinating process."""
+    @classmethod
+    def create_group(cls, memory, group_ranks):
+        """Create one single-process communication domain in logical-device order."""
+        ranks = list(group_ranks)
+        if not ranks or len(set(ranks)) != len(ranks) or any(type(rank) is not int or rank < 0 for rank in ranks):
+            raise ValueError("HCCL groups require distinct nonnegative logical device IDs")
         library = ctypes.CDLL("libhccl.so", mode=ctypes.RTLD_GLOBAL)
-        function = _bind(library, "HcclGetRootInfo", [ctypes.c_void_p])
-        root = ctypes.create_string_buffer(4108)
-        _check(function(root), "HcclGetRootInfo")
-        return root.raw
-
-    def __init__(self, memory, rank, world, group_ranks=None, *, root_info):
-        self.memory, self.rank, self.world = memory, rank, world
-        self.group_ranks = list(range(world)) if group_ranks is None else group_ranks
-        local_rank = self.group_ranks.index(rank)
-        memory.select(rank)
-        self.library = ctypes.CDLL("libhccl.so", mode=ctypes.RTLD_GLOBAL)
         pointer, u64, integer = ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int
-        _bind(self.library, "HcclGetRootInfo", [pointer])
-        _bind(self.library, "HcclCommInitRootInfo", [ctypes.c_uint32, pointer, ctypes.c_uint32, ctypes.POINTER(pointer)])
-        _bind(self.library, "HcclCommDestroy", [pointer])
-        _bind(self.library, "HcclAlltoAll", [pointer, u64, integer, pointer, u64, integer, pointer, pointer])
-        _bind(self.library, "HcclAllGather", [pointer, pointer, u64, integer, pointer, pointer])
-        _bind(self.library, "HcclReduceScatter", [pointer, pointer, u64, integer, integer, pointer, pointer])
-        self.stream, self.comm = pointer(), pointer()
-        _check(memory.library.aclrtCreateStream(ctypes.byref(self.stream)), "aclrtCreateStream")
+        init_types = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(pointer)]
+        initialize = _bind(library, "HcclCommInitAll", init_types)
+        _bind(library, "HcclCommDestroy", [pointer])
+        _bind(library, "HcclAlltoAll", [pointer, u64, integer, pointer, u64, integer, pointer, pointer])
+        _bind(library, "HcclAllGather", [pointer, pointer, u64, integer, pointer, pointer])
+        _bind(library, "HcclAllReduce", [pointer, pointer, u64, integer, integer, pointer, pointer])
+        _bind(library, "HcclReduceScatter", [pointer, pointer, u64, integer, integer, pointer, pointer])
+        devices, comms = (ctypes.c_int32 * len(ranks))(*ranks), (pointer * len(ranks))()
+        _check(initialize(len(ranks), devices, comms), "HcclCommInitAll")
+        channels = {}
         try:
-            root = ctypes.create_string_buffer(4108)
-            if len(root_info) != ctypes.sizeof(root):
-                raise ValueError("Invalid in-memory HCCL root information size")
-            ctypes.memmove(root, root_info, len(root_info))
-            arguments = [world, root, local_rank, ctypes.byref(self.comm)]
-            _check(self.library.HcclCommInitRootInfo(*arguments), "HcclCommInitRootInfo")
+            for index, rank in enumerate(ranks):
+                channel = cls(memory, rank, ranks, comms[index], library)
+                channels[rank] = channel
+                memory.select(rank)
+                _check(memory.library.aclrtCreateStream(ctypes.byref(channel.stream)), "aclrtCreateStream")
         except BaseException:
-            self.close()
+            for index, rank in enumerate(ranks):
+                try:
+                    if rank in channels:
+                        channels[rank].close()
+                    elif comms[index]:
+                        memory.select(rank)
+                        _check(library.HcclCommDestroy(comms[index]), "HcclCommDestroy")
+                except BaseException:
+                    logging.getLogger(__name__).exception("HCCL group initialization cleanup failed")
             raise
+        return channels
+
+    def __init__(self, memory, rank, group_ranks, comm, library):
+        self.memory, self.rank, self.world = memory, rank, len(group_ranks)
+        self.group_ranks, self.library = list(group_ranks), library
+        self.stream, self.comm = ctypes.c_void_p(), ctypes.c_void_p(comm)
         self.buffers_peak = 0
         self.transfers = []
 
@@ -129,7 +137,7 @@ class HCCLBytes:
         if value.device.type != "cpu" or not value.is_contiguous():
             raise ValueError("HCCL byte transport requires a contiguous CPU staging container")
         byte_count = value.numel() * value.element_size()
-        if not byte_count or (collective != "all_gather" and byte_count % self.world):
+        if not byte_count or (collective in ("all_to_all", "reduce_scatter") and byte_count % self.world):
             raise ValueError("Every rank must provide an equal nonempty block for every peer")
         if collective == "all_gather":
             received = torch.empty((self.world * value.shape[0], *value.shape[1:]), dtype=value.dtype)
@@ -137,6 +145,10 @@ class HCCLBytes:
             if value.dtype not in (torch.bfloat16, torch.float32) or value.shape[0] % self.world:
                 raise ValueError("Reduce-scatter requires equal BF16/FP32 row buckets")
             received = torch.empty((value.shape[0] // self.world, *value.shape[1:]), dtype=value.dtype)
+        elif collective == "all_reduce":
+            if value.dtype not in (torch.bfloat16, torch.float32):
+                raise ValueError("All-reduce requires BF16/FP32 values")
+            received = torch.empty_like(value)
         elif collective == "all_to_all":
             received = torch.empty_like(value)
         else:
@@ -158,18 +170,25 @@ class HCCLBytes:
                     status = self.library.HcclAlltoAll(*arguments)
                 elif collective == "all_gather":
                     status = self.library.HcclAllGather(send_buffer, recv_buffer, byte_count, 7, self.comm, self.stream)
+                elif collective == "reduce_scatter":
+                    dtype = 11 if value.dtype == torch.bfloat16 else 4
+                    count = received.numel()
+                    arguments = [send_buffer, recv_buffer, count, dtype, 0, self.comm, self.stream]
+                    status = self.library.HcclReduceScatter(*arguments)
                 else:
                     dtype = 11 if value.dtype == torch.bfloat16 else 4
                     count = received.numel()
-                    status = self.library.HcclReduceScatter(send_buffer, recv_buffer, count, dtype, 0, self.comm, self.stream)
+                    arguments = [send_buffer, recv_buffer, count, dtype, 0, self.comm, self.stream]
+                    status = self.library.HcclAllReduce(*arguments)
                 _check(status, "HCCL/" + collective)
                 _check(acl.aclrtSynchronizeStream(self.stream), "aclrtSynchronizeStream")
             self.memory.sample(self.rank, stage + "/execute")
             arguments = [received.data_ptr(), received_bytes, recv_buffer, received_bytes, 2]
             _check(acl.aclrtMemcpy(*arguments), "aclrtMemcpy/D2H")
+            reduction = collective in ("reduce_scatter", "all_reduce")
             self.transfers.append({"stage": stage, "bytes_per_peer": peer_bytes, "world": self.world,
                                    "shape": list(value.shape), "dtype": str(value.dtype), "collective": collective,
-                                   "transport_type": "BF16/FP32 SUM" if collective == "reduce_scatter" else "UINT8"})
+                                   "transport_type": "BF16/FP32 SUM" if reduction else "UINT8"})
         finally:
             if recv_buffer.value:
                 _check(acl.aclrtFree(recv_buffer), "aclrtFree/receive")

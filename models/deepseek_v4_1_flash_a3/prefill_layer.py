@@ -92,12 +92,17 @@ def make_prefill_layer_entries(
         final_unpack=make_sp_gather_unpack(capacity, 20480, tp),
         pre_unpack=make_sp_gather_unpack(capacity, 4, tp, pl.FP32, 4),
         router=make_moe_router(capacity, config, pl.FP32),
-        shared=make_shared_moe_w8a8(capacity, config, fused_activation=True, fused_channel_dtype=pl.FP32),
-        routed=make_shared_moe_w8a8(expert_capacity, config, fused_activation=True),
+        shared=make_shared_moe_w8a8(
+            capacity, config, fused_activation=True, fused_channel_dtype=pl.FP32, partitions=tp,
+        ),
+        routed=make_shared_moe_w8a8(
+            expert_capacity, config, fused_activation=True, fused_channel_dtype=pl.FP32,
+            token_first=True, fused_requantize=True,
+        ),
         dispatch_pack=make_ep_dispatch_pack(capacity, 5120, 384, 6, ep),
         dispatch_unpack=make_ep_dispatch_unpack(capacity, 5120, 384, 6, ep, expert_capacity),
         return_pack=make_ep_return_pack(capacity, 5120, 384, 6, ep, expert_capacity),
-        combine=make_moe_combine(capacity, 5120, 6, ep),
+        combine=make_moe_combine(capacity, 5120, 6, ep, weight_dtype=pl.BF16),
         mask_moe=make_sp_masked_zero(capacity, 5120),
         mask_output=make_sp_masked_zero(capacity, 20480),
     )
@@ -464,7 +469,12 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 ],
             )
             reduction[rank][case] = packed
-    scattered = exchange("attention-output-scatter", reduction, "reduce_scatter", "tp")
+    reduced = exchange("attention-output-reduce", reduction, "all_reduce", "tp")
+    scattered = [{} for _ in range(world)]
+    for rank in range(world):
+        begin = (rank % tp) * capacity
+        for case, value in reduced[rank].items():
+            scattered[rank][case] = value[begin : begin + capacity].contiguous()
     dispatch_packets = [{} for _ in range(world)]
     routes, packet_rows = capacity * 6, world * capacity * 6
     for case in batch["cases"]:

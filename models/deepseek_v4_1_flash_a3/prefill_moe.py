@@ -525,10 +525,12 @@ def make_route_restore(tokens):
     return route_restore
 
 
-def make_moe_combine(capacity, hidden=COMBINE_D, topk=COMBINE_TOPK, world=2):
+def make_moe_combine(capacity, hidden=COMBINE_D, topk=COMBINE_TOPK, world=2, *, weight_dtype=pl.FP32):
     """Restore returned token/top-k rows, weight experts, and add the shared result."""
     routes = capacity * topk
     packet_rows = world * routes
+    if weight_dtype not in (pl.FP32, pl.BF16):
+        raise ValueError("Route weights require FP32 or BF16 multiplication boundaries")
 
     @pl.jit
     def moe_combine(
@@ -542,6 +544,15 @@ def make_moe_combine(capacity, hidden=COMBINE_D, topk=COMBINE_TOPK, world=2):
         returned_routes: pl.InOut[pl.Tensor[[routes, 4], pl.INT64]],
         active: pl.Scalar[pl.INT32],
     ):
+        rounded_weights = pl.create_tensor([capacity, 16], dtype=pl.FP32)
+        for block in pl.spmd((active + 7) // 8, name_hint="moe_route_weight_cast"):
+            token_begin = block * 8
+            rows = pl.min(8, active - token_begin)
+            source = pl.slice(route_weights, [8, 16], [token_begin, 0], valid_shape=[rows, topk])
+            padded = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 8, 16)
+            rounded = pl.cast(padded, weight_dtype, mode="rint")
+            widened = pl.cast(rounded, pl.FP32)
+            rounded_weights[token_begin : token_begin + 8, :] = pl.set_validshape(widened, rows, 16)
         route_map = pl.create_tensor([routes, 8], dtype=pl.INT32)
         for _block in pl.spmd(1, name_hint="moe_ep_restore_metadata"):
             for original in pl.range(routes):
@@ -565,8 +576,9 @@ def make_moe_combine(capacity, hidden=COMBINE_D, topk=COMBINE_TOPK, world=2):
                 packet = pl.cast(pl.read(route_map, [route_row, 0]), pl.INDEX)
                 if packet >= 0:
                     value = pl.cast(packet_hidden[packet : packet + 1, :], pl.FP32)
-                    weight = pl.read(route_weights, [token, slot])
-                    acc = pl.add(acc, pl.mul(value, weight))
+                    weight = pl.read(rounded_weights, [token, slot])
+                    weighted = pl.mul(value, weight)
+                    acc = pl.add(acc, weighted)
             narrowed = pl.cast(acc, pl.BF16, mode="rint")
             routed[token : token + 1, :] = narrowed
             shared_row = pl.cast(shared[token : token + 1, :], pl.FP32)
@@ -577,7 +589,9 @@ def make_moe_combine(capacity, hidden=COMBINE_D, topk=COMBINE_TOPK, world=2):
     return moe_combine
 
 
-def _make_shared_activation(capacity, intermediate, limit, fused_activation, fused_channel_dtype=pl.FP16):
+def _make_shared_activation(
+    capacity, intermediate, limit, fused_activation, fused_channel_dtype=pl.FP16, token_first=False,
+):
     """Select fused channel precision or standalone BF16 activation rounding."""
     width = intermediate * 2
     tile = 256
@@ -652,14 +666,21 @@ def _make_shared_activation(capacity, intermediate, limit, fused_activation, fus
             gate_channels = pl.reshape(channels[column : column + tile], [1, tile])
             up_channels = pl.reshape(channels[up_column : up_column + tile], [1, tile])
             row_scale = pl.row_min(scales[token : token + SHARED_VEC_M_TILE, :])
-            gate_channel = pl.col_expand_mul(pl.cast(gate_i32, pl.FP32), gate_channels)
-            up_channel = pl.col_expand_mul(pl.cast(up_i32, pl.FP32), up_channels)
-            if fp16_channel:
+            if token_first:
+                gate_token = pl.row_expand_mul(pl.cast(gate_i32, pl.FP32), row_scale)
+                up_token = pl.row_expand_mul(pl.cast(up_i32, pl.FP32), row_scale)
+                gate = pl.col_expand_mul(gate_token, gate_channels)
+                up = pl.col_expand_mul(up_token, up_channels)
+            elif fp16_channel:
+                gate_channel = pl.col_expand_mul(pl.cast(gate_i32, pl.FP32), gate_channels)
+                up_channel = pl.col_expand_mul(pl.cast(up_i32, pl.FP32), up_channels)
                 gate_half = pl.cast(gate_channel, pl.FP16, mode="rint")
                 up_half = pl.cast(up_channel, pl.FP16, mode="rint")
                 gate = pl.row_expand_mul(pl.cast(gate_half, pl.FP32), row_scale)
                 up = pl.row_expand_mul(pl.cast(up_half, pl.FP32), row_scale)
             else:
+                gate_channel = pl.col_expand_mul(pl.cast(gate_i32, pl.FP32), gate_channels)
+                up_channel = pl.col_expand_mul(pl.cast(up_i32, pl.FP32), up_channels)
                 gate = pl.row_expand_mul(gate_channel, row_scale)
                 up = pl.row_expand_mul(up_channel, row_scale)
             gate = pl.set_validshape(pl.fillpad(gate, pad_value=pl.PadValue.zero), SHARED_VEC_M_TILE, tile)
@@ -677,7 +698,10 @@ def _make_shared_activation(capacity, intermediate, limit, fused_activation, fus
     return fp32_activation
 
 
-def make_shared_moe_w8a8_inline(capacity, config, *, fused_activation=False, fused_channel_dtype=pl.FP16):
+def make_shared_moe_w8a8_inline(
+    capacity, config, *, fused_activation=False, fused_channel_dtype=pl.FP16,
+    token_first=False, fused_requantize=False,
+):
     """Build gate/up, clamped SwiGLU and down with selected fused channel precision."""
     if fused_channel_dtype not in (pl.FP16, pl.FP32):
         raise ValueError("Fused channel scaling requires FP16 or FP32")
@@ -686,10 +710,12 @@ def make_shared_moe_w8a8_inline(capacity, config, *, fused_activation=False, fus
     gate_up_width = intermediate * 2
     limit = config["swiglu_limit"]
     activation_dtype = pl.FP32 if fused_activation else pl.BF16
-    activate = _make_shared_activation(capacity, intermediate, limit, fused_activation, fused_channel_dtype)
+    activate = _make_shared_activation(
+        capacity, intermediate, limit, fused_activation, fused_channel_dtype, token_first,
+    )
 
     quant_x = _shared_make_quantize(capacity, hidden)
-    quant_hidden = _shared_make_quantize(capacity, intermediate, activation_dtype)
+    quant_hidden = _shared_make_quantize(capacity, intermediate, activation_dtype, fused_requantize=fused_requantize)
     dot_gate_up = _shared_make_dot(capacity, hidden, gate_up_width)
     dot_down = _shared_make_dot(capacity, intermediate, hidden)
     channel_dtype = fused_channel_dtype if fused_activation else pl.FP32
@@ -725,29 +751,67 @@ def make_shared_moe_w8a8_inline(capacity, config, *, fused_activation=False, fus
     return shared_moe_w8a8_inline
 
 
-def make_shared_moe_w8a8(capacity, config, *, fused_activation=False, fused_channel_dtype=pl.FP16):
+def make_shared_moe_w8a8(
+    capacity, config, *, fused_activation=False, fused_channel_dtype=pl.FP16,
+    token_first=False, fused_requantize=False, partitions=1,
+):
     """Build a standalone JIT kernel for the shared expert."""
     hidden = config["hidden_size"]
-    intermediate = config["moe_intermediate_size"]
+    if partitions not in (1, 2, 4) or config["moe_intermediate_size"] % partitions:
+        raise ValueError("Shared expert partitions must divide the intermediate width")
+    local_width = config["moe_intermediate_size"] // partitions
+    intermediate = (local_width + 255) // 256 * 256
+    local_config = dict(config, moe_intermediate_size=intermediate)
     gate_up_width = intermediate * 2
     compute = make_shared_moe_w8a8_inline(
         capacity,
-        config,
+        local_config,
         fused_activation=fused_activation,
         fused_channel_dtype=fused_channel_dtype,
+        token_first=token_first,
+        fused_requantize=fused_requantize,
     )
 
     @pl.jit
     def shared_moe_w8a8(
         x: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
-        gate_up_weight: pl.Tensor[[hidden * (gate_up_width // 64), 64], pl.INT8],
-        gate_up_scale: pl.Tensor[[gate_up_width], pl.FP32],
-        down_weight: pl.Tensor[[intermediate * (hidden // 64), 64], pl.INT8],
+        gate_up_weight: pl.Tensor[[partitions * hidden * (gate_up_width // 64), 64], pl.INT8],
+        gate_up_scale: pl.Tensor[[partitions * gate_up_width], pl.FP32],
+        down_weight: pl.Tensor[[partitions * intermediate * (hidden // 64), 64], pl.INT8],
         down_scale: pl.Tensor[[hidden], pl.FP32],
         output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        compute(x, gate_up_weight, gate_up_scale, down_weight, down_scale, output, active)
+        if partitions == 1:
+            compute(x, gate_up_weight, gate_up_scale, down_weight, down_scale, output, active)
+        else:
+            partials = pl.create_tensor([partitions * capacity, hidden], dtype=pl.BF16)
+            for peer in pl.unroll(partitions):
+                gate_begin = peer * hidden * (gate_up_width // 64)
+                gate_end = gate_begin + hidden * (gate_up_width // 64)
+                down_begin = peer * intermediate * (hidden // 64)
+                down_end = down_begin + intermediate * (hidden // 64)
+                local_gate = gate_up_weight[gate_begin : gate_end, :]
+                local_scale = gate_up_scale[peer * gate_up_width : (peer + 1) * gate_up_width]
+                local_down = down_weight[down_begin : down_end, :]
+                local_output = partials[peer * capacity : (peer + 1) * capacity, :]
+                compute(x, local_gate, local_scale, local_down, down_scale, local_output, active)
+            for block in pl.spmd(((active + 7) // 8) * (hidden // 256), name_hint="shared_tp_reduce"):
+                token = block // (hidden // 256) * 8
+                column = block % (hidden // 256) * 256
+                rows = pl.min(8, active - token)
+                a = pl.cast(partials[token : token + 8, column : column + 256], pl.FP32)
+                b = pl.cast(partials[capacity + token : capacity + token + 8, column : column + 256], pl.FP32)
+                pair = pl.cast(pl.add(a, b), pl.BF16, mode="rint")
+                if partitions == 4:
+                    third = 2 * capacity + token
+                    fourth = 3 * capacity + token
+                    c = pl.cast(partials[third : third + 8, column : column + 256], pl.FP32)
+                    d = pl.cast(partials[fourth : fourth + 8, column : column + 256], pl.FP32)
+                    other = pl.cast(pl.add(c, d), pl.BF16, mode="rint")
+                    total = pl.add(pl.cast(pair, pl.FP32), pl.cast(other, pl.FP32))
+                    pair = pl.cast(total, pl.BF16, mode="rint")
+                output[token : token + 8, column : column + 256] = pl.set_validshape(pair, rows, 256)
         return x, output
 
     return shared_moe_w8a8
@@ -1041,7 +1105,7 @@ def golden_ep_return_pack(tensors):
             tensors["sent_hidden"][packet] = tensors["expert_y"][source]
 
 
-def golden_moe_combine(tensors):
+def golden_moe_combine(tensors, *, weight_dtype=torch.float32):
     """Evaluate the same ordered FP32 route reduction for standalone validation."""
     import torch
 
@@ -1062,13 +1126,17 @@ def golden_moe_combine(tensors):
             row = token * topk + slot
             if row in mapping:
                 value = tensors["packet_hidden"][mapping[row]].float()
-                acc += value * tensors["route_weights"][token, slot]
+                weight = tensors["route_weights"][token, slot].to(weight_dtype).float()
+                acc += value * weight
         routed = acc.to(torch.bfloat16)
         tensors["routed"][token] = routed
         tensors["output"][token] = (routed.float() + tensors["shared"][token].float()).to(torch.bfloat16)
 
 
-def golden_shared_moe_w8a8(tensors, *, fused_activation=False, fused_channel_dtype=pl.FP16):
+def golden_shared_moe_w8a8(
+    tensors, *, fused_activation=False, fused_channel_dtype=pl.FP16,
+    token_first=False, fused_requantize=False, partitions=1,
+):
     """Evaluate channel scaling, activation rounding and requantization for validation."""
     import torch
 
@@ -1076,36 +1144,51 @@ def golden_shared_moe_w8a8(tensors, *, fused_activation=False, fused_channel_dty
     if not active:
         return
 
-    def quantize(value):
+    def quantize(value, fused=False):
         value = value.float()
         maximum = value.abs().amax(-1, keepdim=True).clamp_min(1e-30)
-        scale = maximum * (1.0 / 127.0)
-        quantized = (value * (127.0 / maximum)).round().clamp(-127, 127).to(torch.int32)
+        if fused:
+            scale = maximum / 127.0
+            scaled = (value * scale.reciprocal()).to(torch.float16).float()
+        else:
+            scale = maximum * (1.0 / 127.0)
+            scaled = value * (127.0 / maximum)
+        quantized = scaled.round().clamp(-127, 127).to(torch.int32)
         return quantized, scale
 
-    def dot(payload, weight, channels, scale):
+    def dot(payload, weight, channels, scale, *, token_first=False):
         logical = unpack_blocked_weight(weight, payload.shape[-1], channels.numel())
         accumulator = payload @ logical.to(torch.int32)
+        if token_first:
+            return (accumulator.float() * scale) * channels.float()
         channel = accumulator.float() * channels.float()
         if fused_activation and fused_channel_dtype == pl.FP16:
             channel = channel.to(torch.float16).float()
         return channel * scale
 
-    payload, scale = quantize(tensors["x"][:active])
-    gate_up = dot(payload, tensors["gate_up_weight"], tensors["gate_up_scale"], scale)
-    if not fused_activation:
-        gate_up = gate_up.to(torch.bfloat16).float()
-    gate, up = gate_up.chunk(2, dim=-1)
-    gate, up = gate.clamp(max=10.0), up.clamp(-10.0, 10.0)
-    if fused_activation:
-        activation = (gate / (1.0 + torch.exp(-gate))) * up
-    else:
-        sigmoid = torch.sigmoid(gate).to(torch.bfloat16)
-        silu = (gate * sigmoid.float()).to(torch.bfloat16)
-        activation = (silu.float() * up).to(torch.bfloat16)
-    payload, scale = quantize(activation)
-    down = dot(payload, tensors["down_weight"], tensors["down_scale"], scale)
-    tensors["output"][:active] = down.to(torch.bfloat16)
+    parts = []
+    gates = tensors["gate_up_weight"].chunk(partitions, dim=0)
+    channels = tensors["gate_up_scale"].chunk(partitions)
+    downs = tensors["down_weight"].chunk(partitions, dim=0)
+    for gate_weight, gate_scale, down_weight in zip(gates, channels, downs):
+        payload, scale = quantize(tensors["x"][:active])
+        gate_up = dot(payload, gate_weight, gate_scale, scale, token_first=token_first)
+        if not fused_activation:
+            gate_up = gate_up.to(torch.bfloat16).float()
+        gate, up = gate_up.chunk(2, dim=-1)
+        gate, up = gate.clamp(max=10.0), up.clamp(-10.0, 10.0)
+        if fused_activation:
+            activation = (gate / (1.0 + torch.exp(-gate))) * up
+        else:
+            sigmoid = torch.sigmoid(gate).to(torch.bfloat16)
+            silu = (gate * sigmoid.float()).to(torch.bfloat16)
+            activation = (silu.float() * up).to(torch.bfloat16)
+        payload, scale = quantize(activation, fused_requantize)
+        down = dot(payload, down_weight, tensors["down_scale"], scale)
+        parts.append(down.to(torch.bfloat16))
+    while len(parts) > 1:
+        parts = [(a.float() + b.float()).to(torch.bfloat16) for a, b in zip(parts[::2], parts[1::2])]
+    tensors["output"][:active] = parts[0]
 
 
 def validate_moe_router(*, device=0, compile_only=False, platform="a2a3", sim=False):
@@ -1326,16 +1409,26 @@ def validate_shared_moe(*, device=0, compile_only=False, platform="a2a3", sim=Fa
 
     torch.manual_seed(41)
     capacity, hidden, intermediate = 16, 256, 256
-    config = {"hidden_size": hidden, "moe_intermediate_size": intermediate, "swiglu_limit": 10.0}
-    for fused, channel_dtype in ((False, pl.FP32), (True, pl.FP16), (True, pl.FP32)):
+    modes = [
+        dict(fused_activation=False, fused_channel_dtype=pl.FP32),
+        dict(fused_activation=True, fused_channel_dtype=pl.FP16),
+        dict(fused_activation=True, fused_channel_dtype=pl.FP32),
+        dict(fused_activation=True, fused_channel_dtype=pl.FP32, token_first=True, fused_requantize=True),
+        dict(fused_activation=True, fused_channel_dtype=pl.FP32, partitions=4),
+    ]
+    for mode in modes:
+        partitions = mode.get("partitions", 1)
+        config = dict(hidden_size=hidden, moe_intermediate_size=intermediate * partitions, swiglu_limit=10.0)
         for active in (0, 1, 7, 16):
             x = torch.randn(capacity, hidden, dtype=torch.bfloat16)
-            gate_up = pack_blocked_weight(torch.randint(-32, 33, (hidden, 2 * intermediate), dtype=torch.int8))
-            down = pack_blocked_weight(torch.randint(-32, 33, (intermediate, hidden), dtype=torch.int8))
+            gates = [torch.randint(-32, 33, (hidden, 2 * intermediate), dtype=torch.int8) for _ in range(partitions)]
+            downs = [torch.randint(-32, 33, (intermediate, hidden), dtype=torch.int8) for _ in range(partitions)]
+            gate_up = torch.cat([pack_blocked_weight(value) for value in gates])
+            down = torch.cat([pack_blocked_weight(value) for value in downs])
             specs = [
                 TensorSpec("x", list(x.shape), x.dtype, init_value=x),
                 TensorSpec("gate_up_weight", list(gate_up.shape), gate_up.dtype, init_value=gate_up),
-                TensorSpec("gate_up_scale", [2 * intermediate], torch.float32, init_value=0.002),
+                TensorSpec("gate_up_scale", [2 * intermediate * partitions], torch.float32, init_value=0.002),
                 TensorSpec("down_weight", list(down.shape), down.dtype, init_value=down),
                 TensorSpec("down_scale", [hidden], torch.float32, init_value=0.002),
                 TensorSpec("output", [capacity, hidden], torch.bfloat16, init_value=-12.5),
@@ -1343,25 +1436,15 @@ def validate_shared_moe(*, device=0, compile_only=False, platform="a2a3", sim=Fa
             ]
             result = run(
                 compile_only=compile_only,
-                fn=make_shared_moe_w8a8(
-                    capacity,
-                    config,
-                    fused_activation=fused,
-                    fused_channel_dtype=channel_dtype,
-                ),
+                fn=make_shared_moe_w8a8(capacity, config, **mode),
                 specs=specs,
-                golden_fn=partial(
-                    golden_shared_moe_w8a8,
-                    fused_activation=fused,
-                    fused_channel_dtype=channel_dtype,
-                ),
+                golden_fn=partial(golden_shared_moe_w8a8, **mode),
                 config={"backend_type": platform, "execution_mode": sim, "device_id": device},
                 rtol=0.05,
                 atol=0.05,
             )
             if not result.passed:
-                mode = f"fused={fused}, channel={channel_dtype}, active={active}"
-                raise RuntimeError(f"Expert validation failed: {mode}: {result.error}")
+                raise RuntimeError(f"Expert validation failed: {mode}, active={active}: {result.error}")
 
 
 def main():

@@ -27,3 +27,7 @@ entries. Arithmetic, rounding and cache semantics are preserved.
 See the [model documentation](../../docs/models/deepseek_v4_1_flash_a3/index.md),
 [Decode scope](../../docs/models/deepseek_v4_1_flash_a3/decode.md) and
 [module owners](MODULE_ALIGNMENT.md) for configuration, usage and current limits.
+
+The [native vLLM-Ascend accuracy workflow](../../docs/models/deepseek_v4_1_flash_a3/accuracy.md)
+uses fixed TP4/DP4/EP16 prompt/Decode traces and compares full-vocabulary logits,
+Top1 and TopK through the repository's `tools/` entries.

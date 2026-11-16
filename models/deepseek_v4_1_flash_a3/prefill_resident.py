@@ -360,7 +360,7 @@ class ResidentNetworkRuntime:
         schema = [(case, tuple(packet)) for case, packet in packets[0].items()]
         if any([(case, tuple(packet)) for case, packet in row.items()] != schema for row in packets):
             raise ValueError("Resident collective rank packet orders differ")
-        if collective not in ("all_gather", "all_to_all", "reduce_scatter"):
+        if collective not in ("all_gather", "all_to_all", "reduce_scatter", "all_reduce"):
             raise ValueError("Unsupported resident collective")
         groups = self._group_ranks(group)
         for ranks in groups:
@@ -375,24 +375,22 @@ class ResidentNetworkRuntime:
                                 or not value.is_contiguous() or value.ndim < 1 or value.numel() == 0
                                 or value.shape != reference.shape or value.dtype != reference.dtype):
                             raise ValueError("Resident collective peer tensor ABIs differ")
-                        if collective != "all_gather" and value.numel() * value.element_size() % len(ranks):
+                        partitioned = collective in ("all_to_all", "reduce_scatter")
+                        if partitioned and value.numel() * value.element_size() % len(ranks):
                             raise ValueError("Resident collective byte count does not divide across peers")
                         if collective == "reduce_scatter" and (
                                 value.dtype not in (torch.bfloat16, torch.float32) or value.shape[0] % len(ranks)):
                             raise ValueError("Resident reduce-scatter requires equal BF16/FP32 row buckets")
+                        if collective == "all_reduce" and value.dtype not in (torch.bfloat16, torch.float32):
+                            raise ValueError("Resident all-reduce requires BF16/FP32 values")
         if group not in self.channels:
             memory = CANNMemory(diagnostics=False)
             channels = {}
             for ranks in groups:
-                root_info = HCCLBytes.root_info(memory)
-
-                def connect(rank):
-                    channel = HCCLBytes(memory, rank, len(ranks), ranks, root_info=root_info)
+                connected = HCCLBytes.create_group(memory, ranks)
+                for channel in connected.values():
                     self._stack.callback(channel.close)
-                    return rank, channel
-
-                with ThreadPoolExecutor(max_workers=len(ranks)) as pool:
-                    channels.update(pool.map(connect, ranks))
+                channels.update(connected)
             self.channels[group] = channels
         channels, outputs = self.channels[group], [{} for _ in packets]
         begin = perf_counter()
