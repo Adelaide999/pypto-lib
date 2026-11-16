@@ -252,3 +252,6 @@ CPU goldens, imports and IR specialization do not establish NPU accuracy.
 Complete-network accuracy, dataset scores, full-model HBM residency and
 performance still require device evidence. Serving scheduler integration and independent full-network accuracy
 acceptance remain outside this generation entry.
+
+See [Serving integration](serving-integration.md) for the accepted version
+pair, request-pool interfaces, and validation still required after rebasing.
