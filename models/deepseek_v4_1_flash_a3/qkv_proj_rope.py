@@ -30,6 +30,7 @@ from .runtime_config import validate_tp
 from .utils import unpack_blocked_weight
 from .gemm import N_TILE as DECODE_QKV_N_TILE
 from .gemm import make_blocked_weight_pack
+from .quant import decode_quantize_per_token_int8
 
 
 # model config
@@ -1002,11 +1003,12 @@ def decode_qkv_reference(
     *,
     weight_layout: str = "blocked",
 ) -> dict[str, torch.Tensor]:
-    """CPU/PyTorch golden for the same boundaries as :func:`make_qkv_w8a8`.
+    """CPU/PyTorch golden for the same boundaries as :func:`make_decode_qkv_w8a8`.
 
     The returned tensors include the three projected BF16 values and the two
     RoPE outputs.  All matrix products use an explicit INT32 accumulator and
-    FP32 token/channel dequantization, matching ``W8A8_DYNAMIC``.
+    FP32 token/channel dequantization, matching ``W8A8_DYNAMIC``. Decode
+    quantization and dequantization retain the device's FP32 operation order.
     Weights use the loader's blocked layout; ``weight_layout="kn"`` selects
     logical ``[K, N]`` operands for direct-tile callers.
     """
@@ -1022,14 +1024,16 @@ def decode_qkv_reference(
             ("wkv", shape.hidden_size, shape.head_dim),
         ):
             weights[name] = unpack_blocked_weight(weights[name], input_width, output_width)
-    x_i8, x_scale = quantize_per_token_int8(value)
+    x_i8, x_scale = decode_quantize_per_token_int8(value)
     qa_i32 = int8_matmul(x_i8, weights["wq_a"].transpose(-2, -1).contiguous())
-    qa = (qa_i32.float() * x_scale.float() * weights["wq_a_scale"].float().reshape(1, -1)).to(torch.bfloat16)
+    qa_channels = qa_i32.float() * weights["wq_a_scale"].float().reshape(1, -1)
+    qa = (qa_channels * x_scale).to(torch.bfloat16)
     latent = decode_rms_norm_reference(qa, weights["q_norm_weight"], shape.rms_norm_eps)
 
-    q_i8, q_scale = quantize_per_token_int8(latent)
+    q_i8, q_scale = decode_quantize_per_token_int8(latent)
     qb_i32 = int8_matmul(q_i8, weights["wq_b"].transpose(-2, -1).contiguous())
-    qb = (qb_i32.float() * q_scale.float() * weights["wq_b_scale"].float().reshape(1, -1)).to(torch.bfloat16)
+    qb_scale = weights["wq_b_scale"].float().reshape(1, -1) * q_scale
+    qb = (qb_i32.float() * qb_scale).to(torch.bfloat16)
     query = decode_rope_reference(
         qb,
         cosine,
@@ -1040,9 +1044,8 @@ def decode_qkv_reference(
     )
 
     kv_i32 = int8_matmul(x_i8, weights["wkv"].transpose(-2, -1).contiguous())
-    kv_linear = (kv_i32.float() * x_scale.float() * weights["wkv_scale"].float().reshape(1, -1)).to(
-        torch.bfloat16
-    )
+    kv_channels = kv_i32.float() * weights["wkv_scale"].float().reshape(1, -1)
+    kv_linear = (kv_channels * x_scale).to(torch.bfloat16)
     kv_normed = decode_rms_norm_reference(kv_linear, weights["kv_norm_weight"], shape.rms_norm_eps)
     window_kv = decode_rope_reference(kv_normed, cosine, sine, 1, shape.head_dim, shape.qk_rope_head_dim)
     return {
