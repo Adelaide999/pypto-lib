@@ -100,6 +100,8 @@ def main(argv=None):
         before_decode = session.weights.counters()
         chunks = prefill.get("completed_prefill_chunks", [prefill])
         prefill_forward_seconds = sum(chunk["timings"]["chunk_seconds"] for chunk in chunks)
+        report.update(moe_slab_rows=session.program.moe_geometry[0]["slab_rows"],
+                      decode_moe_slab_rows=session.phase_programs[16].moe_geometry[0]["slab_rows"])
         report["timings"].update(
             prefill_call_seconds=prefill_call_seconds,
             compilation=prefill["compilation"],

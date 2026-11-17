@@ -128,7 +128,7 @@ Omitting `compiled` compiles inside the forward.
 | Attention packing | Inverse RoPE and head packet packing |
 | Output projection | Head unpack, grouped projection and reduction packing |
 | FFN dispatch | HC, normalization and router |
-| MoE slabs | 16 source rows per rank, EP dispatch, routed experts, return and combine |
+| MoE slabs | Bounded source slabs, EP dispatch, fused unpack/experts/return packing, and combine |
 | MoE finish | Valid-row masking and FFN HC post |
 | Head | SP unpack, RMSNorm and vocabulary projection |
 
@@ -170,11 +170,36 @@ unpack. All ranks execute the same number of slab collectives, including
 empty ranks. Slab token IDs are local to the current slice; combine writes
 into the original SP slice at the corresponding slab offset.
 
-Each source contributes at most 16 rows per MoE round. The per-peer bucket
-holds `16 * TopK` rows, and each hidden packet is 15 MiB per rank and direction.
-The per-expert bound is `min(DP * capacity, EP * 16)`: 64 rows at capacity 16
-and 256 rows at capacity 128. Shared computation retains the phase capacity.
-This is a communication workspace bound, not a total HBM measurement.
+Each compiled phase freezes a MoE slab width of 1, 2, 4, 8 or 16 from its
+initial valid SP row counts. The per-peer bucket holds `slab * TopK` rows.
+Per-expert storage rounds `min(DP * capacity, EP * slab)` up to a multiple of
+16. Later admissions reuse these bounds and execute as many rounds as their
+physical SP rows require; all ranks retain the same collective count.
+The separately compiled one-token Decode phase uses a one-row slab, a 960 KiB
+hidden packet per rank and direction, and 16 rows per expert. A full 128-token Prefill chunk retains
+16-row slabs, 15 MiB packets and 256 rows per expert. Shared computation
+retains the phase capacity. These are communication workspace bounds, not
+total HBM measurements.
+
+DP groups with no tokens skip local attention normalization, QKV, indexing,
+cache arithmetic and output projection. They supply initialized zero packets
+to the unchanged TP collectives and retain cache-version publication and EP
+expert participation. A TP lane without a local query still executes its KV
+work when its DP group has tokens.
+
+SP shards with no valid source tokens also skip FFN routing, shared experts,
+source packing, combine and FFN HC output computation. Their physical output
+rows are zeroed and their packet counts remain zero. Every EP rank still
+receives routes; a nonempty received bucket runs unpack, grouped experts and
+return packing in one L2 region, even when that rank's DP group is empty.
+Received route metadata is checked against the per-expert capacity before
+the fused region executes. Ranks with no received routes skip that region.
+
+Device collectives enqueue every packet field in the same order on each
+rank's communication stream and synchronize once after the batch. Source and
+destination allocations remain owned until the batch completes or failure
+cleanup drains the stream. MoE routes, hidden payloads and counts retain their
+separate tensor layouts and collective calls.
 
 Intermediate CPU tensors describe device-owned storage. Activations and HCCL
 payloads stay on device; integer controls and final logits are explicitly read
@@ -189,6 +214,14 @@ Host descriptors must not be mutated after the device becomes authoritative.
 Runtime receipts include per-rank transfer totals, workspace requests, reuse
 counts and device fill bytes. Device fill bytes are separate from H2D bytes;
 the aggregate transfer counters and their per-rank sums share one lock.
+
+Per-chunk `execution.json` schema 2 stores dynamic timings and communication
+receipts. Its `static_audit` references include paths and SHA256 digests for
+the generation's `weight-audit.json` and the phase program's
+`execution-audit.json`. Checkpoint reads and host weight accounting are
+written once per generation; full compiled layer bindings and compiler
+receipts are written once per phase. The referenced files retain the complete
+audit data without repeating it in each token report.
 
 The pinned PyPTO worker retains at most 64 callable registrations. Completed
 registrations are retired through the underlying simpler worker before a slot

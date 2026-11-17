@@ -270,7 +270,8 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 normed,
                 physical,
             ]
-            execute("collapse_norm", rank, case, arguments, outputs, ("hc_pre", "attention_norm"))
+            if total:
+                execute("collapse_norm", rank, case, arguments, outputs, ("hc_pre", "attention_norm"))
             states[rank][case] = dict(
                 original=original,
                 physical=physical,
@@ -296,6 +297,9 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             original = originals[rank]
             state = states[rank][case]
             physical, total = state["physical"], state["total"]
+            if not total:
+                head_packets[rank][case] = zeros(rank, tp * capacity, head_width)
+                return
             full_norm = zeros(rank, capacity, 5120)
             execute(
                 "sp_unpack",
@@ -456,6 +460,9 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
         def project_rank(rank):
             state, tp_rank = states[rank][case], rank % tp
             total, physical = state["total"], state["physical"]
+            if not total:
+                reduction[rank][case] = zeros(rank, tp * capacity, 5120)
+                return
             heads, woa, wob = (
                 zeros(rank, capacity, head_width),
                 zeros(rank, capacity, output_width),
@@ -499,13 +506,19 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
         def route_rank(rank):
             state = states[rank][case]
             physical = state["physical"]
-            changed = zeros(rank, capacity, 4, 5120)
             buffers = runtime.get("layer_buffers")
             if buffers is None:
                 output = torch.full((capacity, 4, 5120), runtime["output_sentinel"], dtype=torch.bfloat16)
                 pre = zeros(rank, capacity, 4, dtype=torch.float32)
             else:
                 output, pre = buffers(rank, case)
+            if not state["valid"]:
+                if physical:
+                    empty = zeros(rank, physical, 4, 5120)
+                    copy_runtime_tensor(runtime, output[:physical], empty, rank)
+                state.update(output_hidden=output, ffn_pre=zeros(rank, capacity, 4, dtype=torch.float32))
+                return
+            changed = zeros(rank, capacity, 4, 5120)
             post = zeros(rank, capacity, 4, dtype=torch.float32)
             comb, collapsed = zeros(rank, capacity, 4, 4, dtype=torch.float32), zeros(rank, capacity, 5120)
             normed, router_input = zeros(rank, capacity, 5120), zeros(rank, capacity, 5120, dtype=torch.float32)
@@ -547,7 +560,8 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 returned_routes=allocate_runtime_tensor(runtime, (routes, 4), torch.int64, rank, fill=-1),
             )
     map_ranks(allocate_rank_slab)
-    rounds = (max(1, (capacity + tp - 1) // tp) + slab - 1) // slab
+    max_physical = max(record["SP_physical_rows"] for records in batch["cases"].values() for record in records)
+    rounds = max(1, (max_physical + slab - 1) // slab)
     for round_id in range(rounds):
         base = round_id * slab
         dispatch_packets = [{} for _ in range(world)]
@@ -556,9 +570,10 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 state, work = states[rank][case], slab_work[rank][case]
                 packet = {name: work[name] for name in ("routes", "hidden", "counts")}
                 valid = max(0, min(slab, state["valid"] - base))
-                arguments = [state["normed"][base:base + slab], state["route_ids"][base:base + slab],
-                             packet["routes"], packet["hidden"], packet["counts"], valid, rank]
-                execute("dispatch_pack", rank, case, arguments, packet, "dispatch_pack")
+                if state["valid"]:
+                    arguments = [state["normed"][base:base + slab], state["route_ids"][base:base + slab],
+                                 packet["routes"], packet["hidden"], packet["counts"], valid, rank]
+                    execute("dispatch_pack", rank, case, arguments, packet, "dispatch_pack")
                 dispatch_packets[rank][case] = packet
         map_ranks(pack_rank_slab)
         pending = None
@@ -572,6 +587,8 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 def execute_rank_shared(rank):
                     for case in batch["cases"]:
                         state = states[rank][case]
+                        if not state["valid"]:
+                            continue
                         shared_operands = expert_weights(rank, None)
                         arguments = [state["normed"], *shared_operands, state["shared"], state["physical"]]
                         execute("shared", rank, case, arguments, {"shared": state["shared"]}, "shared")
@@ -585,29 +602,34 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 state, work = states[rank][case], slab_work[rank][case]
                 valid_by_rank = [max(0, min(slab, states[source][case]["valid"] - base)) for source in range(world)]
                 controls = {name: read_runtime_control(runtime, packet[name], rank) for name in ("routes", "counts")}
-                expected_total = validate_received_routes(controls, rank, layout, routes, valid_by_rank)
+                expected_total = validate_received_routes(
+                    controls, rank, layout, routes, valid_by_rank, expert_capacity=expert_capacity,
+                )
+                returns[rank][case] = dict(routes=packet["routes"], hidden=work["sent"], counts=packet["counts"])
+                if expected_total == 0:
+                    continue
                 unpack_args = [packet["routes"], packet["hidden"], packet["counts"], work["recv_routes"],
                                work["recv_hidden"], work["expert_x"], work["expert_counts"], work["packet_map"],
                                work["total"], rank]
-                execute("dispatch_unpack", rank, case, unpack_args, {}, "dispatch_unpack")
+                with memory.interval(rank, "load", "grouped-experts"):
+                    if "grouped_expert" in weight_provider:
+                        expert_operands = weight_provider["grouped_expert"](rank)
+                    else:
+                        local_values = [expert_weights(rank, rank * local_experts + local)
+                                        for local in range(local_experts)]
+                        expert_operands = tuple(torch.cat([values[i] for values in local_values]) for i in range(4))
+                expert_args = [work["expert_x"], *expert_operands, work["expert_counts"], work["expert_y"]]
+                return_args = [work["expert_y"], packet["counts"], work["packet_map"], work["sent"]]
+                execute_region(runtime, "moe_experts_l2", rank, case, [
+                    ("dispatch_unpack", unpack_args, {}, "dispatch_unpack"),
+                    ("routed", expert_args, {"expert_output": work["expert_y"]}, "routed"),
+                    ("return_pack", return_args, {"return_hidden": work["sent"]}, "return_pack"),
+                ])
                 if int(read_runtime_control(runtime, work["total"], rank)[0]) != expected_total:
                     raise RuntimeError("Dispatch unpack lost received routes")
                 counts = read_runtime_control(runtime, work["expert_counts"], rank)
                 if bool(((counts < 0) | (counts > expert_capacity)).any()):
                     raise RuntimeError("Expert slab exceeded its proven per-round bound")
-                if expected_total > 0:
-                    with memory.interval(rank, "load", "grouped-experts"):
-                        if "grouped_expert" in weight_provider:
-                            expert_operands = weight_provider["grouped_expert"](rank)
-                        else:
-                            local_values = [expert_weights(rank, rank * local_experts + local)
-                                            for local in range(local_experts)]
-                            expert_operands = tuple(torch.cat([values[i] for values in local_values]) for i in range(4))
-                    arguments = [work["expert_x"], *expert_operands, work["expert_counts"], work["expert_y"]]
-                    execute("routed", rank, case, arguments, {"expert_output": work["expert_y"]}, "routed")
-                arguments = [work["expert_y"], packet["counts"], work["packet_map"], work["sent"]]
-                execute("return_pack", rank, case, arguments, {"return_hidden": work["sent"]}, "return_pack")
-                returns[rank][case] = dict(routes=packet["routes"], hidden=work["sent"], counts=packet["counts"])
         map_ranks(execute_rank_experts)
         returned = exchange(f"expert-return-r{round_id}", returns, "all_to_all", "ep", packets=True)
         def combine_rank_slab(rank):
@@ -615,6 +637,11 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 state, work = states[rank][case], slab_work[rank][case]
                 valid = max(0, min(slab, state["valid"] - base))
                 physical = max(0, min(slab, state["physical"] - base))
+                if valid == 0:
+                    counts = read_runtime_control(runtime, packet["counts"], rank)
+                    if bool((counts[:, 0] != 0).any()):
+                        raise RuntimeError("HCCL returned routes to an empty source slab")
+                    continue
                 controls = {name: read_runtime_control(runtime, packet[name], rank) for name in ("routes", "counts")}
                 route_ids = read_runtime_control(runtime, state["route_ids"][base:base + slab], rank)
                 validate_returned_routes(controls, rank, routes, route_ids, valid)
@@ -627,6 +654,10 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     def finish_rank_moe(rank):
         for case in batch["cases"]:
             state = states[rank][case]
+            if not state["valid"]:
+                final_hidden[rank][case], final_pre[rank][case] = state["output_hidden"], state["ffn_pre"]
+                state["padded_hidden"] = state["output_hidden"]
+                continue
             valid, physical = state["valid"], state["physical"]
             combined, output = state["combined"], state["output_hidden"]
             execute_region(runtime, "moe_finish_l2", rank, case, [
@@ -709,6 +740,13 @@ REGIONS = {
             ),
         ),
     ),
+    "moe_experts_l2": (
+        ("dispatch_unpack", ("packet_routes", "packet_hidden", "packet_counts", "recv_routes", "recv_hidden",
+                             "expert_x", "expert_counts", "packet_map", "received_total", "owner_rank")),
+        ("routed", ("expert_x", "gate_up_weight", "gate_up_scale", "down_weight", "down_scale",
+                    "expert_counts", "expert_y")),
+        ("return_pack", ("expert_y", "packet_counts", "packet_map", "sent_hidden")),
+    ),
     "moe_finish_l2": (
         ("mask_moe", ("combined", "valid", "physical")),
         ("hc_post", ("combined", "changed", "post", "comb", "output", "physical")),
@@ -718,7 +756,8 @@ REGIONS = {
 STAGE_REGIONS = {
     "embedding": ("input_l2",),
     "output": ("head_l2",),
-    "layer": ("qkv_l2", "attention_pack_l2", "output_projection_l2", "ffn_dispatch_l2", "moe_finish_l2"),
+    "layer": ("qkv_l2", "attention_pack_l2", "output_projection_l2", "ffn_dispatch_l2",
+              "moe_experts_l2", "moe_finish_l2"),
 }
 
 

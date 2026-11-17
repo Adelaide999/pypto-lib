@@ -9,7 +9,9 @@
 """CPU regressions for fixed-history full-vocabulary precision comparisons."""
 
 from copy import deepcopy
+import math
 from pathlib import Path
+from shutil import copytree
 from types import SimpleNamespace
 
 import pytest
@@ -105,6 +107,130 @@ def test_decode_regression_fails_cli_and_preserves_prefill(captures, tmp_path):
     assert not report["steps"][1]["top1_match"]
     assert not report["steps"][1]["logits_pass"]
     assert report["steps"][2]["logits_pass"]
+
+
+def test_step_error_quantile_coordinate_and_native_top1_margin():
+    actual = torch.tensor([0.75, 1.0, 0.0, 2.0])
+    expected = torch.tensor([1.0, 0.875, 0.0, 0.0])
+    row = accuracy.step_metrics(actual, expected, trace_token=2, topk=1)
+    assert row["rmse"] == pytest.approx(math.sqrt(4.078125 / 4))
+    assert row["relative_l2"] == pytest.approx(math.sqrt(4.078125 / 1.765625))
+    assert row["p99_abs_error"] == pytest.approx(1.9475)
+    assert row["max_abs_error_token_id"] == 3
+    assert row["worst_token_actual_logit"] == 2
+    assert row["worst_token_reference_logit"] == 0
+    assert row["worst_token_signed_error"] == 2
+    assert row["reference_top1_top2_margin"] == 0.125
+    assert not row["top1_match"]
+
+
+def test_step_metrics_record_zero_norm_and_single_token_vocabulary():
+    row = accuracy.step_metrics(torch.tensor([-2.0]), torch.tensor([0.0]), trace_token=0, topk=1)
+    assert row["relative_l2"] == 2e12
+    assert row["reference_near_zero_norm"]
+    assert row["reference_l2_norm"] == 0
+    assert row["cosine_similarity"] is None
+    assert row["reference_top1_top2_margin"] is None
+    assert row["p99_abs_error"] == 2
+    assert row["worst_token_signed_error"] == -2
+    assert row["top1_match"]
+
+
+def test_report_summarizes_step_distribution_and_preserves_short_cases(captures):
+    actual, expected, logits = captures
+    for directory, shift in ((actual, 1), (expected, 0)):
+        manifest = accuracy.read_json(directory / "manifest.json")
+        case = {key: manifest["cases"][0][key] for key in ("id", "prompt_token_ids", "trace_token_ids")}
+        observed = logits + shift * torch.tensor([[0], [1], [2]])
+        short = dict(id="short", prompt_token_ids=[2], trace_token_ids=[4])
+        manifest["cases"] = [accuracy.save_case(directory, case, observed, 8),
+                             accuracy.save_case(directory, short, logits[:1] + 4 * shift, 8)]
+        manifest["expected_case_ids"].append("short")
+        accuracy.write_json(directory / "manifest.json", manifest)
+    report = accuracy.compare_captures(actual, expected, topk=3)
+    assert report["status"] == "measured"
+    assert report["summary"]["rmse"] == pytest.approx(dict(mean=1.75, p95=3.7, max=4))
+    assert report["by_case"]["trace"]["summary"]["rmse"] == pytest.approx(dict(mean=1, p95=1.9, max=2))
+    assert report["by_case"]["short"]["summary"]["rmse"] == dict(mean=4, p95=4, max=4)
+    assert "decode" not in report["by_case"]["short"]["by_phase"]
+    assert report["by_phase"]["decode"]["rmse"] == pytest.approx(dict(mean=1.5, p95=1.95, max=2))
+    worst = report["summary"]["worst_rmse"]
+    assert (worst["case_id"], worst["phase"], worst["step"], worst["context_length"]) == ("short", "prefill", 0, 1)
+    assert worst["value"] == 4
+    assert worst["max_abs_error_token_id"] == 0
+    assert worst["worst_token_signed_error"] == 4
+    assert report["captures"]["reference_manifest_sha256"] == accuracy.file_sha256(expected / "manifest.json")
+
+
+def test_report_hashes_the_supplied_manifest_path(captures):
+    actual, expected, _ = captures
+    custom_manifest = actual / "capture.json"
+    (actual / "manifest.json").rename(custom_manifest)
+    report = accuracy.compare_captures(custom_manifest, expected, topk=3)
+    assert report["captures"]["actual_manifest_sha256"] == accuracy.file_sha256(custom_manifest)
+
+
+def test_native_top1_tie_is_explicit():
+    row = accuracy.step_metrics(torch.tensor([0.0, 2.0]), torch.tensor([1.0, 1.0]), trace_token=1, topk=1)
+    assert row["reference_top1_top2_margin"] == 0
+    assert not row["top1_match"]
+
+
+@pytest.mark.parametrize("backend", ["pypto", "vllm-ascend"])
+def test_repeatability_measures_same_backend_by_phase(captures, tmp_path, backend):
+    actual, expected, logits = captures
+    first = actual if backend == "pypto" else expected
+    second = copytree(first, tmp_path / "repeat")
+    manifest = accuracy.read_json(second / "manifest.json")
+    case = {key: manifest["cases"][0][key] for key in ("id", "prompt_token_ids", "trace_token_ids")}
+    repeated = logits + torch.tensor([[0], [0.5], [0.25]])
+    manifest["cases"][0] = accuracy.save_case(second, case, repeated, manifest["vocab_size"])
+    accuracy.write_json(second / "manifest.json", manifest)
+    output = tmp_path / "repeatability.json"
+    assert accuracy.main(["repeatability", "--first", str(first), "--second", str(second),
+                          "--backend", backend, "--output", str(output), "--topk", "3"]) == 0
+    report = accuracy.read_json(output)
+    assert report["status"] == "measured"
+    assert report["comparison"] == "repeatability"
+    assert report["backend"] == backend
+    assert report["summary"]["rmse"]["mean"] == 0.25
+    assert report["by_phase"]["prefill"]["max_abs_error"] == 0
+    assert report["by_phase"]["decode"]["max_abs_error"] == 0.5
+    assert report["steps"][1]["worst_token_signed_error"] == -0.5
+    assert report["captures"]["reference_manifest_sha256"] == accuracy.file_sha256(second / "manifest.json")
+    assert all("logits_pass" not in row for row in report["steps"])
+
+
+def test_repeatability_preserves_native_accuracy_backend_restriction(captures, tmp_path):
+    actual, expected, _ = captures
+    second = copytree(actual, tmp_path / "repeat")
+    with pytest.raises(ValueError, match="wrong backend"):
+        accuracy.compare_captures(actual, second, topk=3)
+    with pytest.raises(ValueError, match="wrong backend"):
+        accuracy.measure_repeatability(actual, expected, backend="pypto", topk=3)
+
+
+@pytest.mark.parametrize("corruption", ["chunk_size", "contexts", "incomplete", "modified_logits"])
+def test_repeatability_rejects_mismatched_or_invalid_captures(captures, tmp_path, corruption):
+    actual, _, _ = captures
+    second = copytree(actual, tmp_path / "repeat")
+    if corruption == "chunk_size":
+        edit_manifest(second, lambda manifest: manifest.update(chunk_size=128))
+    elif corruption == "contexts":
+        edit_manifest(second, lambda manifest: manifest["cases"][0]["contexts"][1].append(6))
+    elif corruption == "incomplete":
+        edit_manifest(second, lambda manifest: manifest.update(status="running"))
+    else:
+        with (second / "trace.pt").open("ab") as stream:
+            stream.write(b"modified")
+    with pytest.raises(ValueError):
+        accuracy.measure_repeatability(actual, second, backend="pypto", topk=3)
+
+
+def test_repeatability_rejects_the_same_manifest(captures):
+    actual, _, _ = captures
+    with pytest.raises(ValueError, match="two independent captures"):
+        accuracy.measure_repeatability(actual, actual / "manifest.json", backend="pypto", topk=3)
 
 
 @pytest.mark.parametrize("field", ["checkpoint_identity", "case_spec_sha256", "checkpoint", "chunk_size"])

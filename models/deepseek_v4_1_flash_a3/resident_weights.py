@@ -8,11 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """One static checkpoint, host preparation and device bank per A3 generation."""
 
+from pathlib import Path
 from time import perf_counter
 
 from .cache import decode_cache_views
 
 from .weights import ResidentNetworkWeights
+from .utils import file_sha, write_json
 
 
 class A3ResidentWeights:
@@ -30,6 +32,7 @@ class A3ResidentWeights:
         self.initialization_timings = {}
         self.ready, self._closed = False, False
         self._frozen_counters = None
+        self.audit_reference = None
 
     @property
     def reader(self):
@@ -109,6 +112,16 @@ class A3ResidentWeights:
         """Reject checkpoint reads, host packing or static uploads in a token step."""
         if not self.ready or self.counters() != self._frozen_counters:
             raise RuntimeError("Static weights changed after generation session preload")
+
+    def write_audit(self, path):
+        """Persist the sealed checkpoint and host preparation receipts once."""
+        self.assert_static_unchanged()
+        if self.audit_reference is None:
+            path = Path(path).resolve()
+            write_json(path, dict(checkpoint_reads=self.reader.consumed, host_preparations=self.reader.preparations,
+                                  layer_host_weight_accounting=self.layer_receipts))
+            self.audit_reference = dict(path=str(path), sha256=file_sha(path))
+        return self.audit_reference
 
     def for_layer(self, layer):
         return self.prefill.for_layer(layer)

@@ -10,7 +10,7 @@ owners for linear algebra, quantization, normalization, RoPE and cache operation
 - `network.py`: shared TP4 program registry, layer execution and generation session.
 - `resident_weights.py`: one static weight owner and per-logical-weight audit.
 - `generate.py`: DP4/TP4/EP16 Prefill followed by one-token Decode on the same workers.
-- `prefill_layer.py`: concurrent rank stages and bounded 16-row MoE slabs.
+- `prefill_layer.py`: concurrent rank stages and bounded MoE slabs of up to 16 rows.
 - `prefill_resident.py`: persistent compute queues, device activations and HCCL transfers.
 - `decode_layer.py`: full-width Decode layer dispatch and SWA/Engram layer bodies.
 - `decode_swa.py`, `decode_c1a.py`, `decode_c2a.py`: Decode attention compositions.

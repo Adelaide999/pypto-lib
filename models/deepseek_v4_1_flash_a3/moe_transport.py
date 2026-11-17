@@ -189,21 +189,47 @@ class HCCLBytes:
             raise ValueError("Unsupported basic collective: " + collective)
         _check(status, "HCCL/" + collective)
 
-    def exchange_device(self, value, received, stage, collective="all_to_all"):
-        """Serialize device transfers with channel reuse and shutdown."""
+    def exchange_device_batch(self, transfers, collective="all_to_all"):
+        """Enqueue caller-owned fields in order and drain the channel once."""
         with self._lock:
             if self._closed:
                 raise RuntimeError("HCCL transport is closed")
             if self._pending:
                 raise RuntimeError("HCCL transport has undrained work; close it before reuse")
-            return self._exchange_device(value, received, stage, collective)
+            transfers = tuple(transfers)
+            if not transfers:
+                raise ValueError("Device collectives require at least one field")
+            for value, received, _ in transfers:
+                self._validate_device_transfer(value, received, collective)
+            self.memory.select(self.rank)
+            batch_bytes = sum(value.nbytes + received.nbytes for value, received, _ in transfers)
+            self.buffers_peak = max(self.buffers_peak, batch_bytes)
+            try:
+                with self.memory.interval(self.rank, "communication", transfers[0][2]):
+                    for value, received, stage in transfers:
+                        self.memory.sample(self.rank, stage + "/device")
+                        send_buffer = ctypes.c_void_p(value.data_ptr)
+                        recv_buffer = ctypes.c_void_p(received.data_ptr)
+                        output_count = received.nbytes // (2 if value.dtype == torch.bfloat16 else 4)
+                        self._enqueue_collective(
+                            send_buffer, recv_buffer, value.nbytes, output_count, value.dtype, collective,
+                        )
+                    _check(self.memory.library.aclrtSynchronizeStream(self.stream), "aclrtSynchronizeStream")
+                    self._pending = False
+            finally:
+                if self._pending:
+                    _check(self.memory.library.aclrtSynchronizeStream(self.stream), "aclrtSynchronizeStream/failure")
+                    self._pending = False
+            for value, received, stage in transfers:
+                self.transfers.append({
+                    "stage": stage, "bytes_per_peer": value.nbytes // self.world, "world": self.world,
+                    "shape": list(value.shape), "dtype": str(value.dtype), "collective": collective,
+                    "transport_type": "BF16/FP32 SUM" if collective in ("reduce_scatter", "all_reduce") else "UINT8",
+                    "host_staging": False,
+                })
 
-    def _exchange_device(self, value, received, stage, collective="all_to_all"):
-        """Exchange caller-owned device allocations after their producer completes.
-
-        The caller validates rank ownership and retains both allocations through
-        this synchronous call. This method does not allocate or copy host data.
-        """
+    def _validate_device_transfer(self, value, received, collective):
+        """Validate owning device allocations before any batch field is enqueued."""
         from pypto.runtime import DeviceTensor
 
         if not isinstance(value, DeviceTensor) or not isinstance(received, DeviceTensor):
@@ -235,26 +261,6 @@ class HCCLBytes:
             raise ValueError("Device collective output allocation has the wrong shape or byte extent")
         if max(value.data_ptr, received.data_ptr) < min(value.data_ptr + value.nbytes, received.data_ptr + received.nbytes):
             raise ValueError("Device collective input and output allocations overlap")
-        self.memory.select(self.rank)
-        self.buffers_peak = max(self.buffers_peak, value.nbytes + received.nbytes)
-        self.memory.sample(self.rank, stage + "/device")
-        send_buffer = ctypes.c_void_p(value.data_ptr)
-        recv_buffer = ctypes.c_void_p(received.data_ptr)
-        output_count = received.nbytes // (2 if value.dtype == torch.bfloat16 else 4)
-        try:
-            with self.memory.interval(self.rank, "communication", stage):
-                self._enqueue_collective(send_buffer, recv_buffer, value.nbytes, output_count, value.dtype, collective)
-                _check(self.memory.library.aclrtSynchronizeStream(self.stream), "aclrtSynchronizeStream")
-                self._pending = False
-        finally:
-            if self._pending:
-                _check(self.memory.library.aclrtSynchronizeStream(self.stream), "aclrtSynchronizeStream/failure")
-                self._pending = False
-        self.transfers.append({"stage": stage, "bytes_per_peer": value.nbytes // self.world, "world": self.world,
-                               "shape": list(value.shape), "dtype": str(value.dtype), "collective": collective,
-                               "transport_type": "BF16/FP32 SUM" if collective in ("reduce_scatter", "all_reduce") else "UINT8",
-                               "host_staging": False})
-        return received
 
     def exchange(self, value, stage, collective="all_to_all"):
         with self._lock:

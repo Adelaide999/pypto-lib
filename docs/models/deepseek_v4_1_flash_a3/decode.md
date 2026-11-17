@@ -6,6 +6,13 @@ static weight handles, HCCL groups and paged cache allocations. Prefill uses
 capacity 16 or 128; one-token Decode retains capacity 16.
 The scheduler remains on the host; model arithmetic runs on A3.
 
+The compiled MoE packet slab follows the admitted SP row count, up to 16,
+while per-expert buffers retain 16-row alignment. A separately compiled one-token Decode phase
+uses a one-row slab and 16 rows per expert. Empty DP groups skip their local
+attention work while retaining zero TP packets, collective participation and
+cache-version publication. TP lanes in an active DP group retain KV work
+even when they own no local query.
+
 ## Owners
 
 | Responsibility | Module |
@@ -75,7 +82,7 @@ hashing and gathering the small dynamic lookup rows remain CPU input
 preparation. This mode does not claim that the complete tables reside in HBM.
 The LM head, normalization and vocabulary shard assembly run on A3.
 
-`generation/result.json` records both runtime identities, checkpoint and
+`generation/result.json` records the Prefill and Decode slab widths, both runtime identities, checkpoint and
 static upload counts, per-step zero-load checks, expert ownership, cache
 pointer aliases, cleanup status and measured host wall times.
 The `timings` object separates static weight initialization, Prefill forward,

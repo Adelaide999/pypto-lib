@@ -41,7 +41,7 @@ def engine_kwargs(spec, *, chunk_size=16):
 def sampling_params(case):
     from vllm import SamplingParams
 
-    return SamplingParams(temperature=0.0, logprobs=-1, detokenize=False,
+    return SamplingParams(temperature=0.0, logprobs=-1, detokenize=False, max_tokens=len(case["trace_token_ids"]),
                           trace_decode_token_ids=list(case["trace_token_ids"]))
 
 

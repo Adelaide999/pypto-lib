@@ -896,6 +896,7 @@ class ResidentNetworkRuntime:
 
         def transfer(rank):
             channel = channels[rank]
+            transfers, destination_owners = [], []
             for case, names in schema:
                 outputs[rank][case] = {}
                 for name in names:
@@ -915,13 +916,17 @@ class ResidentNetworkRuntime:
                     destination = _device_view(owner["allocation"], received)
                     source_owner = self._value_owner(value, rank)
                     source = _device_view(source_owner["allocation"], value, source_owner.get("base_offset", 0))
-                    try:
-                        channel.exchange_device(source, destination, identity, collective)
-                    except BaseException:
-                        self.failed_ranks.add(rank)
-                        raise
-                    owner["device_written"] = True
+                    transfers.append((source, destination, identity))
+                    destination_owners.append(owner)
                     outputs[rank][case][name] = received
+            if transfers:
+                try:
+                    channel.exchange_device_batch(transfers, collective)
+                except BaseException:
+                    self.failed_ranks.add(rank)
+                    raise
+                for owner in destination_owners:
+                    owner["device_written"] = True
 
         self._exchange_rank_tasks(transfer, range(world))
         seconds = perf_counter() - begin
@@ -930,6 +935,8 @@ class ResidentNetworkRuntime:
         self.stats["transport_seconds"] += seconds
         receipts = [dict(rank=rank, backend="device CANN/HCCL", activation_staging=False, group_ranks=channels[rank].group_ranks,
                          collective=collective, stage=stage, seconds=seconds, files_used=False,
+                         field_count=sum(len(names) for _, names in schema),
+                         stream_waits_per_rank=sum(len(names) for _, names in schema) if host_control else 1,
                          memory=dict(scope="Transport buffers only; not total HBM or a peak",
                                      samples=[], intervals=[], transport_buffer_peak_bytes=channels[rank].buffers_peak))
                     for rank in range(world)]

@@ -230,9 +230,13 @@ def capture_pypto(spec, cases_path, output, *, chunk_size=16):
     return report
 
 
-def load_capture(path, backend):
+def capture_manifest_path(path):
     path = Path(path)
-    path = path / "manifest.json" if path.is_dir() else path
+    return path / "manifest.json" if path.is_dir() else path
+
+
+def load_capture(path, backend):
+    path = capture_manifest_path(path)
     capture = read_json(path)
     if capture.get("schema_version") != 1 or capture.get("status") != "complete":
         raise ValueError(f"{backend}: capture is incomplete or has an unsupported schema")
@@ -263,20 +267,32 @@ def load_logits(root, record, vocabulary):
 def step_metrics(actual, reference, trace_token, topk):
     actual, reference = actual.to(torch.float64), reference.to(torch.float64)
     delta = actual - reference
+    absolute_error = delta.abs()
+    worst_token = int(absolute_error.argmax())
     actual_logprob = actual.log_softmax(dim=-1)
     reference_logprob = reference.log_softmax(dim=-1)
     actual_topk = actual.topk(topk).indices.tolist()
     reference_topk = reference.topk(topk).indices.tolist()
-    norm = actual.norm() * reference.norm()
+    actual_norm, reference_norm = actual.norm(), reference.norm()
+    norm = actual_norm * reference_norm
     cosine = float(torch.dot(actual, reference) / norm) if float(norm) > 0 else None
-    relative_l2 = float(delta.norm() / reference.norm().clamp_min(1e-12))
+    relative_l2 = float(delta.norm() / reference_norm.clamp_min(1e-12))
     kl = float((reference_logprob.exp() * (reference_logprob - actual_logprob)).sum())
-    return dict(max_abs_error=float(delta.abs().max()), mean_abs_error=float(delta.abs().mean()),
+    reference_top2 = reference.topk(min(2, reference.numel())).values
+    reference_margin = float(reference_top2[0] - reference_top2[1]) if len(reference_top2) == 2 else None
+    return dict(max_abs_error=float(absolute_error[worst_token]), mean_abs_error=float(absolute_error.mean()),
+                p99_abs_error=float(absolute_error.quantile(0.99)), max_abs_error_token_id=worst_token,
+                worst_token_actual_logit=float(actual[worst_token]),
+                worst_token_reference_logit=float(reference[worst_token]),
+                worst_token_signed_error=float(delta[worst_token]),
                 rmse=float(delta.square().mean().sqrt()), relative_l2=relative_l2,
+                actual_l2_norm=float(actual_norm), reference_l2_norm=float(reference_norm),
+                reference_near_zero_norm=bool(reference_norm < 1e-12),
                 cosine_similarity=cosine, logprob_max_abs_error=float((actual_logprob - reference_logprob).abs().max()),
                 kl_reference_to_actual=max(0.0, kl),
                 top1_match=int(actual.argmax()) == int(reference.argmax()),
                 actual_top1=int(actual.argmax()), reference_top1=int(reference.argmax()),
+                reference_top1_top2_margin=reference_margin,
                 actual_topk=actual_topk, reference_topk=reference_topk,
                 topk_overlap=len(set(actual_topk).intersection(reference_topk)) / topk,
                 trace_token_id=trace_token, actual_trace_logprob=float(actual_logprob[trace_token]),
@@ -284,14 +300,44 @@ def step_metrics(actual, reference, trace_token, topk):
 
 
 def summarize(rows):
-    return dict(steps=len(rows), top1_agreement=sum(row["top1_match"] for row in rows) / len(rows),
-                mean_topk_overlap=sum(row["topk_overlap"] for row in rows) / len(rows),
-                max_abs_error=max(row["max_abs_error"] for row in rows),
-                max_logprob_abs_error=max(row["logprob_max_abs_error"] for row in rows))
+    summary = dict(steps=len(rows), top1_agreement=sum(row["top1_match"] for row in rows) / len(rows),
+                   mean_topk_overlap=sum(row["topk_overlap"] for row in rows) / len(rows),
+                   max_abs_error=max(row["max_abs_error"] for row in rows),
+                   max_logprob_abs_error=max(row["logprob_max_abs_error"] for row in rows),
+                   reference_near_zero_norm_steps=sum(row["reference_near_zero_norm"] for row in rows))
+    for metric in ("rmse", "relative_l2", "p99_abs_error"):
+        values = torch.tensor([row[metric] for row in rows], dtype=torch.float64)
+        summary[metric] = dict(mean=float(values.mean()), p95=float(values.quantile(0.95)), max=float(values.max()))
+    for metric in ("rmse", "relative_l2", "max_abs_error"):
+        worst = max(rows, key=lambda row: row[metric])
+        summary["worst_" + metric] = {key: worst[key] for key in (
+            "case_id", "phase", "step", "context_length", "max_abs_error_token_id",
+            "worst_token_actual_logit", "worst_token_reference_logit", "worst_token_signed_error",
+        )}
+        summary["worst_" + metric]["value"] = worst[metric]
+    return summary
 
 
 def compare_captures(actual_path, reference_path, *, topk=10, rtol=None, atol=None,
                      max_error_ratio=0.0, require_top1=False):
+    return _compare_captures(actual_path, reference_path, actual_backend="pypto", reference_backend="vllm-ascend",
+                             topk=topk, rtol=rtol, atol=atol, max_error_ratio=max_error_ratio,
+                             require_top1=require_top1)
+
+
+def measure_repeatability(first_path, second_path, *, backend, topk=10):
+    if backend not in ("pypto", "vllm-ascend"):
+        raise ValueError("Repeatability requires the pypto or vllm-ascend backend")
+    if capture_manifest_path(first_path).resolve() == capture_manifest_path(second_path).resolve():
+        raise ValueError("Repeatability requires two independent captures, not the same manifest")
+    report = _compare_captures(first_path, second_path, actual_backend=backend, reference_backend=backend,
+                               topk=topk)
+    report.update(comparison="repeatability", backend=backend)
+    return report
+
+
+def _compare_captures(actual_path, reference_path, *, actual_backend, reference_backend,
+                      topk=10, rtol=None, atol=None, max_error_ratio=0.0, require_top1=False):
     if (rtol is None) != (atol is None):
         raise ValueError("Supply both --rtol and --atol, or omit both for measurement only")
     for name, value in (("rtol", rtol), ("atol", atol), ("max_error_ratio", max_error_ratio)):
@@ -299,8 +345,8 @@ def compare_captures(actual_path, reference_path, *, topk=10, rtol=None, atol=No
             raise ValueError(f"{name} must be finite and nonnegative")
     if max_error_ratio > 1 or (rtol is None and max_error_ratio != 0):
         raise ValueError("An outlier ratio in [0,1] requires explicit tolerances")
-    actual_root, actual = load_capture(actual_path, "pypto")
-    reference_root, reference = load_capture(reference_path, "vllm-ascend")
+    actual_root, actual = load_capture(actual_path, actual_backend)
+    reference_root, reference = load_capture(reference_path, reference_backend)
     for key in ("case_spec_sha256", "checkpoint", "checkpoint_identity", "vocab_size", "chunk_size"):
         if not actual.get(key) or actual[key] != reference.get(key):
             raise ValueError(f"Capture {key} differs; the comparison would use different inputs or weights")
@@ -339,13 +385,23 @@ def compare_captures(actual_path, reference_path, *, topk=10, rtol=None, atol=No
     gated = comparator is not None or require_top1
     by_phase = {phase: summarize([row for row in rows if row["phase"] == phase])
                 for phase in ("prefill", "decode") if any(row["phase"] == phase for row in rows)}
+    by_case = {}
+    for case in actual["cases"]:
+        case_rows = [row for row in rows if row["case_id"] == case["id"]]
+        phases = {phase: summarize([row for row in case_rows if row["phase"] == phase])
+                  for phase in ("prefill", "decode") if any(row["phase"] == phase for row in case_rows)}
+        by_case[case["id"]] = dict(summary=summarize(case_rows), by_phase=phases)
+    capture_hashes = {}
+    for name, path in (("actual", actual_path), ("reference", reference_path)):
+        capture_hashes[name + "_manifest_sha256"] = file_sha256(capture_manifest_path(path))
     return dict(schema_version=1, status=("pass" if passed else "fail") if gated else "measured",
                 topology=TOPOLOGY, output_kind="raw_logits", case_spec_sha256=actual["case_spec_sha256"],
                 checkpoint=actual["checkpoint"], checkpoint_identity=actual["checkpoint_identity"],
                 chunk_size=actual["chunk_size"],
+                captures=capture_hashes,
                 policy=dict(rtol=rtol, atol=atol, max_error_ratio=max_error_ratio,
                             require_top1=require_top1, topk=topk),
-                summary=summarize(rows), by_phase=by_phase, steps=rows)
+                summary=summarize(rows), by_phase=by_phase, by_case=by_case, steps=rows)
 
 
 def main(argv=None):
@@ -370,6 +426,12 @@ def main(argv=None):
     compare.add_argument("--atol", type=float)
     compare.add_argument("--max-error-ratio", type=float, default=0.0)
     compare.add_argument("--require-top1", action="store_true")
+    repeat = commands.add_parser("repeatability", help="Measure two same-backend captures without accuracy gates")
+    repeat.add_argument("--first", type=Path, required=True)
+    repeat.add_argument("--second", type=Path, required=True)
+    repeat.add_argument("--backend", choices=("pypto", "vllm-ascend"), required=True)
+    repeat.add_argument("--output", type=Path, required=True)
+    repeat.add_argument("--topk", type=int, default=10)
     args = parser.parse_args(argv)
     try:
         if args.command == "prepare":
@@ -386,8 +448,11 @@ def main(argv=None):
         else:
             if args.output.exists():
                 raise FileExistsError("Comparison report already exists; use a new output path")
-            result = compare_captures(args.actual, args.reference, topk=args.topk, rtol=args.rtol, atol=args.atol,
-                                      max_error_ratio=args.max_error_ratio, require_top1=args.require_top1)
+            if args.command == "repeatability":
+                result = measure_repeatability(args.first, args.second, backend=args.backend, topk=args.topk)
+            else:
+                result = compare_captures(args.actual, args.reference, topk=args.topk, rtol=args.rtol, atol=args.atol,
+                                          max_error_ratio=args.max_error_ratio, require_top1=args.require_top1)
             write_json(args.output, result)
             print(json.dumps(dict(status=result["status"], **result["summary"], output=str(args.output))))
             return 1 if result["status"] == "fail" else 0

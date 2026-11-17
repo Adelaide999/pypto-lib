@@ -1263,11 +1263,12 @@ def validate_moe_router(*, device=0, compile_only=False, platform="a2a3", sim=Fa
                 )
 
 
-def validate_received_routes(packet, rank, layout, routes, valid_by_rank=None):
+def validate_received_routes(packet, rank, layout, routes, valid_by_rank=None, *, expert_capacity=None):
     """Check transported source, expert ownership and bounded bucket metadata."""
     counts = [int(packet["counts"][peer, 0]) for peer in range(layout.ep)]
     if any(not 0 <= count <= routes for count in counts):
         raise ValueError("HCCL received bucket count exceeds its fixed capacity")
+    expert_counts = {}
     for peer, count in enumerate(counts):
         for row in range(count):
             source, token, slot, expert = packet["routes"][peer * routes + row].tolist()
@@ -1275,6 +1276,9 @@ def validate_received_routes(packet, rank, layout, routes, valid_by_rank=None):
                 raise RuntimeError("HCCL delivered inconsistent route metadata")
             if valid_by_rank is not None and token >= valid_by_rank[peer]:
                 raise RuntimeError("HCCL dispatched a masked source row")
+            expert_counts[expert] = expert_counts.get(expert, 0) + 1
+    if expert_capacity is not None and any(count > expert_capacity for count in expert_counts.values()):
+        raise RuntimeError("Received routes exceed the proven per-expert slab bound")
     return sum(counts)
 
 

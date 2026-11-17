@@ -131,16 +131,33 @@ def _merge_inputs(inputs, cache):
     return dict(inputs, **cache)
 
 
-def network_layer_geometry(provider, topology, layer_id):
+def network_layer_geometry(provider, topology, layer_id, moe_geometry=None):
     """Check the live routed row bound without rebuilding any operator IR."""
     geometry = provider.runtime_geometry()
     batch = provider.batch_for_layer(layer_id)
     total = max(sum(record["SP_valid_rows"] for record in records) for records in batch["cases"].values())
-    # One expert can receive every valid token once; SP shards partition each DP chunk.
     bound = geometry["capacity"] * topology["dp"]
     if total > bound:
         raise ValueError("Actual routed token rows exceed the compiled per-DP chunk capacity")
-    expert_capacity = min(bound, topology["ep"] * 16)
+    max_rows = max(record["SP_valid_rows"] for records in batch["cases"].values() for record in records)
+    slab = min(16, 1 << (max(1, max_rows) - 1).bit_length())
+    if moe_geometry is not None:
+        slab = moe_geometry["slab_rows"]
+    if not 1 <= slab <= min(16, geometry["capacity"]) or geometry["capacity"] % slab:
+        raise ValueError("Routed packet slab exceeds the compiled row capacity")
+    rounds = max(1, (max_rows + slab - 1) // slab)
+    routed_bound = max(
+        sum(max(0, min(slab, record["SP_valid_rows"] - base)) for record in records)
+        for records in batch["cases"].values()
+        for base in range(0, rounds * slab, slab)
+    )
+    expert_bound = min(bound, topology["ep"] * slab)
+    expert_capacity = max(16, (expert_bound + 15) // 16 * 16)
+    if moe_geometry is not None:
+        expert_capacity = moe_geometry["expert_capacity"]
+    if expert_capacity <= 0 or expert_capacity % 16 or routed_bound > expert_capacity:
+        raise ValueError("Actual routed expert rows exceed the compiled slab bound")
+    geometry = dict(geometry, moe_slab_rows=slab)
     return geometry, expert_capacity
 
 
@@ -179,7 +196,7 @@ def make_network_layer_entries(provider, config, topology, layer_id, definitions
         cache_layout=layout,
         role=role,
         network_cache=True,
-        moe_slab_rows=16,
+        moe_slab_rows=geometry["moe_slab_rows"],
     )
     definitions = make_network_l2_entries(entries, geometry["capacity"])
     if definitions_cache is not None:
@@ -187,7 +204,7 @@ def make_network_layer_entries(provider, config, topology, layer_id, definitions
     return definitions, geometry, expert_capacity
 
 
-def _compile_signature(provider, model_config, topology, engram_contracts):
+def _compile_signature(provider, model_config, topology, engram_contracts, moe_geometry):
     """Freeze all compile-time geometry and constants, excluding token values and live cache bytes."""
 
     def encode(value):
@@ -206,6 +223,7 @@ def _compile_signature(provider, model_config, topology, engram_contracts):
     )
     signature = dict(
         geometry=provider.runtime_geometry(),
+        moe_geometry=moe_geometry,
         layouts=provider.layouts,
         model=model_config,
         topology=topology,
@@ -227,9 +245,11 @@ class NetworkProgram:
         self.directory.mkdir(parents=True, exist_ok=False)
         self.stages, self._buckets = {}, {}
         self._specializations, self._layer_definitions = {}, {}
+        self.moe_geometry = {}
         self.records = []
         self.compile_seconds = 0.0
         self.ready = False
+        self.audit_reference = None
 
     def bind(self, stage, definitions):
         """Compile one stage or verify its existing specialization before reuse."""
@@ -282,8 +302,10 @@ class NetworkProgram:
 
     def compile(self, provider, model_config, topology, engram_contracts):
         """Compile embedding, forty complete layers, both Engram slots and the final head."""
-        signature = _compile_signature(provider, model_config, topology, engram_contracts)
         if self.ready:
+            for layer, moe_geometry in self.moe_geometry.items():
+                network_layer_geometry(provider, topology, layer, moe_geometry)
+            signature = _compile_signature(provider, model_config, topology, engram_contracts, self.moe_geometry)
             if signature != self._signature:
                 raise ValueError("The compiled network geometry or constants changed")
             return self
@@ -301,9 +323,13 @@ class NetworkProgram:
             )
             self.bind("validation", {"finite": make_finite_check(geometry["capacity"])})
             for layer in range(40):
-                definitions, _, _ = make_network_layer_entries(
+                definitions, layer_geometry, expert_capacity = make_network_layer_entries(
                     provider, text, topology, layer, self._layer_definitions
                 )
+                if "moe_slab_rows" in layer_geometry:
+                    self.moe_geometry[layer] = dict(
+                        slab_rows=layer_geometry["moe_slab_rows"], expert_capacity=expert_capacity,
+                    )
                 self.bind(f"layer{layer}", definitions)
             batch = provider.hash_batch()
             max_blocks = max(
@@ -343,12 +369,22 @@ class NetworkProgram:
                     "output",
                 ),
             )
-            self._signature = signature
+            self._signature = _compile_signature(provider, model_config, topology, engram_contracts, self.moe_geometry)
             self.ready = True
         finally:
             self.prepare_seconds = perf_counter() - begin
             write_json(self.directory / "compilation.json", self.summary())
         return self
+
+    def write_execution_audit(self, compiled):
+        """Persist complete layer bindings and compilation receipts once per phase."""
+        if not self.ready or set(compiled) != set(range(40)):
+            raise ValueError("A network execution audit requires all forty compiled layers")
+        if self.audit_reference is None:
+            path = self.directory / "execution-audit.json"
+            write_json(path, dict(compiled=compiled, compilation=self.summary()))
+            self.audit_reference = dict(path=str(path), sha256=file_sha(path))
+        return self.audit_reference
 
     def summary(self):
         """Report actual compiler work separately from device execution and accuracy."""
@@ -363,6 +399,7 @@ class NetworkProgram:
             stage_bindings=sum(map(len, self.stages.values())),
             layer_definition_specializations=len(self._layer_definitions),
             specialized_functions=len(self._specializations),
+            moe_geometry=self.moe_geometry,
             compile_seconds=self.compile_seconds,
             compile_phase="pypto_ir_pto_cpp_generation",
             device_binary_build_and_weight_loading="not_measured_here",
@@ -597,7 +634,8 @@ class NetworkExecutor:
         self.resident.release_values(keep)
 
     def for_layer(self, layer_id):
-        geometry, expert_capacity = network_layer_geometry(self.provider, self.topology, layer_id)
+        moe_geometry = self.program.moe_geometry[layer_id]
+        geometry, expert_capacity = network_layer_geometry(self.provider, self.topology, layer_id, moe_geometry)
         batch = self.provider.batch_for_layer(layer_id)
         if self.current_layer != layer_id:
             self.current_entries = None
@@ -614,7 +652,7 @@ class NetworkExecutor:
             enable_expert_parallel=True,
             capacity=geometry["capacity"],
             expert_capacity=expert_capacity,
-            moe_slab_rows=16,
+            moe_slab_rows=geometry["moe_slab_rows"],
             cache_blocks=geometry["cache_blocks"],
             requests=geometry["requests"],
             table_pages=geometry["table_pages"],
@@ -1010,8 +1048,7 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
         weights = A3ResidentWeights(contract["checkpoint"], topology, contract["model_config"], resident)
         stack.callback(weights.close)
         weights.preload_once(progress)
-        write_json(output / "weight-audit.json", dict(checkpoint_reads=weights.reader.consumed,
-                                                      host_preparations=weights.reader.preparations))
+        weights.write_audit(output / "weight-audit.json")
         for family, values in (("raw", provider.arenas), ("shared", provider.shared)):
             for rank, cases in enumerate(values):
                 for case, tensors in cases.items():
@@ -1222,11 +1259,12 @@ def run_network_chunk(
         write_json(
             output / "execution.json",
             dict(
+                schema_version=2,
                 at=datetime.now(timezone.utc).isoformat(),
                 outcome=f"executed_actual_full40_{phase}_pending_independent_comparison",
                 reports=reports,
-                compiled=executor.compiled,
-                compilation=program.summary(),
+                static_audit=dict(program=program.write_execution_audit(executor.compiled),
+                                  weights=weights.audit_reference),
                 timings=dict(
                     layers=layer_timings,
                     chunk_seconds=chunk_seconds,
@@ -1235,8 +1273,6 @@ def run_network_chunk(
                     checkpoint_read_seconds=weights.reader.read_seconds - initial_read_seconds,
                     checkpoint_read_calls=weights.reader.read_calls - initial_read_calls,
                 ),
-                consumed_checkpoint=weights.reader.consumed,
-                layer_host_weight_accounting=weights.layer_receipts,
                 memory_samples=memory.samples,
                 memory_intervals=memory.intervals,
                 capacity_verified_by_execution=False,

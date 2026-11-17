@@ -96,6 +96,10 @@ raw-logits mode; this collector stores that field as logits, then computes
 normalized log probabilities during CPU comparison. `prompt_logprobs` is
 incompatible with trace replay and is not requested.
 
+The collector sets `max_tokens` to the frozen trace length explicitly. Native
+request normalization can otherwise truncate a longer trace at the sampling
+parameter's default token limit.
+
 Only DP rank 0 receives a request. Other DP engines participate through native
 dummy batches for expert-parallel collectives. All TP ranks in DP rank 0
 receive the same IDs. Prefix caching, asynchronous scheduling and speculation
@@ -114,13 +118,21 @@ In the vLLM-Ascend environment, with this repository on `PYTHONPATH`:
 
 ```bash
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
-python -m tools.deepseek_v41_vllm_reference \
+ASCEND_RT_VISIBLE_DEVICES='' python -m tools.deepseek_v41_vllm_reference \
     --cases "$RUN_DIR/cases.json" --output "$RUN_DIR/reference" --check-config
 ```
 
 The vLLM check constructs its native `EngineArgs` configuration and validates
 trace replay and full-vocabulary sampling requests. It creates no workers,
 loads no model weights and verifies that the NPU remains uninitialized.
+Hide devices for this check because native plugin imports can otherwise probe
+Triton device properties and initialize the NPU. Apply the empty visibility
+only to the configuration command; capture uses the scheduler's allocation.
+The installed vLLM and vLLM-Ascend sources must both support V4.1, Engram,
+and native trace replay. A successful smoke test with another model or a
+matching package version alone does not establish these capabilities. An
+unsupported `engram_config` or `enable_trace_replay` argument is an environment
+mismatch; do not remove those settings to obtain a reference capture.
 
 ## Capture on allocated devices
 
@@ -166,11 +178,44 @@ python -m tools.deepseek_v41_accuracy compare \
     --output "$RUN_DIR/metrics.json" --topk 10
 ```
 
-The report contains per-step maximum/mean absolute error, RMSE, relative L2,
+The report contains per-step maximum/mean/p99 absolute error, RMSE, relative L2,
 cosine similarity, log-probability error, KL divergence, Top1 agreement, TopK
-overlap and trace-token log probabilities. Aggregates distinguish Prefill
-from Decode. The tool rejects differing inputs, histories, checkpoints,
+overlap and trace-token log probabilities. Errors and quantiles are computed
+in FP64; quantiles use linear interpolation. Each step records the worst
+vocabulary coordinate, both logits and their signed difference. Native
+Top1-to-Top2 margins retain ties as zero, including when `--topk 1` is used.
+A single-token vocabulary has no Top2 margin. Reference norms below `1e-12`
+are flagged, and relative L2 keeps its `1e-12` denominator floor.
+
+The overall, per-phase and per-case summaries contain the mean, p95 and
+maximum of step RMSE, relative L2 and p99 absolute error. Each summary also
+identifies its worst RMSE, relative-L2 and maximum-absolute-error step by case,
+phase, step and context length. The attached vocabulary coordinate is the
+largest absolute error within that step. Overall means weight every step
+equally; `by_case` preserves short cases and their phase summaries. Chunk size
+remains explicit in each report, and the report hashes both source manifests
+so baseline and candidate reports can be tied to the same native capture.
+
+The tool rejects differing inputs, histories, checkpoints,
 chunk sizes, incomplete vocabularies, modified artifacts and nonfinite data.
+
+Measure baseline run-to-run variation with two independently executed captures
+from the same backend, frozen cases, environment and chunk size:
+
+```bash
+python -m tools.deepseek_v41_accuracy repeatability \
+    --backend pypto --first "$RUN_DIR/pypto-repeat-1" \
+    --second "$RUN_DIR/pypto-repeat-2" --output "$RUN_DIR/pypto-repeatability.json"
+```
+
+Use `--backend vllm-ascend` for native repeats. This command shares the input,
+history and tensor-integrity checks and reports per-step, per-phase and per-case
+variation. Its `actual` fields refer to the first run and `reference` fields to
+the second; it always reports `measured`, without accuracy gates. The reports
+measure observed variation between those runs, not a statistical bound on future
+runs. Record and inspect both runs' full environment identities separately.
+The ordinary `compare` command still requires PyPTO against native vLLM-Ascend;
+do not relabel manifests to compare repeats or candidates.
 
 Without an explicit acceptance policy the status is `measured`, even when
 all values match. To obtain a `pass` or `fail` verdict, supply the agreed
