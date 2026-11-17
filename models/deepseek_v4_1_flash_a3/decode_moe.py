@@ -723,11 +723,11 @@ def golden_decode_shared_moe_w8a8(tensors, *, fused_activation=False):
     tensors["output"][:active] = down.to(torch.bfloat16)
 
 
-def validate_decode_moe_router(*, device=0, compile_only=False, platform="a2a3", sim=False):
-    """Validate text/vision routing, FP32 inputs, and untouched inactive rows."""
+def decode_moe_router_golden_cases(*, build=True):
+    """Cover text/vision Top6 routing with FP32 inputs and inactive rows."""
     from functools import partial
 
-    from golden import ScalarSpec, TensorSpec, run
+    from golden import ScalarSpec, TensorSpec
 
     torch.manual_seed(41)
     capacity, hidden, experts, topk = 16, 256, 384, 6
@@ -752,21 +752,38 @@ def validate_decode_moe_router(*, device=0, compile_only=False, platform="a2a3",
             TensorSpec("route_weights", [capacity, topk], torch.float32, init_value=-12.5),
             ScalarSpec("active", torch.int32, active),
         ]
+        case = dict(
+            name=f"decode-router-active{active}",
+            specs=specs,
+            golden_fn=partial(golden_decode_moe_router, config=config),
+            rtol=0.01,
+            atol=0.001,
+        )
+        if build:
+            case["fn"] = make_decode_moe_router(capacity, config)
+        yield case
+
+
+def validate_decode_moe_router(*, device=0, compile_only=False, platform="a2a3", sim=False):
+    """Validate text/vision routing, FP32 inputs, and untouched inactive rows."""
+    from golden import run
+
+    for case in decode_moe_router_golden_cases():
+        name = case.pop("name")
         result = run(
-            fn=make_decode_moe_router(capacity, config), specs=specs,
-            golden_fn=partial(golden_decode_moe_router, config=config), compile_only=compile_only,
+            **case,
+            compile_only=compile_only,
             config={"backend_type": platform, "execution_mode": sim, "device_id": device},
-            rtol=0.01, atol=0.001,
         )
         if not result.passed:
-            raise RuntimeError(f"Decode router validation failed: active={active}: {result.error}")
+            raise RuntimeError(f"Decode router validation failed: {name}: {result.error}")
 
 
-def validate_decode_shared_moe(*, device=0, compile_only=False, platform="a2a3", sim=False):
-    """Validate Decode shared experts with both activation boundaries and partial slabs."""
+def decode_shared_moe_golden_cases(*, build=True):
+    """Cover Decode W8A8 shared experts with both activation boundaries and inactive rows."""
     from functools import partial
 
-    from golden import ScalarSpec, TensorSpec, run
+    from golden import ScalarSpec, TensorSpec
 
     torch.manual_seed(41)
     capacity, hidden, intermediate = 16, 256, 256
@@ -789,15 +806,30 @@ def validate_decode_shared_moe(*, device=0, compile_only=False, platform="a2a3",
                 TensorSpec("output", [capacity, hidden], torch.bfloat16, init_value=-12.5),
                 ScalarSpec("active", torch.int32, active),
             ]
-            result = run(
-                fn=make_decode_shared_moe_w8a8(capacity, config, fused_activation=fused), specs=specs,
+            case = dict(
+                name=f"decode-shared-fused{int(fused)}-active{active}",
+                specs=specs,
                 golden_fn=partial(golden_decode_shared_moe_w8a8, fused_activation=fused),
-                compile_only=compile_only,
-                config={"backend_type": platform, "execution_mode": sim, "device_id": device},
                 rtol=0.05, atol=0.05,
             )
-            if not result.passed:
-                raise RuntimeError(f"Decode shared expert failed: fused={fused}, active={active}: {result.error}")
+            if build:
+                case["fn"] = make_decode_shared_moe_w8a8(capacity, config, fused_activation=fused)
+            yield case
+
+
+def validate_decode_shared_moe(*, device=0, compile_only=False, platform="a2a3", sim=False):
+    """Validate Decode shared experts with both activation boundaries and partial slabs."""
+    from golden import run
+
+    for case in decode_shared_moe_golden_cases():
+        name = case.pop("name")
+        result = run(
+            **case,
+            compile_only=compile_only,
+            config={"backend_type": platform, "execution_mode": sim, "device_id": device},
+        )
+        if not result.passed:
+            raise RuntimeError(f"Decode shared expert failed: {name}: {result.error}")
 
 
 def main():

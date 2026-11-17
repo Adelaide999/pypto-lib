@@ -514,8 +514,8 @@ def make_decode_hc(capacity, config):
     return hc_entry
 
 
-def golden_hc(tensors, *, config):
-    """Evaluate rounded projection weights, tiled FP32 sums and ordered HC mixing."""
+def golden_hc_pre(tensors, *, config, decode=False):
+    """Compute phase-specific HC projection, Sinkhorn mixes and incoming collapse."""
     import torch
 
     active = int(tensors["active"])
@@ -526,9 +526,11 @@ def golden_hc(tensors, *, config):
     x = tensors["x"][:active].float()
     hc, hidden = config["hc_mult"], config["hidden_size"]
     flat = x.reshape(active, hc * hidden)
-    bits = tensors["function"].contiguous().view(torch.int32).to(torch.int64)
-    rounded_bits = (((bits + 2048) >> 12) << 12).to(torch.int32)
-    weight = rounded_bits.contiguous().view(torch.float32)
+    weight = tensors["function"].float()
+    if not decode:
+        bits = weight.contiguous().view(torch.int32).to(torch.int64)
+        rounded_bits = (((bits + 2048) >> 12) << 12).to(torch.int32)
+        weight = rounded_bits.contiguous().view(torch.float32)
     squares = torch.zeros(active, dtype=torch.float32)
     for column in range(0, flat.shape[1], D_TILE):
         chunk = flat[:, column : column + D_TILE]
@@ -536,8 +538,11 @@ def golden_hc(tensors, *, config):
     inverse = torch.rsqrt(squares * (1.0 / flat.shape[1]) + config["rms_norm_eps"])
     channels = (hc + 2) * hc
     projected = torch.zeros((active, channels), dtype=torch.float32)
-    for column in range(0, flat.shape[1], PROJ_K_TILE):
-        product = flat[:, column : column + PROJ_K_TILE] @ weight[:, column : column + PROJ_K_TILE].T
+    projection_tile = D_TILE if decode else PROJ_K_TILE
+    for column in range(0, flat.shape[1], projection_tile):
+        source = flat[:, column:column + projection_tile]
+        weights = weight[:, column:column + projection_tile]
+        product = (source[:, None] * weights[None]).sum(-1) if decode else source @ weights.T
         projected = projected + product
     projected = projected * inverse[:, None]
     scale, base = tensors["scale"], tensors["base"]
@@ -563,20 +568,32 @@ def golden_hc(tensors, *, config):
     collapsed = torch.zeros((active, hidden), dtype=torch.float32)
     for stream in range(hc):
         collapsed = collapsed + x[:, stream] * tensors["incoming"][:active, stream, None]
-    merged = torch.empty_like(x)
-    for stream in range(hc):
-        value = tensors["sublayer"][:active].float() * post[:, stream, None]
-        for source in range(hc):
-            value = value + x[:, source] * comb[:, source, stream, None]
-        merged[:, stream] = value
     for name, value in (
         ("next_pre", pre),
         ("post", post),
         ("comb", comb),
         ("collapsed", collapsed),
-        ("merged", merged),
     ):
         tensors[name][:active] = value.to(tensors[name].dtype)
+
+
+def golden_hc_post(tensors):
+    """Expand the sublayer output and mix residual streams in FP32 order."""
+    active = int(tensors["active"])
+    x = tensors["x"][:active].float()
+    streams = x.shape[1]
+    for stream in range(streams):
+        value = tensors["sublayer"][:active].float() * tensors["post"][:active, stream, None]
+        for source in range(streams):
+            term = x[:, source] * tensors["comb"][:active, source, stream, None]
+            value = value + term
+        tensors["merged"][:active, stream] = value.to(tensors["merged"].dtype)
+
+
+def golden_hc(tensors, *, config):
+    """Evaluate Prefill HC coefficients, incoming collapse and residual mixing."""
+    golden_hc_pre(tensors, config=config)
+    golden_hc_post(tensors)
 
 
 def hc_prefix_compare(active):

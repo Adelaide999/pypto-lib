@@ -68,6 +68,82 @@ python -m models.deepseek_v4_1_flash_a3.decode_moe -p a2a3 --compile-only
 These commands compile bounded operator cases; they do not execute a network.
 Omit `--compile-only` on an allocated A3 device to run operator comparisons.
 
+## Operator CPU goldens
+
+Operator files own their Torch `golden_fn`, `TensorSpec` fixtures and
+`golden.run(..., compare_fn=...)` entries. CPU references reuse child
+operator references; they do not call the NPU runtime or CANN. PyPTO and
+CPU-capable PyTorch are still required to import the operator definitions.
+
+| Owner | Reference and bounded coverage |
+| --- | --- |
+| `input_pack.py`, `qkv_proj_rope.py` | Embedding, initial HC and BF16 projections |
+| `hc.py`, `swa.py`, `indexer.py` | HC mixing, paged attention and discrete selection |
+| `prefill_moe.py`, `decode_moe.py` | Phase-specific 384-expert/Top6 routing and W8A8 shared experts |
+| `engram.py` | Group32 INT8 lookup, Prefill hash/layout/gate and Host-prepared Decode rows |
+| `decode_swa.py` | Full-width HC, RMSNorm, W8A8 QKV/RoPE, paged SWA, inverse RoPE, BF16 output projections and residual mixing |
+
+The full-width SWA entry uses the existing `make_attention_kn_block` kernel
+and `golden_swa`; `build_swa_specs` constructs its KN weights, RoPE values,
+page-edge history, skipped publication slots and all-masked attention row.
+The default cases have 0, 1, 7 and 16 active rows at capacity 16. Numerical
+outputs retain `rtol=0.05, atol=0.05` with no failing-element allowance.
+Inactive InOut rows, positions, cache lengths and unmapped cache rows remain
+exact; the output projection explicitly clears its inactive output rows to zero.
+Only published cache rows use numerical comparison, through the harness's
+mapped-pool comparator.
+
+The Engram `decode-rows` entry validates the existing `make_decode_engram`
+kernel with `golden_decode_engram_rows` and `build_decode_engram_specs`.
+The Host has already looked up and dequantized the 24 table entries into
+6144 BF16 values per token. Those values enter the kernel as `lookup`;
+the kernel performs projection and original-basis gating. Its golden never
+moves a whole table into the kernel or performs a device lookup. Masked
+residuals and inactive rows are exact. The separate `decode-lookup` entry
+retains bounded legacy lookup coverage with the actual 256-value table row
+width and eight group32 scales.
+
+Compile or simulate the same operator entry without allocating an NPU:
+
+```bash
+python -m models.deepseek_v4_1_flash_a3.decode_swa -p a2a3 --active 7 --compile-only
+python -m models.deepseek_v4_1_flash_a3.decode_swa -p a2a3 --active 7 --sim
+python -m models.deepseek_v4_1_flash_a3.engram -p a2a3 --component decode-rows --active 7 --sim
+```
+
+To evaluate only the Torch reference, construct values from the owning specs
+and call its golden directly. This does not compile or execute a kernel:
+
+```python
+from golden import TensorSpec
+from models.deepseek_v4_1_flash_a3.decode_swa import build_swa_specs, golden_swa
+
+values = {
+    spec.name: spec.create_tensor().clone()
+    if isinstance(spec, TensorSpec) else spec.to_python()
+    for spec in build_swa_specs(active=7)
+}
+golden_swa(values)
+```
+
+The native SWA and Engram Decode-row entries accept `--save-data`,
+`--golden-data` and `--runtime-dir` for the standard harness workflow:
+
+```bash
+python -m models.deepseek_v4_1_flash_a3.decode_swa --active 7 --sim --save-data
+python -m models.deepseek_v4_1_flash_a3.decode_swa --active 7 --sim \
+  --golden-data build_output/<compiled-case>/data
+```
+
+Use the data directory printed by the first run. Replay requires an explicit
+active-row case and matching shapes, dtypes, scalar controls, weight layout
+and source contract. A standard harness `data/out` directory contains Torch
+expected outputs; it is not an actual NPU readback. Historical actual outputs
+are reusable only with every corresponding initial input buffer and the same
+operator ABI. Logs, token IDs or logits alone do not reconstruct these inputs.
+CPU reference evaluation and simulator comparisons do not establish physical
+NPU accuracy, distributed communication, whole-network accuracy or performance.
+
 ## Whole-network Prefill
 
 `prefill_fwd.prefill_fwd` executes embedding, initial HC, layers 0 through 39,

@@ -33,6 +33,17 @@ WINDOW_PAGE_ROWS = WINDOW_SIZE = 128
 SCHEDULE_INT32_MAX = (1 << 31) - 1
 
 
+def validate_golden_active(golden_data, active):
+    """Require saved runtime controls to match active-prefix comparator bounds."""
+    if golden_data is None:
+        return
+    saved = torch.load(Path(golden_data) / "in" / "active.pt", map_location="cpu", weights_only=True)
+    if not isinstance(saved, torch.Tensor) or saved.ndim != 0 or saved.dtype != torch.int32:
+        raise ValueError("Golden active.pt must be a scalar INT32 tensor")
+    if int(saved) != active:
+        raise ValueError(f"Golden active={int(saved)} does not match the selected active={active}")
+
+
 def allocate_runtime_tensor(runtime, shape, dtype, rank, *, fill=0):
     """Allocate initialized scratch through its execution owner's workspace bank."""
     allocate = runtime.get("workspace")

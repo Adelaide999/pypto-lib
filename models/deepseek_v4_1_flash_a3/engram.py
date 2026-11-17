@@ -18,7 +18,6 @@ import pypto.language as pl
 from .runtime_config import SPMD_WORKER_LIMIT
 import torch
 from .qkv_proj_rope import make_bf16_projection_staged
-from .config import FLASH
 
 D, HC, COLS, ROW_WIDTH = 5120, 4, 24, 256
 K, N = COLS * ROW_WIDTH, (HC + 1) * D
@@ -45,7 +44,6 @@ RESTORE_M_TILE = 16
 ENGRAM_D_TILE = 256
 
 
-DECODE_ATTENTION_WIDTH = FLASH.num_attention_heads * FLASH.head_dim
 DECODE_CAPACITY = 16
 
 
@@ -790,6 +788,8 @@ def golden_masked_gate_compare(active):
             return passed, detail
         token_mask = context["inputs"].get("token_mask")
         if token_mask is None:
+            token_mask = context["inputs"].get("mask")
+        if token_mask is None:
             token_mask = context["expected_outputs"]["token_mask"]
         masked = token_mask[:active] == 0
         if masked.any():
@@ -1187,9 +1187,9 @@ def make_decode_resident_int8_lookup(capacity, table_rows, columns=COLS, head_st
     @pl.jit
     def lookup_rows(
         staging_ids: pl.Tensor[[capacity, COLS], pl.INT32],
-        table: pl.Tensor[[table_rows, DECODE_ATTENTION_WIDTH], pl.INT8],
+        table: pl.Tensor[[table_rows, ROW_WIDTH], pl.INT8],
         table_scales: pl.Tensor[[table_rows, 8], pl.FP32],
-        lookup: pl.InOut[pl.Tensor[[capacity, columns * DECODE_ATTENTION_WIDTH], pl.BF16]],
+        lookup: pl.InOut[pl.Tensor[[capacity, columns * ROW_WIDTH], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
         for task in pl.spmd(active * columns, name_hint="engram_ecotech_i8_lookup"):
@@ -1206,7 +1206,7 @@ def make_decode_resident_int8_lookup(capacity, table_rows, columns=COLS, head_st
                         code_fp32 = pl.cast(code_half, pl.FP32)
                         scale = pl.read(table_scales, [row, group])
                         decoded = pl.cast(pl.mul(code_fp32, scale), pl.BF16, mode="rint")
-                start = column * DECODE_ATTENTION_WIDTH + group * 32
+                start = column * ROW_WIDTH + group * 32
                 lookup[token:token + 1, start:start + 32] = decoded
         return lookup
 
@@ -1225,7 +1225,7 @@ def make_decode_engram_ecotech(capacity, table_rows, rms_norm_eps=1e-20):
     @pl.jit
     def engram_ecotech(
         staging_ids: pl.Tensor[[capacity, COLS], pl.INT32],
-        table: pl.Tensor[[table_rows, DECODE_ATTENTION_WIDTH], pl.INT8],
+        table: pl.Tensor[[table_rows, ROW_WIDTH], pl.INT8],
         table_scales: pl.Tensor[[table_rows, 8], pl.FP32],
         wkv: pl.Tensor[[K, N], pl.BF16],
         channel_weight: pl.Tensor[[HC, D], pl.FP32],
@@ -1252,7 +1252,7 @@ def golden_decode_int8_lookup(tensors, *, head_start=0, row_start=0):
     """Evaluate guarded shard selection, group32 scaling and inactive rows."""
     active = int(tensors["active"])
     width = tensors["lookup"].shape[1]
-    columns = width // DECODE_ATTENTION_WIDTH
+    columns = width // ROW_WIDTH
     ids = tensors["staging_ids"][:active, head_start:head_start + columns]
     codes, scales = reference_int8_rows(ids, tensors["table"], tensors["table_scales"], row_start=row_start)
     values = codes.float().reshape(active, columns, 8, 32) * scales.reshape(active, columns, 8, 1)
@@ -1286,7 +1286,7 @@ def decode_engram_int8_golden_cases():
     from .qkv_proj_rope import golden_prefix_compare
 
     capacity, rows, row_start = 16, 19, 1_000_000_000
-    table = (torch.arange(rows * DECODE_ATTENTION_WIDTH).reshape(rows, DECODE_ATTENTION_WIDTH) % 256 - 128).to(torch.int8)
+    table = (torch.arange(rows * ROW_WIDTH).reshape(rows, ROW_WIDTH) % 256 - 128).to(torch.int8)
     table[:, :8] = torch.tensor([-128, -1, 1, 127, 2, -2, 64, -64], dtype=torch.int8)
     group_scales = torch.tensor([1.00390625, 0.007843137, 0.33333334, 1e-4, 2.5, 0.0, 1.99609375, 0.03125])
     table_scales = group_scales.repeat(rows, 1)
@@ -1298,9 +1298,9 @@ def decode_engram_int8_golden_cases():
         head_start = COLS - columns
         specs = [
             TensorSpec("staging_ids", [capacity, COLS], torch.int32, init_value=ids),
-            TensorSpec("table", [rows, DECODE_ATTENTION_WIDTH], torch.int8, init_value=table),
+            TensorSpec("table", [rows, ROW_WIDTH], torch.int8, init_value=table),
             TensorSpec("table_scales", [rows, 8], torch.float32, init_value=table_scales),
-            TensorSpec("lookup", [capacity, columns * DECODE_ATTENTION_WIDTH], torch.bfloat16, init_value=-12.5),
+            TensorSpec("lookup", [capacity, columns * ROW_WIDTH], torch.bfloat16, init_value=-12.5),
             ScalarSpec("active", torch.int32, active, compile_runtime=True),
         ]
         reference = partial(golden_decode_int8_lookup, head_start=head_start, row_start=row_start)
@@ -1381,15 +1381,111 @@ def make_decode_engram():
     return decode_engram
 
 
-if __name__ == "__main__":
+def golden_decode_engram_rows(tensors):
+    """Project Host-prepared BF16 rows, restore hidden basis and apply the residual gate."""
+    import torch
+    from .qkv_proj_rope import golden_bf16_projection
+
+    active = int(tensors["active"])
+    capacity = tensors["hidden"].shape[0]
+    if not 0 <= active <= capacity:
+        raise ValueError("Engram active rows must fit the actual capacity")
+    if not active:
+        return
+    projected = torch.empty((capacity, N), dtype=torch.bfloat16)
+    golden_bf16_projection(dict(
+        source=tensors["lookup"], weight=tensors["weight"], output=projected, num_tokens=active,
+    ))
+    values = dict(
+        hidden=tensors["hidden"], rotation_block=tensors["rotation"],
+        original=torch.empty((capacity, HC, HIDDEN), dtype=torch.float32), kv=projected,
+        channel_weight=tensors["channel_weight"], token_mask=tensors["mask"],
+        probabilities=torch.empty((capacity, HC), dtype=torch.float32),
+        output=tensors["output"], active=active,
+    )
+    golden_original_basis_hidden(values)
+    golden_original_basis_gate(values)
+
+
+def build_decode_engram_specs(active=7, *, seed=419):
+    """Build full-width Host-prepared rows, mixed token masks and inactive sentinels."""
+    import torch
+    from golden import ScalarSpec, TensorSpec
+
+    if not 0 <= active <= DECODE_CAPACITY:
+        raise ValueError("Engram active rows must be in [0, 16]")
+
+    def random_tensor(shape, dtype, offset, scale):
+        generator = torch.Generator().manual_seed(seed + offset)
+        return (torch.randn(shape, generator=generator) * scale).to(dtype)
+
+    def random_spec(name, shape, dtype, offset, scale):
+        return TensorSpec(name, shape, dtype, init_value=lambda: random_tensor(shape, dtype, offset, scale))
+
+    rotation, _ = torch.linalg.qr(random_tensor((32, 32), torch.float32, 4, 1.0))
+    mask = (torch.arange(DECODE_CAPACITY) % 3 != 1).to(torch.int32)
+    mask[active:] = -7
+    return [
+        random_spec("hidden", [DECODE_CAPACITY, HC, HIDDEN], torch.bfloat16, 0, 0.25),
+        random_spec("lookup", [DECODE_CAPACITY, K], torch.bfloat16, 1, 0.1),
+        random_spec("weight", [K, N], torch.bfloat16, 2, 0.01),
+        random_spec("channel_weight", [HC, HIDDEN], torch.float32, 3, 0.2),
+        TensorSpec("rotation", [32, 32], torch.float32, init_value=rotation.contiguous()),
+        TensorSpec("mask", [DECODE_CAPACITY], torch.int32, init_value=mask),
+        TensorSpec("output", [DECODE_CAPACITY, HC, HIDDEN], torch.bfloat16, init_value=-37.0),
+        ScalarSpec("active", torch.int32, active, compile_runtime=True),
+    ]
+
+
+def main(argv=None):
+    """Validate Engram lookup, Prefill state and Host-prepared Decode rows."""
     import argparse
+    from golden import run
+    from .utils import validate_golden_active
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", choices=("a2a3",), default="a2a3")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--sim", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
-    options = vars(parser.parse_args())
-    validate_engram_int8(**options)
-    validate_engram_observed(**options)
-    validate_prefill_engram(**options)
+    parser.add_argument("--component", choices=("all", "prefill", "decode-lookup", "decode-rows"), default="all")
+    parser.add_argument("--active", type=int, choices=range(17))
+    parser.add_argument("--seed", type=int, default=419)
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data")
+    parser.add_argument("--runtime-dir")
+    args = parser.parse_args(argv)
+    capture = args.save_data or args.golden_data or args.runtime_dir or args.active is not None
+    if capture and args.component != "decode-rows":
+        parser.error("capture and replay options require --component decode-rows")
+    if (args.golden_data or args.runtime_dir) and args.active is None:
+        parser.error("replay requires one explicit --active case")
+    validate_golden_active(args.golden_data, args.active)
+    options = dict(platform=args.platform, device=args.device, sim=args.sim, compile_only=args.compile_only)
+    if args.component in ("all", "prefill"):
+        validate_engram_int8(**options)
+        validate_engram_observed(**options)
+        validate_prefill_engram(**options)
+    if args.component in ("all", "decode-lookup"):
+        validate_decode_engram_int8(**options)
+    if args.component in ("all", "decode-rows"):
+        for active in (0, 1, 7, 16) if args.active is None else (args.active,):
+            result = run(
+                fn=make_decode_engram(),
+                specs=build_decode_engram_specs(active, seed=args.seed),
+                golden_fn=golden_decode_engram_rows,
+                compare_fn={"output": golden_masked_gate_compare(active)},
+                config=dict(backend_type=args.platform, execution_mode=args.sim, device_id=args.device),
+                compile_only=args.compile_only,
+                save_data=args.save_data,
+                golden_data=args.golden_data,
+                runtime_dir=args.runtime_dir,
+            )
+            if not result.passed:
+                raise SystemExit(result.error or 1)
+            if args.save_data and not args.compile_only:
+                print(f"[GOLDEN] data: {result.work_dir / 'data'}")
+
+
+if __name__ == "__main__":
+    main()

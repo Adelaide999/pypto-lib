@@ -1219,12 +1219,12 @@ def golden_shared_moe_w8a8(
     tensors["output"][:active] = parts[0]
 
 
-def validate_moe_router(*, device=0, compile_only=False, platform="a2a3", sim=False):
-    """Validate natural and controlled routing using the product router definition."""
+def moe_router_golden_cases(*, build=True):
+    """Cover natural and controlled Top6 routing with 384 experts and inactive rows."""
     from functools import partial
 
     import torch
-    from golden import ScalarSpec, TensorSpec, run
+    from golden import ScalarSpec, TensorSpec
 
     torch.manual_seed(41)
     capacity, hidden, experts, topk = 16, 256, 384, 6
@@ -1251,19 +1251,31 @@ def validate_moe_router(*, device=0, compile_only=False, platform="a2a3", sim=Fa
                 TensorSpec("route_weights", [capacity, topk], torch.float32, init_value=-12.5),
                 ScalarSpec("active", torch.int32, active),
             ]
-            result = run(
-                compile_only=compile_only,
-                fn=make_moe_router(capacity, settings),
+            case = dict(
+                name=f"router-controlled{int(controlled)}-active{active}",
                 specs=specs,
                 golden_fn=partial(golden_moe_router, config=settings),
-                config={"backend_type": platform, "execution_mode": sim, "device_id": device},
                 rtol=0.01,
                 atol=0.001,
             )
-            if not result.passed:
-                raise RuntimeError(
-                    f"Router validation failed: controlled={controlled}, active={active}: {result.error}"
-                )
+            if build:
+                case["fn"] = make_moe_router(capacity, settings)
+            yield case
+
+
+def validate_moe_router(*, device=0, compile_only=False, platform="a2a3", sim=False):
+    """Validate natural and controlled routing using the product router definition."""
+    from golden import run
+
+    for case in moe_router_golden_cases():
+        name = case.pop("name")
+        result = run(
+            **case,
+            compile_only=compile_only,
+            config={"backend_type": platform, "execution_mode": sim, "device_id": device},
+        )
+        if not result.passed:
+            raise RuntimeError(f"Router validation failed: {name}: {result.error}")
 
 
 def validate_received_routes(packet, rank, layout, routes, valid_by_rank=None, *, expert_capacity=None):
@@ -1432,12 +1444,12 @@ def validate_moe_combine(*, device=0, compile_only=False, platform="a2a3", sim=F
             raise RuntimeError(f"Combine validation failed: active={active}, valid={valid}: {result.error}")
 
 
-def validate_shared_moe(*, device=0, compile_only=False, platform="a2a3", sim=False):
-    """Validate standalone BF16 and fused FP16/FP32 channel boundaries."""
+def shared_moe_golden_cases(*, build=True):
+    """Cover W8A8 experts with BF16, FP16/FP32 and partitioned activation boundaries."""
     from functools import partial
 
     import torch
-    from golden import ScalarSpec, TensorSpec, run
+    from golden import ScalarSpec, TensorSpec
 
     torch.manual_seed(41)
     capacity, hidden, intermediate = 16, 256, 256
@@ -1448,7 +1460,7 @@ def validate_shared_moe(*, device=0, compile_only=False, platform="a2a3", sim=Fa
         dict(fused_activation=True, fused_channel_dtype=pl.FP32, token_first=True, fused_requantize=True),
         dict(fused_activation=True, fused_channel_dtype=pl.FP32, partitions=4),
     ]
-    for mode in modes:
+    for mode_index, mode in enumerate(modes):
         partitions = mode.get("partitions", 1)
         config = dict(hidden_size=hidden, moe_intermediate_size=intermediate * partitions, swiglu_limit=10.0)
         for active in (0, 1, 7, 16):
@@ -1466,17 +1478,31 @@ def validate_shared_moe(*, device=0, compile_only=False, platform="a2a3", sim=Fa
                 TensorSpec("output", [capacity, hidden], torch.bfloat16, init_value=-12.5),
                 ScalarSpec("active", torch.int32, active),
             ]
-            result = run(
-                compile_only=compile_only,
-                fn=make_shared_moe_w8a8(capacity, config, **mode),
+            case = dict(
+                name=f"shared-mode{mode_index}-active{active}",
                 specs=specs,
                 golden_fn=partial(golden_shared_moe_w8a8, **mode),
-                config={"backend_type": platform, "execution_mode": sim, "device_id": device},
                 rtol=0.05,
                 atol=0.05,
             )
-            if not result.passed:
-                raise RuntimeError(f"Expert validation failed: {mode}, active={active}: {result.error}")
+            if build:
+                case["fn"] = make_shared_moe_w8a8(capacity, config, **mode)
+            yield case
+
+
+def validate_shared_moe(*, device=0, compile_only=False, platform="a2a3", sim=False):
+    """Validate standalone BF16 and fused FP16/FP32 channel boundaries."""
+    from golden import run
+
+    for case in shared_moe_golden_cases():
+        name = case.pop("name")
+        result = run(
+            **case,
+            compile_only=compile_only,
+            config={"backend_type": platform, "execution_mode": sim, "device_id": device},
+        )
+        if not result.passed:
+            raise RuntimeError(f"Expert validation failed: {name}: {result.error}")
 
 
 def main():
