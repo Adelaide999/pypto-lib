@@ -113,7 +113,7 @@ def make_hc_pre_inline(capacity, config):
             mean = pl.mul(square_sum_tile, 1.0 / flat_width)
             argument = pl.add(mean, norm_eps)
             rsqrt_tmp = pl.create_tile([1, TOKEN_TILE], dtype=pl.FP32)
-            inverse_tile = pl.tile.rsqrt(argument, rsqrt_tmp)
+            inverse_tile = pl.tile.rsqrt(argument, rsqrt_tmp, high_precision=True)
             pl.store(inverse_tile, [token, 0], inverse)
 
         rounded_function = pl.create_tensor([channels, flat_width], dtype=pl.FP32)
