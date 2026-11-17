@@ -66,7 +66,7 @@ chat token IDs when testing chat inputs.
 
 The example's trace is a fixed history, not an expected answer. Each prompt
 and trace must be nonempty, the trace may contain at most 256 IDs, and their
-combined length must not exceed 2048 positions.
+combined length must not exceed 16384 positions.
 
 ## Align Prefill and Decode
 

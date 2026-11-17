@@ -19,12 +19,11 @@ from .config import FLASH
 from .cache import resolve_layer_role
 from .network import NetworkProgram, _merge_inputs, prepare_network_provider, run_network_runtime
 from .prefill_prepare import TokenChunkInputs, checkpoint_cache, tokenize_prompt
-from .runtime_config import configure_devices
+from .runtime_config import MAX_CONTEXT_TOKENS as MAX_CONTEXT, configure_devices
 from .utils import write_json
 
 
 TOPOLOGY = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
-MAX_CONTEXT = 2048
 
 
 def network_plan():
@@ -135,7 +134,7 @@ def main(argv=None):
     history = [int(item) for item in args.history_tokens.split(",")] if args.history_tokens else []
     tokens = [int(item) for item in args.tokens.split(",")]
     if args.decode_steps < 1 or not tokens or len(history) + len(tokens) + args.decode_steps - 1 > MAX_CONTEXT:
-        parser.error("Require positive steps within the 2048-position session reservation")
+        parser.error(f"Require positive steps within the {MAX_CONTEXT}-position session reservation")
     if not args.compile_only:
         configure_devices(args.devices, world=16)
     cache, config = checkpoint_cache(args.checkpoint, TOPOLOGY)

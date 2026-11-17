@@ -18,6 +18,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
 import pypto.language as pl
+from .runtime_config import SPMD_WORKER_LIMIT
 import torch
 from .config import FLASH as M
 from .gemm import make_dot, make_fp32_dequantize, make_int8_gemm
@@ -159,30 +160,30 @@ def make_bf16_projection_staged(width, output_width, *, capacity=None):
         num_tokens: pl.Scalar[pl.INT32],
     ):
         blocks = (num_tokens + M_TILE - 1) // M_TILE * (output_width // n_tile)
-        with pl.spmd(blocks, name_hint="prefill_bf16_projection_cube"):
-            block = pl.tile.get_block_idx()
-            row = block // (output_width // n_tile) * M_TILE
-            col = block % (output_width // n_tile) * n_tile
-            rows = pl.min(M_TILE, num_tokens - row)
-            owner = col // n_owner_tile
-            parity = owner % 2 * shift_enabled
-            phase = shift_step * ((owner // 2) % n_pairs)
-            acc = pl.create_tile([M_TILE, n_tile], dtype=pl.FP32)
-            first = (parity * (width // k_tile - 1) + phase) % (width // k_tile) * k_tile
-            initial_a = pl.load(source, [row, first], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Vec)
-            initial_b = pl.load(weight, [first, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
-            acc = pl.matmul_acc(acc, initial_a, initial_b, init_cond=True)
-            for step in pl.pipeline(1, width // k_tile, stage=2):
-                directed = step + parity * (width // k_tile - 1 - 2 * step)
-                physical = (directed + phase) % (width // k_tile)
-                k = physical * k_tile
-                a = pl.load(source, [row, k], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Mat)
-                b = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
-                acc = pl.matmul_acc(acc, a, b)
-            transferred = pl.mul(acc, 1.0)
-            transferred = pl.set_validshape(transferred, rows, n_tile)
-            narrowed = pl.cast(transferred, pl.BF16, mode="rint")
-            pl.store(narrowed, [row, col], output)
+        with pl.spmd(pl.min(blocks, SPMD_WORKER_LIMIT), name_hint="prefill_bf16_projection_cube"):
+            for block in pl.range(pl.tile.get_block_idx(), blocks, SPMD_WORKER_LIMIT):
+                row = block // (output_width // n_tile) * M_TILE
+                col = block % (output_width // n_tile) * n_tile
+                rows = pl.min(M_TILE, num_tokens - row)
+                owner = col // n_owner_tile
+                parity = owner % 2 * shift_enabled
+                phase = shift_step * ((owner // 2) % n_pairs)
+                acc = pl.create_tile([M_TILE, n_tile], dtype=pl.FP32)
+                first = (parity * (width // k_tile - 1) + phase) % (width // k_tile) * k_tile
+                initial_a = pl.load(source, [row, first], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Vec)
+                initial_b = pl.load(weight, [first, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                acc = pl.matmul_acc(acc, initial_a, initial_b, init_cond=True)
+                for step in pl.pipeline(1, width // k_tile, stage=2):
+                    directed = step + parity * (width // k_tile - 1 - 2 * step)
+                    physical = (directed + phase) % (width // k_tile)
+                    k = physical * k_tile
+                    a = pl.load(source, [row, k], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Mat)
+                    b = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                    acc = pl.matmul_acc(acc, a, b)
+                transferred = pl.mul(acc, 1.0)
+                transferred = pl.set_validshape(transferred, rows, n_tile)
+                narrowed = pl.cast(transferred, pl.BF16, mode="rint")
+                pl.store(narrowed, [row, col], output)
         return output
 
     return project
@@ -217,30 +218,30 @@ def make_prefill_grouped_output(tp=1):
         """Stage Wo-A values with Vector startup and fused BF16 Vector stores."""
         flat_weight = pl.reshape(weight, [LOCAL_O_WIDTH, O_GROUP_IN])
         blocks = (num_tokens + M_TILE - 1) // M_TILE * row_blocks
-        with pl.spmd(blocks, name_hint="prefill_grouped_o_a_cube", allow_early_resolve=True):
-            block = pl.tile.get_block_idx()
-            t0 = block // row_blocks * M_TILE
-            owner = block % row_blocks
-            group = owner // n_blocks
-            local_n = owner % n_blocks * n_tile
-            n0 = group * O_LORA + local_n
-            rows = pl.min(M_TILE, num_tokens - t0)
-            columns = pl.min(n_tile, O_LORA - local_n)
-            acc = pl.create_tile([M_TILE, n_tile], dtype=pl.FP32)
-            initial_a = pl.load(x, [t0, group * O_GROUP_IN], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Vec)
-            initial_w = pl.load(flat_weight, [n0, 0], [n_tile, k_tile], valid_shape=[columns, k_tile], target_memory=pl.Mem.Mat)
-            initial_w = pl.tile.transpose_view(initial_w)
-            acc = pl.matmul_acc(acc, initial_a, initial_w, init_cond=True)
-            for kb in pl.pipeline(1, O_GROUP_IN // k_tile, stage=4):
-                k0 = kb * k_tile
-                x_offset = group * O_GROUP_IN + k0
-                a = pl.load(x, [t0, x_offset], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Mat)
-                w = pl.load(flat_weight, [n0, k0], [n_tile, k_tile], valid_shape=[columns, k_tile], target_memory=pl.Mem.Mat)
-                w = pl.tile.transpose_view(w)
-                acc = pl.matmul_acc(acc, a, w)
-            value = pl.set_validshape(pl.mul(acc, 1.0), rows, columns)
-            narrowed = pl.cast(value, pl.BF16, mode="rint")
-            pl.store(narrowed, [t0, n0], output)
+        with pl.spmd(pl.min(blocks, SPMD_WORKER_LIMIT), name_hint="prefill_grouped_o_a_cube", allow_early_resolve=True):
+            for block in pl.range(pl.tile.get_block_idx(), blocks, SPMD_WORKER_LIMIT):
+                t0 = block // row_blocks * M_TILE
+                owner = block % row_blocks
+                group = owner // n_blocks
+                local_n = owner % n_blocks * n_tile
+                n0 = group * O_LORA + local_n
+                rows = pl.min(M_TILE, num_tokens - t0)
+                columns = pl.min(n_tile, O_LORA - local_n)
+                acc = pl.create_tile([M_TILE, n_tile], dtype=pl.FP32)
+                initial_a = pl.load(x, [t0, group * O_GROUP_IN], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Vec)
+                initial_w = pl.load(flat_weight, [n0, 0], [n_tile, k_tile], valid_shape=[columns, k_tile], target_memory=pl.Mem.Mat)
+                initial_w = pl.tile.transpose_view(initial_w)
+                acc = pl.matmul_acc(acc, initial_a, initial_w, init_cond=True)
+                for kb in pl.pipeline(1, O_GROUP_IN // k_tile, stage=4):
+                    k0 = kb * k_tile
+                    x_offset = group * O_GROUP_IN + k0
+                    a = pl.load(x, [t0, x_offset], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Mat)
+                    w = pl.load(flat_weight, [n0, k0], [n_tile, k_tile], valid_shape=[columns, k_tile], target_memory=pl.Mem.Mat)
+                    w = pl.tile.transpose_view(w)
+                    acc = pl.matmul_acc(acc, a, w)
+                value = pl.set_validshape(pl.mul(acc, 1.0), rows, columns)
+                narrowed = pl.cast(value, pl.BF16, mode="rint")
+                pl.store(narrowed, [t0, n0], output)
         return output
 
     return prefill_grouped_output

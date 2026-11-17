@@ -14,6 +14,7 @@ from copy import deepcopy
 from functools import lru_cache
 from pathlib import Path
 import pypto.language as pl
+from .runtime_config import SPMD_WORKER_LIMIT
 import torch
 from .swa import GATHER_TILE, make_swa_leaves
 from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY
@@ -471,25 +472,28 @@ def make_network_sparse_read(capacity, config, geometry):
         output: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        selected = pl.create_tensor([capacity * 640, head_dim], dtype=pl.BF16)
-        for block in pl.spmd(active * (640 // GATHER_TILE), name_hint="network_distinct_cache_gather"):
-            token = block // (640 // GATHER_TILE)
-            begin = block % (640 // GATHER_TILE) * GATHER_TILE
-            for group_lane in pl.pipeline(0, GATHER_TILE, stage=4):
-                lane = begin + group_lane
-                element = token * 640 + lane
-                index = pl.read(indices, [token, lane])
-                if index >= 0:
-                    page = pl.cast(index // 128, pl.INDEX)
-                    row = pl.cast(index % 128, pl.INDEX)
-                    if lane < 128:
-                        column = own_offset + row * head_dim
-                        selected[element : element + 1, :] = own_raw[page : page + 1, column : column + head_dim]
+        selected_rows = pl.max(active, 1) * 640
+        selected = pl.create_tensor([selected_rows, head_dim], dtype=pl.BF16)
+        block_count = active * (640 // GATHER_TILE)
+        for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='network_distinct_cache_gather'):
+            for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
+                token = block // (640 // GATHER_TILE)
+                begin = block % (640 // GATHER_TILE) * GATHER_TILE
+                for group_lane in pl.pipeline(0, GATHER_TILE, stage=4):
+                    lane = begin + group_lane
+                    element = token * 640 + lane
+                    index = pl.read(indices, [token, lane])
+                    if index >= 0:
+                        page = pl.cast(index // 128, pl.INDEX)
+                        row = pl.cast(index % 128, pl.INDEX)
+                        if lane < 128:
+                            column = own_offset + row * head_dim
+                            selected[element : element + 1, :] = own_raw[page : page + 1, column : column + head_dim]
+                        else:
+                            column = long_offset + row * head_dim
+                            selected[element : element + 1, :] = long_raw[page : page + 1, column : column + head_dim]
                     else:
-                        column = long_offset + row * head_dim
-                        selected[element : element + 1, :] = long_raw[page : page + 1, column : column + head_dim]
-                else:
-                    selected[element : element + 1, :] = pl.full([1, head_dim], dtype=pl.BF16, value=0.0)
+                        selected[element : element + 1, :] = pl.full([1, head_dim], dtype=pl.BF16, value=0.0)
         attend(query, selected, indices, sink, output, active)
         return output
 

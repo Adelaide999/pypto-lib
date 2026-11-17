@@ -23,6 +23,7 @@ from .quant import make_decode_dequantize as make_dequantize, make_decode_dynami
 from .rope import decode_rope_reference, make_decode_adjacent_rope as decode_indexer_projection_make_rope, make_decode_rope as decode_make_rope, make_rope, rope_reference
 from .gemm import N_TILE
 from .gemm import make_blocked_weight_pack
+from .runtime_config import MAX_CONTEXT_TOKENS
 
 
 # ``npu_dynamic_quant`` is nearest rounding for ordinary values, but an exact
@@ -54,7 +55,7 @@ DECODE_INDEX_SCALE_MIN = 2.0**-24
 # model config
 CANDIDATE_BLOCK_SIZE = 8
 CANDIDATE_TOPK_BLOCKS = 2048
-SCORE_WIDTH = 2048
+SCORE_WIDTH = MAX_CONTEXT_TOKENS
 POOL_CAPACITY = SCORE_WIDTH // CANDIDATE_BLOCK_SIZE
 
 
@@ -66,7 +67,7 @@ INDEX_TOPK = 512
 KEY_CAPACITY = 512
 KEY_TILE = 32
 HEAD_TILE = 16
-INDEXER_SELECT_KEY_CAPACITY = 2048
+INDEXER_SELECT_KEY_CAPACITY = SCORE_WIDTH
 SORT_TILE = 2048
 INDEX_WIDTH = 128
 WINDOW_SIZE = 128
@@ -609,9 +610,10 @@ def make_candidate_block_pool(
     if capacity <= 0 or capacity % 16:
         raise ValueError("candidate pool capacity must be a positive multiple of 16")
     if score_width != SCORE_WIDTH or topk_blocks != CANDIDATE_TOPK_BLOCKS:
-        raise ValueError("A2/A3 candidate pool uses a fixed 2048-row score bucket")
+        raise ValueError(f"A2/A3 candidate pool uses a fixed {SCORE_WIDTH}-row score bucket")
     if block_size != CANDIDATE_BLOCK_SIZE:
         raise ValueError("A2/A3 candidate blocks contain eight compressed rows")
+    POOL_SORT_TILE = 512 if POOL_CAPACITY <= 512 else 2048
 
     @pl.jit
     def kernel(
@@ -651,15 +653,17 @@ def make_candidate_block_pool(
                     pl.mul(pl.cast(pinned, pl.FP32), 1.0e30),
                 )
                 logical_ids = pl.sub(lanes, pl.mul(pl.add(lanes, 1), invalid))
-                sort_scores = pl.tile.full([1, POOL_CAPACITY], dtype=pl.FP32, value=-1.0e30)
+                sort_scores = pl.tile.full([1, POOL_SORT_TILE], dtype=pl.FP32, value=-1.0e30)
                 sort_scores = pl.tile.assemble(sort_scores, maxima, [0, 0])
-                sort_ids = pl.tile.full([1, POOL_CAPACITY], dtype=pl.INT32, value=-1)
+                sort_ids = pl.tile.full([1, POOL_SORT_TILE], dtype=pl.INT32, value=-1)
                 sort_ids = pl.tile.assemble(sort_ids, logical_ids, [0, 0])
-                sort_tmp = pl.tile.create([1, 2 * POOL_CAPACITY], dtype=pl.FP32)
+                sort_tmp = pl.tile.create([1, 2 * POOL_SORT_TILE], dtype=pl.FP32)
                 unsigned_ids = pl.reinterpret_view(sort_ids, pl.UINT32)
                 pairs = pl.tile.sort32(sort_scores, unsigned_ids, tmp=sort_tmp)
                 pairs = pl.tile.mrgsort(pairs, block_len=64)
                 pairs = pl.tile.mrgsort(pairs, block_len=256)
+                if POOL_SORT_TILE > 512:
+                    pairs = pl.tile.mrgsort(pairs, block_len=1024)
                 leading_pairs = pl.tile.slice(pairs, [1, 2 * POOL_CAPACITY], [0, 0])
                 sorted_ids = pl.tile.gather_mask(
                     leading_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
@@ -1068,14 +1072,15 @@ def make_prefill_indexer_select(
         raise ValueError("capacity must be a positive multiple of 16")
     if heads != INDEX_HEADS or head_dim != INDEX_HEAD_DIM:
         raise ValueError("A2/A3 QLI uses 32 heads x 128")
-    if key_capacity not in (512, 1024, 2048):
-        raise ValueError("A2/A3 QLI key_capacity must be 512, 1024 or 2048")
+    if key_capacity not in (512, 1024, 2048, 4096, 8192, 16384):
+        raise ValueError("A2/A3 QLI key_capacity must be 512, 1024, 2048, 4096, 8192 or 16384")
     if topk != INDEX_TOPK:
         raise ValueError(f"A2/A3 QLI uses fixed topk={INDEX_TOPK}")
     if compress_ratio not in (1, 2):
         raise ValueError("compress_ratio must be 1 or 2")
     KEY_ROWS_TILE = 512
     SORT_ROWS_TILE = 512 if key_capacity == 512 else SORT_TILE
+    LOAD_ROWS_TILE = min(key_capacity, SORT_ROWS_TILE)
 
     @pl.jit.inline
     def select_one(
@@ -1126,26 +1131,44 @@ def make_prefill_indexer_select(
             short_tail = pl.tile.full([1, topk - 32], dtype=pl.INT32, value=-1)
             pl.store(short_tail, [token, 32], indices)
         else:
-            # Use the smallest complete four-way merge tree for this key bucket.
-            actual_scores = pl.load(scores, [token, 0], [1, key_capacity])
-            row_raw = pl.tile.full([1, SORT_ROWS_TILE], dtype=pl.FP32, value=NEGATIVE_INF)
-            row_raw = pl.tile.assemble(row_raw, actual_scores, [0, 0])
-            absolute = pl.tile.arange(0, [1, SORT_ROWS_TILE], dtype=pl.INT32)
-            distance = pl.mul(pl.sub(absolute, pl.cast(visible, pl.INT32)), -1)
-            valid = pl.minimum(pl.maximum(distance, 0), 1)
-            invalid = pl.sub(pl.tile.full([1, SORT_ROWS_TILE], dtype=pl.INT32, value=1), valid)
-            valid_scores = pl.mul(row_raw, pl.cast(valid, pl.FP32))
-            invalid_scores = pl.mul(pl.cast(invalid, pl.FP32), NEGATIVE_INF)
-            row = pl.add(valid_scores, invalid_scores)
-            logical_ids = pl.sub(absolute, pl.mul(pl.add(absolute, 1), invalid))
-            sort_tmp = pl.tile.create([1, 2 * SORT_ROWS_TILE], dtype=pl.FP32)
-            pairs = pl.tile.sort32(row, pl.reinterpret_view(logical_ids, pl.UINT32), tmp=sort_tmp)
-            pairs = pl.tile.mrgsort(pairs, block_len=64)
-            pairs = pl.tile.mrgsort(pairs, block_len=256)
-            if SORT_ROWS_TILE > 512:
-                pairs = pl.tile.mrgsort(pairs, block_len=1024)
-            leading = pl.tile.slice(pairs, [1, 2 * topk], [0, 0])
-            selected = pl.tile.gather_mask(leading, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+            padding_scores = pl.tile.full([1, topk], dtype=pl.FP32, value=NEGATIVE_INF)
+            padding_ids = pl.tile.full([1, topk], dtype=pl.INT32, value=-1)
+            padding_tmp = pl.tile.create([1, 2 * topk], dtype=pl.FP32)
+            padding_bits = pl.reinterpret_view(padding_ids, pl.UINT32)
+            padding_pairs = pl.tile.sort32(padding_scores, padding_bits, tmp=padding_tmp)
+            running_pairs = padding_pairs
+            for first in pl.range(0, key_capacity, LOAD_ROWS_TILE):
+                actual_scores = pl.load(scores, [token, first], [1, LOAD_ROWS_TILE])
+                row_raw = pl.tile.full([1, SORT_ROWS_TILE], dtype=pl.FP32, value=NEGATIVE_INF)
+                row_raw = pl.tile.assemble(row_raw, actual_scores, [0, 0])
+                absolute = pl.tile.arange(0, [1, SORT_ROWS_TILE], dtype=pl.INT32)
+                absolute = pl.add(absolute, pl.cast(first, pl.INT32))
+                distance = pl.mul(pl.sub(absolute, pl.cast(visible, pl.INT32)), -1)
+                valid = pl.minimum(pl.maximum(distance, 0), 1)
+                invalid = pl.sub(pl.tile.full([1, SORT_ROWS_TILE], dtype=pl.INT32, value=1), valid)
+                valid_scores = pl.mul(row_raw, pl.cast(valid, pl.FP32))
+                invalid_scores = pl.mul(pl.cast(invalid, pl.FP32), NEGATIVE_INF)
+                row = pl.add(valid_scores, invalid_scores)
+                logical_ids = pl.sub(absolute, pl.mul(pl.add(absolute, 1), invalid))
+                sort_tmp = pl.tile.create([1, 2 * SORT_ROWS_TILE], dtype=pl.FP32)
+                index_bits = pl.reinterpret_view(logical_ids, pl.UINT32)
+                pairs = pl.tile.sort32(row, index_bits, tmp=sort_tmp)
+                pairs = pl.tile.mrgsort(pairs, block_len=64)
+                pairs = pl.tile.mrgsort(pairs, block_len=256)
+                if SORT_ROWS_TILE > 512:
+                    pairs = pl.tile.mrgsort(pairs, block_len=1024)
+                leading = pl.tile.slice(pairs, [1, 2 * topk], [0, 0])
+                if key_capacity > SORT_ROWS_TILE:
+                    merge_pairs = pl.tile.create([1, 8 * topk], dtype=pl.FP32)
+                    merge_pairs = pl.tile.assemble(merge_pairs, running_pairs, [0, 0])
+                    merge_pairs = pl.tile.assemble(merge_pairs, leading, [0, 2 * topk])
+                    merge_pairs = pl.tile.assemble(merge_pairs, padding_pairs, [0, 4 * topk])
+                    merge_pairs = pl.tile.assemble(merge_pairs, padding_pairs, [0, 6 * topk])
+                    merged = pl.tile.mrgsort(merge_pairs, block_len=2 * topk)
+                    running_pairs = pl.tile.slice(merged, [1, 2 * topk], [0, 0])
+                else:
+                    running_pairs = leading
+            selected = pl.tile.gather_mask(running_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
             pl.store(selected, [token, 0], indices)
         return scores, indices
 
@@ -1216,7 +1239,7 @@ def validate_prefill_select(*, device=0, sim=False, compile_only=False, cpu_only
     if cpu_only and compile_only:
         raise ValueError("CPU golden checks and kernel compilation are separate modes")
     records = []
-    cases = (indexer_select_golden_cases(build=not cpu_only, key_capacity=keys) for keys in (512, 1024, 2048))
+    cases = (indexer_select_golden_cases(build=not cpu_only, key_capacity=keys) for keys in (512, 1024, 2048, 4096, 8192, 16384))
     for case in chain.from_iterable(cases):
         name = case.pop("name")
         if cpu_only:
@@ -1715,14 +1738,14 @@ def golden_indexer_select(tensors, *, compress_ratio=2):
 
 
 def validate(*, device=0, sim=False, compile_only=False, cpu_only=False):
-    """Check empty rows, partial blocks, 512/1024 boundaries and the 2048-row limit."""
+    """Check empty rows, partial blocks and candidate publication through 16384 keys."""
     import torch
     from golden import ScalarSpec, TensorSpec, run
 
     if cpu_only and compile_only:
         raise ValueError("CPU golden checks and kernel compilation are separate modes")
     capacity, shared_rows = 16, 32
-    lengths = torch.tensor([0, 1, 7, 8, 9, 511, 512, 513, 1023, 1024, 1025, 2040, 2041, 2047, 2048, -1]).int()
+    lengths = torch.tensor([0, 1, 7, 8, 9, 511, 512, 513, 2048, 4096, 8191, 8192, 8193, 16383, 16384, -1]).int()
     block_scores = (torch.arange(POOL_CAPACITY) * 73) % POOL_CAPACITY
     scores = (block_scores[:, None] + torch.arange(8)[None, :] / 16).flatten().repeat(capacity, 1)
     records = []
@@ -1808,8 +1831,8 @@ def indexer_select_golden_cases(*, build=True, key_capacity=INDEXER_SELECT_KEY_C
     from golden import ScalarSpec, TensorSpec
 
     capacity = 16
-    rows = torch.arange(INDEXER_SELECT_KEY_CAPACITY, dtype=torch.int32)
-    key = torch.zeros((INDEXER_SELECT_KEY_CAPACITY, INDEX_HEAD_DIM), dtype=torch.int8)
+    rows = torch.arange(key_capacity, dtype=torch.int32)
+    key = torch.zeros((key_capacity, INDEX_HEAD_DIM), dtype=torch.int8)
     key[:, 0] = (rows // 16).to(torch.int8)
     key[:, 1] = (rows % 16).to(torch.int8)
     query = torch.ones((capacity, INDEX_HEADS, INDEX_HEAD_DIM), dtype=torch.int8)
@@ -1820,14 +1843,21 @@ def indexer_select_golden_cases(*, build=True, key_capacity=INDEXER_SELECT_KEY_C
     weights = ((heads % 5 + 3.0) / 11.0).repeat(capacity, 1).to(torch.float16)
     boundaries = [-1, 0, 1, 31, 127, 511, 512, 513, 1023, 1024, 1025, 2046, 2047, 2048, 4095, 7]
     positions = torch.tensor(boundaries, dtype=torch.int32)
-    key = key[:key_capacity]
+    key_scale = torch.full((key_capacity,), 0.75, dtype=torch.float16)
+    if key_capacity > 2048:
+        key.zero_()
+        key[:, 0] = 1
+        scale_bits = ((rows * 2017) % key_capacity + 0x1800).to(torch.int16)
+        key_scale = scale_bits.view(torch.float16)
+        positions = torch.tensor([-1, 0, 31, 32, 511, 512, 2047, 2048,
+                                  4095, 4096, 8191, 8192, 8198, 16383, 32766, 32767], dtype=torch.int32)
     for ratio in (1, 2):
         for active in (0, 1, 7, capacity):
             specs = [
                 TensorSpec("query", [capacity, INDEX_HEADS, INDEX_HEAD_DIM], torch.int8, init_value=query),
                 TensorSpec("query_scale", [capacity, INDEX_HEADS], torch.float16, init_value=query_scale),
                 TensorSpec("key", [key_capacity, INDEX_HEAD_DIM], torch.int8, init_value=key),
-                TensorSpec("key_scale", [key_capacity], torch.float16, init_value=0.75),
+                TensorSpec("key_scale", [key_capacity], torch.float16, init_value=key_scale),
                 TensorSpec("weights", [capacity, INDEX_HEADS], torch.float16, init_value=weights),
                 TensorSpec("positions", [capacity], torch.int32, init_value=positions),
                 TensorSpec("scores", [capacity, key_capacity], torch.float32, init_value=-53.0),

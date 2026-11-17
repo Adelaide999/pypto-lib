@@ -10,6 +10,7 @@
 
 import math
 import pypto.language as pl
+from .runtime_config import SPMD_WORKER_LIMIT
 import torch
 from .quant import make_dequantize, make_quantize
 from .utils import pack_blocked_weight
@@ -179,19 +180,21 @@ def make_bf16_linear(capacity: int, width: int, output_width: int):
         output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(((active + 15) // 16) * blocks, name_hint="dsv41_a2a3_bf16_linear"):
-            t0 = (block // blocks) * 16
-            n0 = (block % blocks) * n_tile
-            rows = pl.min(16, active - t0)
-            acc = pl.create_tensor([16, n_tile], dtype=pl.FP32)
-            for k0 in pl.pipeline(0, width, 256, stage=2):
-                lhs = pl.slice(value, [16, 256], [t0, k0], valid_shape=[rows, 256])
-                lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), 16, 256)
-                rhs = weight[k0 : k0 + 256, n0 : n0 + n_tile]
-                acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
-            output[t0 : t0 + 16, n0 : n0 + n_tile] = pl.set_validshape(
-                pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
-            )
+        block_count = (active + 15) // 16 * blocks
+        for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='dsv41_a2a3_bf16_linear'):
+            for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
+                t0 = (block // blocks) * 16
+                n0 = (block % blocks) * n_tile
+                rows = pl.min(16, active - t0)
+                acc = pl.create_tensor([16, n_tile], dtype=pl.FP32)
+                for k0 in pl.pipeline(0, width, 256, stage=2):
+                    lhs = pl.slice(value, [16, 256], [t0, k0], valid_shape=[rows, 256])
+                    lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), 16, 256)
+                    rhs = weight[k0 : k0 + 256, n0 : n0 + n_tile]
+                    acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
+                output[t0 : t0 + 16, n0 : n0 + n_tile] = pl.set_validshape(
+                    pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
+                )
         return output
 
     return linear

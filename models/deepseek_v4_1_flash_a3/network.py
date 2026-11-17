@@ -29,6 +29,7 @@ from .cache import attach_network_cache_geometry, network_cache_geometry, resolv
 from .engram import make_prefill_engram_entries
 from .input_pack import make_input_entries
 from .lm_head import make_output_entries
+from .runtime_config import PREFILL_CAPACITIES, network_ring_heap
 from .prefill_layer import (
     REGIONS, execute_region, region_arguments, make_network_l2_entries,
     make_prefill_layer_entries, run_prefill_layer_inmemory,
@@ -570,14 +571,14 @@ class NetworkExecutor:
         self.phase = phase
         self.activation_banks = {}
 
-    def execute_entry(self, entry, rank, arguments):
+    def execute_entry(self, entry, rank, arguments, *, empty_capture=False):
         """Bind one existing compiled entry to the generation's persistent worker."""
         if self.resident is None:
             raise ValueError("Ordinary execution requires an initialized resident runtime")
         key = id(entry.compiled)
         if key not in self.resident_abis:
             self.resident_abis[key] = network_parameter_abi(entry.compiled)
-        self.resident.execute(entry.compiled, rank, arguments, self.resident_abis[key])
+        self.resident.execute(entry.compiled, rank, arguments, self.resident_abis[key], empty_capture=empty_capture)
 
     def exchange(self, stage, values, collective, group, *, packets=False, host_control=False):
         if not stage or "/" in stage or ".." in stage:
@@ -644,7 +645,8 @@ class NetworkExecutor:
             self.current_layer = layer_id
 
         def execute(name, rank, case, arguments, outputs, responsibility=None):
-            self.execute_entry(self.current_entries[name], rank, arguments)
+            empty_capture = name == "mask_output" and arguments[-2] == arguments[-1]
+            self.execute_entry(self.current_entries[name], rank, arguments, empty_capture=empty_capture)
 
         return dict(
             topology=self.topology,
@@ -668,6 +670,7 @@ class NetworkExecutor:
             read_control=self.resident.read_control,
             copy_tensor=self.resident.copy_tensor,
             workspace=self.resident.workspace,
+            release_tensors=self.resident.release_tensors,
             layer_buffers=self.layer_buffers,
             stage_namespace=f"{self.namespace}-layer{layer_id}",
         )
@@ -857,7 +860,7 @@ def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=F
         raise ValueError("The network runtime requires EP16 with TP1/2/4 and PP1/PCP1/DCP1")
     if (
         not all(contract["required_modes"].values())
-        or contract["capacity"] not in (16, 128)
+        or contract["capacity"] not in PREFILL_CAPACITIES
         or contract["scheduler_capacity"] != 8192
     ):
         raise ValueError("Retain the original model modes and bounded actual scheduler ABI")
@@ -1042,7 +1045,10 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
                 request.close()
     provider = prepare_network_provider(inputs, contract, output.name)
     with ExitStack() as stack:
-        resident = stack.enter_context(ResidentNetworkRuntime(assigned, topology))
+        profiling = dict(contract.get("profiling", {}))
+        profiling.setdefault("output_dir", str(output / "profiling"))
+        ring_heap = network_ring_heap(contract["capacity"], contract["model_config"]["text_config"], topology["tp"])
+        resident = stack.enter_context(ResidentNetworkRuntime(assigned, topology, profiling=profiling, ring_heap=ring_heap))
         for phase_program in phase_programs.values():
             resident.register(phase_program)
         weights = A3ResidentWeights(contract["checkpoint"], topology, contract["model_config"], resident)
@@ -1102,6 +1108,7 @@ def run_network_chunk(
     topology, model_config = contract["topology"], contract["model_config"]
     text = dict(model_config["text_config"], image_sentinel_base_id=model_config["image_token_id"])
     namespace = f"chunk{epoch}"
+    resident.profiling.begin_chunk(phase, epoch)
     if progress is not None:
         progress(dict(stage="executing_embedding", epoch=epoch))
     runtime_path = output / "runtime_config.json"
@@ -1251,6 +1258,7 @@ def run_network_chunk(
             formal_accuracy="not_run",
         )
         resident.release_values()
+        profiling = resident.profiling.finish_chunk()
         runtime["resident_runtime"] = resident.summary()
         write_json(runtime_path, runtime)
         chunk_seconds = perf_counter() - begin
@@ -1273,6 +1281,7 @@ def run_network_chunk(
                     checkpoint_read_seconds=weights.reader.read_seconds - initial_read_seconds,
                     checkpoint_read_calls=weights.reader.read_calls - initial_read_calls,
                 ),
+                profiling=profiling,
                 memory_samples=memory.samples,
                 memory_intervals=memory.intervals,
                 capacity_verified_by_execution=False,

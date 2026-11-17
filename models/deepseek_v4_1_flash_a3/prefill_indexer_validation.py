@@ -23,7 +23,7 @@ import shutil
 import torch
 from golden import ScalarSpec, TensorSpec, run
 from .gemm import prepare_ecotech_dynamic_weight
-from .indexer import golden_indexer_select, indexer_active_compare, indexer_select_golden_cases
+from .indexer import INDEXER_SELECT_KEY_CAPACITY, golden_indexer_select, indexer_active_compare, indexer_select_golden_cases
 from .prefill_indexer import golden_index_key_gather, make_prefill_indexer_chain
 from .qkv_proj_rope import golden_prefix_compare
 from .utils import unpack_blocked_weight
@@ -48,6 +48,11 @@ BOUNDARY_CASES = (
     ("ratio2-single", 512, 2, 1, 1, 1),
     ("ratio2-partial-page", 1024, 2, 4, 513, 1008),
     ("ratio1-tail-position", 2048, 1, 4, 2048, 2044),
+    ("ratio2-8k-prefill-tail", 8192, 2, 4, 4096, 8188),
+    ("ratio2-8k-decode", 8192, 2, 1, 4099, 8198),
+    ("ratio1-long-history", 8192, 1, 4, 8192, 8188),
+    ("ratio1-8k-decode", 16384, 1, 1, 8199, 8198),
+    ("ratio1-16k-tail", 16384, 1, 4, 16384, 16380),
 )
 
 
@@ -211,12 +216,23 @@ def precision_only():
 
 def existing_device_gates(device, *, include_select=True):
     """Run every existing score/Top-K case and paged gather boundary with build reuse."""
+    from .compressor import index_cache_publish_golden_cases
     from .prefill_indexer import make_index_key_gather
 
     builds = {}
     records = []
     with precision_only():
-        for keys in ((512, 1024, 2048) if include_select else ()):
+        for rows in (64, 128):
+            build = None
+            for entry in index_cache_publish_golden_cases(page_rows=rows):
+                name = entry.pop("name")
+                result = run(**entry, runtime_dir=build,
+                             config=dict(backend_type="a2a3", execution_mode=False, device_id=device))
+                if not result.passed:
+                    raise RuntimeError(f"{name}: {result.error}")
+                build = result.work_dir
+                records.append(dict(name=name, kernel="passed", work_dir=str(build)))
+        for keys in ((512, 1024, 2048, 4096, 8192, 16384) if include_select else ()):
             for entry in indexer_select_golden_cases(key_capacity=keys):
                 ratio = int(entry["name"].split("ratio")[1].split("-")[0])
                 identity = (keys, ratio)
@@ -233,20 +249,21 @@ def existing_device_gates(device, *, include_select=True):
                 builds[identity] = result.work_dir
                 records.append(dict(name=entry["name"], kernel="passed", work_dir=str(result.work_dir)))
         for rows in (64, 128):
-            pages, blocks = 2048 // rows, 2048 // rows + 2
+            keys = INDEXER_SELECT_KEY_CAPACITY
+            pages, blocks = keys // rows, keys // rows + 2
             physical = torch.arange(blocks * rows)
             codes = ((physical[:, None] + torch.arange(128)[None]) % 127).to(torch.int8)
             codes = codes.reshape(blocks, rows, 1, 128)
             scales = ((physical.float() + 1) / 4096).half().reshape(blocks, rows, 1, 1)
             table = torch.stack((torch.arange(1, pages + 1), torch.arange(pages, 0, -1))).int()
             build = None
-            for length in (0, 1, 511, 512, 513, 1024, 2048):
+            for length in (0, 1, 511, 512, 513, 2048, 4096, 4097, 8192, 8193, 16383, keys):
                 specs = [
                     TensorSpec("cache", [blocks, rows, 1, 128], torch.int8, init_value=codes),
                     TensorSpec("scales", [blocks, rows, 1, 1], torch.float16, init_value=scales),
                     TensorSpec("table", [2, pages], torch.int32, init_value=table),
-                    TensorSpec("key", [2048, 128], torch.int8, init_value=-53),
-                    TensorSpec("key_scale", [2048], torch.float16, init_value=-59),
+                    TensorSpec("key", [keys, 128], torch.int8, init_value=-53),
+                    TensorSpec("key_scale", [keys], torch.float16, init_value=-59),
                     ScalarSpec("request", torch.int32, 1, compile_runtime=True),
                     ScalarSpec("length", torch.int32, length, compile_runtime=True),
                 ]

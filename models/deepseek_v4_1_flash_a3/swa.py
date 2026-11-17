@@ -16,6 +16,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
 import pypto.language as pl
+from .runtime_config import SPMD_WORKER_LIMIT
 import torch as decode_swa_cache_torch
 import torch as decode_torch
 import torch
@@ -31,6 +32,7 @@ FUSED_VALUE_TILE = 256
 GATHER_TILE = 16
 
 BLOCK_SIZE = 128
+SELECTED_ROWS = pl.dynamic("SELECTED_ROWS")
 
 
 def make_swa_leaves(capacity, cache_blocks, config):
@@ -67,28 +69,30 @@ def make_swa_leaves(capacity, cache_blocks, config):
     def gather(
         cache: pl.Tensor[[cache_blocks, 128, 1, head_dim], pl.BF16],
         indices: pl.Tensor[[capacity, window], pl.INT32],
-        selected: pl.Tensor[[capacity * window, head_dim], pl.BF16],
+        selected: pl.Tensor[[SELECTED_ROWS, head_dim], pl.BF16],
         active: pl.Scalar[pl.INT32],
     ):
         flat = pl.reshape(cache, [cache_rows, head_dim])
-        for block in pl.spmd(active * (window // GATHER_TILE), name_hint="a2_swa_gather"):
-            token = block // (window // GATHER_TILE)
-            begin = block % (window // GATHER_TILE) * GATHER_TILE
-            for lane in pl.pipeline(0, GATHER_TILE, stage=4):
-                column = begin + lane
-                index = pl.read(indices, [token, column])
-                element = token * window + column
-                if index >= 0:
-                    row = pl.cast(index, pl.INDEX)
-                    selected[element : element + 1, :] = flat[row : row + 1, :]
-                else:
-                    selected[element : element + 1, :] = pl.full([1, head_dim], dtype=pl.BF16, value=0.0)
+        block_count = active * (window // GATHER_TILE)
+        for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='a2_swa_gather'):
+            for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
+                token = block // (window // GATHER_TILE)
+                begin = block % (window // GATHER_TILE) * GATHER_TILE
+                for lane in pl.pipeline(0, GATHER_TILE, stage=4):
+                    column = begin + lane
+                    index = pl.read(indices, [token, column])
+                    element = token * window + column
+                    if index >= 0:
+                        row = pl.cast(index, pl.INDEX)
+                        selected[element : element + 1, :] = flat[row : row + 1, :]
+                    else:
+                        selected[element : element + 1, :] = pl.full([1, head_dim], dtype=pl.BF16, value=0.0)
         return selected
 
     @pl.jit.inline
     def attend(
         query: pl.Tensor[[capacity, width], pl.BF16],
-        selected: pl.Tensor[[capacity * window, head_dim], pl.BF16],
+        selected: pl.Tensor[[SELECTED_ROWS, head_dim], pl.BF16],
         indices: pl.Tensor[[capacity, window], pl.INT32],
         sink: pl.Tensor[[heads], pl.FP32],
         output: pl.Tensor[[capacity, width], pl.BF16],
@@ -96,112 +100,114 @@ def make_swa_leaves(capacity, cache_blocks, config):
     ):
         qflat = pl.reshape(query, [capacity * heads, head_dim])
         oflat = pl.reshape(output, [capacity * heads, head_dim])
-        for block in pl.spmd(active * (heads // HEAD_TILE), name_hint="a2_swa_attention", optimizations=[pl.cross_core_slot(slot_num=1)]):
-            token = block // (heads // HEAD_TILE)
-            head = block % (heads // HEAD_TILE) * HEAD_TILE
-            query_row = token * heads + head
-            # Include the zero-value sink before narrowing exp(scores-max) to
-            # BF16, matching the native softmax's rounding boundary.
-            maximum = pl.reshape(sink[head : head + HEAD_TILE], [1, HEAD_TILE])
-            denominator = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=1.0)
-            numerator = pl.full([HEAD_TILE, head_dim], dtype=pl.FP32, value=0.0)
-            sparse_maximum = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=-1e30)
-            saved_scores = pl.full([HEAD_TILE, 512], dtype=pl.FP32, value=0.0)
-            if window == 640:
-                for sparse_part in pl.unroll(512 // attention_tile):
-                    sparse_column = 128 + sparse_part * attention_tile
-                    sparse_row = token * window + sparse_column
-                    sparse_query = qflat[query_row : query_row + HEAD_TILE, :]
-                    sparse_kv = selected[sparse_row : sparse_row + attention_tile, :]
-                    sparse_dot = pl.matmul(sparse_query, sparse_kv, b_trans=True)
-                    sparse_scores = pl.mul(sparse_dot, score_scale)
-                    saved_column = sparse_part * attention_tile
-                    saved_scores[:, saved_column:saved_column + attention_tile] = sparse_scores
-                    sparse_ids = indices[token : token + 1, sparse_column : sparse_column + attention_tile]
-                    sparse_ids_fp32 = pl.cast(sparse_ids, pl.FP32)
-                    sparse_shifted = pl.add(sparse_ids_fp32, 1.0)
-                    sparse_positive = pl.maximum(sparse_shifted, 0.0)
-                    sparse_valid = pl.minimum(sparse_positive, 1.0)
-                    sparse_invalid = pl.sub(sparse_valid, 1.0)
-                    sparse_bias = pl.mul(sparse_invalid, 1e30)
-                    sparse_scores = pl.col_expand_add(sparse_scores, sparse_bias)
-                    sparse_row_max = pl.row_max(sparse_scores)
-                    sparse_local_max = pl.reshape(sparse_row_max, [1, HEAD_TILE])
-                    sparse_maximum = pl.maximum(sparse_maximum, sparse_local_max)
-            for part in pl.unroll(attention_parts):
-                if window == 640 and part > 0:
-                    cache_column = 128 + (part - 1) * attention_tile
-                else:
-                    cache_column = part * attention_tile
-                cache_row = token * window + cache_column
-                q = qflat[query_row : query_row + HEAD_TILE, :]
-                kv = selected[cache_row : cache_row + attention_tile, :]
+        block_count = active * (heads // HEAD_TILE)
+        for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='a2_swa_attention', optimizations=[pl.cross_core_slot(slot_num=1)]):
+            for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
+                token = block // (heads // HEAD_TILE)
+                head = block % (heads // HEAD_TILE) * HEAD_TILE
+                query_row = token * heads + head
+                # Include the zero-value sink before narrowing exp(scores-max) to
+                # BF16, matching the native softmax's rounding boundary.
+                maximum = pl.reshape(sink[head : head + HEAD_TILE], [1, HEAD_TILE])
+                denominator = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=1.0)
+                numerator = pl.full([HEAD_TILE, head_dim], dtype=pl.FP32, value=0.0)
+                sparse_maximum = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=-1e30)
+                saved_scores = pl.full([HEAD_TILE, 512], dtype=pl.FP32, value=0.0)
                 if window == 640:
-                    if part > 0:
-                        score_column = (part - 1) * attention_tile
-                        scores = saved_scores[:, score_column:score_column + attention_tile]
+                    for sparse_part in pl.unroll(512 // attention_tile):
+                        sparse_column = 128 + sparse_part * attention_tile
+                        sparse_row = token * window + sparse_column
+                        sparse_query = qflat[query_row : query_row + HEAD_TILE, :]
+                        sparse_kv = selected[sparse_row : sparse_row + attention_tile, :]
+                        sparse_dot = pl.matmul(sparse_query, sparse_kv, b_trans=True)
+                        sparse_scores = pl.mul(sparse_dot, score_scale)
+                        saved_column = sparse_part * attention_tile
+                        saved_scores[:, saved_column:saved_column + attention_tile] = sparse_scores
+                        sparse_ids = indices[token : token + 1, sparse_column : sparse_column + attention_tile]
+                        sparse_ids_fp32 = pl.cast(sparse_ids, pl.FP32)
+                        sparse_shifted = pl.add(sparse_ids_fp32, 1.0)
+                        sparse_positive = pl.maximum(sparse_shifted, 0.0)
+                        sparse_valid = pl.minimum(sparse_positive, 1.0)
+                        sparse_invalid = pl.sub(sparse_valid, 1.0)
+                        sparse_bias = pl.mul(sparse_invalid, 1e30)
+                        sparse_scores = pl.col_expand_add(sparse_scores, sparse_bias)
+                        sparse_row_max = pl.row_max(sparse_scores)
+                        sparse_local_max = pl.reshape(sparse_row_max, [1, HEAD_TILE])
+                        sparse_maximum = pl.maximum(sparse_maximum, sparse_local_max)
+                for part in pl.unroll(attention_parts):
+                    if window == 640 and part > 0:
+                        cache_column = 128 + (part - 1) * attention_tile
+                    else:
+                        cache_column = part * attention_tile
+                    cache_row = token * window + cache_column
+                    q = qflat[query_row : query_row + HEAD_TILE, :]
+                    kv = selected[cache_row : cache_row + attention_tile, :]
+                    if window == 640:
+                        if part > 0:
+                            score_column = (part - 1) * attention_tile
+                            scores = saved_scores[:, score_column:score_column + attention_tile]
+                        else:
+                            dot = pl.matmul(q, kv, b_trans=True)
+                            scores = pl.mul(dot, score_scale)
                     else:
                         dot = pl.matmul(q, kv, b_trans=True)
                         scores = pl.mul(dot, score_scale)
-                else:
-                    dot = pl.matmul(q, kv, b_trans=True)
-                    scores = pl.mul(dot, score_scale)
-                index_tile = indices[token : token + 1, cache_column : cache_column + attention_tile]
-                index_float = pl.cast(index_tile, pl.FP32)
-                shifted_index = pl.add(index_float, 1.0)
-                positive_index = pl.maximum(shifted_index, 0.0)
-                valid = pl.minimum(positive_index, 1.0)
-                if window == 640 and part == 0:
-                    own_mask = pl.full([1, attention_tile], dtype=pl.FP32, value=0.0)
-                    own_mask[:, :WINDOW_TILE] = pl.full([1, WINDOW_TILE], dtype=pl.FP32, value=1.0)
-                    valid = pl.mul(valid, own_mask)
-                invalid = pl.sub(valid, 1.0)
-                bias = pl.mul(invalid, 1e30)
-                scores = pl.col_expand_add(scores, bias)
-                if window == 640:
-                    if part > 0:
-                        local_max = sparse_maximum
+                    index_tile = indices[token : token + 1, cache_column : cache_column + attention_tile]
+                    index_float = pl.cast(index_tile, pl.FP32)
+                    shifted_index = pl.add(index_float, 1.0)
+                    positive_index = pl.maximum(shifted_index, 0.0)
+                    valid = pl.minimum(positive_index, 1.0)
+                    if window == 640 and part == 0:
+                        own_mask = pl.full([1, attention_tile], dtype=pl.FP32, value=0.0)
+                        own_mask[:, :WINDOW_TILE] = pl.full([1, WINDOW_TILE], dtype=pl.FP32, value=1.0)
+                        valid = pl.mul(valid, own_mask)
+                    invalid = pl.sub(valid, 1.0)
+                    bias = pl.mul(invalid, 1e30)
+                    scores = pl.col_expand_add(scores, bias)
+                    if window == 640:
+                        if part > 0:
+                            local_max = sparse_maximum
+                        else:
+                            row_max = pl.row_max(scores)
+                            local_max = pl.reshape(row_max, [1, HEAD_TILE])
                     else:
                         row_max = pl.row_max(scores)
                         local_max = pl.reshape(row_max, [1, HEAD_TILE])
-                else:
-                    row_max = pl.row_max(scores)
-                    local_max = pl.reshape(row_max, [1, HEAD_TILE])
-                if window == 640 and part > 1:
-                    next_max = maximum
-                else:
-                    next_max = pl.maximum(maximum, local_max)
-                max_difference = pl.sub(maximum, next_max)
-                correction = pl.exp(max_difference)
-                max_column = pl.reshape(next_max, [HEAD_TILE, 1])
-                shifted = pl.row_expand_sub(scores, max_column)
-                exponential = pl.exp(shifted)
-                probabilities = pl.col_expand_mul(exponential, valid)
-                row_sum = pl.row_sum(probabilities)
-                probability_sum = pl.reshape(row_sum, [1, HEAD_TILE])
-                if window == 640 and part > 1:
-                    denominator = pl.add(denominator, probability_sum)
-                else:
-                    old_denominator = pl.mul(denominator, correction)
-                    denominator = pl.add(old_denominator, probability_sum)
-                weights = pl.cast(probabilities, pl.BF16, mode="round")
-                weighted = pl.matmul(weights, kv)
-                if window == 640 and part > 1:
-                    numerator = pl.add(numerator, weighted)
-                else:
-                    correction_column = pl.reshape(correction, [HEAD_TILE, 1])
-                    corrected = pl.row_expand_mul(numerator, correction_column)
-                    numerator = pl.add(corrected, weighted)
-                maximum = next_max
-            denominator_column = pl.reshape(denominator, [HEAD_TILE, 1])
-            result = pl.row_expand_div(numerator, denominator_column)
-            oflat[query_row : query_row + HEAD_TILE, :] = pl.cast(result, pl.BF16, mode="rint")
+                    if window == 640 and part > 1:
+                        next_max = maximum
+                    else:
+                        next_max = pl.maximum(maximum, local_max)
+                    max_difference = pl.sub(maximum, next_max)
+                    correction = pl.exp(max_difference)
+                    max_column = pl.reshape(next_max, [HEAD_TILE, 1])
+                    shifted = pl.row_expand_sub(scores, max_column)
+                    exponential = pl.exp(shifted)
+                    probabilities = pl.col_expand_mul(exponential, valid)
+                    row_sum = pl.row_sum(probabilities)
+                    probability_sum = pl.reshape(row_sum, [1, HEAD_TILE])
+                    if window == 640 and part > 1:
+                        denominator = pl.add(denominator, probability_sum)
+                    else:
+                        old_denominator = pl.mul(denominator, correction)
+                        denominator = pl.add(old_denominator, probability_sum)
+                    weights = pl.cast(probabilities, pl.BF16, mode="round")
+                    weighted = pl.matmul(weights, kv)
+                    if window == 640 and part > 1:
+                        numerator = pl.add(numerator, weighted)
+                    else:
+                        correction_column = pl.reshape(correction, [HEAD_TILE, 1])
+                        corrected = pl.row_expand_mul(numerator, correction_column)
+                        numerator = pl.add(corrected, weighted)
+                    maximum = next_max
+                denominator_column = pl.reshape(denominator, [HEAD_TILE, 1])
+                result = pl.row_expand_div(numerator, denominator_column)
+                oflat[query_row : query_row + HEAD_TILE, :] = pl.cast(result, pl.BF16, mode="rint")
         return output
 
     @pl.jit.inline
     def attend_wide_sparse(
         query: pl.Tensor[[capacity, width], pl.BF16],
-        selected: pl.Tensor[[capacity * window, head_dim], pl.BF16],
+        selected: pl.Tensor[[SELECTED_ROWS, head_dim], pl.BF16],
         indices: pl.Tensor[[capacity, window], pl.INT32],
         sink: pl.Tensor[[heads], pl.FP32],
         output: pl.Tensor[[capacity, width], pl.BF16],
@@ -209,55 +215,57 @@ def make_swa_leaves(capacity, cache_blocks, config):
     ):
         qflat = pl.reshape(query, [capacity * heads, head_dim])
         oflat = pl.reshape(output, [capacity * heads, head_dim])
-        for block in pl.spmd(active * (heads // HEAD_TILE), name_hint="wide_sparse_attention", optimizations=[pl.cross_core_slot(slot_num=1)]):
-            token = block // (heads // HEAD_TILE)
-            head = block % (heads // HEAD_TILE) * HEAD_TILE
-            query_row = token * heads + head
-            cache_row = token * window
-            own_kv = selected[cache_row:cache_row + 128, :]
-            q = qflat[query_row:query_row + HEAD_TILE, :]
-            own_dot = pl.matmul(q, own_kv, b_trans=True)
-            own_scores = pl.mul(own_dot, score_scale)
-            own_ids = pl.cast(indices[token:token + 1, :128], pl.FP32)
-            own_valid = pl.minimum(pl.maximum(pl.add(own_ids, 1.0), 0.0), 1.0)
-            own_bias = pl.mul(pl.sub(own_valid, 1.0), 1e30)
-            own_scores = pl.col_expand_add(own_scores, own_bias)
-            own_max = pl.reshape(pl.row_max(own_scores), [1, HEAD_TILE])
-            sink_row = pl.reshape(sink[head:head + HEAD_TILE], [1, HEAD_TILE])
-            maximum = pl.maximum(sink_row, own_max)
-            own_exp = pl.exp(pl.row_expand_sub(own_scores, pl.reshape(maximum, [HEAD_TILE, 1])))
-            own_prob = pl.col_expand_mul(own_exp, own_valid)
-            own_sum = pl.reshape(pl.row_sum(own_prob), [1, HEAD_TILE])
-            denominator = pl.add(pl.exp(pl.sub(sink_row, maximum)), own_sum)
-            own_weights = pl.cast(own_prob, pl.BF16, mode="round")
-            own_weighted = pl.matmul(own_weights, own_kv)
-            sparse_acc = pl.create_tensor([HEAD_TILE, 512], dtype=pl.FP32)
-            for feature in pl.range(0, head_dim, 256):
-                sparse_q = qflat[query_row:query_row + HEAD_TILE, feature:feature + 256]
-                sparse_k = selected[cache_row + 128:cache_row + 640, feature:feature + 256]
-                sparse_acc = pl.matmul_acc(sparse_acc, sparse_q, sparse_k, b_trans=True, init_cond=(feature == 0))
-            sparse_scores = pl.mul(sparse_acc, score_scale)
-            sparse_ids = pl.cast(indices[token:token + 1, 128:640], pl.FP32)
-            sparse_valid = pl.minimum(pl.maximum(pl.add(sparse_ids, 1.0), 0.0), 1.0)
-            sparse_bias = pl.mul(pl.sub(sparse_valid, 1.0), 1e30)
-            sparse_scores = pl.col_expand_add(sparse_scores, sparse_bias)
-            sparse_max = pl.reshape(pl.row_max(sparse_scores), [1, HEAD_TILE])
-            next_max = pl.maximum(maximum, sparse_max)
-            correction = pl.exp(pl.sub(maximum, next_max))
-            sparse_exp = pl.exp(pl.row_expand_sub(sparse_scores, pl.reshape(next_max, [HEAD_TILE, 1])))
-            sparse_prob = pl.col_expand_mul(sparse_exp, sparse_valid)
-            sparse_sum = pl.reshape(pl.row_sum(sparse_prob), [1, HEAD_TILE])
-            denominator = pl.add(pl.mul(denominator, correction), sparse_sum)
-            sparse_weights = pl.cast(sparse_prob, pl.BF16, mode="round")
-            correction_column = pl.reshape(correction, [HEAD_TILE, 1])
-            denominator_column = pl.reshape(denominator, [HEAD_TILE, 1])
-            for value_column in pl.range(0, head_dim, 256):
-                sparse_v = selected[cache_row + 128:cache_row + 640, value_column:value_column + 256]
-                sparse_weighted = pl.matmul(sparse_weights, sparse_v)
-                own_part = own_weighted[:, value_column:value_column + 256]
-                numerator = pl.add(pl.row_expand_mul(own_part, correction_column), sparse_weighted)
-                result = pl.row_expand_div(numerator, denominator_column)
-                oflat[query_row:query_row + HEAD_TILE, value_column:value_column + 256] = pl.cast(result, pl.BF16, mode="rint")
+        block_count = active * (heads // HEAD_TILE)
+        for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='wide_sparse_attention', optimizations=[pl.cross_core_slot(slot_num=1)]):
+            for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
+                token = block // (heads // HEAD_TILE)
+                head = block % (heads // HEAD_TILE) * HEAD_TILE
+                query_row = token * heads + head
+                cache_row = token * window
+                own_kv = selected[cache_row:cache_row + 128, :]
+                q = qflat[query_row:query_row + HEAD_TILE, :]
+                own_dot = pl.matmul(q, own_kv, b_trans=True)
+                own_scores = pl.mul(own_dot, score_scale)
+                own_ids = pl.cast(indices[token:token + 1, :128], pl.FP32)
+                own_valid = pl.minimum(pl.maximum(pl.add(own_ids, 1.0), 0.0), 1.0)
+                own_bias = pl.mul(pl.sub(own_valid, 1.0), 1e30)
+                own_scores = pl.col_expand_add(own_scores, own_bias)
+                own_max = pl.reshape(pl.row_max(own_scores), [1, HEAD_TILE])
+                sink_row = pl.reshape(sink[head:head + HEAD_TILE], [1, HEAD_TILE])
+                maximum = pl.maximum(sink_row, own_max)
+                own_exp = pl.exp(pl.row_expand_sub(own_scores, pl.reshape(maximum, [HEAD_TILE, 1])))
+                own_prob = pl.col_expand_mul(own_exp, own_valid)
+                own_sum = pl.reshape(pl.row_sum(own_prob), [1, HEAD_TILE])
+                denominator = pl.add(pl.exp(pl.sub(sink_row, maximum)), own_sum)
+                own_weights = pl.cast(own_prob, pl.BF16, mode="round")
+                own_weighted = pl.matmul(own_weights, own_kv)
+                sparse_acc = pl.create_tensor([HEAD_TILE, 512], dtype=pl.FP32)
+                for feature in pl.range(0, head_dim, 256):
+                    sparse_q = qflat[query_row:query_row + HEAD_TILE, feature:feature + 256]
+                    sparse_k = selected[cache_row + 128:cache_row + 640, feature:feature + 256]
+                    sparse_acc = pl.matmul_acc(sparse_acc, sparse_q, sparse_k, b_trans=True, init_cond=(feature == 0))
+                sparse_scores = pl.mul(sparse_acc, score_scale)
+                sparse_ids = pl.cast(indices[token:token + 1, 128:640], pl.FP32)
+                sparse_valid = pl.minimum(pl.maximum(pl.add(sparse_ids, 1.0), 0.0), 1.0)
+                sparse_bias = pl.mul(pl.sub(sparse_valid, 1.0), 1e30)
+                sparse_scores = pl.col_expand_add(sparse_scores, sparse_bias)
+                sparse_max = pl.reshape(pl.row_max(sparse_scores), [1, HEAD_TILE])
+                next_max = pl.maximum(maximum, sparse_max)
+                correction = pl.exp(pl.sub(maximum, next_max))
+                sparse_exp = pl.exp(pl.row_expand_sub(sparse_scores, pl.reshape(next_max, [HEAD_TILE, 1])))
+                sparse_prob = pl.col_expand_mul(sparse_exp, sparse_valid)
+                sparse_sum = pl.reshape(pl.row_sum(sparse_prob), [1, HEAD_TILE])
+                denominator = pl.add(pl.mul(denominator, correction), sparse_sum)
+                sparse_weights = pl.cast(sparse_prob, pl.BF16, mode="round")
+                correction_column = pl.reshape(correction, [HEAD_TILE, 1])
+                denominator_column = pl.reshape(denominator, [HEAD_TILE, 1])
+                for value_column in pl.range(0, head_dim, 256):
+                    sparse_v = selected[cache_row + 128:cache_row + 640, value_column:value_column + 256]
+                    sparse_weighted = pl.matmul(sparse_weights, sparse_v)
+                    own_part = own_weighted[:, value_column:value_column + 256]
+                    numerator = pl.add(pl.row_expand_mul(own_part, correction_column), sparse_weighted)
+                    result = pl.row_expand_div(numerator, denominator_column)
+                    oflat[query_row:query_row + HEAD_TILE, value_column:value_column + 256] = pl.cast(result, pl.BF16, mode="rint")
         return output
 
     return publish, gather, attend_wide_sparse if window == 640 and head_dim % 256 == 0 else attend
@@ -285,66 +293,68 @@ def _make_swa_read_single_window(capacity, cache_blocks, config):
         qflat = pl.reshape(query, [capacity * heads, head_dim])
         oflat = pl.reshape(output, [capacity * heads, head_dim])
         flat = pl.reshape(cache, [cache_rows, head_dim])
-        for block in pl.spmd(active * (heads // head_tile), name_hint="prefill_swa_read_fused", optimizations=[pl.cross_core_slot(slot_num=1, local_slot_num=1)]):
-            token = block // (heads // head_tile)
-            head = block % (heads // head_tile) * head_tile
-            query_row = token * heads + head
-            q = qflat[query_row:query_row + head_tile, :]
-            kv = pl.create_l1([WINDOW_TILE, head_dim], pl.BF16)
-            run_start = pl.cast(0, pl.INDEX)
-            run_source = pl.read(indices, [token, 0])
-            previous = run_source
-            for scan in pl.range(WINDOW_TILE // 4):
-                for within in pl.unroll(4):
-                    row = scan * 4 + within
-                    if row > 0:
-                        current = pl.read(indices, [token, row])
-                        run_break = (previous >= 0 and current != previous + 1) or (previous < 0 and current >= 0)
-                        if run_break:
-                            source = pl.cast(pl.max(run_source, 0), pl.INDEX)
-                            run_rows = row - run_start
-                            kv = pl.gather_row(kv, flat, [run_start, 0], [source, 0], [WINDOW_TILE, head_dim], valid_shape=[run_rows, head_dim])
-                            run_start = row
-                            run_source = current
-                        previous = current
-            source = pl.cast(pl.max(run_source, 0), pl.INDEX)
-            run_rows = WINDOW_TILE - run_start
-            kv = pl.gather_row(kv, flat, [run_start, 0], [source, 0], [WINDOW_TILE, head_dim], valid_shape=[run_rows, head_dim])
-            dot = pl.matmul(q, kv, b_trans=True, out_dtype=pl.FP32)
-            for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
-                dot_part = pl.aiv_shard(dot)
-                lane_head = head + lane * (head_tile // 2)
-                scores = pl.mul(dot_part, score_scale)
-                ids = pl.cast(indices[token:token + 1, :], pl.FP32)
-                valid = pl.minimum(pl.maximum(pl.add(ids, 1.0), 0.0), 1.0)
-                bias = pl.mul(pl.sub(valid, 1.0), 1e30)
-                scores = pl.col_expand_add(scores, bias)
-                local_max = pl.reshape(pl.row_max(scores), [1, head_tile // 2])
-                sink_row = pl.reshape(sink[lane_head:lane_head + head_tile // 2], [1, head_tile // 2])
-                maximum = pl.maximum(local_max, sink_row)
-                sink_exp = pl.exp(pl.sub(sink_row, maximum))
-                max_column = pl.reshape(maximum, [head_tile // 2, 1])
-                exponential = pl.exp(pl.row_expand_sub(scores, max_column))
-                probabilities = pl.col_expand_mul(exponential, valid)
-                probability_sum = pl.reshape(pl.row_sum(probabilities), [1, head_tile // 2])
-                denominator = pl.add(sink_exp, probability_sum)
-                weights = pl.cast(probabilities, pl.BF16, mode="round")
-                full_weights = pl.aic_gather(weights)
-                denominator_column = pl.reshape(denominator, [head_tile // 2, 1])
-            for value_column in pl.range(0, head_dim, value_tile):
-                values = kv[:, value_column:value_column + value_tile]
-                weighted = pl.matmul(full_weights, values, out_dtype=pl.FP32)
-                for lane_out in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
-                    weighted_part = pl.aiv_shard(weighted)
-                    for epilogue in pl.unroll(2):
-                        row_start = epilogue * (head_tile // 4)
-                        row_end = row_start + head_tile // 4
-                        weighted_rows = weighted_part[row_start:row_end, :]
-                        denominator_rows = denominator_column[row_start:row_end, :]
-                        result = pl.row_expand_div(weighted_rows, denominator_rows)
-                        output_row = query_row + lane_out * (head_tile // 2) + row_start
-                        narrowed = pl.cast(result, pl.BF16, mode="rint")
-                        oflat[output_row:output_row + head_tile // 4, value_column:value_column + value_tile] = narrowed
+        block_count = active * (heads // head_tile)
+        for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='prefill_swa_read_fused', optimizations=[pl.cross_core_slot(slot_num=1, local_slot_num=1)]):
+            for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
+                token = block // (heads // head_tile)
+                head = block % (heads // head_tile) * head_tile
+                query_row = token * heads + head
+                q = qflat[query_row:query_row + head_tile, :]
+                kv = pl.create_l1([WINDOW_TILE, head_dim], pl.BF16)
+                run_start = pl.cast(0, pl.INDEX)
+                run_source = pl.read(indices, [token, 0])
+                previous = run_source
+                for scan in pl.range(WINDOW_TILE // 4):
+                    for within in pl.unroll(4):
+                        row = scan * 4 + within
+                        if row > 0:
+                            current = pl.read(indices, [token, row])
+                            run_break = (previous >= 0 and current != previous + 1) or (previous < 0 and current >= 0)
+                            if run_break:
+                                source = pl.cast(pl.max(run_source, 0), pl.INDEX)
+                                run_rows = row - run_start
+                                kv = pl.gather_row(kv, flat, [run_start, 0], [source, 0], [WINDOW_TILE, head_dim], valid_shape=[run_rows, head_dim])
+                                run_start = row
+                                run_source = current
+                            previous = current
+                source = pl.cast(pl.max(run_source, 0), pl.INDEX)
+                run_rows = WINDOW_TILE - run_start
+                kv = pl.gather_row(kv, flat, [run_start, 0], [source, 0], [WINDOW_TILE, head_dim], valid_shape=[run_rows, head_dim])
+                dot = pl.matmul(q, kv, b_trans=True, out_dtype=pl.FP32)
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    dot_part = pl.aiv_shard(dot)
+                    lane_head = head + lane * (head_tile // 2)
+                    scores = pl.mul(dot_part, score_scale)
+                    ids = pl.cast(indices[token:token + 1, :], pl.FP32)
+                    valid = pl.minimum(pl.maximum(pl.add(ids, 1.0), 0.0), 1.0)
+                    bias = pl.mul(pl.sub(valid, 1.0), 1e30)
+                    scores = pl.col_expand_add(scores, bias)
+                    local_max = pl.reshape(pl.row_max(scores), [1, head_tile // 2])
+                    sink_row = pl.reshape(sink[lane_head:lane_head + head_tile // 2], [1, head_tile // 2])
+                    maximum = pl.maximum(local_max, sink_row)
+                    sink_exp = pl.exp(pl.sub(sink_row, maximum))
+                    max_column = pl.reshape(maximum, [head_tile // 2, 1])
+                    exponential = pl.exp(pl.row_expand_sub(scores, max_column))
+                    probabilities = pl.col_expand_mul(exponential, valid)
+                    probability_sum = pl.reshape(pl.row_sum(probabilities), [1, head_tile // 2])
+                    denominator = pl.add(sink_exp, probability_sum)
+                    weights = pl.cast(probabilities, pl.BF16, mode="round")
+                    full_weights = pl.aic_gather(weights)
+                    denominator_column = pl.reshape(denominator, [head_tile // 2, 1])
+                for value_column in pl.range(0, head_dim, value_tile):
+                    values = kv[:, value_column:value_column + value_tile]
+                    weighted = pl.matmul(full_weights, values, out_dtype=pl.FP32)
+                    for lane_out in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        weighted_part = pl.aiv_shard(weighted)
+                        for epilogue in pl.unroll(2):
+                            row_start = epilogue * (head_tile // 4)
+                            row_end = row_start + head_tile // 4
+                            weighted_rows = weighted_part[row_start:row_end, :]
+                            denominator_rows = denominator_column[row_start:row_end, :]
+                            result = pl.row_expand_div(weighted_rows, denominator_rows)
+                            output_row = query_row + lane_out * (head_tile // 2) + row_start
+                            narrowed = pl.cast(result, pl.BF16, mode="rint")
+                            oflat[output_row:output_row + head_tile // 4, value_column:value_column + value_tile] = narrowed
         return output
 
     return swa_read_single_window
@@ -369,7 +379,8 @@ def make_swa_read(capacity, cache_blocks, config):
         output: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        selected = pl.create_tensor([capacity * window, head_dim], dtype=pl.BF16)
+        selected_rows = pl.max(active, 1) * window
+        selected = pl.create_tensor([selected_rows, head_dim], dtype=pl.BF16)
         gather(cache, indices, selected, active)
         attend(query, selected, indices, sink, output, active)
         return output

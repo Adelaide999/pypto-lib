@@ -3,7 +3,7 @@
 The 40-layer network uses DP4/TP4/EP16 and one persistent generation session.
 Prefill and one-token Decode share TP4 operators, a compiled program registry,
 static weight handles, HCCL groups and paged cache allocations. Prefill uses
-capacity 16 or 128; one-token Decode retains capacity 16.
+capacities from 16 through 8192; one-token Decode retains capacity 16.
 The scheduler remains on the host; model arithmetic runs on A3.
 
 The compiled MoE packet slab follows the admitted SP row count, up to 16,
@@ -68,7 +68,10 @@ Use the site's allocator and its assigned device list for execution. The
 first predicted token comes from Prefill; a four-token limit exercises three
 Decode steps. Prompt chunks honor `--chunk-size`. Cache pages are reserved
 for the prompt and all requested output tokens before initialization.
-History is preserved in full up to the 2048-position context bound.
+History is preserved in full up to the 16384-position context bound. An
+8192-token prompt with `--chunk-size 8192 --max-new-tokens 8 --ignore-eos`
+runs one Prefill chunk and seven Decode steps on the same cache allocation.
+Use `--tokens-file prompt-8192.json` for an explicit JSON array of input IDs.
 
 Decode updates token IDs, positions, masks and lookup rows through reusable
 dynamic device buffers. It advances the original cache provider without a

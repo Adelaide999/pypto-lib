@@ -15,6 +15,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
 import pypto.language as pl
+from .runtime_config import SPMD_WORKER_LIMIT
 import torch
 
 from .gemm import (
@@ -225,19 +226,21 @@ def make_moe_router_inline(capacity, config, input_dtype=pl.BF16):
         route_weights: pl.Tensor[[capacity, topk], pl.FP32],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(active * (experts // ROUTER_EXPERT_TILE), name_hint="a2_moe_gate_fp32"):
-            token = block // (experts // ROUTER_EXPERT_TILE)
-            expert = block % (experts // ROUTER_EXPERT_TILE) * ROUTER_EXPERT_TILE
-            dot_sum = pl.full([1, ROUTER_EXPERT_TILE], dtype=pl.FP32, value=0.0)
-            for inner in pl.range(0, hidden, ROUTER_D_TILE):
-                source_storage = pl.create_tensor([1, ROUTER_D_TILE], dtype=input_dtype)
-                source_storage[:, :] = x[token : token + 1, inner : inner + ROUTER_D_TILE]
-                source = widen(source_storage)
-                weight = gate_weight[expert : expert + ROUTER_EXPERT_TILE, inner : inner + ROUTER_D_TILE]
-                product = pl.col_expand_mul(weight, source)
-                partial = pl.reshape(pl.row_sum(product), [1, ROUTER_EXPERT_TILE])
-                dot_sum = pl.add(dot_sum, partial)
-            logits[token : token + 1, expert : expert + ROUTER_EXPERT_TILE] = dot_sum
+        block_count = active * (experts // ROUTER_EXPERT_TILE)
+        for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='a2_moe_gate_fp32'):
+            for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
+                token = block // (experts // ROUTER_EXPERT_TILE)
+                expert = block % (experts // ROUTER_EXPERT_TILE) * ROUTER_EXPERT_TILE
+                dot_sum = pl.full([1, ROUTER_EXPERT_TILE], dtype=pl.FP32, value=0.0)
+                for inner in pl.range(0, hidden, ROUTER_D_TILE):
+                    source_storage = pl.create_tensor([1, ROUTER_D_TILE], dtype=input_dtype)
+                    source_storage[:, :] = x[token : token + 1, inner : inner + ROUTER_D_TILE]
+                    source = widen(source_storage)
+                    weight = gate_weight[expert : expert + ROUTER_EXPERT_TILE, inner : inner + ROUTER_D_TILE]
+                    product = pl.col_expand_mul(weight, source)
+                    partial = pl.reshape(pl.row_sum(product), [1, ROUTER_EXPERT_TILE])
+                    dot_sum = pl.add(dot_sum, partial)
+                logits[token : token + 1, expert : expert + ROUTER_EXPERT_TILE] = dot_sum
 
         raw_scores = pl.create_tensor([capacity, experts], dtype=pl.FP32)
         selected_ids = pl.create_tensor([capacity, ROUTER_TOPK_TILE], dtype=pl.INT32)

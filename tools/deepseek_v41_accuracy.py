@@ -23,9 +23,9 @@ import traceback
 
 import torch
 
+from models.deepseek_v4_1_flash_a3.runtime_config import MAX_CONTEXT_TOKENS as MAX_CONTEXT, MAX_PREFILL_CHUNK_SIZE
 
 TOPOLOGY = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
-MAX_CONTEXT = 2048
 MAX_TRACE = 256
 CHECKPOINT_METADATA = (
     "config.json", "quant_model_weights.safetensors.index.json", "quant_model_description.json", "tokenizer.json",
@@ -414,7 +414,7 @@ def main(argv=None):
     pypto = commands.add_parser("pypto", help="Capture existing Prefill/Decode with one persistent session per case")
     pypto.add_argument("--cases", type=Path, required=True)
     pypto.add_argument("--output", type=Path, required=True)
-    pypto.add_argument("--chunk-size", type=int, choices=range(1, 129), default=16)
+    pypto.add_argument("--chunk-size", type=int, choices=range(1, MAX_PREFILL_CHUNK_SIZE + 1), default=16)
     pypto.add_argument("--check-config", action="store_true",
                        help="Validate cases without loading weights or using NPU")
     compare = commands.add_parser("compare", help="Compare raw full-vocabulary logits on CPU")

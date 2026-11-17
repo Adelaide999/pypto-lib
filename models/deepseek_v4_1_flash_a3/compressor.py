@@ -271,6 +271,7 @@ def make_indexer_cache_publish(capacity, blocks, width):
 def make_index_cache_publish_observed(capacity, blocks, page_rows=64):
     """Quantize padded index rows and publish codes and FP16 scales with one writer."""
     width = 128
+    ROWS_TILE = gcd(capacity, 128)
     quantize = make_quantize(capacity, width, rows_tile=16)
 
     @pl.jit
@@ -289,16 +290,20 @@ def make_index_cache_publish_observed(capacity, blocks, page_rows=64):
         scale_values = pl.reshape(row_scales, [1, capacity * 8])
         with pl.spmd(1, name_hint="index_fused_publication"):
             _writer = pl.tile.get_block_idx()
-            staged_payload = payload[:, :]
-            narrowed_scales = pl.cast(scale_values[:, :], pl.FP16, mode="rint")
-            for token in pl.range(active):
-                block = pl.read(slots, [token, 0])
-                offset = pl.read(slots, [token, 1])
-                if block >= 0 and offset >= 0:
-                    row = pl.cast(block * page_rows + offset, pl.INDEX)
-                    flat_cache[row : row + 1, :] = staged_payload[token : token + 1, :]
-                    publication_scale = pl.read(narrowed_scales, [0, token * 8])
-                    pl.write(flat_scales, [row, 0], publication_scale)
+            for first in pl.range(0, active, ROWS_TILE):
+                staged_payload = payload[first : first + ROWS_TILE, :]
+                staged_scales = scale_values[:, first * 8 : (first + ROWS_TILE) * 8]
+                narrowed_scales = pl.cast(staged_scales, pl.FP16, mode="rint")
+                count = pl.min(ROWS_TILE, active - first)
+                for local in pl.range(count):
+                    token = first + local
+                    block = pl.read(slots, [token, 0])
+                    offset = pl.read(slots, [token, 1])
+                    if block >= 0 and offset >= 0:
+                        row = pl.cast(block * page_rows + offset, pl.INDEX)
+                        flat_cache[row : row + 1, :] = staged_payload[local : local + 1, :]
+                        publication_scale = pl.read(narrowed_scales, [0, local * 8])
+                        pl.write(flat_scales, [row, 0], publication_scale)
         return cache, scales, payload, row_scales
 
     return index_cache_publish
@@ -1498,3 +1503,56 @@ def make_decode_layer2_c1c2_kn(capacity, config):
         )
 
     return layer2_c1c2
+
+
+def golden_index_cache_publish(values):
+    """Quantize active rows and scatter valid slots, preserving all other cache bytes."""
+    import torch
+
+    active = int(values["active"])
+    source = values["value"][:active].float()
+    maximum = source.abs().amax(dim=1, keepdim=True)
+    codes = torch.round(source * (127.0 / maximum.clamp_min(1e-30))).clamp(-127, 127).to(torch.int8)
+    scales = maximum * (1.0 / 127.0)
+    values["payload"][:active] = codes
+    values["row_scales"][:active] = scales.expand(-1, 8)
+    for token in range(active):
+        block, offset = values["slots"][token].tolist()
+        if block >= 0 and offset >= 0:
+            values["cache"][block, offset, 0] = codes[token]
+            values["scales"][block, offset, 0, 0] = scales[token, 0].half()
+
+
+def index_cache_publish_golden_cases(*, capacity=256, page_rows=64):
+    """Cover publication tile boundaries, inactive rows and invalid cache slots."""
+    import torch
+    from golden import ScalarSpec, TensorSpec
+
+    blocks = (capacity + page_rows - 1) // page_rows + 2
+    rows = torch.arange(capacity)
+    columns = torch.arange(128)
+    pattern = ((rows[:, None] * 7 + columns[None] * 13) % 31 - 15).float()
+    value = (pattern * (2.0 ** (rows % 5 - 2))[:, None]).bfloat16()
+    value[::13] = 0
+    physical = capacity - 1 - rows + page_rows
+    slots = torch.stack((physical // page_rows, physical % page_rows), dim=1).int()
+    slots[::11, 0] = -1
+    slots[::17, 1] = -1
+    active_rows = sorted({0, 1, min(127, capacity), min(128, capacity), min(129, capacity), capacity - 1, capacity})
+    for active in active_rows:
+        yield dict(
+            name=f"index-publish-rows{capacity}-page{page_rows}-active{active}",
+            fn=make_index_cache_publish_observed(capacity, blocks, page_rows),
+            specs=[
+                TensorSpec("value", [capacity, 128], torch.bfloat16, init_value=value),
+                TensorSpec("slots", [capacity, 2], torch.int32, init_value=slots),
+                TensorSpec("cache", [blocks, page_rows, 1, 128], torch.int8, init_value=-53),
+                TensorSpec("scales", [blocks, page_rows, 1, 1], torch.float16, init_value=-59),
+                TensorSpec("payload", [capacity, 128], torch.int8, init_value=-61),
+                TensorSpec("row_scales", [capacity, 8], torch.float32, init_value=-67),
+                ScalarSpec("active", torch.int32, active, compile_runtime=True),
+            ],
+            golden_fn=golden_index_cache_publish,
+            rtol=1e-6,
+            atol=0,
+        )

@@ -22,6 +22,7 @@ import torch
 from pypto import ir, passes
 from pypto.ir.compiled_program import extract_param_infos
 from .utils import allocate_runtime_tensor, copy_runtime_tensor, read_runtime_control
+from .runtime_config import MAX_PREFILL_CHUNK_SIZE
 
 
 def validate_prefill_ownership(layout, ownership):
@@ -171,7 +172,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
         raise ValueError("Original parallel and model modes must remain enabled")
     validate_prefill_ownership(layout, runtime["ownership"])
     capacity, expert_capacity = runtime["capacity"], runtime["expert_capacity"]
-    if not 0 < capacity <= 512 or capacity % 16 or expert_capacity <= 0 or expert_capacity % 16:
+    if not 0 < capacity <= MAX_PREFILL_CHUNK_SIZE or capacity % 16 or expert_capacity <= 0 or expert_capacity % 16:
         raise ValueError("The current complete core requires bounded positive 16-row capacities")
     if any(len(records) != world for records in batch["cases"].values()):
         raise ValueError("Every batch must cover the actual complete world")
@@ -650,6 +651,14 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                              state["combined"][base:base + slab], work["returned_routes"], physical]
                 execute("combine", rank, case, arguments, {}, "combine")
         map_ranks(combine_rank_slab)
+        if runtime.get("release_tensors") is not None:
+            runtime["release_tensors"]([
+                (rank, value)
+                for packets in (received, returned)
+                for rank, cases in enumerate(packets)
+                for packet in cases.values()
+                for value in packet.values()
+            ])
     final_hidden, final_pre = [{} for _ in range(world)], [{} for _ in range(world)]
     def finish_rank_moe(rank):
         for case in batch["cases"]:

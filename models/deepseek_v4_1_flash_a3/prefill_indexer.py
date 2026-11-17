@@ -508,7 +508,7 @@ def validate_key_gather(*, device=0, sim=False, compile_only=False, cpu_only=Fal
         codes = codes.reshape(blocks, rows, 1, INDEX_WIDTH)
         scales = ((physical.float() + 1) / 4096).half().reshape(blocks, rows, 1, 1)
         table = torch.stack((torch.arange(1, pages + 1), torch.arange(pages, 0, -1))).int()
-        for length in (0, 1, 511, 512, 513, 1024, 2048):
+        for length in (0, 1, 511, 512, 513, 2048, 4096, 4097, 8192, 8193, 16383, KEY_CAPACITY):
             specs = [
                 TensorSpec("cache", [blocks, rows, 1, INDEX_WIDTH], torch.int8, init_value=codes),
                 TensorSpec("scales", [blocks, rows, 1, 1], torch.float16, init_value=scales),

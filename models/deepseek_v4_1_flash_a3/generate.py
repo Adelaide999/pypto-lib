@@ -20,7 +20,7 @@ from tokenizers import Tokenizer
 from .decode_network import DecodeNetwork, TOPOLOGY
 from .prefill_fwd import prefill_fwd
 from .prefill_prepare import checkpoint_cache, tokenize_prompt
-from .runtime_config import configure_devices, prefill_execution_capacity
+from .runtime_config import MAX_CONTEXT_TOKENS, MAX_PREFILL_CHUNK_SIZE, configure_devices, prefill_execution_capacity
 from .utils import write_json
 
 
@@ -31,24 +31,35 @@ def main(argv=None):
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--prompt")
     inputs.add_argument("--tokens")
+    inputs.add_argument("--tokens-file", type=Path, help="JSON array of prompt token IDs")
     parser.add_argument("--devices", type=lambda value: [int(item) for item in value.split(",")], required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--result", type=Path)
     parser.add_argument("--max-new-tokens", type=int, default=3)
     parser.add_argument("--chunk-size", type=int, default=128)
     parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5),
+                        help="Device capture level: 0 disables capture; the bare flag selects 1")
+    parser.add_argument("--profile-phase", choices=("all", "prefill", "decode"), default="all",
+                        help="Capture all forward phases or only Prefill/Decode")
+    parser.add_argument("--profile-output", type=Path, help="Device trace root; defaults to OUTPUT/profiling")
     args = parser.parse_args(argv)
-    if not 1 <= args.chunk_size <= 128 or not 1 <= args.max_new_tokens <= 256:
-        parser.error("Require chunk size 1..128 and a new-token limit in 1..256")
+    if not 1 <= args.chunk_size <= MAX_PREFILL_CHUNK_SIZE or not 1 <= args.max_new_tokens <= 256:
+        parser.error(f"Require chunk size 1..{MAX_PREFILL_CHUNK_SIZE} and a new-token limit in 1..256")
     started = perf_counter()
     args.checkpoint, args.output = args.checkpoint.resolve(), args.output.resolve()
     result_dir = (args.result or args.output / "generation").resolve()
     model = json.loads((args.checkpoint / "config.json").read_text())
     tokenizer = Tokenizer.from_file(str(args.checkpoint / "tokenizer.json"))
-    raw = args.prompt if args.prompt is not None else [int(item) for item in args.tokens.split(",")]
+    if args.tokens_file is not None:
+        raw = json.loads(args.tokens_file.read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            parser.error("--tokens-file must contain a JSON array of token IDs")
+    else:
+        raw = args.prompt if args.prompt is not None else [int(item) for item in args.tokens.split(",")]
     tokens = tokenize_prompt(raw, args.checkpoint, model["text_config"]["vocab_size"])
-    if len(tokens) + args.max_new_tokens > 2048:
-        parser.error("Prompt plus generation exceeds the 2048-position session reservation")
+    if len(tokens) + args.max_new_tokens > MAX_CONTEXT_TOKENS:
+        parser.error(f"Prompt plus generation exceeds the {MAX_CONTEXT_TOKENS}-position session reservation")
     devices = configure_devices(args.devices, world=16)
     args.output.mkdir(parents=True, exist_ok=False)
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -56,10 +67,14 @@ def main(argv=None):
     cache, config = checkpoint_cache(args.checkpoint, TOPOLOGY, capacity=prefill_execution_capacity(args.chunk_size))
     checkpoint_contract_seconds = perf_counter() - preparation_started
     config.update(chunk_size=args.chunk_size, context_capacity=len(tokens) + args.max_new_tokens)
+    profiling = dict(level=args.enable_chip_swimlane, phase=args.profile_phase,
+                     output_dir=str((args.profile_output or args.output / "profiling").resolve()))
+    config["profiling"] = profiling
     eos = model.get("eos_token_id", model["text_config"].get("eos_token_id"))
     report = dict(status="executing", checkpoint=str(args.checkpoint), topology=TOPOLOGY,
                   devices=devices, chunk_size=args.chunk_size, prefill_capacity=config["capacity"],
-                  decode_capacity=16, moe_slab_rows=16, prompt_token_ids=tokens, generated_token_ids=[], phases=[], accuracy="not_run")
+                  decode_capacity=16, moe_slab_rows=16, prompt_token_ids=tokens, generated_token_ids=[], phases=[],
+                  profiling=profiling, accuracy="not_run")
     write_json(result_dir / "prompt.json", report)
     session, network = None, None
     generated, decode_timings, token_timings = [], [], []
@@ -158,6 +173,7 @@ def main(argv=None):
         if session is not None:
             report["session_closed"] = session.closed
             report["runtime_closed"] = session.runtime.summary()["closed"]
+            report["profiling"] = session.runtime.profiling.summary()
         if cleanup_failures:
             report["cleanup_failures"] = cleanup_failures
             if not primary_error:

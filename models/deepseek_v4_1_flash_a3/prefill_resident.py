@@ -11,12 +11,15 @@
 import logging
 import os
 import struct
+import sys
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+from pathlib import Path
 from time import perf_counter
 from threading import Condition, Lock, RLock, Thread
 import torch
+from .utils import write_json
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -169,16 +172,135 @@ class _RankExecutor:
             self._slot.reset(None, ())
 
 
+class NetworkProfiler:
+    """Collect one device trace per dispatch, grouped by phase, chunk and logical rank."""
+
+    def __init__(self, devices, *, level=0, phase="all", output_dir=None):
+        if type(level) is not int or not 0 <= level <= 4:
+            raise ValueError("Chip swimlane level must be an integer in 0..4")
+        if phase not in ("all", "prefill", "decode"):
+            raise ValueError("Profile phase must be all, prefill or decode")
+        if level and output_dir is None:
+            raise ValueError("Enabled network profiling requires an output directory")
+        self.level, self.phase = level, phase
+        self.devices = tuple(devices)
+        self.output = Path(output_dir).resolve() if output_dir is not None else None
+        self.current, self.chunks, self.name_maps = None, [], {}
+        self.started = False
+
+    def begin_chunk(self, phase, epoch):
+        """Open a fresh capture scope after model initialization and before dispatch."""
+        if self.current is not None:
+            raise RuntimeError("The previous profiling chunk has not been finalized")
+        if not self.level or self.phase not in ("all", phase):
+            return
+        if phase not in ("prefill", "decode") or type(epoch) is not int or epoch < 0:
+            raise ValueError("Profiling requires a valid phase and nonnegative chunk epoch")
+        if not self.started:
+            self.output.mkdir(parents=True, exist_ok=False)
+            self.started = True
+        directory = self.output / phase / f"chunk-{epoch:06d}"
+        directory.mkdir(parents=True, exist_ok=False)
+        self.current = dict(phase=phase, epoch=epoch, directory=directory,
+                            ranks=[[] for _ in self.devices])
+
+    def prepare_call(self, compiled, rank, staged, arguments, parameters, *, empty_capture=False, ring_heap=None):
+        """Reserve a unique output prefix without changing cached dispatch arguments."""
+        if self.current is None:
+            return None, None
+        from pypto.runtime import RunConfig
+
+        calls = self.current["ranks"][rank]
+        directory = self.current["directory"] / f"rank-{rank:02d}" / f"call-{len(calls):06d}"
+        directory.mkdir(parents=True, exist_ok=False)
+        record = dict(rank=rank, physical_device=int(self.devices[rank]), call=len(calls),
+                      phase=self.current["phase"], epoch=self.current["epoch"], level=self.level,
+                      compiled_directory=str(compiled.output_dir), directory=str(directory),
+                      staged=staged, empty_capture=empty_capture, ring_heap=ring_heap, status="started")
+        record["scalar_arguments"] = {
+            parameter.get("name", f"arg{index}"): value
+            for index, (value, parameter) in enumerate(zip(arguments, parameters)) if parameter["shape"] is None
+        }
+        calls.append(record)
+        config = RunConfig(enable_chip_swimlane=self.level, ring_heap=ring_heap)
+        return record, compiled._build_call_config(config, dfx_dir=directory)
+
+    def finish_chunk(self, *, completed=True):
+        """Index raw captures and offline conversion commands without replaying model state."""
+        if self.current is None:
+            return None
+        from pypto.runtime.runner import _write_name_map
+
+        chunk, self.current = self.current, None
+        missing, ranks = [], []
+        for rank, calls in enumerate(chunk["ranks"]):
+            for record in calls:
+                directory = Path(record["directory"])
+                source = Path(record["compiled_directory"])
+                raw = directory / "chip_swimlane_records.json"
+                record["raw_trace"] = str(raw) if raw.is_file() else None
+                if raw.is_file():
+                    if source not in self.name_maps:
+                        symbols = self.output / "symbols" / f"program-{len(self.name_maps):04d}"
+                        symbols.mkdir(parents=True, exist_ok=False)
+                        prebuilt = (source / "binary_manifest.json").is_file()
+                        self.name_maps[source] = _write_name_map(source, symbols, prebuilt=prebuilt)
+                    names = self.name_maps[source]
+                    command = [sys.executable, "-m", "simpler_setup.tools.swimlane_converter", str(raw),
+                               "-o", str(directory / "swimlane.json")]
+                    if names is not None:
+                        command.extend(("--func-names", str(names)))
+                    record["convert_command"] = command
+                    record["capture_status"] = "captured"
+                elif any(record["scalar_arguments"].get(name) == 0 for name in ("active", "num_tokens")):
+                    record["capture_status"] = "not_emitted_zero_active"
+                elif record["empty_capture"]:
+                    record["capture_status"] = "not_emitted_empty_dispatch"
+                elif record["status"] == "completed":
+                    record["capture_status"] = "missing"
+                    missing.append(str(directory))
+                else:
+                    record["capture_status"] = "dispatch_failed"
+                write_json(directory / "dispatch.json", record)
+            index = chunk["directory"] / f"rank-{rank:02d}" / "index.json"
+            index.parent.mkdir(parents=True, exist_ok=True)
+            write_json(index, dict(rank=rank, physical_device=int(self.devices[rank]), calls=calls))
+            ranks.append(dict(rank=rank, calls=len(calls), index=str(index)))
+        status = "complete" if completed and not missing else "incomplete"
+        summary = dict(phase=chunk["phase"], epoch=chunk["epoch"], level=self.level,
+                       status=status, ranks=ranks, missing_traces=missing,
+                       index=str(chunk["directory"] / "index.json"))
+        write_json(Path(summary["index"]), summary)
+        self.chunks.append(summary)
+        write_json(self.output / "index.json", self.summary())
+        if completed and missing:
+            raise RuntimeError(f"Profiling did not emit {len(missing)} dispatch traces; see {summary['index']}")
+        return summary
+
+    def summary(self):
+        """Describe capture coverage and paths without implying cross-rank clock alignment."""
+        return dict(enabled=bool(self.level), level=self.level, phase=self.phase,
+                    output_dir=str(self.output) if self.output is not None else None,
+                    scope="per-dispatch PyPTO device compute; host-trace.json records host dispatch and collectives",
+                    cross_rank_clock_alignment=False, chunks=list(self.chunks))
+
+
 class ResidentNetworkRuntime:
     """Own one worker, program registry and allocation bank per logical rank."""
 
-    def __init__(self, devices, topology, *, worker_factory=None, device_copy=None, device_readback=None, device_fill=None):
+    def __init__(self, devices, topology, *, worker_factory=None, device_copy=None, device_readback=None,
+                 device_fill=None, profiling=None, ring_heap=None):
         begin = perf_counter()
         self.devices, self.topology = tuple(devices), dict(topology)
         os.environ.setdefault("HCCL_EXEC_TIMEOUT", "180")
         os.environ.setdefault("HCCL_CONNECT_TIMEOUT", "180")
         if len(self.devices) != topology["ep"] or len(set(self.devices)) != len(self.devices):
             raise ValueError("Resident runtime requires the exact complete distinct device mapping")
+        self.profiling = NetworkProfiler(self.devices, **(profiling or {}))
+        from pypto.runtime import RunConfig
+
+        self.ring_heap = ring_heap
+        self._run_config = RunConfig(ring_heap=ring_heap) if ring_heap is not None else None
         self.workers, self.pinned, self.channels = [], {}, {}
         self.device_owners = {}
         self.device_readonly = {}
@@ -264,6 +386,10 @@ class ResidentNetworkRuntime:
         try:
             self.close()
         except BaseException:
+            try:
+                self.profiling.finish_chunk(completed=False)
+            except BaseException:
+                _LOGGER.exception("Profiling finalization failed during resident cleanup")
             if error is None:
                 raise
             _LOGGER.exception("Resident cleanup failed while unwinding %s", error_type.__name__)
@@ -329,6 +455,7 @@ class ResidentNetworkRuntime:
                         errors.append(error)
             if errors:
                 raise errors[0]
+            self.profiling.finish_chunk(completed=False)
             self.pinned.clear()
             self.device_owners.clear()
             self.rotations.clear()
@@ -474,12 +601,12 @@ class ResidentNetworkRuntime:
             self.stats["staging_worker_initializations"] += 1
         return self.staging_workers[rank]
 
-    def execute(self, compiled, rank, arguments, abi, *, staged=False):
+    def execute(self, compiled, rank, arguments, abi, *, staged=False, empty_capture=False):
         """Dispatch shared arithmetic with cached bindings and device-owned operands."""
         with self._dispatch_locks[rank]:
-            self._execute(compiled, rank, arguments, abi, staged=staged)
+            self._execute(compiled, rank, arguments, abi, staged=staged, empty_capture=empty_capture)
 
-    def _execute(self, compiled, rank, arguments, abi, *, staged):
+    def _execute(self, compiled, rank, arguments, abi, *, staged, empty_capture=False):
         from pypto.runtime import DeviceTensor
 
         if self._closed:
@@ -517,6 +644,8 @@ class ResidentNetworkRuntime:
                 owner["device_written"] = True
             bound.append(self._view(owner["allocation"], value, owner.get("base_offset", 0)))
         started = perf_counter()
+        capture, call_config = self.profiling.prepare_call(compiled, rank, staged, bound, abi["params"],
+                                                         empty_capture=empty_capture, ring_heap=self.ring_heap)
         try:
             # Retire completed callable slots; tensor allocations belong to the worker.
             if self._native_dispatch:
@@ -527,10 +656,18 @@ class ResidentNetworkRuntime:
                     worker._impl.unregister(cache[oldest])
                     del cache[oldest]
                     self.stats["program_evictions"] += 1
-            self._run_compiled(compiled, rank, staged, worker, bound)
-        except BaseException:
+            self._run_compiled(compiled, rank, staged, worker, bound, call_config=call_config)
+            if capture is not None:
+                capture["status"] = "completed"
+        except BaseException as error:
+            if capture is not None:
+                capture.update(status="failed", error_type=type(error).__name__, error=str(error))
             self.failed_ranks.add(rank)
             raise
+        finally:
+            if capture is not None:
+                capture.update(host_start=started, host_end=perf_counter())
+                write_json(Path(capture["directory"]) / "dispatch.json", capture)
         self.trace.append(dict(kind="worker_run", rank=rank, start=started, end=perf_counter()))
         self.stats["dispatches"] += 1
 
@@ -559,21 +696,22 @@ class ResidentNetworkRuntime:
         else:
             worker.copy_from(destination, source, nbytes)
 
-    def _run_compiled(self, compiled, rank, staged, worker, bound):
+    def _run_compiled(self, compiled, rank, staged, worker, bound, *, call_config=None):
         """Reuse validated wire descriptors for the same live device spans and scalar values."""
         from pypto.runtime import DeviceTensor
 
-        if not self._native_dispatch:
-            worker.run(compiled, *bound)
+        if not self._native_dispatch and call_config is None:
+            if self._run_config is None:
+                worker.run(compiled, *bound)
+            else:
+                worker.run(compiled, *bound, config=self._run_config)
             return
         worker._check_binding(compiled)
         runtime_config = compiled.runtime_config
         thread_count = runtime_config.get("aicpu_thread_num")
         host_indices = runtime_config.get("host_tensor_indices", ())
-        if (type(host_indices) not in (tuple, list) or host_indices
-                or type(thread_count) not in (int, type(None))):
-            worker.run(compiled, *bound)
-            return
+        cacheable = (type(host_indices) in (tuple, list) and not host_indices
+                     and type(thread_count) in (int, type(None)))
         signature = []
         for value in bound:
             if isinstance(value, DeviceTensor):
@@ -583,14 +721,24 @@ class ResidentNetworkRuntime:
             elif type(value) in (bool, int):
                 signature.append((type(value), value))
             else:
-                worker.run(compiled, *bound)
-                return
+                cacheable = False
+                break
+        if not cacheable:
+            if call_config is None:
+                if self._run_config is None:
+                    worker.run(compiled, *bound)
+                else:
+                    worker.run(compiled, *bound, config=self._run_config)
+            else:
+                arguments, coerced, _ = compiled._build_orch_args(*bound, worker=worker._impl)
+                worker._run_chip(compiled.chip_callable, arguments, call_config)
+            return
         key = id(compiled), thread_count, tuple(signature)
         cache = self._dispatch_cache.setdefault((rank, staged), OrderedDict())
         record = cache.get(key)
         if record is None:
             arguments, coerced, _ = compiled._build_orch_args(*bound, worker=worker._impl)
-            config = compiled._build_call_config()
+            config = compiled._build_call_config(self._run_config)
             record = compiled, coerced, compiled.chip_callable, arguments, config
             cache[key] = record
             if len(cache) > 64:
@@ -600,7 +748,7 @@ class ResidentNetworkRuntime:
                 if isinstance(value, DeviceTensor):
                     worker._require_owned_resident_tensor(value, "Resident dispatch argument")
             cache.move_to_end(key)
-        worker._run_chip(record[2], record[3], record[4])
+        worker._run_chip(record[2], record[3], record[4] if call_config is None else call_config)
 
     def _value_owner(self, value, rank, *, initialize=True):
         with self.rank_locks[rank]:
@@ -788,19 +936,31 @@ class ResidentNetworkRuntime:
         if self._closed:
             raise RuntimeError("Resident runtime is closed")
         retained = {(rank, value.untyped_storage()._cdata) for rank, value in keep}
+        self._retire_values(set(self.values) - retained)
+
+    def release_tensors(self, values):
+        """Recycle completed communication roots after all rank consumers finish."""
+        if self._closed:
+            raise RuntimeError("Resident runtime is closed")
+        keys = {(rank, value.untyped_storage()._cdata) for rank, value in values}
+        if keys.intersection(self.pinned):
+            raise ValueError("Cannot recycle pinned weights or cache storage")
+        self._retire_values(keys.intersection(self.values))
+
+    def _retire_values(self, keys):
+        """Return retired allocations to their owning rank's reuse pool."""
         retired = set()
-        for key in list(self.values):
-            if key not in retained:
-                owner = self.values.pop(key)
-                allocation = owner["allocation"]
-                retired.add(id(allocation.buffer))
-                self.device_active[id(allocation.buffer)] = False
-                if owner.get("workspace"):
-                    value = owner["source"]
-                    shape_key = key[0], tuple(value.shape), value.dtype
-                    self.free_workspaces.setdefault(shape_key, []).append(owner)
-                else:
-                    self.free_values.setdefault((key[0], allocation.nbytes), []).append(allocation)
+        for key in keys:
+            owner = self.values.pop(key)
+            allocation = owner["allocation"]
+            retired.add(id(allocation.buffer))
+            self.device_active[id(allocation.buffer)] = False
+            if owner.get("workspace"):
+                value = owner["source"]
+                shape_key = key[0], tuple(value.shape), value.dtype
+                self.free_workspaces.setdefault(shape_key, []).append(owner)
+            else:
+                self.free_values.setdefault((key[0], allocation.nbytes), []).append(allocation)
         self.alias_leases = {key: value for key, value in self.alias_leases.items() if id(value.buffer) not in retired}
 
     def _group_ranks(self, group):
@@ -894,7 +1054,9 @@ class ResidentNetworkRuntime:
         channels, outputs = self.channels[group], [{} for _ in packets]
         begin = perf_counter()
 
-        def transfer(rank):
+        prepared = [None] * world
+
+        def prepare(rank):
             channel = channels[rank]
             transfers, destination_owners = [], []
             for case, names in schema:
@@ -902,9 +1064,6 @@ class ResidentNetworkRuntime:
                 for name in names:
                     value = packets[rank][case][name]
                     identity = stage + "/" + case + "/" + name
-                    if host_control:
-                        outputs[rank][case][name] = channel.exchange(value, identity, collective)
-                        continue
                     shape = list(value.shape)
                     if collective == "all_gather":
                         shape[0] *= len(channel.group_ranks)
@@ -919,6 +1078,18 @@ class ResidentNetworkRuntime:
                     transfers.append((source, destination, identity))
                     destination_owners.append(owner)
                     outputs[rank][case][name] = received
+            prepared[rank] = transfers, destination_owners
+
+        def transfer(rank):
+            channel = channels[rank]
+            if host_control:
+                for case, names in schema:
+                    outputs[rank][case] = {}
+                    for name in names:
+                        identity = stage + "/" + case + "/" + name
+                        outputs[rank][case][name] = channel.exchange(packets[rank][case][name], identity, collective)
+                return
+            transfers, destination_owners = prepared[rank]
             if transfers:
                 try:
                     channel.exchange_device_batch(transfers, collective)
@@ -928,6 +1099,8 @@ class ResidentNetworkRuntime:
                 for owner in destination_owners:
                     owner["device_written"] = True
 
+        if not host_control:
+            self._exchange_rank_tasks(prepare, range(world))
         self._exchange_rank_tasks(transfer, range(world))
         seconds = perf_counter() - begin
         self.trace.append(dict(kind="collective", stage=stage, start=begin, end=perf_counter()))
@@ -945,6 +1118,8 @@ class ResidentNetworkRuntime:
     def summary(self):
         """Report actual allocations and dispatches separately from numerical acceptance."""
         return dict(self.stats, transfer_by_rank=[dict(rank=rank, **row) for rank, row in enumerate(self.transfer_stats)],
+                    profiling=self.profiling.summary(),
+                    ring_heap=self.ring_heap,
                     assigned_devices=list(self.devices),
                     runtime_identity=id(self), worker_identities=[id(worker) for worker in self.workers],
                     registered_programs=len(self.programs), closed=self._closed,

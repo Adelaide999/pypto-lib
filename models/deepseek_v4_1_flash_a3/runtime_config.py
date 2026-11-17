@@ -11,11 +11,42 @@
 from dataclasses import dataclass
 
 
+MAX_CONTEXT_TOKENS = 16384
+PREFILL_CAPACITIES = (16, 128, 256, 512, 1024, 2048, 4096, 8192)
+MAX_PREFILL_CHUNK_SIZE = PREFILL_CAPACITIES[-1]
+SPMD_WORKER_LIMIT = 256
+
+
 def prefill_execution_capacity(chunk_size):
     """Select the bounded Prefill shape while retaining the 16-row Decode ABI."""
-    if type(chunk_size) is not int or not 1 <= chunk_size <= 128:
-        raise ValueError("Chunk size must be in 1..128")
-    return 16 if chunk_size <= 16 else 128
+    if type(chunk_size) is not int or not 1 <= chunk_size <= MAX_PREFILL_CHUNK_SIZE:
+        raise ValueError(f"Chunk size must be in 1..{MAX_PREFILL_CHUNK_SIZE}")
+    return next(capacity for capacity in PREFILL_CAPACITIES if chunk_size <= capacity)
+
+
+def network_ring_heap(capacity, config, tp):
+    """Size sparse-gather and mixed-kernel pipeline heaps for a network admission."""
+    if capacity not in PREFILL_CAPACITIES:
+        raise ValueError("Unsupported network execution capacity")
+    validate_tp(tp)
+    default = 256 * 1024 * 1024
+    query_rows = (capacity + tp - 1) // tp
+    selected_bytes = query_rows * (config["sliding_window"] + config["index_topk"]) * config["head_dim"] * 2
+    hidden, hc = config["hidden_size"], config["hc_mult"]
+    intermediate = ((config["moe_intermediate_size"] // tp + 255) // 256) * 256
+    # Full-capacity shared-expert partials and unrolled quantized projections.
+    shared_bytes = capacity * tp * (hidden * 7 + intermediate * 9 + 32)
+    # HC preparation, inverse scale, rounded function and function accumulation.
+    hc_width = hc * (hc + 2)
+    hc_bytes = capacity * (hidden * hc * 4 + 32 + hc_width * 4) + hc_width * hidden * hc * 4
+    outer_bytes = max(selected_bytes, shared_bytes, hc_bytes)
+    # Index selection keeps one 16384-element FP32 pipeline per query row.
+    pipe_bytes = capacity * 16384 * 4
+    if max(outer_bytes, pipe_bytes) <= default:
+        return None
+    outer_heap = 1 << (outer_bytes + 1024 * 1024 - 1).bit_length() if outer_bytes > default else 0
+    inner_heap = 1 << (pipe_bytes + 1024 * 1024 - 1).bit_length() if pipe_bytes > default else 0
+    return (0, outer_heap, inner_heap, 0)
 
 
 def validate_tp(tp):

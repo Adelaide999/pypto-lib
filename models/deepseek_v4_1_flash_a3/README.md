@@ -35,6 +35,21 @@ The [native vLLM-Ascend accuracy workflow](../../docs/models/deepseek_v4_1_flash
 uses fixed TP4/DP4/EP16 prompt/Decode traces and compares full-vocabulary logits,
 Top1 and TopK through the repository's `tools/` entries.
 
-Generation defaults to 128-token Prefill chunks; Decode retains capacity 16.
+Generation defaults to 128-token Prefill chunks and accepts chunks up to 8192;
+Decode retains capacity 16. The context limit is 16384 tokens, including
+reserved output positions. For batch size 1, 8192 input tokens and eight output
+tokens, use `--tokens-file prompt-8192.json --chunk-size 8192 --max-new-tokens 8 --ignore-eos`
+on 16 allocated devices. The JSON file contains the prompt token
+ID array. This executes one Prefill chunk followed by seven Decode steps with
+the fixed DP4/TP4/EP16 topology.
 Timing reports separate weight initialization, Prefill, Decode and first-token
 wall time. Execution-only performance runs do not establish numerical accuracy.
+
+Add `--enable-chip-swimlane 1 --profile-phase all` to `generate.py` to capture
+the complete network's device dispatches. Capture is disabled by default;
+`--profile-phase prefill` or `decode` selects one phase, and level `4` records
+detailed scheduler information. Raw traces and conversion commands are saved
+under `OUTPUT/profiling/<phase>/chunk-*/rank-*/call-*`, independently for each
+logical rank and invocation. Use `--profile-output` to choose a fresh directory.
+See [network profiling](../../docs/models/deepseek_v4_1_flash_a3/index.md#network-profiling)
+for configuration, offline Perfetto conversion and timing scope.

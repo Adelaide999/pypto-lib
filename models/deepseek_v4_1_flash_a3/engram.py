@@ -15,6 +15,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
 import pypto.language as pl
+from .runtime_config import SPMD_WORKER_LIMIT
 import torch
 from .qkv_proj_rope import make_bf16_projection_staged
 from .config import FLASH
@@ -284,13 +285,15 @@ def make_original_basis_hidden(capacity):
             original, [capacity * ENGRAM_ECOTECH_HC * (ENGRAM_ECOTECH_D // ROTATION_TILE), ROTATION_TILE]
         )
         blocks = active * ENGRAM_ECOTECH_HC * (ENGRAM_ECOTECH_D // ROTATION_TILE // RESTORE_M_TILE)
-        for task in pl.spmd(blocks, name_hint="engram_ecotech_original_basis_cube"):
-            row = task * RESTORE_M_TILE
-            source_bf16 = flat_hidden[row : row + RESTORE_M_TILE, :]
-            source_fp32 = pl.cast(source_bf16, pl.FP32)
-            rotation_fp32 = rotation_block[:, :]
-            restored = pl.matmul(source_fp32, rotation_fp32, out_dtype=pl.FP32, b_trans=True)
-            flat_original[row : row + RESTORE_M_TILE, :] = pl.mul(restored, 1.0)
+        task_count = blocks
+        for task_worker in pl.spmd(pl.min(task_count, SPMD_WORKER_LIMIT), name_hint='engram_ecotech_original_basis_cube'):
+            for task in pl.range(task_worker, task_count, SPMD_WORKER_LIMIT):
+                row = task * RESTORE_M_TILE
+                source_bf16 = flat_hidden[row : row + RESTORE_M_TILE, :]
+                source_fp32 = pl.cast(source_bf16, pl.FP32)
+                rotation_fp32 = rotation_block[:, :]
+                restored = pl.matmul(source_fp32, rotation_fp32, out_dtype=pl.FP32, b_trans=True)
+                flat_original[row : row + RESTORE_M_TILE, :] = pl.mul(restored, 1.0)
         return original
 
     return restore

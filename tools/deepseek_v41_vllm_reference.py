@@ -18,6 +18,7 @@ import traceback
 
 import torch
 
+from models.deepseek_v4_1_flash_a3.runtime_config import MAX_PREFILL_CHUNK_SIZE
 from tools.deepseek_v41_accuracy import (
     MAX_CONTEXT, TOPOLOGY, allocated_devices, load_cases, new_capture, save_case, write_json,
 )
@@ -178,7 +179,7 @@ def main(argv=None):
     parser.add_argument("--tensor-parallel", type=int, choices=(4,), default=4)
     parser.add_argument("--data-parallel", type=int, choices=(4,), default=4)
     parser.add_argument("--expert-parallel", type=int, choices=(16,), default=16)
-    parser.add_argument("--chunk-size", type=int, choices=range(1, 129), default=16)
+    parser.add_argument("--chunk-size", type=int, choices=range(1, MAX_PREFILL_CHUNK_SIZE + 1), default=16)
     parser.add_argument("--check-config", action="store_true",
                         help="Inspect native config without loading weights or NPU")
     args = parser.parse_args(argv)

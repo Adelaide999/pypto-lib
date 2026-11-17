@@ -16,10 +16,9 @@ from pathlib import Path
 import torch
 from .cache import resolve_layer_role
 from .utils import file_sha, write_json
-from .runtime_config import prefill_execution_capacity
+from .runtime_config import MAX_CONTEXT_TOKENS as MAX_CONTEXT, prefill_execution_capacity
 
 
-MAX_CONTEXT = 2048
 PAGE_ROWS = 128
 
 
@@ -134,7 +133,7 @@ def tokenize_prompt(inputs, checkpoint, vocabulary):
         inputs = tokenizer.encode(inputs).ids
     if (not isinstance(inputs, (list, tuple)) or not 1 <= len(inputs) <= MAX_CONTEXT
             or any(type(token) is not int or not 0 <= token < vocabulary for token in inputs)):
-        raise ValueError("Require 1..2048 integer token IDs within the checkpoint vocabulary")
+        raise ValueError(f"Require 1..{MAX_CONTEXT} integer token IDs within the checkpoint vocabulary")
     return list(inputs)
 
 

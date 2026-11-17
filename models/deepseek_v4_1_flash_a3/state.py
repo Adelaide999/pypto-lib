@@ -15,6 +15,7 @@ import torch
 from .cache import resolve_layer_role
 from .prefill_compressed_runtime import physical_cache_views
 from .prefill_network_engram import NetworkEngramHistory
+from .runtime_config import MAX_PREFILL_CHUNK_SIZE, PREFILL_CAPACITIES
 
 
 DTYPE_BYTES = {"torch.int8": 1, "torch.float16": 2, "torch.bfloat16": 2, "torch.float32": 4}
@@ -163,7 +164,7 @@ class NetworkCacheProvider:
         )
         _require(all(topology[name] == 1 for name in ("pp", "pcp", "dcp")), "Require PP1/PCP1/DCP1")
         _require(
-            0 < capacity <= 512 and capacity % 16 == 0 and scheduler_capacity >= capacity,
+            0 < capacity <= MAX_PREFILL_CHUNK_SIZE and capacity % 16 == 0 and scheduler_capacity >= capacity,
             "Freeze the bounded executable and actual scheduler capacities",
         )
         _require(
@@ -574,7 +575,7 @@ class NetworkCacheProvider:
 
     def set_execution_capacity(self, capacity):
         """Switch execution geometry while retaining scheduler publication views."""
-        _require(capacity in (16, 128), "Require a registered 16- or 128-row execution shape")
+        _require(capacity in PREFILL_CAPACITIES, "Require a registered Prefill or Decode execution shape")
         self.capacity = capacity
 
     def runtime_geometry(self):

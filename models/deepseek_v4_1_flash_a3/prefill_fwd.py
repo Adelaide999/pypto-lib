@@ -18,6 +18,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
 from .network import NetworkProgram as PrefillProgram, _merge_inputs, prepare_network_provider, run_network_runtime
+from .runtime_config import MAX_CONTEXT_TOKENS, MAX_PREFILL_CHUNK_SIZE
 
 
 def compile_prefill(inputs, *, cache, config, output, weights=None):
@@ -77,9 +78,9 @@ def prefill_fwd(
 ):
     """Execute the existing network using explicit checkpoint and cache-state providers.
 
-    ``inputs`` accepts raw completion text, 1..2048 token IDs, or prepared
+    ``inputs`` accepts raw completion text, 1..16384 token IDs, or prepared
     backbone tensors and their input contract. Automatic inputs use one DP
-    engine and chunks of up to 128 tokens; config may set chunk_size/dp_rank.
+    engine and chunks of up to 8192 tokens; config may set chunk_size/dp_rank.
     Embedding and initial HC execute inside this forward unless explicit
     prepared backbone tensors are supplied.
     ``cache`` supplies the canonical all-rank cache ABI, source descriptors and
@@ -164,13 +165,13 @@ def load_configuration(path):
             raise ValueError("prompt must contain raw completion text")
         if "token_ids" in settings and (
             not isinstance(settings["token_ids"], list)
-            or not 1 <= len(settings["token_ids"]) <= 2048
+            or not 1 <= len(settings["token_ids"]) <= MAX_CONTEXT_TOKENS
             or any(type(token) is not int or token < 0 for token in settings["token_ids"])
         ):
-            raise ValueError("token_ids must contain 1..2048 nonnegative integers")
+            raise ValueError(f"token_ids must contain 1..{MAX_CONTEXT_TOKENS} nonnegative integers")
         if settings.get("continuations"):
             raise ValueError("Automatic Prefill owns its continuation descriptors")
-        for name, default, lower, upper in (("chunk_size", 16, 1, 128), ("dp_rank", 0, 0, 3)):
+        for name, default, lower, upper in (("chunk_size", 16, 1, MAX_PREFILL_CHUNK_SIZE), ("dp_rank", 0, 0, 3)):
             value = settings.get(name, default)
             if type(value) is not int or not lower <= value <= upper:
                 raise ValueError(f"{name} must be an integer in {lower}..{upper}")

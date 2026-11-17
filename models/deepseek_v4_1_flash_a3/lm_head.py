@@ -11,6 +11,7 @@
 from dataclasses import asdict
 
 import pypto.language as pl
+from .runtime_config import SPMD_WORKER_LIMIT
 
 from .config import FLASH
 from .gemm import make_bf16_linear, make_decode_bf16_linear
@@ -49,15 +50,17 @@ def make_output_vocab_unpack(capacity, vocabulary, tp):
         output: pl.InOut[pl.Tensor[[capacity, vocabulary], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(((active + 15) // 16) * (vocabulary // 64), name_hint="prefill_output_vocab_unpack"):
-            token = block // (vocabulary // 64) * 16
-            column = block % (vocabulary // 64) * 64
-            peer = column // local_width
-            source = peer * capacity + token
-            local_column = column % local_width
-            rows = pl.min(16, active - token)
-            value = packet[source:source + 16, local_column:local_column + 64]
-            output[token:token + 16, column:column + 64] = pl.set_validshape(value, rows, 64)
+        block_count = (active + 15) // 16 * (vocabulary // 64)
+        for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='prefill_output_vocab_unpack'):
+            for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
+                token = block // (vocabulary // 64) * 16
+                column = block % (vocabulary // 64) * 64
+                peer = column // local_width
+                source = peer * capacity + token
+                local_column = column % local_width
+                rows = pl.min(16, active - token)
+                value = packet[source:source + 16, local_column:local_column + 64]
+                output[token:token + 16, column:column + 64] = pl.set_validshape(value, rows, 64)
         return output
 
     return vocab_unpack

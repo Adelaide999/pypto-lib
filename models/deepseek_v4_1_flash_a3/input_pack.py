@@ -15,6 +15,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
 import pypto.language as pl
+from .runtime_config import SPMD_WORKER_LIMIT
 
 
 # tiling
@@ -36,18 +37,20 @@ def make_vocab_embedding(capacity, hidden, vocabulary, tp):
         vocab_start: pl.Scalar[pl.INT32],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(active * (hidden // D_TILE), name_hint="prefill_vocab_embedding"):
-            token = block // (hidden // D_TILE)
-            column = block % (hidden // D_TILE) * D_TILE
-            global_id = pl.cast(pl.read(token_ids, [token]), pl.INT32)
-            local_id = global_id - vocab_start
-            tile = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
-            if pl.read(live, [token]) > 0:
-                if local_id >= 0:
-                    if local_id < local_rows:
-                        row = pl.cast(local_id, pl.INDEX)
-                        tile = weight[row : row + 1, column : column + D_TILE]
-            output[token : token + 1, column : column + D_TILE] = tile
+        block_count = active * (hidden // D_TILE)
+        for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='prefill_vocab_embedding'):
+            for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
+                token = block // (hidden // D_TILE)
+                column = block % (hidden // D_TILE) * D_TILE
+                global_id = pl.cast(pl.read(token_ids, [token]), pl.INT32)
+                local_id = global_id - vocab_start
+                tile = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
+                if pl.read(live, [token]) > 0:
+                    if local_id >= 0:
+                        if local_id < local_rows:
+                            row = pl.cast(local_id, pl.INDEX)
+                            tile = weight[row : row + 1, column : column + D_TILE]
+                output[token : token + 1, column : column + D_TILE] = tile
         return output
 
     return embedding
@@ -68,16 +71,18 @@ def make_initial_hc(capacity, hidden, hc_mult):
         active: pl.Scalar[pl.INT32],
     ):
         flattened = pl.reshape(streams, [capacity, hc_mult * hidden])
-        for block in pl.spmd(physical * hc_mult * (hidden // D_TILE), name_hint="prefill_initial_hc"):
-            column = block % (hidden // D_TILE) * D_TILE
-            lane = block // (hidden // D_TILE) % hc_mult
-            token = block // (hidden // D_TILE) // hc_mult
-            source = tp_rank * physical + token
-            tile = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
-            if source < active:
-                tile = embedding[source : source + 1, column : column + D_TILE]
-            offset = lane * hidden + column
-            flattened[token : token + 1, offset : offset + D_TILE] = tile
+        block_count = physical * hc_mult * (hidden // D_TILE)
+        for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='prefill_initial_hc'):
+            for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
+                column = block % (hidden // D_TILE) * D_TILE
+                lane = block // (hidden // D_TILE) % hc_mult
+                token = block // (hidden // D_TILE) // hc_mult
+                source = tp_rank * physical + token
+                tile = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
+                if source < active:
+                    tile = embedding[source : source + 1, column : column + D_TILE]
+                offset = lane * hidden + column
+                flattened[token : token + 1, offset : offset + D_TILE] = tile
         for instance in pl.spmd(1, name_hint="prefill_initial_premix"):
             for token in pl.range(physical):
                 for lane in pl.unroll(hc_mult):
@@ -101,15 +106,17 @@ def make_vocab_reduce(capacity, hidden, tp):
         output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(active * (hidden // D_TILE), name_hint="prefill_vocab_reduce"):
-            token = block // (hidden // D_TILE)
-            column = block % (hidden // D_TILE) * D_TILE
-            total = pl.full([1, D_TILE], dtype=pl.FP32, value=0.0)
-            for peer in pl.unroll(tp):
-                row = peer * capacity + token
-                shard = gathered[row : row + 1, column : column + D_TILE]
-                total = pl.add(total, pl.cast(shard, pl.FP32))
-            output[token : token + 1, column : column + D_TILE] = pl.cast(total, pl.BF16, mode="rint")
+        block_count = active * (hidden // D_TILE)
+        for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='prefill_vocab_reduce'):
+            for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
+                token = block // (hidden // D_TILE)
+                column = block % (hidden // D_TILE) * D_TILE
+                total = pl.full([1, D_TILE], dtype=pl.FP32, value=0.0)
+                for peer in pl.unroll(tp):
+                    row = peer * capacity + token
+                    shard = gathered[row : row + 1, column : column + D_TILE]
+                    total = pl.add(total, pl.cast(shard, pl.FP32))
+                output[token : token + 1, column : column + D_TILE] = pl.cast(total, pl.BF16, mode="rint")
         return output
 
     return reduce_embedding
@@ -280,11 +287,13 @@ def make_sp_masked_zero(capacity, width):
         valid: pl.Scalar[pl.INT32],
         physical: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd((physical - valid) * (width // D_TILE), name_hint="prefill_sp_masked_zero"):
-            token = valid + block // (width // D_TILE)
-            column = block % (width // D_TILE) * D_TILE
-            tile = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
-            value[token : token + 1, column : column + D_TILE] = tile
+        block_count = (physical - valid) * (width // D_TILE)
+        for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='prefill_sp_masked_zero'):
+            for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
+                token = valid + block // (width // D_TILE)
+                column = block % (width // D_TILE) * D_TILE
+                tile = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
+                value[token : token + 1, column : column + D_TILE] = tile
         return value
 
     return masked_zero
@@ -300,14 +309,16 @@ def make_head_pack(capacity, heads, head_dim, tp):
         packed: pl.InOut[pl.Tensor[[tp * capacity, local_width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        for row in pl.spmd(tp * capacity, name_hint="prefill_cp_head_pack"):
-            peer = row // capacity
-            token = row % capacity
-            if token < active:
-                source = peer * local_width
-                packed[row : row + 1, 0 : local_width] = value[token : token + 1, source : source + local_width]
-            else:
-                packed[row : row + 1, 0 : local_width] = pl.full([1, local_width], dtype=pl.BF16, value=0.0)
+        row_count = tp * capacity
+        for row_worker in pl.spmd(pl.min(row_count, SPMD_WORKER_LIMIT), name_hint='prefill_cp_head_pack'):
+            for row in pl.range(row_worker, row_count, SPMD_WORKER_LIMIT):
+                peer = row // capacity
+                token = row % capacity
+                if token < active:
+                    source = peer * local_width
+                    packed[row : row + 1, 0 : local_width] = value[token : token + 1, source : source + local_width]
+                else:
+                    packed[row : row + 1, 0 : local_width] = pl.full([1, local_width], dtype=pl.BF16, value=0.0)
         return packed
 
     return head_pack
@@ -334,12 +345,14 @@ def make_sp_gather_unpack(capacity, width, tp, dtype=pl.BF16, tile=D_TILE):
                         state_value = pl.read(packet, [source, column])
                         pl.write(output, [token, column], state_value)
         else:
-            for block in pl.spmd(active * (width // tile), name_hint="prefill_sp_gather_unpack"):
-                token = block // (width // tile)
-                column = block % (width // tile) * tile
-                source = token // physical * capacity + token % physical
-                vector_value = packet[source : source + 1, column : column + tile]
-                output[token : token + 1, column : column + tile] = vector_value
+            block_count = active * (width // tile)
+            for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='prefill_sp_gather_unpack'):
+                for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
+                    token = block // (width // tile)
+                    column = block % (width // tile) * tile
+                    source = token // physical * capacity + token % physical
+                    vector_value = packet[source : source + 1, column : column + tile]
+                    output[token : token + 1, column : column + tile] = vector_value
         return output
 
     return gather_unpack
@@ -355,15 +368,17 @@ def make_sp_reduce_pack(capacity, hidden, tp):
         physical: pl.Scalar[pl.INT32],
         active: pl.Scalar[pl.INT32],
     ):
-        for row in pl.spmd(tp * capacity, name_hint="prefill_sp_reduce_pack"):
-            peer = row // capacity
-            local = row % capacity
-            source = peer * physical + local
-            valid = pl.min(physical, pl.max(active - peer * physical, 0))
-            if local < valid:
-                packed[row : row + 1, 0 : hidden] = value[source : source + 1, 0 : hidden]
-            else:
-                packed[row : row + 1, 0 : hidden] = pl.full([1, hidden], dtype=pl.BF16, value=0.0)
+        row_count = tp * capacity
+        for row_worker in pl.spmd(pl.min(row_count, SPMD_WORKER_LIMIT), name_hint='prefill_sp_reduce_pack'):
+            for row in pl.range(row_worker, row_count, SPMD_WORKER_LIMIT):
+                peer = row // capacity
+                local = row % capacity
+                source = peer * physical + local
+                valid = pl.min(physical, pl.max(active - peer * physical, 0))
+                if local < valid:
+                    packed[row : row + 1, 0 : hidden] = value[source : source + 1, 0 : hidden]
+                else:
+                    packed[row : row + 1, 0 : hidden] = pl.full([1, hidden], dtype=pl.BF16, value=0.0)
         return packed
 
     return reduce_pack

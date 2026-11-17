@@ -73,7 +73,7 @@ Omit `--compile-only` on an allocated A3 device to run operator comparisons.
 `prefill_fwd.prefill_fwd` executes embedding, initial HC, layers 0 through 39,
 final HC collapse, RMSNorm and the vocabulary head. Each layer consumes the
 previous layer's actual activations. The implemented topology is
-DP4/TP4/EP16, PP1/PCP1/DCP1, with Prefill capacity 16 or 128 and Decode capacity 16. Physical devices are explicit
+DP4/TP4/EP16, PP1/PCP1/DCP1, with Prefill capacities up to 8192 and Decode capacity 16. Physical devices are explicit
 and ordered by logical rank. Duplicate IDs, rank-count mismatches and a
 conflicting `ASCEND_RT_VISIBLE_DEVICES` mapping are rejected before initialization.
 
@@ -91,13 +91,13 @@ result = prefill_fwd(
 logits = result["logits"][0]["fresh"]
 ```
 
-For automatic inputs, `inputs` is raw completion text or 1..2048 token IDs.
+For automatic inputs, `inputs` is raw completion text or 1..16384 token IDs.
 The entry tokenizes with the checkpoint tokenizer, reserves pages for the
-complete prompt and processes chunks of up to 128 tokens. `chunk_size` can
-select 1..128 and `dp_rank` can select 0..3. Other DP engines remain empty.
+complete prompt and processes chunks of up to 8192 tokens. `chunk_size` can
+select 1..8192 and `dp_rank` can select 0..3. Other DP engines remain empty.
 Positions, sequence lengths, page tables, slot mappings, C2 cross-chunk state
-and Engram history persist across chunks. Indexer searches up to 2048
-positions, keeps TopK 512 and excludes future positions. This automatic path
+and Engram history persist across chunks. Indexer searches up to 16384
+compressed keys, keeps TopK 512 and excludes future positions. This automatic path
 handles one request; it is not a multi-request serving scheduler.
 
 `cache_state` supplies canonical cache-layout and both Engram templates.
@@ -153,14 +153,20 @@ a cleanup error is propagated when there is no earlier failure.
 
 ### Concurrent execution and bounded MoE storage
 
-The generation command defaults to `--chunk-size 128`. Requests with chunk
-sizes 1..16 use capacity 16; sizes 17..128 use capacity 128, including their
-partial final chunk. Decode always uses capacity 16. Both shapes are compiled
+The generation command defaults to `--chunk-size 128`. Each request uses the
+smallest fitting capacity from 16, 128, 256, 512, 1024, 2048, 4096 and 8192,
+including its partial final chunk. Decode always uses capacity 16. Both shapes are compiled
 before execution and share static weights, cache backing storage, workers,
-and Engram history. The scheduler and context bounds remain 8192 and 2048.
+and Engram history. The scheduler capacity is 8192; the context bound is 16384,
+including reserved generation positions. An 8192-token prompt can therefore
+continue through all seven Decode steps needed for eight output tokens.
 Shared index and candidate publication buffers retain their 8192-row ABI
-when execution capacity switches from 128 to 16.
-The 256/512 shapes are not enabled by this change.
+when execution capacity switches from Prefill to 16-row Decode.
+Long-history Indexer selection sorts at most 2048 keys per tile and merges
+the tile results into the global Top-512. Ratio-1 layers retain one key per
+context token; ratio-2 layers retain one key per completed token pair.
+Candidate pooling covers all 2048 eight-key blocks while retaining the
+original 2048-entry publication ABI.
 
 Each rank has one persistent compute queue. Independent ranks are submitted
 before the stage joins; owned experts execute in order within their rank.
@@ -340,6 +346,41 @@ python -m models.deepseek_v4_1_flash_a3.generate \
   --max-new-tokens 3 --ignore-eos --output build_output/ds41-generation
 ```
 
+For batch size 1, 8192 input tokens, one 8192-token Prefill chunk and eight
+output tokens, supply a JSON array containing exactly 8192 token IDs:
+
+```bash
+python -m models.deepseek_v4_1_flash_a3.generate \
+  --checkpoint weights/deepseek-v4.1-flash-w8a8 \
+  --tokens-file prompt-8192.json --devices "$TASK_DEVICE" \
+  --chunk-size 8192 --max-new-tokens 8 --ignore-eos \
+  --output build_output/ds41-generation-8k
+```
+
+Run this command in a job allocated 16 devices. Only DP rank 0 receives the
+request; every EP rank participates in expert execution. The first output
+token comes from Prefill and the remaining seven from Decode. The 8K chunk
+is a single network admission, not a sequence of 128-token forwards. MoE
+continues to use bounded internal communication slabs. This configuration
+increases activation and full-vocabulary output storage; it does not change
+Engram's CPU lookup placement or reduce the model's expert count.
+
+The resident runtime sizes ring 1 for active-query BF16 sparse gathers and
+full-capacity HC/shared-expert intermediates, and ring 2 for mixed-kernel
+pipeline buffers including index selection. Required sizes include 1 MiB
+of additional space and are rounded to runtime-supported powers of two.
+Capacity 8192 with TP4 uses 2 GiB on ring 1 and 1 GiB on ring 2; other rings
+retain their defaults. These settings apply with profiling enabled or disabled
+and remain in effect through Decode. Each TP rank gathers at most 2048 query
+rows, requiring 1280 MiB; shared-expert intermediates require about 1337 MiB.
+MoE communication receive buffers are recycled after each completed round.
+All ranks allocate collective buffers before any rank submits the collective.
+Ring heaps are additional to weights, KV caches and host tables.
+Wide embedding, packing, routing, attention, projection and output launches
+use at most 256 SPMD workers, with each worker iterating over its assigned
+blocks. This bounds the runtime's 16-bit subtask counters and pipeline memory
+while retaining one complete network admission for the 8K chunk.
+
 The command derives its cache and Engram contracts from checkpoint metadata,
 reserves prompt and output pages once, and feeds each predicted token into a
 single-token Decode step. It retains the same workers, static handles, cache
@@ -347,6 +388,106 @@ pools and request history until the session closes. Engram projection/gating
 and the vocabulary head run on A3; dynamic Engram lookup rows are prepared
 from the persistent host tables. See [Decode](decode.md) for standalone
 commands and the read/upload/cache-alias audit fields.
+
+## Network profiling
+
+The persistent generation runtime supports optional chip swimlane capture
+across embedding, all 40 layers and the vocabulary head. The same controls
+apply to Prefill and Decode, including cached resident dispatches:
+
+```bash
+python -m models.deepseek_v4_1_flash_a3.generate \
+  --checkpoint weights/deepseek-v4.1-flash-w8a8 \
+  --tokens-file prompt-8192.json --devices "$TASK_DEVICE" \
+  --chunk-size 8192 --max-new-tokens 8 --ignore-eos \
+  --enable-chip-swimlane 1 --profile-phase all \
+  --output build_output/ds41-generation-8k-profile
+```
+
+Run on 16 allocated devices. The capture starts after compilation and static
+weight initialization. It observes each actual dispatch once and retains the
+same weight, KV cache and Engram state throughout generation.
+
+| Option | Behavior |
+| --- | --- |
+| `--enable-chip-swimlane 0` | Default; no device trace files are created. |
+| `--enable-chip-swimlane` or `--enable-chip-swimlane 1` | Capture AICore task timing. |
+| `--enable-chip-swimlane 4` | Include detailed runtime scheduler records. Levels 2 and 3 are also passed through to PyPTO. |
+| `--profile-phase all` | Default; capture both Prefill and Decode. |
+| `--profile-phase prefill` / `decode` | Capture only the selected phase on the persistent runtime. |
+| `--profile-output PATH` | Fresh capture root; defaults to `OUTPUT/profiling`. Existing roots are rejected. |
+
+Python callers of `prefill_fwd` can set the same controls in the network
+configuration before creating the resident session:
+
+```python
+config["profiling"] = {
+    "level": 1,
+    "phase": "all",
+    "output_dir": "build_output/ds41-device-profile",
+}
+```
+
+For the `prefill_fwd --config` entry, place this object in the referenced
+network contract JSON. The retained Decode session inherits these settings.
+If `output_dir` is omitted, the Python entry uses its output directory's
+`profiling` subdirectory. Settings are fixed for that session.
+
+The output structure separates phases, chunk epochs, logical ranks and
+invocations. Each rank index also records its physical device ID:
+
+```text
+profiling/
+  index.json
+  symbols/program-*/name_map_*.json
+  prefill/chunk-000000/
+    index.json
+    rank-00/
+      index.json
+      call-000000/
+        chip_swimlane_records.json
+        dispatch.json
+      call-000001/...
+    rank-01/...
+  decode/chunk-000001/rank-00/call-000000/...
+```
+
+Every chunk has an index for every allocated rank, including empty ranks.
+A zero-active dispatch may emit no device records; its `dispatch.json` then
+has `raw_trace: null` and `capture_status: "not_emitted_zero_active"`.
+The output mask also has no device tasks when every physical row is valid;
+an absent trace is then marked `not_emitted_empty_dispatch`. These calls still
+execute once. A missing trace from other completed dispatches fails capture and
+lists the affected calls in the chunk index. Failure cleanup preserves partial
+captures as `incomplete`. Reuse a new output directory for the next run.
+
+Raw traces are collected during execution. Convert selected calls offline in
+the same activated PyPTO environment using the command stored in each
+`dispatch.json`. For example, convert every captured call for Prefill rank 0:
+
+```python
+import json
+import subprocess
+from pathlib import Path
+
+root = Path("build_output/ds41-generation-8k-profile/profiling")
+for path in sorted(root.glob("prefill/chunk-*/rank-00/call-*/dispatch.json")):
+    record = json.loads(path.read_text())
+    if "convert_command" in record:
+        subprocess.run(record["convert_command"], check=True)
+```
+
+Open a resulting `call-*/swimlane.json` in Perfetto. Each file represents one
+invocation on one card. This first version does not stitch calls or align
+clocks across cards; `cross_rank_clock_alignment` is explicitly false in the
+capture summary. Dependency-arrow capture is not enabled by these controls.
+
+`generation/result.json`, per-chunk `execution.json` and `runtime_config.json`
+reference capture coverage and indexes. Device traces cover PyPTO compute;
+CPU Engram lookup and HCCL device kernels are outside their scope. The existing
+`host-trace.json` retains host dispatch and collective intervals. Profiling
+adds instrumentation and file I/O to forward execution, so disable it when
+comparing the existing host-wall-time reports with vLLM-Ascend.
 
 ## Correctness scope
 
