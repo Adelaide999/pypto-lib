@@ -519,7 +519,7 @@ def quantize_per_channel_int8(weight: torch.Tensor) -> tuple[torch.Tensor, torch
 
 
 def decode_quantize_per_token_int8(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mirror the FP32 reciprocal and rounding order of ``make_decode_quantize``.
+    """Mirror the FP32 division and rounding order of ``make_decode_quantize``.
 
     Both BF16 and FP32 inputs use ``x * (127 / amax)`` before nearest-even
     conversion. Dividing by the dequant scale can cross an INT8 half-integer
@@ -528,7 +528,7 @@ def decode_quantize_per_token_int8(value: torch.Tensor) -> tuple[torch.Tensor, t
     source = value.float()
     maximum = source.abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)
     dequant_scale = maximum * (1.0 / CONTRACT.int8_scale_max)
-    inverse = CONTRACT.int8_scale_max / maximum
+    inverse = torch.div(torch.full_like(maximum, CONTRACT.int8_scale_max), maximum)
     payload = _round_symmetric_int8(source * inverse)
     return payload, dequant_scale
 
