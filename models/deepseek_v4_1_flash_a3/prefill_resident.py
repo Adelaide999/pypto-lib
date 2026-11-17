@@ -172,7 +172,7 @@ class _RankExecutor:
 class ResidentNetworkRuntime:
     """Own one worker, program registry and allocation bank per logical rank."""
 
-    def __init__(self, devices, topology, *, worker_factory=None, device_copy=None, device_readback=None):
+    def __init__(self, devices, topology, *, worker_factory=None, device_copy=None, device_readback=None, device_fill=None):
         begin = perf_counter()
         self.devices, self.topology = tuple(devices), dict(topology)
         os.environ.setdefault("HCCL_EXEC_TIMEOUT", "180")
@@ -191,8 +191,12 @@ class ResidentNetworkRuntime:
         self.dynamic = {}
         self.values = {}
         self.free_values = {}
+        self.free_workspaces = {}
+        self._stats_lock = Lock()
+        self.transfer_stats = [dict() for _ in devices]
         self._device_copy = device_copy or self._copy_device
         self._device_readback = device_readback or self._copy_from_device
+        self._device_fill = device_fill or self._fill_device
         self._memory = None
         self.allocations = [[] for _ in devices]
         self.failed_ranks = set()
@@ -219,7 +223,8 @@ class ResidentNetworkRuntime:
                           transport_calls=0, transport_seconds=0.0, device_weight_upload_calls=0,
                           device_weight_upload_seconds=0.0,
                           dynamic_allocations=0, cache_h2d_bytes=0, control_d2h_bytes=0, output_d2h_bytes=0,
-                          activation_d2h_bytes=0, d2d_bytes=0, program_evictions=0, staging_worker_initializations=0)
+                          activation_d2h_bytes=0, d2d_bytes=0, program_evictions=0, staging_worker_initializations=0,
+                          workspace_fill_bytes=0, workspace_requests=0, workspace_reuses=0)
         try:
             if worker_factory is None:
                 from pypto.backend import BackendType
@@ -337,6 +342,7 @@ class ResidentNetworkRuntime:
             self.parameter_abis.clear()
             self.values.clear()
             self.free_values.clear()
+            self.free_workspaces.clear()
             self._device_views.clear()
             self._dispatch_cache.clear()
 
@@ -397,12 +403,12 @@ class ResidentNetworkRuntime:
                                     name=name, versions={id(value): (value, value._version)})
             kind = "weight_bytes" if readonly else "state_bytes"
             self.stats[kind][rank] += allocation.nbytes
-            self.stats["h2d_bytes"] += allocation.nbytes
+            self._record_transfer(rank, "h2d_bytes", allocation.nbytes)
             if readonly:
                 self.stats["device_weight_upload_calls"] += 1
                 self.stats["device_weight_upload_seconds"] += perf_counter() - upload_begin
             elif name.startswith("raw/"):
-                self.stats["cache_h2d_bytes"] += allocation.nbytes
+                self._record_transfer(rank, "cache_h2d_bytes", allocation.nbytes)
 
     def handle(self, value, rank):
         """Return a typed alias of an already uploaded host allocation."""
@@ -449,7 +455,7 @@ class ResidentNetworkRuntime:
         self.device_readonly[id(result.buffer)] = True
         self.device_active[id(result.buffer)] = True
         self.stats["weight_bytes"][rank] += result.nbytes
-        self.stats["h2d_bytes"] += result.nbytes
+        self._record_transfer(rank, "h2d_bytes", result.nbytes)
         self.stats["device_weight_upload_calls"] += 1
         self.stats["device_weight_upload_seconds"] += perf_counter() - upload_begin
         self.alias_leases[id(result)] = result
@@ -614,7 +620,7 @@ class ResidentNetworkRuntime:
                     raise ValueError("A device-owned allocation changed on the host: " + owner["name"])
                 copy = owner["host"]
                 self._copy(self.workers[rank], owner["allocation"].data_ptr, copy.data_ptr(), copy.numel(), 1)
-                self.stats["h2d_bytes"] += copy.numel()
+                self._record_transfer(rank, "h2d_bytes", copy.numel())
                 owner["versions"] = {index: (tensor, tensor._version)
                                      for index, (tensor, _) in owner["versions"].items()}
             owner["versions"][id(value)] = value, value._version
@@ -625,7 +631,7 @@ class ResidentNetworkRuntime:
                 if owner["device_written"]:
                     raise ValueError("A device activation descriptor was modified on the host")
                 self._copy(self.workers[rank], owner["allocation"].data_ptr, host.data_ptr(), host.numel(), 1)
-                self.stats["h2d_bytes"] += host.numel()
+                self._record_transfer(rank, "h2d_bytes", host.numel())
                 owner["version"] = value._version
             return owner
         pool = self.free_values.setdefault((rank, host.numel()), [])
@@ -641,11 +647,52 @@ class ResidentNetworkRuntime:
             self.stats["dynamic_allocations"] += 1
         self.device_active[id(allocation.buffer)] = True
         if initialize:
-            self.stats["h2d_bytes"] += host.numel()
+            self._record_transfer(rank, "h2d_bytes", host.numel())
         owner = dict(source=value, version=value._version, allocation=allocation, readonly=False,
                      device_written=False)
         self.values[key] = owner
         return owner
+
+    def _record_transfer(self, rank, kind, amount):
+        """Accumulate aggregate and per-rank transfer counters under one lock."""
+        with self._stats_lock:
+            self.stats[kind] += amount
+            row = self.transfer_stats[rank]
+            row[kind] = row.get(kind, 0) + amount
+
+    def _fill_device(self, destination, nbytes, value, rank):
+        self._memory_for(rank).fill(destination, nbytes, value)
+
+    def workspace(self, shape, dtype, rank, *, fill=0):
+        """Reuse device scratch and initialize zero or integer -1 bytes on device."""
+        integral = dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
+        if fill != 0 and not (fill == -1 and integral):
+            raise ValueError("Device workspaces support zero or integer -1 initialization")
+        shape = tuple(shape)
+        if not shape or any(size <= 0 for size in shape):
+            raise ValueError("Device workspaces require positive dimensions")
+        with self.rank_locks[rank]:
+            if self._closed:
+                raise RuntimeError("Resident runtime is closed")
+            self._select(rank)
+            pool = self.free_workspaces.setdefault((rank, shape, dtype), [])
+            if pool:
+                owner = pool.pop()
+                value = owner["source"]
+                owner["version"] = value._version
+                self.values[rank, value.untyped_storage()._cdata] = owner
+                self.device_active[id(owner["allocation"].buffer)] = True
+                self._record_transfer(rank, "workspace_reuses", 1)
+            else:
+                value = torch.empty(shape, dtype=dtype)
+                owner = self._value_owner_locked(value, rank, initialize=False)
+                owner["workspace"] = True
+            allocation = owner["allocation"]
+            self._device_fill(allocation.data_ptr, allocation.nbytes, 0 if fill == 0 else 255, rank)
+            owner["device_written"] = True
+            self._record_transfer(rank, "workspace_requests", 1)
+            self._record_transfer(rank, "workspace_fill_bytes", allocation.nbytes)
+            return value
 
     def tensor(self, value, rank):
         """Return a typed device alias without copying an authoritative payload."""
@@ -670,8 +717,8 @@ class ResidentNetworkRuntime:
             self._device_readback(result.data_ptr(), source.data_ptr, source.nbytes, rank)
         else:
             self._copy(self.workers[rank], result.data_ptr(), source.data_ptr, source.nbytes, 2)
-        self.stats["d2h_bytes"] += source.nbytes
-        self.stats[kind + "_d2h_bytes"] += source.nbytes
+        self._record_transfer(rank, "d2h_bytes", source.nbytes)
+        self._record_transfer(rank, kind + "_d2h_bytes", source.nbytes)
         return result
 
     def read_control(self, value, rank):
@@ -728,7 +775,7 @@ class ResidentNetworkRuntime:
         target = _device_view(destination_owner["allocation"], destination, destination_owner.get("base_offset", 0))
         value = _device_view(source_owner["allocation"], source, source_owner.get("base_offset", 0))
         self._device_copy(target.data_ptr, value.data_ptr, value.nbytes, rank)
-        self.stats["d2d_bytes"] += value.nbytes
+        self._record_transfer(rank, "d2d_bytes", value.nbytes)
         key = rank, destination.untyped_storage()._cdata
         owner = self.pinned.get(key, self.values.get(key))
         if owner["readonly"]:
@@ -748,7 +795,12 @@ class ResidentNetworkRuntime:
                 allocation = owner["allocation"]
                 retired.add(id(allocation.buffer))
                 self.device_active[id(allocation.buffer)] = False
-                self.free_values.setdefault((key[0], allocation.nbytes), []).append(allocation)
+                if owner.get("workspace"):
+                    value = owner["source"]
+                    shape_key = key[0], tuple(value.shape), value.dtype
+                    self.free_workspaces.setdefault(shape_key, []).append(owner)
+                else:
+                    self.free_values.setdefault((key[0], allocation.nbytes), []).append(allocation)
         self.alias_leases = {key: value for key, value in self.alias_leases.items() if id(value.buffer) not in retired}
 
     def _group_ranks(self, group):
@@ -885,7 +937,8 @@ class ResidentNetworkRuntime:
 
     def summary(self):
         """Report actual allocations and dispatches separately from numerical acceptance."""
-        return dict(self.stats, assigned_devices=list(self.devices),
+        return dict(self.stats, transfer_by_rank=[dict(rank=rank, **row) for rank, row in enumerate(self.transfer_stats)],
+                    assigned_devices=list(self.devices),
                     runtime_identity=id(self), worker_identities=[id(worker) for worker in self.workers],
                     registered_programs=len(self.programs), closed=self._closed,
                     compute_queues=len(self.compute_queues), communication_threads=len(self.devices),

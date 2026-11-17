@@ -21,7 +21,7 @@ import pypto.language as pl
 import torch
 from pypto import ir, passes
 from pypto.ir.compiled_program import extract_param_infos
-from .utils import copy_runtime_tensor, read_runtime_control
+from .utils import allocate_runtime_tensor, copy_runtime_tensor, read_runtime_control
 
 
 def validate_prefill_ownership(layout, ownership):
@@ -216,11 +216,11 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
         stage = namespace + "-" + stage if namespace else stage
         return runtime["exchange"](stage, values, collective, group, packets=packets)
 
-    def zeros(*shape, dtype=torch.bfloat16):
-        return torch.zeros(shape, dtype=dtype)
+    def zeros(rank, *shape, dtype=torch.bfloat16):
+        return allocate_runtime_tensor(runtime, shape, dtype, rank)
 
     def pad(value, rank):
-        target = zeros(capacity, *value.shape[1:], dtype=value.dtype)
+        target = torch.zeros((capacity, *value.shape[1:]), dtype=value.dtype)
         copy_runtime_tensor(runtime, target[:len(value)], value, rank)
         return target
 
@@ -252,9 +252,9 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             engram = None if engram_states is None else engram_states[rank][case]
             if engram is not None:
                 hidden = engram["hidden"]
-            pre, post = zeros(capacity, 4, dtype=torch.float32), zeros(capacity, 4, dtype=torch.float32)
-            comb = zeros(capacity, 4, 4, dtype=torch.float32)
-            collapsed, normed = zeros(capacity, 5120), zeros(capacity, 5120)
+            pre, post = zeros(rank, capacity, 4, dtype=torch.float32), zeros(rank, capacity, 4, dtype=torch.float32)
+            comb = zeros(rank, capacity, 4, 4, dtype=torch.float32)
+            collapsed, normed = zeros(rank, capacity, 5120), zeros(rank, capacity, 5120)
             outputs = dict(pre=pre, post=post, comb=comb, collapsed=collapsed, normed=normed)
             arguments = [
                 hidden,
@@ -296,7 +296,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             original = originals[rank]
             state = states[rank][case]
             physical, total = state["physical"], state["total"]
-            full_norm = zeros(capacity, 5120)
+            full_norm = zeros(rank, capacity, 5120)
             execute(
                 "sp_unpack",
                 rank,
@@ -309,7 +309,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             query_rows = max(0, min(end, total) - min(start, total))
             q_input = pad(full_norm[start : start + query_rows], rank)
             positions = pad(original["positions"], rank)
-            cosine, sine = zeros(capacity, 32, dtype=torch.float32), zeros(capacity, 32, dtype=torch.float32)
+            cosine, sine = zeros(rank, capacity, 32, dtype=torch.float32), zeros(rank, capacity, 32, dtype=torch.float32)
             execute(
                 "rope_tables",
                 rank,
@@ -321,12 +321,12 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             q_cos = pad(cosine[start:start + query_rows], rank)
             q_sin = pad(sine[start:start + query_rows], rank)
             wqa, latent, qb, query = (
-                zeros(capacity, 1280),
-                zeros(capacity, 1280),
-                zeros(capacity, 32768),
-                zeros(capacity, 32768),
+                zeros(rank, capacity, 1280),
+                zeros(rank, capacity, 1280),
+                zeros(rank, capacity, 32768),
+                zeros(rank, capacity, 32768),
             )
-            kv_raw, kv_norm, kv_rope = zeros(capacity, 512), zeros(capacity, 512), zeros(capacity, 512)
+            kv_raw, kv_norm, kv_rope = zeros(rank, capacity, 512), zeros(rank, capacity, 512), zeros(rank, capacity, 512)
             execute_region(
                 runtime,
                 "qkv_l2",
@@ -377,7 +377,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                     table_pages,
                     layer_id,
                 )
-                inverse = zeros(capacity, 32768)
+                inverse = zeros(rank, capacity, 32768)
             elif role["mode"] in ("reuse", "reindex"):
                 context, cache = run_consumer_attention(
                     state,
@@ -396,7 +396,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                     cosine=cosine,
                     sine=sine,
                 )
-                inverse = zeros(capacity, 32768)
+                inverse = zeros(rank, capacity, 32768)
             else:
                 controls = original["metadata"]
                 schedule = from_controls(
@@ -422,7 +422,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                     {"cache": cache},
                     "cache_publish",
                 )
-                context, inverse = zeros(capacity, 32768), zeros(capacity, 32768)
+                context, inverse = zeros(rank, capacity, 32768), zeros(rank, capacity, 32768)
                 execute(
                     "swa_read",
                     rank,
@@ -431,7 +431,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                     {"context": context},
                     "swa",
                 )
-            packet = zeros(tp * capacity, head_width)
+            packet = zeros(rank, tp * capacity, head_width)
             execute_region(
                 runtime,
                 "attention_pack_l2",
@@ -457,15 +457,15 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             state, tp_rank = states[rank][case], rank % tp
             total, physical = state["total"], state["physical"]
             heads, woa, wob = (
-                zeros(capacity, head_width),
-                zeros(capacity, output_width),
-                zeros(capacity, 5120),
+                zeros(rank, capacity, head_width),
+                zeros(rank, capacity, output_width),
+                zeros(rank, capacity, 5120),
             )
             weight_a = operands["wo_a_grouped_prefill"][
                 tp_rank * local_groups : (tp_rank + 1) * local_groups
             ].contiguous()
             weight_b = operands["wo_b"][tp_rank * output_width : (tp_rank + 1) * output_width].contiguous()
-            packed = zeros(tp * capacity, 5120)
+            packed = zeros(rank, tp * capacity, 5120)
             execute_region(
                 runtime,
                 "output_projection_l2",
@@ -499,19 +499,19 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
         def route_rank(rank):
             state = states[rank][case]
             physical = state["physical"]
-            changed = zeros(capacity, 4, 5120)
+            changed = zeros(rank, capacity, 4, 5120)
             buffers = runtime.get("layer_buffers")
             if buffers is None:
                 output = torch.full((capacity, 4, 5120), runtime["output_sentinel"], dtype=torch.bfloat16)
-                pre = zeros(capacity, 4, dtype=torch.float32)
+                pre = zeros(rank, capacity, 4, dtype=torch.float32)
             else:
                 output, pre = buffers(rank, case)
-            post = zeros(capacity, 4, dtype=torch.float32)
-            comb, collapsed = zeros(capacity, 4, 4, dtype=torch.float32), zeros(capacity, 5120)
-            normed, router_input = zeros(capacity, 5120), zeros(capacity, 5120, dtype=torch.float32)
-            logits = zeros(capacity, 384, dtype=torch.float32)
-            weights = zeros(capacity, 6, dtype=torch.float32)
-            ids = torch.zeros((capacity, 6), dtype=torch.int32)
+            post = zeros(rank, capacity, 4, dtype=torch.float32)
+            comb, collapsed = zeros(rank, capacity, 4, 4, dtype=torch.float32), zeros(rank, capacity, 5120)
+            normed, router_input = zeros(rank, capacity, 5120), zeros(rank, capacity, 5120, dtype=torch.float32)
+            logits = zeros(rank, capacity, 384, dtype=torch.float32)
+            weights = zeros(rank, capacity, 6, dtype=torch.float32)
+            ids = zeros(rank, capacity, 6, dtype=torch.int32)
             token_ids = pad(state["original"]["input_ids"], rank)
             gate = raw[f"{prefix}.ffn.gate.weight"].float()
             execute_region(runtime, "ffn_dispatch_l2", rank, case, [
@@ -527,21 +527,24 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                  dict(logits=logits, route_ids=ids, route_weights=weights), "router"),
             ])
             state.update(changed=changed, ffn_pre=pre, ffn_post=post, ffn_comb=comb, weights=weights,
-                         route_ids=ids, normed=normed, shared=zeros(capacity, 5120), output_hidden=output,
-                         combined=zeros(capacity, 5120))
+                         route_ids=ids, normed=normed, shared=zeros(rank, capacity, 5120), output_hidden=output,
+                         combined=zeros(rank, capacity, 5120))
         map_ranks(route_rank)
     slab_work = [{} for _ in range(world)]
     def allocate_rank_slab(rank):
         for case in batch["cases"]:
             slab_work[rank][case] = dict(
-                routes=torch.full((packet_rows, 4), -1, dtype=torch.int64), hidden=zeros(packet_rows, 5120),
-                counts=torch.zeros((world, MAP_PAD), dtype=torch.int32),
-                recv_routes=torch.full((packet_rows, 4), -1, dtype=torch.int64), recv_hidden=zeros(packet_rows, 5120),
-                expert_x=zeros(local_experts * expert_capacity, 5120), expert_y=zeros(local_experts * expert_capacity, 5120),
-                expert_counts=torch.zeros(local_experts, dtype=torch.int64),
-                packet_map=torch.full((packet_rows, MAP_PAD), -1, dtype=torch.int32),
-                total=torch.zeros(MAP_PAD, dtype=torch.int32), sent=zeros(packet_rows, 5120), routed=zeros(slab, 5120),
-                returned_routes=torch.full((routes, 4), -1, dtype=torch.int64),
+                routes=allocate_runtime_tensor(runtime, (packet_rows, 4), torch.int64, rank, fill=-1),
+                hidden=zeros(rank, packet_rows, 5120),
+                counts=zeros(rank, world, MAP_PAD, dtype=torch.int32),
+                recv_routes=allocate_runtime_tensor(runtime, (packet_rows, 4), torch.int64, rank, fill=-1),
+                recv_hidden=zeros(rank, packet_rows, 5120),
+                expert_x=zeros(rank, local_experts * expert_capacity, 5120),
+                expert_y=zeros(rank, local_experts * expert_capacity, 5120),
+                expert_counts=zeros(rank, local_experts, dtype=torch.int64),
+                packet_map=allocate_runtime_tensor(runtime, (packet_rows, MAP_PAD), torch.int32, rank, fill=-1),
+                total=zeros(rank, MAP_PAD, dtype=torch.int32), sent=zeros(rank, packet_rows, 5120), routed=zeros(rank, slab, 5120),
+                returned_routes=allocate_runtime_tensor(runtime, (routes, 4), torch.int64, rank, fill=-1),
             )
     map_ranks(allocate_rank_slab)
     rounds = (max(1, (capacity + tp - 1) // tp) + slab - 1) // slab

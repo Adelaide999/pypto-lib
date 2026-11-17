@@ -51,6 +51,7 @@ class CANNMemory:
         _bind(self.library, "aclrtFree", [pointer])
         _bind(self.library, "aclrtMallocHost", [ctypes.POINTER(pointer), size])
         _bind(self.library, "aclrtFreeHost", [pointer])
+        _bind(self.library, "aclrtMemset", [pointer, size, integer, size])
         _bind(self.library, "aclrtMemcpy", [pointer, size, pointer, size, integer])
         _bind(self.library, "aclrtMemcpyAsync", [pointer, size, pointer, size, integer, pointer])
         _bind(self.library, "aclrtGetMemInfo", [integer, ctypes.POINTER(size), ctypes.POINTER(size)])
@@ -87,6 +88,12 @@ class CANNMemory:
             raise ValueError("CANN staging requires positive bytes and H2D/D2H direction")
         arguments = [destination, nbytes, source, nbytes, direction]
         _check(self.library.aclrtMemcpy(*arguments), "aclrtMemcpy/staging")
+
+    def fill(self, destination, nbytes, value):
+        """Synchronously fill an owned device span with one byte value."""
+        if nbytes <= 0 or not 0 <= value <= 255:
+            raise ValueError("CANN fill requires positive bytes and an unsigned byte value")
+        _check(self.library.aclrtMemset(destination, nbytes, value, nbytes), "aclrtMemset/workspace")
 
     def sample(self, rank, stage):
         if not self.diagnostics:

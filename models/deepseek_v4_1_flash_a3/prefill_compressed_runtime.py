@@ -9,7 +9,7 @@
 """Schedule physical compressed Prefill with aliased raw caches and shared index state."""
 
 import torch
-from .utils import copy_runtime_tensor, read_runtime_control
+from .utils import allocate_runtime_tensor, copy_runtime_tensor, read_runtime_control
 
 
 DTYPES = {str(dtype): dtype for dtype in (torch.int8, torch.float16, torch.float32, torch.bfloat16)}
@@ -107,7 +107,7 @@ def run_compressed_attention(
             raise ValueError("Long and own-SWA owner pages overlap in their shared arena")
 
     def zeros(*shape, dtype=torch.bfloat16):
-        return torch.zeros(shape, dtype=dtype)
+        return allocate_runtime_tensor(state.get("runtime", {}), shape, dtype, rank)
 
     def pad(value, rows=capacity, fill=0):
         result = torch.full((rows, *value.shape[1:]), fill, dtype=value.dtype)
@@ -192,7 +192,7 @@ def run_compressed_attention(
             dict(ring=ring, pooled=pooled, normalized=normalized),
             ("c2_pool", "c2_ring"),
         )
-        source_positions = zeros(capacity, dtype=torch.int64)
+        source_positions = torch.zeros(capacity, dtype=torch.int64)
         source_metadata = global_meta[prefix + "compressor.state_cache"]
         if total:
             source_positions[:total].copy_(source_metadata["c2_source_positions"])

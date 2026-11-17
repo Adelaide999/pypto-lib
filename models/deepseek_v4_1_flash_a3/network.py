@@ -629,6 +629,7 @@ class NetworkExecutor:
             output_sentinel=-37.0,
             read_control=self.resident.read_control,
             copy_tensor=self.resident.copy_tensor,
+            workspace=self.resident.workspace,
             layer_buffers=self.layer_buffers,
             stage_namespace=f"{self.namespace}-layer{layer_id}",
         )

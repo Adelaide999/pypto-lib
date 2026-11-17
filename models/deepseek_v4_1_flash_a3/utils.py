@@ -33,6 +33,12 @@ WINDOW_PAGE_ROWS = WINDOW_SIZE = 128
 SCHEDULE_INT32_MAX = (1 << 31) - 1
 
 
+def allocate_runtime_tensor(runtime, shape, dtype, rank, *, fill=0):
+    """Allocate initialized scratch through its execution owner's workspace bank."""
+    allocate = runtime.get("workspace")
+    return torch.full(shape, fill, dtype=dtype) if allocate is None else allocate(shape, dtype, rank, fill=fill)
+
+
 def copy_runtime_tensor(runtime, destination, source, rank):
     """Copy an activation view through its execution owner's transfer callback."""
     copy = runtime.get("copy_tensor")

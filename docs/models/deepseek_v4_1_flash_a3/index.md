@@ -178,8 +178,17 @@ This is a communication workspace bound, not a total HBM measurement.
 
 Intermediate CPU tensors describe device-owned storage. Activations and HCCL
 payloads stay on device; integer controls and final logits are explicitly read
-back. Completed layer allocations return to a size-based pool. Host descriptors
-must not be mutated after the device becomes authoritative.
+back. Attention and MoE scratch descriptors and device allocations return to a
+rank/shape/dtype workspace pool after each layer. Reuse resets zero and integer
+`-1` padding directly on device through synchronous CANN byte fills, without
+creating initialized CPU payloads or uploading them. Host-prepared metadata,
+static weights, persistent caches and layer-boundary buffers retain their
+existing ownership. Other completed allocations return to the size-based pool.
+Host descriptors must not be mutated after the device becomes authoritative.
+
+Runtime receipts include per-rank transfer totals, workspace requests, reuse
+counts and device fill bytes. Device fill bytes are separate from H2D bytes;
+the aggregate transfer counters and their per-rank sums share one lock.
 
 The pinned PyPTO worker retains at most 64 callable registrations. Completed
 registrations are retired through the underlying simpler worker before a slot

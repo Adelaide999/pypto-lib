@@ -10,7 +10,7 @@
 
 import torch
 from .prefill_compressed_runtime import physical_cache_views
-from .utils import copy_runtime_tensor, read_runtime_control
+from .utils import allocate_runtime_tensor, copy_runtime_tensor, read_runtime_control
 
 
 def run_consumer_attention(state, query, operands, execute, rank, case,
@@ -131,7 +131,7 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
     indices = torch.full((capacity, 640), -1, dtype=torch.int32)
     execute("sparse_index_pack", rank, case, [window, compressed, indices, query_rows],
             dict(indices=indices), "compressed_attention")
-    context = torch.zeros((capacity, 32768), dtype=torch.bfloat16)
+    context = allocate_runtime_tensor(state.get("runtime", {}), (capacity, 32768), torch.bfloat16, rank)
     if network is not None:
         controls = read_runtime_control(state.get("runtime", {}), indices[:query_rows], rank)
         validate_network_sparse_indices(controls, original, network, query_rows)
