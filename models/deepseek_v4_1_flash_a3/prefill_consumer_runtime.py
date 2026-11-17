@@ -39,7 +39,7 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
     long_descriptor = live["layout"]["views"][long_name]
     network = live.get("network_geometry")
     if network is not None:
-        from .cache import load_network_index, network_cache_geometry, owned_cache_pages
+        from .cache import network_cache_geometry, owned_cache_pages
         from .cache import raw_cache_matrix, validate_network_sparse_indices
 
         if network != network_cache_geometry(live["layout"], role, cache_blocks):
@@ -97,8 +97,7 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
             index_pages = owned_cache_pages(original, source_prefix + "indexer.k_cache", network["codes"])
             if index_pages != source_pages:
                 raise ValueError("Refresh source index and long cache owner pages differ")
-            dense_index = load_network_index(raw, network, index_pages, execute, rank, case)
-            codes, scales = dense_index["codes"], dense_index["scales"]
+            codes, scales = (raw_cache_matrix(raw, network[name]) for name in ("codes", "scales"))
         else:
             geometry = physical_index_geometry(live["layout"], source_prefix, cache_blocks)
             dense_index = {}

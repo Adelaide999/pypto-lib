@@ -72,9 +72,9 @@ class CANNMemory:
     def select(self, rank):
         _check(self.library.aclrtSetDevice(rank), "aclrtSetDevice")
 
-    def sample(self, rank, stage):
+    def sample(self, rank, stage, *, force=False):
         self.select(rank)
-        if not self.diagnostics:
+        if not self.diagnostics and not force:
             return None
         free, total = ctypes.c_size_t(), ctypes.c_size_t()
         _check(self.library.aclrtGetMemInfo(1, ctypes.byref(free), ctypes.byref(total)), "aclrtGetMemInfo")

@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""One-token DP4/TP4/EP16 Decode over the generation session's resident network."""
+"""Packed one-token-per-request Decode over the generation session's resident network."""
 
 import argparse
 import json
@@ -19,12 +19,12 @@ from .config import FLASH
 from .cache import resolve_layer_role
 from .network import NetworkProgram, _merge_inputs, prepare_network_provider, run_network_runtime
 from .prefill_prepare import TokenChunkInputs, checkpoint_cache, tokenize_prompt
-from .runtime_config import configure_devices
+from .runtime_config import ParallelPlan, configure_devices
 from .utils import write_json
 
 
 TOPOLOGY = dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1)
-MAX_CONTEXT = 2048
+MAX_CONTEXT = 1048576
 
 
 def network_plan():
@@ -33,7 +33,7 @@ def network_plan():
 
 
 class DecodeNetwork:
-    """Advance one request token using the same TP4 layer ABI in both execution modes."""
+    """Advance packed requests using the session's fixed TP1/2/4 network geometry."""
 
     def __init__(self, *, runtime=None, resident_weights=None, cache_views=None, session=None,
                  devices=None, output=None, progress=None):
@@ -55,8 +55,9 @@ class DecodeNetwork:
             raise ValueError("External Decode requires the generation session with its live provider and history")
 
     def _bind(self, session):
-        if session.closed or session.failed or session.contract["topology"] != TOPOLOGY:
-            raise ValueError("Decode requires a live DP4/TP4/EP16 generation session")
+        if session.closed or session.failed:
+            raise ValueError("Decode requires a live generation session")
+        self.plan = ParallelPlan.from_topology(session.contract["topology"])
         if session.request_inputs is None:
             raise ValueError("Decode requires the session's original request metadata owner")
         if self.devices is not None and list(map(int, self.devices)) != list(map(int, session.runtime.devices)):
@@ -82,10 +83,11 @@ class DecodeNetwork:
         before = self.weights.counters()
         cache_h2d = self.runtime.stats["cache_h2d_bytes"]
         chunk = self.session.request_inputs.chunk([token], dp_rank=self.dp_rank)
+        phase = chunk["inputs"]["input_contract"]["phase"]
         result = self.session.advance(chunk, output=self.output / f"step-{self._steps + 1}",
-                                      progress=self.progress, phase="decode")
-        logits = result["logits"][self.dp_rank * TOPOLOGY["tp"]]["fresh"][-1]
-        if not torch.isfinite(logits).all():
+                                      progress=self.progress, phase=phase)
+        logits = (result["request_outputs"][0]["logits"] if result["request_outputs"] else None)
+        if logits is not None and not torch.isfinite(logits).all():
             self.session.failed = True
             raise RuntimeError("Non-finite Decode vocabulary logits")
         self.weights.assert_static_unchanged()
@@ -100,6 +102,16 @@ class DecodeNetwork:
             engram_lookup="dynamic_host_rows")
         write_json(self.output / f"step-{self._steps}" / "decode.json", self.last_timings)
         return logits
+
+    def step_batch(self, queries):
+        """Decode one token per ready request and return samples in caller order."""
+        if self._closed or self.session is None:
+            raise RuntimeError("Decode requires an open initialized generation session")
+        chunk = self.session.request_inputs.batch(queries, phase="decode")
+        result = self.session.advance(chunk, output=self.output / f"step-{self._steps + 1}",
+                                      progress=self.progress, phase="decode")
+        self._steps += 1
+        return result["request_outputs"]
 
     def close(self):
         """Detach this driver; the generation owner closes its shared resources."""
@@ -118,29 +130,34 @@ def main(argv=None):
     parser.add_argument("-d", "--devices", type=lambda value: [int(item) for item in value.split(",")])
     parser.add_argument("-p", "--platform", choices=("a2a3",), default="a2a3")
     parser.add_argument("--ep", type=int, choices=(16,), default=16)
-    parser.add_argument("--tp", type=int, choices=(4,), default=4)
-    parser.add_argument("--dp", type=int, choices=(4,), default=4)
+    parser.add_argument("--tp", type=int, choices=(1, 2, 4), default=4)
+    parser.add_argument("--dp", type=int, choices=(4, 8, 16), default=4)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--tokens", default="0", help="Prompt IDs consumed one token at a time")
     parser.add_argument("--history-tokens", default="", help="History to execute before the current token")
     parser.add_argument("--decode-steps", type=int, default=1)
+    parser.add_argument("--hbm-budget", type=Path)
     parser.add_argument("--output", type=Path, default=Path("build_output/ds41-decode-network"))
     args = parser.parse_args(argv)
+    topology = dict(TOPOLOGY, tp=args.tp, dp=args.dp)
+    ParallelPlan.from_topology(topology)
     if args.plan_only:
-        print(json.dumps(dict(topology=TOPOLOGY, layers=network_plan()), indent=2))
+        print(json.dumps(dict(topology=topology, layers=network_plan()), indent=2))
         return 0
     if args.checkpoint is None or (not args.compile_only and args.devices is None):
         parser.error("Require --checkpoint and, for execution, explicit allocated --devices")
     history = [int(item) for item in args.history_tokens.split(",")] if args.history_tokens else []
     tokens = [int(item) for item in args.tokens.split(",")]
     if args.decode_steps < 1 or not tokens or len(history) + len(tokens) + args.decode_steps - 1 > MAX_CONTEXT:
-        parser.error("Require positive steps within the 2048-position session reservation")
+        parser.error("Require positive steps within the 1048576-position model limit")
     if not args.compile_only:
         configure_devices(args.devices, world=16)
-    cache, config = checkpoint_cache(args.checkpoint, TOPOLOGY)
+    cache, config = checkpoint_cache(args.checkpoint, topology)
+    if args.hbm_budget is not None:
+        config["hbm_budget"] = json.loads(args.hbm_budget.read_text())
     ids = tokenize_prompt(history + tokens, args.checkpoint, FLASH.vocab_size)
-    request = TokenChunkInputs(checkpoint=args.checkpoint, cache=cache, config=config,
+    request = TokenChunkInputs(checkpoint=args.checkpoint, cache=cache, config=dict(config, prompt_length=len(ids)),
         output=args.output / "prepared", context_capacity=len(ids) + args.decode_steps - 1,
         prepare_engram=not args.compile_only)
     session, network = None, None
@@ -150,16 +167,16 @@ def main(argv=None):
         if args.compile_only:
             provider = prepare_network_provider(merged, first["contract"], args.output.name, geometry_only=True)
             program = NetworkProgram(args.output / "compiled").compile(provider, config["model_config"],
-                                                                       TOPOLOGY, cache["engram_contracts"])
+                                                                       topology, cache["engram_contracts"])
             write_json(args.output / "compiled.json", program.summary())
-            print("[decode-network] shared 40-layer TP4 network + device Engram/head COMPILE PASS; execution=not_run")
+            print(f"[decode-network] shared 40-layer TP{args.tp} network + device Engram/head COMPILE PASS; execution=not_run")
             return 0
         progress = lambda record: print(json.dumps(record), flush=True)
         result = run_network_runtime(merged, contract=first["contract"], output=args.output / "network",
             devices=args.devices, keep_runtime=True, request_inputs=request, progress=progress)
         session = result.pop("session")
         network = DecodeNetwork(session=session, output=args.output / "decode", progress=progress)
-        logits = result["logits"][0]["fresh"][-1]
+        logits = result["request_outputs"][0]["logits"] if result["request_outputs"] else None
         for token in ids[1:]:
             logits = network.step(token)
         generated = [int(logits.argmax())]
@@ -167,7 +184,7 @@ def main(argv=None):
             logits = network.step(generated[-1])
             generated.append(int(logits.argmax()))
         summary = dict(status="executed", layers=40, input_steps=len(ids), decode_steps=args.decode_steps,
-            generated_ids=generated, accuracy="not_run", topology=TOPOLOGY,
+            generated_ids=generated, accuracy="not_run", topology=topology,
             resident_weight_initialization=network.initialization_timings, timings=network.last_timings,
             session=session.summary())
         write_json(args.output / "result.json", summary)

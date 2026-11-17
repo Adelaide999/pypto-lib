@@ -976,5 +976,7 @@ def make_physical_compressed_entries(
         if compress_ratio != role["ratio"]:
             raise ValueError("Network producer ratio differs from its original physical role")
         geometry = network_cache_geometry(cache_layout, role, cache_blocks)
-        entries.update(make_network_cache_entries(capacity, config, geometry, role))
+        entries.update(make_network_cache_entries(capacity, config, geometry, role, requests, table_pages))
+        entries.pop("candidate_pool", None)
+        entries.pop("candidate_publish", None)
     return entries

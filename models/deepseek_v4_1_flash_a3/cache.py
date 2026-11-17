@@ -16,7 +16,6 @@ from pathlib import Path
 import pypto.language as pl
 import torch
 from .swa import make_swa_leaves
-from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY
 
 
 # tiling
@@ -485,7 +484,7 @@ def make_network_sparse_read(capacity, config, geometry):
     return sparse_read
 
 
-def make_network_cache_entries(capacity, config, geometry, role):
+def make_network_cache_entries(capacity, config, geometry, role, requests=1, table_pages=1):
     """Build only actual cache-addressing and owner-page transfer entries."""
     role = resolve_layer_role(role["physical_layer"], role)
     entries = dict(
@@ -496,18 +495,9 @@ def make_network_cache_entries(capacity, config, geometry, role):
         entries["network_compressed_publish"] = make_network_cache_publish(capacity, geometry["long"])
     if role["mode"] == "reuse":
         return entries
-    for name in ("codes", "scales"):
-        plane = geometry[name]
-        payload, stride, offset = plane["payload"], plane["stride"], plane["offset"]
-        tile = min(128, payload)
-        dtype = PTO_DTYPES[plane["dtype"]]
-        entries["network_load_" + name] = make_paged_cache_copy(
-            1, payload, stride, payload, source_offset=offset, dtype=dtype, copy_tile=tile
-        )
-        if role["mode"] == "full":
-            entries["network_store_" + name] = make_paged_cache_copy(
-                1, payload, payload, stride, destination_offset=offset, dtype=dtype, copy_tile=tile
-            )
+    from .paged_indexer import make_paged_index_entries
+
+    entries.update(make_paged_index_entries(capacity, geometry, role, requests, table_pages))
     return entries
 
 
@@ -603,19 +593,26 @@ def attach_network_cache_geometry(provider):
 
 
 def validate_live_refresh_candidates(original, shared, source_id):
-    """Preserve the short full-coverage guard against the actual live candidate buffer."""
+    """Validate full short-history coverage or an actual bounded, pinned global source pool."""
     starts = original["metadata"]["query_start_loc"].tolist()
     metadata = original["cache_metadata"]["actual_metadata"]
     prefix = f"model.layers.{source_id}.self_attn."
     lengths = metadata[prefix + "indexer.k_cache"]["global_metadata"]["cache_seq_lens"].tolist()
-    if any(length < 0 or length > KEY_CAPACITY for length in lengths):
-        raise ValueError("Refresh history exceeds the supported index-key capacity")
+    if any(length < 0 or length > 1048576 for length in lengths):
+        raise ValueError("Refresh history exceeds the original-position model limit")
     start = original["cp_token_range"][0]
     candidates = shared["candidates"]
     for local in range(original["actual_local_query_rows"]):
         token = start + local
         request = next(i for i in range(len(starts) - 1) if starts[i] <= token < starts[i + 1])
         visible = min(lengths[request], int(original["positions"][token]) + 1)
-        available = set(candidates[local].reshape(-1).tolist())
-        if not set(range((visible + 7) // 8)).issubset(available):
-            raise ValueError("This input requires candidate pruning; no dense substitute is supported")
+        values = candidates[local].reshape(-1).tolist()
+        available = [value for value in values if value >= 0]
+        blocks = (visible + 7) // 8
+        if (len(available) != min(blocks, 2048) or len(available) != len(set(available))
+                or values != available + [-1] * (len(values) - len(available))
+                or any(value >= blocks for value in available)
+                or (blocks and available[0] != blocks - 1)):
+            raise ValueError("Candidate pool is stale, unpinned, duplicated or outside its request history")
+        if blocks <= 2048 and set(available) != set(range(blocks)):
+            raise ValueError("Short-history candidate publication lost full block coverage")

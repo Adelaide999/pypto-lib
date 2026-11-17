@@ -699,6 +699,11 @@ REGIONS = {
         ("norm", ("collapsed", "norm_weight", "normalized", "active")),
         ("projection", ("normalized", "weight", "local_logits", "active")),
     ),
+    "sample_head_l2": (
+        ("sp_unpack", ("gathered", "collapsed", "sample_rows", "physical", "active")),
+        ("norm", ("collapsed", "norm_weight", "normalized", "active")),
+        ("projection", ("normalized", "weight", "local_logits", "active")),
+    ),
     "qkv_l2": (
         ("wq_a", ("q_input", "wq_a", "wq_a_scale", "wqa", "query_rows")),
         ("q_norm", ("wqa", "q_norm", "latent", "query_rows")),
@@ -779,6 +784,7 @@ REGIONS = {
 STAGE_REGIONS = {
     "embedding": ("input_l2",),
     "output": ("head_l2",),
+    "sample_output": ("sample_head_l2",),
     "layer": ("qkv_l2", "attention_pack_l2", "output_projection_l2", "ffn_dispatch_l2", "moe_finish_l2"),
 }
 

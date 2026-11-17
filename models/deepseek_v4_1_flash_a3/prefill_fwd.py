@@ -77,9 +77,9 @@ def prefill_fwd(
 ):
     """Execute the existing network using explicit checkpoint and cache-state providers.
 
-    ``inputs`` accepts raw completion text, 1..2048 token IDs, or prepared
+    ``inputs`` accepts raw completion text, 1..1048576 token IDs, or prepared
     backbone tensors and their input contract. Automatic inputs use one DP
-    engine and chunks of up to 16 tokens; config may set chunk_size/dp_rank.
+    engine and chunks within the configured new-token budget (up to 512).
     Embedding and initial HC execute inside this forward unless explicit
     prepared backbone tensors are supplied.
     ``cache`` supplies the canonical all-rank cache ABI, source descriptors and
@@ -108,12 +108,14 @@ def prefill_fwd(
                 )
             tokens = tokenize_prompt(inputs, weights, config["model_config"]["text_config"]["vocab_size"])
             chunk_size = config.get("chunk_size", 16)
-            if type(chunk_size) is not int or not 1 <= chunk_size <= 16:
-                raise ValueError("Chunk size must be in 1..16")
+            budget = config.get("runtime_limits", {}).get("max_num_batched_tokens", config.get("capacity", 16))
+            if type(chunk_size) is not int or not 1 <= chunk_size <= min(budget, 512):
+                raise ValueError("Chunk size must fit the independent network new-token budget (at most 512)")
             request_inputs = TokenChunkInputs(
                 checkpoint=weights,
                 cache=cache,
-                config=config,
+                config=dict(config, prompt_length=len(tokens),
+                            metadata_transport=config.get("metadata_transport", "memory")),
                 output=Path(output) / "prepared",
                 context_capacity=config.get("context_capacity", len(tokens)),
                 prepare_engram=True,
@@ -149,6 +151,23 @@ def prefill_fwd(
             request_inputs.close()
 
 
+def prefill_batch(queries, *, weights, cache, config, devices, output, progress=None):
+    """Start a resident session from packed request queries; caller retains its scheduler."""
+    from .prefill_prepare import TokenChunkInputs
+
+    request = TokenChunkInputs(checkpoint=weights, cache=cache,
+        config=dict(config, metadata_transport=config.get("metadata_transport", "memory")),
+        output=Path(output) / "prepared", context_capacity=config["context_capacity"], prepare_engram=True)
+    try:
+        first = request.batch(queries, phase="prefill")
+        return run_network_runtime(_merge_inputs(first["inputs"], first["cache"]),
+            contract=first["contract"], checkpoint=weights, devices=devices, output=Path(output) / "network",
+            progress=progress, keep_runtime=True, request_inputs=request)
+    except BaseException:
+        request.close()
+        raise
+
+
 def load_configuration(path):
     """Read paths relative to a JSON configuration without importing the device runtime."""
     path = Path(path).resolve()
@@ -163,13 +182,13 @@ def load_configuration(path):
             raise ValueError("prompt must contain raw completion text")
         if "token_ids" in settings and (
             not isinstance(settings["token_ids"], list)
-            or not 1 <= len(settings["token_ids"]) <= 2048
+            or not 1 <= len(settings["token_ids"]) <= 1048576
             or any(type(token) is not int or token < 0 for token in settings["token_ids"])
         ):
-            raise ValueError("token_ids must contain 1..2048 nonnegative integers")
+            raise ValueError("token_ids must contain 1..1048576 nonnegative integers")
         if settings.get("continuations"):
             raise ValueError("Automatic Prefill owns its continuation descriptors")
-        for name, default, lower, upper in (("chunk_size", 16, 1, 16), ("dp_rank", 0, 0, 3)):
+        for name, default, lower, upper in (("chunk_size", 16, 1, 512), ("dp_rank", 0, 0, 15)):
             value = settings.get(name, default)
             if type(value) is not int or not lower <= value <= upper:
                 raise ValueError(f"{name} must be an integer in {lower}..{upper}")

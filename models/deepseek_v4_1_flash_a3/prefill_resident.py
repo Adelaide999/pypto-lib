@@ -56,6 +56,7 @@ class ResidentNetworkRuntime:
         self.rotations = {}
         self.programs = {}
         self.static_parameters = {}
+        self.active_output_programs = set()
         self.dynamic = {}
         self.allocations = [[] for _ in devices]
         self.failed_ranks = set()
@@ -145,6 +146,7 @@ class ResidentNetworkRuntime:
                 self.rotations.clear()
                 self.programs.clear()
                 self.static_parameters.clear()
+                self.active_output_programs.clear()
                 self.dynamic.clear()
 
     def pin(self, value, ranks, *, readonly, name):
@@ -191,6 +193,26 @@ class ResidentNetworkRuntime:
         owner = self.pinned[rank, value.untyped_storage()._cdata]
         return _device_view(owner["allocation"], value, owner["base_offset"])
 
+    def reset_ranges(self, value, rank, ranges):
+        """Synchronously zero bounded byte spans without replacing their owning allocation."""
+        if self._closed or rank in self.failed_ranks:
+            raise RuntimeError("Cannot certify a page reset on a failed resident worker")
+        owner = self.pinned[rank, value.untyped_storage()._cdata]
+        if owner["readonly"]:
+            raise ValueError("Request reset cannot modify resident weights")
+        host = _host_bytes(value)
+        for offset, length in ranges:
+            if (type(offset) is not int or type(length) is not int
+                    or offset < 0 or length <= 0 or offset + length > host.numel()):
+                raise ValueError("Page reset escapes its owning byte allocation")
+        self._select(rank)
+        for offset, length in ranges:
+            zeros = host.narrow(0, offset, length).zero_()
+            self.workers[rank].copy_to(owner["allocation"].data_ptr + offset, zeros.data_ptr(), length)
+            self.stats["page_reset_bytes"] = self.stats.get("page_reset_bytes", 0) + length
+        for tensor, _version in list(owner["versions"].values()):
+            owner["versions"][id(tensor)] = (tensor, tensor._version)
+
     def register(self, program):
         """Admit every phase and boundary entry to the same worker registry."""
         static_names = {
@@ -200,11 +222,13 @@ class ResidentNetworkRuntime:
             "gate_up_weight", "gate_up_scale", "down_weight", "down_scale",
             "wgate", "gamma", "channel_scale", "q_weight", "k_weight", "rotation",
         }
-        for entries in program.stages.values():
+        for stage, entries in program.stages.items():
             for name, entry in entries.items():
                 self.programs[id(entry.compiled)] = entry.compiled
                 names = static_names | {"gate"} if name == "ffn_dispatch_l2" else static_names
                 self.static_parameters[id(entry.compiled)] = names.intersection(entry.compiled.param_names)
+                if stage == "output":
+                    self.active_output_programs.add(id(entry.compiled))
         if len(self.programs) > 64:
             raise ValueError("The shared network exceeds the worker's 64 program slots")
 
@@ -236,6 +260,8 @@ class ResidentNetworkRuntime:
         local, bound = {}, []
         self._select(rank)
         writable, transient = {}, []
+        active_rows = next((int(value) for value, parameter in zip(arguments, abi["params"])
+                            if parameter.get("name") == "active" and parameter["shape"] is None), None)
         error, failed_run = None, False
         try:
             for value, parameter, direction in zip(arguments, abi["params"], abi["effective_directions"]):
@@ -292,6 +318,9 @@ class ResidentNetworkRuntime:
                 bound.append(_device_view(owner["allocation"], value, owner.get("base_offset", 0)))
                 if direction != "In":
                     writable[key] = owner
+                    if id(compiled) in self.active_output_programs and active_rows is not None:
+                        if value.ndim >= 1 and 0 <= active_rows <= value.shape[0]:
+                            owner["readback_bytes"] = active_rows * value.stride(0) * value.element_size()
             try:
                 worker.run(compiled, *bound)
             except BaseException:
@@ -301,8 +330,17 @@ class ResidentNetworkRuntime:
             self.stats["dispatches"] += 1
             for owner in writable.values():
                 host, allocation = owner["host"], owner["allocation"]
-                worker.copy_from(host.data_ptr(), allocation.data_ptr, host.numel())
-                self.stats["d2h_bytes"] += host.numel()
+                nbytes = owner.get("readback_bytes", host.numel())
+                if owner.get("name", "").startswith("raw/"):
+                    # Persistent cache bytes are consumed through their device aliases.
+                    nbytes = 0
+                elif owner.get("name", "").startswith("shared/") and active_rows is not None:
+                    source = owner["source"]
+                    if source.ndim >= 1 and 0 <= active_rows <= source.shape[0]:
+                        nbytes = active_rows * source.stride(0) * source.element_size()
+                if nbytes:
+                    worker.copy_from(host.data_ptr(), allocation.data_ptr, nbytes)
+                    self.stats["d2h_bytes"] += nbytes
                 if "versions" in owner:
                     owner["versions"] = {key: (tensor, tensor._version)
                                          for key, (tensor, _) in owner["versions"].items()}
@@ -423,5 +461,5 @@ class ResidentNetworkRuntime:
                     runtime_identity=id(self), worker_identities=[id(worker) for worker in self.workers],
                     registered_programs=len(self.programs), closed=self._closed,
                     execution_model="persistent_A3_ChipWorkers_with_host_layer_scheduler",
-                    single_device_graph=False, cache_readback="retained for current host consumers",
+                    single_device_graph=False, cache_readback="raw caches stay resident; shared state reads active rows",
                     numerical_acceptance="not_established_by_residency")

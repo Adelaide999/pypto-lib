@@ -11,6 +11,105 @@
 from dataclasses import dataclass
 
 
+@dataclass(frozen=True)
+class RuntimeLimits:
+    """Separate live requests, new query tokens, history and physical buckets."""
+
+    max_num_seqs: int = 16
+    max_num_batched_tokens: int = 16
+    max_model_len: int = 1048576
+    max_seqs_per_dp: int = 16
+    token_buckets: tuple = (16, 64, 256, 512, 1024, 2048)
+    page_size: int = 128
+    index_tile_rows: int = 2048
+
+    def __post_init__(self):
+        object.__setattr__(self, "token_buckets", tuple(self.token_buckets))
+        values = (self.max_num_seqs, self.max_num_batched_tokens, self.max_model_len,
+                  self.max_seqs_per_dp, self.page_size, self.index_tile_rows)
+        if any(type(value) is not int or value <= 0 for value in values):
+            raise ValueError("Runtime limits must be positive integers")
+        if self.max_model_len > 1048576 or self.page_size != 128:
+            raise ValueError("A3 uses 128-token pages and at most 1048576 original positions")
+        if (not self.token_buckets or tuple(sorted(set(self.token_buckets))) != self.token_buckets
+                or any(type(value) is not int or value < 16 or value % 16 for value in self.token_buckets)):
+            raise ValueError("Token buckets must be increasing positive multiples of sixteen")
+        if self.max_num_batched_tokens > self.token_buckets[-1]:
+            raise ValueError("New-token budget exceeds the largest physical bucket")
+        if self.index_tile_rows != 2048:
+            raise ValueError("The A3 QLI scratch tile has 2048 rows, independent of history length")
+
+    def token_capacity(self, tokens):
+        """Select physical capacity without putting the current token count in a compile key."""
+        if type(tokens) is not int or not 0 <= tokens <= self.max_num_batched_tokens:
+            raise ValueError("Dispatch exceeds its independent new-token budget")
+        return next(value for value in self.token_buckets if value >= max(1, tokens))
+
+
+@dataclass(frozen=True)
+class ParallelPlan:
+    """Map one DP-by-TP world onto an expert group and explicit physical devices."""
+
+    devices: tuple
+    dp: int = 4
+    tp: int = 4
+    ep: int = 16
+    experts: int = 384
+
+    def __post_init__(self):
+        if any(type(value) is not int for value in (self.dp, self.tp, self.ep, self.experts)):
+            raise ValueError("Parallel dimensions must be integers")
+        ExpertParallelConfig(self.dp, self.tp, self.ep, self.experts)
+        if self.ep != 16:
+            raise ValueError("The complete A3 network currently deploys one sixteen-rank EP world")
+        assigned = tuple(int(value) for value in validate_devices(self.devices, world=self.ep))
+        object.__setattr__(self, "devices", assigned)
+
+    @classmethod
+    def from_topology(cls, topology, devices=None):
+        if any(topology.get(name, 1) != 1 for name in ("pp", "pcp", "dcp")):
+            raise ValueError("A3 request ownership requires PP1/PCP1/DCP1")
+        return cls(tuple(range(topology["ep"])) if devices is None else tuple(devices),
+                   topology["dp"], topology["tp"], topology["ep"])
+
+    @property
+    def topology(self):
+        return dict(dp=self.dp, tp=self.tp, ep=self.ep, pp=1, pcp=1, dcp=1)
+
+    @property
+    def tp_groups(self):
+        return tuple(tuple(range(dp * self.tp, (dp + 1) * self.tp)) for dp in range(self.dp))
+
+    @property
+    def dp_groups(self):
+        return tuple(tuple(range(lane, self.ep, self.tp)) for lane in range(self.tp))
+
+    @property
+    def ep_groups(self):
+        return (tuple(range(self.ep)),)
+
+    def rank(self, dp, tp=0):
+        if type(dp) is not int or type(tp) is not int or not 0 <= dp < self.dp or not 0 <= tp < self.tp:
+            raise ValueError("Request rank is outside the parallel plan")
+        return dp * self.tp + tp
+
+    def expert_ownership(self, rank):
+        return ExpertParallelConfig(self.dp, self.tp, self.ep, self.experts).ownership(rank)
+
+    def token_range(self, rank, tokens):
+        if type(rank) is not int or not 0 <= rank < self.ep or type(tokens) is not int or tokens < 0:
+            raise ValueError("Invalid rank-local query extent")
+        rows = (tokens + self.tp - 1) // self.tp
+        begin = rank % self.tp * rows
+        return begin, begin + rows, rows, rows * self.tp
+
+    def validate_model(self, text):
+        for name in ("num_attention_heads", "o_groups", "vocab_size", "index_n_heads"):
+            if name in text and (type(text[name]) is not int or text[name] % self.tp):
+                raise ValueError(f"{name} cannot be sharded over the selected TP group")
+        return self
+
+
 def validate_tp(tp):
     """Validate a caller-supplied tensor-parallel specialization."""
     if type(tp) is not int or tp not in (1, 2, 4):
@@ -85,4 +184,5 @@ def configure_devices(devices, *, world):
     return assigned
 
 
-__all__ = ["ExpertParallelConfig", "configure_devices", "validate_devices", "validate_tp"]
+__all__ = ["ExpertParallelConfig", "ParallelPlan", "RuntimeLimits", "configure_devices",
+           "validate_devices", "validate_tp"]

@@ -18,7 +18,7 @@ from tokenizers import Tokenizer
 from .decode_network import DecodeNetwork, TOPOLOGY
 from .prefill_fwd import prefill_fwd
 from .prefill_prepare import checkpoint_cache, tokenize_prompt
-from .runtime_config import configure_devices
+from .runtime_config import ParallelPlan, configure_devices
 from .utils import write_json
 
 
@@ -34,25 +34,35 @@ def main(argv=None):
     parser.add_argument("--result", type=Path)
     parser.add_argument("--max-new-tokens", type=int, default=3)
     parser.add_argument("--chunk-size", type=int, default=16)
+    parser.add_argument("--max-num-batched-tokens", type=int, choices=(16, 64, 256, 512), default=16)
+    parser.add_argument("--tp", type=int, choices=(1, 2, 4), default=4)
+    parser.add_argument("--hbm-budget", type=Path, help="JSON per-rank HBM budget for expanded token/history runs")
     parser.add_argument("--ignore-eos", action="store_true")
     args = parser.parse_args(argv)
-    if not 1 <= args.chunk_size <= 16 or not 1 <= args.max_new_tokens <= 256:
-        parser.error("Require chunk size 1..16 and a new-token limit in 1..256")
+    if not 1 <= args.chunk_size <= args.max_num_batched_tokens or not 1 <= args.max_new_tokens <= 256:
+        parser.error("Require chunk size within the new-token budget and a new-token limit in 1..256")
+    topology = dict(TOPOLOGY, tp=args.tp, dp=16 // args.tp)
+    ParallelPlan.from_topology(topology, args.devices)
     args.checkpoint, args.output = args.checkpoint.resolve(), args.output.resolve()
     result_dir = (args.result or args.output / "generation").resolve()
     model = json.loads((args.checkpoint / "config.json").read_text())
     tokenizer = Tokenizer.from_file(str(args.checkpoint / "tokenizer.json"))
     raw = args.prompt if args.prompt is not None else [int(item) for item in args.tokens.split(",")]
     tokens = tokenize_prompt(raw, args.checkpoint, model["text_config"]["vocab_size"])
-    if len(tokens) + args.max_new_tokens > 2048:
-        parser.error("Prompt plus generation exceeds the 2048-position session reservation")
+    if len(tokens) + args.max_new_tokens > 1048576:
+        parser.error("Prompt plus generation exceeds the 1048576-position model limit")
     devices = configure_devices(args.devices, world=16)
     args.output.mkdir(parents=True, exist_ok=False)
     result_dir.mkdir(parents=True, exist_ok=True)
-    cache, config = checkpoint_cache(args.checkpoint, TOPOLOGY)
+    cache, config = checkpoint_cache(args.checkpoint, topology)
     config.update(chunk_size=args.chunk_size, context_capacity=len(tokens) + args.max_new_tokens)
+    config["runtime_limits"] = dict(max_num_seqs=1, max_seqs_per_dp=1,
+                                   max_num_batched_tokens=args.max_num_batched_tokens,
+                                   max_model_len=1048576)
+    if args.hbm_budget is not None:
+        config["hbm_budget"] = json.loads(args.hbm_budget.read_text())
     eos = model.get("eos_token_id", model["text_config"].get("eos_token_id"))
-    report = dict(status="executing", checkpoint=str(args.checkpoint), topology=TOPOLOGY,
+    report = dict(status="executing", checkpoint=str(args.checkpoint), topology=topology,
                   devices=devices, prompt_token_ids=tokens, generated_token_ids=[], phases=[], accuracy="not_run")
     write_json(result_dir / "prompt.json", report)
     session, network = None, None

@@ -157,9 +157,11 @@ class HostEngram:
                         type(token) is not int or not 0 <= token < len(self.constants["token_map"])
                         for token in [*prefix, *current]
                     )
-                    or request["initial_context_length"] != len(prefix)
+                    or request["initial_context_length"] != request.get("history_start", 0) + len(prefix)
+                    or len(prefix) < min(3, request["initial_context_length"])
                     or request["live_token_mask"] != [1] * len(current)
-                    or request["position_ids"] != list(range(len(prefix), len(prefix) + len(current)))
+                    or request["position_ids"] != list(range(request["initial_context_length"],
+                                                            request["initial_context_length"] + len(current)))
                 ):
                     raise ValueError("Host lookup requires complete contiguous request coordinates")
                 tokens.extend(current)

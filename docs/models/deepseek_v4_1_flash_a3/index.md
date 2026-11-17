@@ -5,6 +5,9 @@ persistent generation session, bounded Decode operators, and a shared TP4
 40-layer network for Prefill and one-token Decode. See [Decode](decode.md) for its implementation scope and
 remaining work.
 
+See [Packed requests and paged history](dynamic-runtime.md) for request admission,
+independent limits, supported TP plans, HBM budgets and the device acceptance order.
+
 ## Development priorities
 
 - Performance target: complete-network correctness and continuous generation
@@ -15,7 +18,7 @@ remaining work.
   measurements on an allocated device group.
 - Compatibility requirements: preserve original layer roles, byte aliases,
   cache/source lifetime, quantization, dtypes, and explicit DP/TP/EP mappings.
-  TP1/TP2 fixed-16 full-network compatibility remains unvalidated.
+  TP1/TP2 full-network device compatibility remains unvalidated.
 
 ## Structure
 
@@ -67,8 +70,10 @@ Omit `--compile-only` on an allocated A3 device to run operator comparisons.
 
 `prefill_fwd.prefill_fwd` executes embedding, initial HC, layers 0 through 39,
 final HC collapse, RMSNorm and the vocabulary head. Each layer consumes the
-previous layer's actual activations. The implemented topology is
-DP4/TP4/EP16, PP1/PCP1/DCP1, with capacity 16. Physical devices are explicit
+previous layer's actual activations. Implemented topologies are
+DP4/TP4/EP16, DP8/TP2/EP16 and DP16/TP1/EP16, with PP1/PCP1/DCP1 and
+token buckets up to 512. Device acceptance remains separate from implementation.
+Physical devices are explicit
 and ordered by logical rank. Duplicate IDs, rank-count mismatches and a
 conflicting `ASCEND_RT_VISIBLE_DEVICES` mapping are rejected before initialization.
 

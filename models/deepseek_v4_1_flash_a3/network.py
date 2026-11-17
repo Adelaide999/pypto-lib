@@ -333,9 +333,10 @@ class NetworkProgram:
             self.bind(
                 "output",
                 make_network_l2_entries(
-                    make_output_entries(geometry["capacity"], text, topology["tp"]),
+                    make_output_entries(geometry["capacity"], text, topology["tp"],
+                                        **({"sample_rows": True} if geometry.get("sample_outputs") else {})),
                     geometry["capacity"],
-                    "output",
+                    "sample_output" if geometry.get("sample_outputs") else "output",
                 ),
             )
             self._signature = signature
@@ -647,6 +648,11 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
     directory = Path(output)
     directory.mkdir(exist_ok=False)
     entries = executor.program.entries_for_stage("output")
+    sampled = executor.provider.sample_outputs
+    if sampled and not any(record["output_rows"] for rows in batch["cases"].values() for record in rows):
+        write_json(directory / "execution.json", dict(outcome="no_request_requires_sampling"))
+        return dict(files={}, logits=[{case: torch.empty((0, config["vocab_size"]), dtype=torch.bfloat16)
+                                      for case in cases} for cases in result["hidden"]])
     norm = weights.reader.load("norm.weight")
     head = weights.reader.load("head.weight")
     if (
@@ -676,7 +682,11 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
     logits_packets = [{} for _ in range(world)]
     for case, records in batch["cases"].items():
         for rank, record in enumerate(records):
-            physical, active = record["SP_physical_rows"], len(record["positions"])
+            physical = record["SP_physical_rows"]
+            output_rows = record["output_rows"] if sampled else list(range(len(record["positions"])))
+            active = len(output_rows)
+            sample_rows = torch.zeros(capacity, dtype=torch.int32)
+            sample_rows[:active] = torch.tensor(output_rows, dtype=torch.int32)
             collapsed = torch.full((capacity, 5120), -17, dtype=torch.bfloat16)
             normalized = torch.full((capacity, 5120), -19, dtype=torch.bfloat16)
             local_logits = torch.full((capacity, config["vocab_size"] // tp), -23, dtype=torch.bfloat16)
@@ -686,13 +696,14 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
                 raise ValueError("Output head must use canonical KN vocabulary shard layout")
             execute_region(
                 {"execute_l2": execute},
-                "head_l2",
+                "sample_head_l2" if sampled else "head_l2",
                 rank,
                 case,
                 (
                     (
                         "sp_unpack",
-                        [gathered[rank][case], collapsed, max(physical, 1), active],
+                        ([gathered[rank][case], collapsed, sample_rows, max(physical, 1), active] if sampled
+                         else [gathered[rank][case], collapsed, max(physical, 1), active]),
                         dict(collapsed=collapsed),
                         "output",
                     ),
@@ -712,26 +723,27 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
     files, actual_logits = {}, [{} for _ in range(world)]
     for case, records in batch["cases"].items():
         for rank, record in enumerate(records):
+            active = len(record["output_rows"]) if sampled else len(record["positions"])
             logits = torch.full((capacity, config["vocab_size"]), -29, dtype=torch.bfloat16)
             execute(
                 "vocab_unpack",
                 rank,
                 case,
-                [gathered_logits[rank][case], logits, len(record["positions"])],
+                [gathered_logits[rank][case], logits, active],
                 dict(logits=logits),
             )
             path = directory / f"rank-{rank}-{case}-network-logits.pt"
             torch.save(
                 dict(
-                    logits=logits,
-                    active=len(record["positions"]),
-                    positions=record["positions"],
+                    logits=logits[:active].clone(),
+                    active=active,
+                    positions=(record["positions"][record["output_rows"]] if sampled else record["positions"]),
                     DP_rank=rank // tp,
                 ),
                 path,
             )
             files[str(path)] = file_sha(path)
-            actual_logits[rank][case] = logits[: len(record["positions"])].clone()
+            actual_logits[rank][case] = logits[:active].clone()
     write_json(
         directory / "execution.json",
         dict(
@@ -776,7 +788,8 @@ def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=F
         raise ValueError("The network runtime requires EP16 with TP1/2/4 and PP1/PCP1/DCP1")
     if (
         not all(contract["required_modes"].values())
-        or contract["capacity"] != 16
+        or type(contract["capacity"]) is not int
+        or not 16 <= contract["capacity"] <= 512 or contract["capacity"] % 16
         or contract["scheduler_capacity"] != 8192
     ):
         raise ValueError("Retain the original model modes and bounded actual scheduler ABI")
@@ -795,7 +808,7 @@ def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=F
         {"fresh": inputs["input_contract"]},
         topology=topology,
         model_config=model_config,
-        capacity=16,
+        capacity=contract["capacity"],
         scheduler_capacity=8192,
         allocation_id=allocation_id,
         sources_by_case={"fresh": inputs["cache_ABI_sources"]},
@@ -807,6 +820,12 @@ def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=F
         cases["fresh"]["topk_indices"].fill_(-1)
     provider.begin_chunk(epoch=0, token_map_id=contract["input_contract_sha256"])
     return provider
+
+
+def request_outputs(logits, contract):
+    """Expose each finished query's final row without depending on packed order."""
+    return [dict(row, logits=logits[row["rank"]]["fresh"][row.get("logit_row", row["row"])].clone())
+            for row in contract.get("output_map", []) if row["sample"]]
 
 
 class GenerationSession:
@@ -841,11 +860,80 @@ class GenerationSession:
         """End the session explicitly; generation never releases a worker between phases."""
         self.close()
 
+    def request_handle(self, request_id):
+        if self.request_inputs is None or request_id not in self.request_inputs.ledger.owners:
+            raise ValueError("Unknown request owner")
+        return self.request_inputs.ledger.owners[request_id].handle
+
+    def _request_ledger(self):
+        if self.closed or self.failed or self.request_inputs is None:
+            raise RuntimeError("Require a live session with its request metadata owner")
+        return self.request_inputs.ledger
+
+    def pause_request(self, handle):
+        self._request_ledger().pause(handle)
+
+    def resume_request(self, handle):
+        self._request_ledger().resume(handle)
+
+    def finish_request(self, handle):
+        self._request_ledger().finish(handle)
+        self.release_request(handle)
+
+    def cancel_request(self, handle):
+        self.release_request(handle)
+
+    def advance_batch(self, queries, *, phase, output, progress=None):
+        """Run a homogeneous packed dispatch over the session's shared scheduler."""
+        if self.closed or self.failed or self.request_inputs is None:
+            raise RuntimeError("Require a live session with its request metadata owner")
+        chunk = self.request_inputs.batch(queries, phase=phase)
+        try:
+            return self.advance(chunk, output=output, progress=progress, phase=phase)
+        except BaseException:
+            if not self.failed:
+                self.request_inputs.rollback()
+            raise
+
+    def _reset_request(self, handle, pages):
+        """Clear retired cache pages and first-SWA history on every TP owner."""
+        if self.closed or self.failed:
+            raise RuntimeError("A failed worker cannot certify reset; close this session")
+        from .cache_pool import cache_page_bytes
+
+        for lane in range(self.contract["topology"]["tp"]):
+            rank = handle.dp_rank * self.contract["topology"]["tp"] + lane
+            all_pages = sorted(page for group in pages for page in group)
+            strides = cache_page_bytes(self.request_inputs.layouts[rank])
+            for key, raw in self.provider.arenas[rank]["fresh"].items():
+                self.runtime.reset_ranges(raw, rank, [(page * strides[key], strides[key])
+                                                      for page in all_pages])
+            templates = self.request_inputs.cache["cache_ABI"][rank]["groups"]
+            index = next(i for i, group in enumerate(templates)
+                         if "model.layers.1.self_attn.swa_cache" in group["names"])
+            history = self.provider.history.caches[rank]["fresh"]
+            for page in pages[index]:
+                history[page * 128:(page + 1) * 128].zero_()
+
+    def release_request(self, handle):
+        """Finish or cancel an owner only after its device pages have been reset."""
+        ledger = self._request_ledger()
+        ledger.get(handle)
+        ledger._idle()
+        try:
+            self.request_inputs.release(handle, self._reset_request)
+            self.provider.confirm_request_reset(handle)
+        except BaseException:
+            self.failed = True
+            raise
+
     def advance(self, chunk, *, output, progress=None, phase="prefill"):
         """Admit fresh controls and run the next chunk over the existing weights and caches."""
         if self.closed or self.failed:
             raise RuntimeError("A closed or failed generation session cannot advance")
         following, contract = chunk["inputs"], chunk["contract"]
+        if following["input_contract"].get("phase", phase) != phase:
+            raise ValueError("The dispatch phase differs from the request transaction")
         fixed = ("topology", "checkpoint", "model_config", "required_modes", "capacity", "scheduler_capacity")
         if any(contract[name] != self.contract[name] for name in fixed):
             raise ValueError("Continuation cannot change the session's model or topology")
@@ -860,8 +948,13 @@ class GenerationSession:
         if len(sources) != self.weights.world:
             raise ValueError("Continuation metadata must cover every active and empty rank")
         metadata, receipts = [], []
+        memory_owned = (self.request_inputs is not None and chunk.get("metadata_owner") is self.request_inputs
+                        and self.request_inputs.pending is not None
+                        and self.request_inputs.pending["chunk"] is chunk)
         for rank, record in enumerate(sources):
-            if record["rank"] != rank or file_sha(record["path"]) != record["sha256"]:
+            memory_source = record.get("transport") == "memory"
+            if (record["rank"] != rank or (memory_source and not memory_owned)
+                    or (not memory_source and file_sha(record["path"]) != record["sha256"])):
                 raise ValueError("Continuation metadata source changed")
             metadata.append(chunk["cache"]["cache_ABI"][rank] if "cache" in chunk else
                             torch.load(record["path"], map_location="cpu", weights_only=True))
@@ -893,6 +986,9 @@ class GenerationSession:
             self.failed = True
             raise
         self.epoch, self.contract = epoch, contract
+        if self.request_inputs is not None:
+            self.request_inputs.commit(contract["input_contract_sha256"])
+        result["request_outputs"] = request_outputs(result["logits"], actual)
         return result
 
     def summary(self):
@@ -927,6 +1023,9 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
     if progress is not None:
         progress(dict(stage="compiling_network", epoch=0))
     provider = prepare_network_provider(inputs, contract, output.name, geometry_only=True)
+    geometry = provider.runtime_geometry()
+    if (geometry["capacity"] > 16 or geometry["table_pages"] > 16) and "hbm_budget" not in contract:
+        raise ValueError("Expanded token/history execution requires an explicit per-rank hbm_budget")
     validate_host_lookup(inputs["engram_lookup"], inputs["engram_contracts"][1], provider.hash_batch())
     program = compiled if compiled is not None else NetworkProgram(output / "compiled")
     program.compile(provider, contract["model_config"], topology, inputs["engram_contracts"])
@@ -937,6 +1036,23 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
         weights = A3ResidentWeights(contract["checkpoint"], topology, contract["model_config"], resident)
         stack.callback(weights.close)
         weights.preload_once(progress)
+        observer = CANNMemory(diagnostics=False)
+        samples = [observer.sample(rank, "resident_weights_loaded", force=True) for rank in range(topology["ep"])]
+        budget = contract.get("hbm_budget")
+        admission = []
+        for rank, sample in enumerate(samples):
+            state_bytes = sum(value.numel() * value.element_size()
+                              for family in (provider.arenas[rank], provider.shared[rank])
+                              for tensors in family.values() for value in tensors.values())
+            reserve = (sum(budget[name][rank] for name in
+                           ("scratch_bytes", "communication_bytes", "runtime_reserve_bytes"))
+                       if budget is not None else 2 * 1024**3)
+            admission.append(dict(rank=rank, free_after_weights=sample["free_bytes"],
+                                  cache_and_shared_bytes=state_bytes, reserved_bytes=reserve))
+        write_json(output / "hbm-admission.json", admission)
+        if any(row["cache_and_shared_bytes"] + row["reserved_bytes"] > row["free_after_weights"]
+               for row in admission):
+            raise MemoryError("The tightest rank cannot admit the fixed cache pool plus peak scratch/reserves")
         write_json(output / "weight-audit.json", dict(checkpoint_reads=weights.reader.consumed,
                                                       host_preparations=weights.reader.preparations))
         for family, values in (("raw", provider.arenas), ("shared", provider.shared)):
@@ -952,6 +1068,9 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
             memory=session.memory, ownership=session.ownership, assigned=assigned,
             engram_contracts=session.engram_contracts, program=program, epoch=0, progress=progress, resident=resident)
         weights.assert_static_unchanged()
+        if request_inputs is not None:
+            request_inputs.commit(contract["input_contract_sha256"])
+        first["request_outputs"] = request_outputs(first["logits"], inputs["input_contract"])
         completed = [first]
         chunks = (continuation,) if isinstance(continuation, Mapping) else continuation
         if chunks is not None:
@@ -1050,7 +1169,7 @@ def run_network_chunk(
     eng_runtime = dict(
         topology=topology,
         assigned_devices=assigned,
-        capacity=16,
+        capacity=provider.capacity,
         stage_namespace=namespace + "-engram",
         output=output / "engram",
         reports=reports,

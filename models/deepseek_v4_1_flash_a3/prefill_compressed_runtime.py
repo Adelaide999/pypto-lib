@@ -80,8 +80,8 @@ def run_compressed_attention(
     views = physical_cache_views(raw, live["layout"])
     network = live.get("network_geometry")
     if network is not None:
-        from .cache import load_network_index, network_cache_geometry, owned_cache_pages
-        from .cache import raw_cache_matrix, store_network_index, validate_network_sparse_indices
+        from .cache import network_cache_geometry, owned_cache_pages
+        from .cache import raw_cache_matrix, validate_network_sparse_indices
 
         if network != network_cache_geometry(live["layout"], role, cache_blocks):
             raise ValueError("Network producer geometry differs from the actual live raw aliases")
@@ -128,8 +128,7 @@ def run_compressed_attention(
     if network is not None:
         cache = raw_cache_matrix(raw, network["long"])
         own_cache = raw_cache_matrix(raw, network["own"])
-        dense = load_network_index(raw, network, index_pages, execute, rank, case)
-        codes, scales = dense["codes"], dense["scales"]
+        codes, scales = (raw_cache_matrix(raw, network[name]) for name in ("codes", "scales"))
         if ratio == 2:
             ring = raw_cache_matrix(raw, network["ring"]).reshape(cache_blocks, 32, 1024)
     elif ratio == 1:
@@ -263,9 +262,7 @@ def run_compressed_attention(
         dict(codes=codes, scales=scales, payload=payload, quant_scale=quant_scale),
         ("index_quant", "cache_publish"),
     )
-    if network is not None:
-        store_network_index(raw, network, index_pages, dense, execute, rank, case)
-    elif ratio == 2:
+    if network is None and ratio == 2:
         cache_codes.copy_(codes)
         cache_scales.copy_(scales)
     swa_slots = slots("swa_cache", torch.int64)
@@ -323,7 +320,6 @@ def run_compressed_attention(
     )
     selected, lengths = selection["selected"], selection["lengths"]
     compressed_indices, window_indices = selection["compressed"], selection["window"]
-    candidate_scores = selection["scores"]
     indices = torch.full((capacity, 640), -1, dtype=torch.int32)
     execute(
         "sparse_index_pack",
@@ -364,6 +360,11 @@ def run_compressed_attention(
         "index_select",
     )
     if ratio == 1:
+        if network is not None:
+            execute("paged_candidate_publish", rank, case,
+                [selection["candidate_blocks"], after["candidates"], query_rows],
+                dict(candidates=after["candidates"]), "candidate_publication")
+            return context, views[prefix + "swa_cache"]
         from .indexer import POOL_CAPACITY
 
         candidate_blocks = torch.full((capacity, POOL_CAPACITY), -1, dtype=torch.int32)
@@ -372,7 +373,7 @@ def run_compressed_attention(
             "candidate_pool",
             rank,
             case,
-            [candidate_scores, selection["visible_lengths"], candidate_blocks, candidate_counts, query_rows],
+            [selection["scores"], selection["visible_lengths"], candidate_blocks, candidate_counts, query_rows],
             dict(blocks=candidate_blocks, counts=candidate_counts),
             "candidate_pool",
         )

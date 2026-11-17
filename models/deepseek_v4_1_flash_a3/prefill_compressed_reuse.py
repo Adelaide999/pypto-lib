@@ -239,5 +239,5 @@ def make_physical_consumer_entries(
 
         geometry = network_cache_geometry(cache_layout, role, cache_blocks)
         del entries["compressed_attention"]
-        entries.update(make_network_cache_entries(capacity, config, geometry, role))
+        entries.update(make_network_cache_entries(capacity, config, geometry, role, requests, table_pages))
     return entries

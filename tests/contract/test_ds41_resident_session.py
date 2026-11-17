@@ -102,6 +102,26 @@ def test_dispatch_reuses_dynamic_buffers_and_never_reuploads_static_or_cache_vie
     assert worker.closed
 
 
+def test_retired_page_reset_preserves_other_pages_and_resident_weight_identity():
+    worker = HostWorker()
+    with ResidentNetworkRuntime([0], dict(dp=1, tp=1, ep=1), worker_factory=lambda rank: worker) as runtime:
+        raw, weight = torch.arange(64, dtype=torch.int8), torch.ones(4)
+        runtime.pin(raw, [0], readonly=False, name="raw/0/fresh/shared")
+        runtime.pin(weight, [0], readonly=True, name="weight")
+        before = runtime.handle(raw, 0)
+        runtime.reset_ranges(raw, 0, [(16, 16), (48, 16)])
+        assert runtime.handle(raw, 0).data_ptr == before.data_ptr
+        expected = torch.arange(64, dtype=torch.int8)
+        expected[16:32] = expected[48:64] = 0
+        assert torch.equal(raw, expected)
+        assert torch.equal(worker.live[before.data_ptr], expected)
+        with pytest.raises(ValueError, match="weights"):
+            runtime.reset_ranges(weight, 0, [(0, 4)])
+        with pytest.raises(ValueError, match="escapes"):
+            runtime.reset_ranges(raw, 0, [(0, 16), (60, 16)])
+        assert torch.equal(raw, expected)
+
+
 def test_resident_checkpoint_reads_are_once_per_name_and_sealed_after_preload(tmp_path):
     save_file({"a": torch.ones(4), "b": torch.zeros(4)}, tmp_path / "model.safetensors")
     (tmp_path / "quant_model_weights.safetensors.index.json").write_text(json.dumps(
@@ -138,6 +158,9 @@ def test_token_feedback_preserves_reserved_pages_and_original_positions(tmp_path
     request = TokenChunkInputs(checkpoint=checkpoint, cache=cache, config=config,
                                output=tmp_path / "prepared", context_capacity=130)
     first = request.chunk([1, 2])
+    with pytest.raises(RuntimeError, match="in flight"):
+        request.chunk([3])
+    request.commit()
     second = request.chunk([3])
     assert first["inputs"]["input_contract"]["epoch"] == 0
     actual = second["inputs"]["input_contract"]

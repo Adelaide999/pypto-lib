@@ -86,8 +86,9 @@ def test_ir_hash_collision_does_not_alias_different_shapes(tmp_path, monkeypatch
     assert first is same and first is not changed
 
 
-def test_output_head_specializes_without_tensor_payloads():
-    definitions = make_output_entries(16, asdict(FLASH), 4)
-    entries = pool.make_network_l2_entries(definitions, 16, "output")
+@pytest.mark.parametrize("sample_rows", [False, True])
+def test_output_head_specializes_without_tensor_payloads(sample_rows):
+    definitions = make_output_entries(16, asdict(FLASH), 4, sample_rows=sample_rows)
+    entries = pool.make_network_l2_entries(definitions, 16, "sample_output" if sample_rows else "output")
     for function in entries.values():
         assert function.specialize().functions

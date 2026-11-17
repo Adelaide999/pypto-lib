@@ -196,7 +196,9 @@ class NetworkCacheProvider:
         self._seen_chunks, self._chunk = set(), None
         self._completed_layers, self._batches = [], {}
         self._sequence_tokens, self._pending_sequence_tokens = {}, {}
+        self._retired_requests = set()
         self._input_by_case = _metadata_copy(input_by_case)
+        self.sample_outputs = all("output_map" in contract for contract in input_by_case.values())
         self._abi_by_case = {}
         for case, payloads in abi_by_case.items():
             _require(
@@ -295,7 +297,8 @@ class NetworkCacheProvider:
                 "Actual request positions are not contiguous",
             )
             _require(
-                len(request["history_tokens"]) == context, "Input history length differs from the real prefix"
+                request.get("history_start", 0) + len(request["history_tokens"]) == context,
+                "Input lookback does not end at the committed prefix",
             )
             ids.extend(tokens)
             positions.extend(pos)
@@ -311,7 +314,11 @@ class NetworkCacheProvider:
     def _record(self, case, layer, rank, payload, contract, active_by_dp):
         role, tp = resolve_layer_role(layer), self.topology["tp"]
         ids, positions, lengths, starts, request_slots = self._input_coordinates(contract, rank)
-        total, requests = len(ids), len(lengths)
+        total, actual_requests = len(ids), len(lengths)
+        requests = contract.get("request_capacity", actual_requests)
+        _require(requests >= actual_requests, "Request controls exceed their reserved capacity")
+        padded_lengths = lengths + [0] * (requests - actual_requests)
+        padded_starts = starts + [total] * (requests - actual_requests)
         _require(
             torch.equal(
                 _cpu_tensor(payload["positions"], torch.int64, [total], "positions"),
@@ -322,14 +329,14 @@ class NetworkCacheProvider:
         _require(
             torch.equal(
                 _cpu_tensor(payload["lengths"], torch.int32, [requests], "lengths"),
-                torch.tensor(lengths, dtype=torch.int32),
+                torch.tensor(padded_lengths, dtype=torch.int32),
             ),
             "Actual captured lengths differ from input",
         )
         _require(
             torch.equal(
                 _cpu_tensor(payload["query_start_loc"], torch.int32, [requests + 1], "query starts"),
-                torch.tensor(starts, dtype=torch.int32),
+                torch.tensor(padded_starts, dtype=torch.int32),
             ),
             "Actual captured query starts differ from input",
         )
@@ -414,6 +421,8 @@ class NetworkCacheProvider:
             force_dummy=total == 0,
             valid_token_count=total,
             request_slots=request_slots,
+            output_rows=[row["row"] for row in contract.get("output_map", [])
+                         if row["dp_rank"] == rank // tp and row["sample"]],
             metadata=dict(
                 query_start_loc=payload["query_start_loc"],
                 seq_lens=payload["lengths"],
@@ -434,8 +443,10 @@ class NetworkCacheProvider:
                 token_begin=starts[index],
                 token_end=starts[index + 1],
                 initial_context_length=lengths[index] - (starts[index + 1] - starts[index]),
+                request_id=contract["DP_engines"][rank // tp]["requests"][index].get("request_id"),
+                generation=contract["DP_engines"][rank // tp]["requests"][index].get("generation", 0),
             )
-            for index in range(requests)
+            for index in range(actual_requests)
         ]
         return record
 
@@ -492,33 +503,36 @@ class NetworkCacheProvider:
             "Chunk cases cannot replace allocation ownership",
         )
         batches = {layer: dict(cases={}, epoch=epoch, token_map_id=token_map_id) for layer in range(40)}
-        token_maps, pending_sequences = {}, {}
+        token_maps, pending_sequences = {}, deepcopy(self._sequence_tokens)
         for case, records in payloads.items():
             _require(
                 len(records) == self.topology["ep"], "Every chunk must retain empty as well as active ranks"
             )
             active = [engine["active"] for engine in inputs[case]["DP_engines"]]
             token_maps[case] = []
+            for retired in inputs[case].get("retired_requests", []):
+                key = (case, retired["dp_rank"], retired["request_slot"])
+                previous = pending_sequences.get(key)
+                _require(previous is not None and previous["generation"] == retired["generation"]
+                         and previous["request_id"] == retired["request_id"], "Stale request retirement")
+                retirement = (*key, retired["generation"], retired["request_id"])
+                _require(retirement in self._retired_requests, "Request pages were not certified reset")
+                del pending_sequences[key]
             for dp_rank, engine in enumerate(inputs[case]["DP_engines"]):
-                previous_slots = {
-                    slot
-                    for old_case, old_dp, slot in self._sequence_tokens
-                    if old_case == case and old_dp == dp_rank
-                }
-                current_slots = {request["request_slot"] for request in engine["requests"]}
-                _require(
-                    previous_slots <= current_slots,
-                    "Request eviction or page reuse needs explicit product-state recovery",
-                )
                 for request in engine["requests"]:
                     key = (case, dp_rank, request["request_slot"])
-                    previous = self._sequence_tokens.get(key, [])
+                    previous = pending_sequences.get(key, dict(length=0, lookback=[],
+                        generation=request.get("generation", 0), request_id=request.get("request_id")))
+                    context, prefix = request["initial_context_length"], request["history_tokens"]
                     _require(
-                        request["initial_context_length"] == len(previous)
-                        and request["history_tokens"] == previous,
+                        context == previous["length"]
+                        and prefix[-8:] == previous["lookback"]
+                        and request.get("generation", 0) == previous["generation"]
+                        and request.get("request_id") == previous["request_id"],
                         "Fresh or continued input history differs from completed product chunks",
                     )
-                    pending_sequences[key] = previous + list(request["token_ids"])
+                    pending_sequences[key] = dict(previous, length=context + len(request["token_ids"]),
+                        lookback=(previous["lookback"] + list(request["token_ids"]))[-8:])
             for layer in range(40):
                 batches[layer]["cases"][case] = [
                     self._record(case, layer, rank, payload, inputs[case], active)
@@ -547,6 +561,7 @@ class NetworkCacheProvider:
         self._seen_chunks.add(identity)
         self._chunk, self._completed_layers, self._batches = identity, [], batches
         self._pending_sequence_tokens = pending_sequences
+        self._retired_requests.clear()
         self._metadata_sources = (
             deepcopy(metadata_sources_by_case) if metadata_sources_by_case is not None else self.sources
         )
@@ -564,6 +579,15 @@ class NetworkCacheProvider:
         resolve_layer_role(layer_id)
         _require(self._chunk is not None, "Begin the actual network chunk before requesting a batch")
         return self._batches[layer_id]
+
+    def confirm_request_reset(self, handle, case="fresh"):
+        """Certify one completed generation after every TP owner's device reset succeeded."""
+        key = (case, handle.dp_rank, handle.state_slot)
+        previous = self._sequence_tokens.get(key)
+        _require(self._completed_layers == list(range(40)) and previous is not None
+                 and previous["generation"] == handle.generation
+                 and previous["request_id"] == handle.request_id, "Reset receipt identifies a stale request")
+        self._retired_requests.add((*key, handle.generation, handle.request_id))
 
     def hash_batch(self):
         """Provide the original first-SWA request mapping for one model-level hash preparation."""
@@ -595,6 +619,7 @@ class NetworkCacheProvider:
             requests=requests,
             table_pages=pages,
             scheduler_capacity=self.scheduler_capacity,
+            sample_outputs=self.sample_outputs,
         )
 
     def state_handles_for_layer(self, layer_id):
