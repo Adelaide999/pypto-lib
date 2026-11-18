@@ -66,7 +66,7 @@ def make_prefill_layer_entries(
 ):
     """Construct shared physical-layer attention, HC and MoE computations."""
     from .hc import make_hc_post_inline, make_hc_pre_inline
-    from .prefill_moe import make_moe_combine
+    from .prefill_moe import make_moe_combine_from_dispatch
     from .prefill_moe import make_ep_dispatch_pack, make_ep_dispatch_unpack, make_ep_return_pack
     from .prefill_moe import make_moe_router
     from .prefill_moe import make_shared_moe_w8a8
@@ -102,7 +102,7 @@ def make_prefill_layer_entries(
         dispatch_pack=make_ep_dispatch_pack(slab, 5120, 384, 6, ep),
         dispatch_unpack=make_ep_dispatch_unpack(slab, 5120, 384, 6, ep, expert_capacity),
         return_pack=make_ep_return_pack(slab, 5120, 384, 6, ep, expert_capacity),
-        combine=make_moe_combine(slab, 5120, 6, ep, weight_dtype=pl.BF16),
+        combine=make_moe_combine_from_dispatch(slab, 5120, 6, ep),
         mask_moe=make_sp_masked_zero(capacity, 5120),
         mask_output=make_sp_masked_zero(capacity, 20480),
     )
@@ -151,6 +151,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     next-layer inputs from files. Buffers are local SP shards, not gathered output.
     """
     from .prefill_moe import DISPATCH_MAP_PAD as MAP_PAD, validate_received_routes, validate_returned_routes
+    from .prefill_moe import DISPATCH_SOURCE_MAP_PAD
     from .prefill_compressed_runtime import run_compressed_attention
     from .prefill_consumer_runtime import run_consumer_attention
     from .cache import invalidate_live_versions, publish_live_versions
@@ -551,6 +552,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 routes=allocate_runtime_tensor(runtime, (packet_rows, 4), torch.int64, rank, fill=-1),
                 hidden=zeros(rank, packet_rows, 5120),
                 counts=zeros(rank, world, MAP_PAD, dtype=torch.int32),
+                source_map=zeros(rank, routes, DISPATCH_SOURCE_MAP_PAD, dtype=torch.int32),
                 recv_routes=allocate_runtime_tensor(runtime, (packet_rows, 4), torch.int64, rank, fill=-1),
                 recv_hidden=zeros(rank, packet_rows, 5120),
                 expert_x=zeros(rank, local_experts * expert_capacity, 5120),
@@ -573,8 +575,9 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 valid = max(0, min(slab, state["valid"] - base))
                 if state["valid"]:
                     arguments = [state["normed"][base:base + slab], state["route_ids"][base:base + slab],
-                                 packet["routes"], packet["hidden"], packet["counts"], valid, rank]
-                    execute("dispatch_pack", rank, case, arguments, packet, "dispatch_pack")
+                                 packet["routes"], packet["hidden"], packet["counts"], work["source_map"], valid, rank]
+                    execute("dispatch_pack", rank, case, arguments, dict(packet, source_map=work["source_map"]),
+                            "dispatch_pack")
                 dispatch_packets[rank][case] = packet
         map_ranks(pack_rank_slab)
         pending = None
@@ -646,9 +649,10 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 controls = {name: read_runtime_control(runtime, packet[name], rank) for name in ("routes", "counts")}
                 route_ids = read_runtime_control(runtime, state["route_ids"][base:base + slab], rank)
                 validate_returned_routes(controls, rank, routes, route_ids, valid)
-                arguments = [packet["routes"], packet["hidden"], packet["counts"],
+                # The return exchange preserves row order within each dispatch bucket.
+                arguments = [packet["routes"], packet["hidden"], work["source_map"],
                              state["weights"][base:base + slab], state["shared"][base:base + slab], work["routed"],
-                             state["combined"][base:base + slab], work["returned_routes"], physical]
+                             state["combined"][base:base + slab], work["returned_routes"], physical, valid]
                 execute("combine", rank, case, arguments, {}, "combine")
         map_ranks(combine_rank_slab)
         if runtime.get("release_tensors") is not None:

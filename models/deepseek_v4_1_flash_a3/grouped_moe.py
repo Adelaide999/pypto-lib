@@ -23,7 +23,7 @@ def make_grouped_routed_experts(capacity, config, local_experts):
     gate_rows = hidden * (width // 64)
     down_rows = intermediate * (hidden // 64)
     row_tile = min(capacity, 64)
-    gate_k_tile = hidden // 4
+    gate_k_tile = hidden // 5
     max_tiles = local_experts * ((capacity + row_tile - 1) // row_tile)
     quantize_x = make_quantize_row(hidden)
     quantize_hidden = make_quantize_row(intermediate, fused_requantize=True)
@@ -77,24 +77,39 @@ def make_grouped_routed_experts(capacity, config, local_experts):
         for block in pl.spmd(active_tiles * (width // 192), name_hint="grouped_gate_up"):
             tile = block // (width // 192)
             expert = pl.cast(pl.read(tile_map, [tile, 0]), pl.INDEX)
-            first_nb = block % (width // 192) * 3
+            nb = block % (width // 192) * 3
             rows = pl.cast(pl.read(tile_map, [tile, 2]), pl.INDEX)
             gate_row = pl.cast(pl.read(tile_map, [tile, 1]), pl.INDEX)
-            for nb in pl.range(first_nb, first_nb + 3):
-                packed_begin = expert * gate_rows + nb * hidden
-                storage = pl.tile.create([row_tile, 64], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc, compact=True)
-                gate_product = pl.tile.set_validshape(storage, rows, 64)
-                for k0 in pl.pipeline(0, hidden, gate_k_tile, stage=2):
-                    gate_source = pl.load(
-                        payload, [gate_row, k0], [row_tile, gate_k_tile], [rows, gate_k_tile],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    weight_begin = packed_begin + k0
-                    gate_weight = pl.load(
-                        gate_up_weight, [weight_begin, 0], [gate_k_tile, 64], target_memory=pl.MemorySpace.Mat,
-                    )
-                    gate_product = pl.tile.matmul_acc(gate_product, gate_source, gate_weight, init_cond=k0 == 0)
-                pl.store(gate_product, [gate_row, nb * 64], gate_acc)
+            packed_begin = expert * gate_rows + nb * hidden
+            left_acc = pl.tile.create([row_tile, 64], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc, compact=True)
+            middle_acc = pl.tile.create([row_tile, 64], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc, compact=True)
+            right_acc = pl.tile.create([row_tile, 64], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc, compact=True)
+            left_product = pl.tile.set_validshape(left_acc, rows, 64)
+            middle_product = pl.tile.set_validshape(middle_acc, rows, 64)
+            right_product = pl.tile.set_validshape(right_acc, rows, 64)
+            for k0 in pl.pipeline(0, hidden, gate_k_tile, stage=2):
+                source = pl.load(
+                    payload, [gate_row, k0], [row_tile, gate_k_tile], [rows, gate_k_tile],
+                    target_memory=pl.MemorySpace.Mat,
+                )
+                left_offset = packed_begin + k0
+                left_weight = pl.load(
+                    gate_up_weight, [left_offset, 0], [gate_k_tile, 64], target_memory=pl.MemorySpace.Mat,
+                )
+                left_product = pl.tile.matmul_acc(left_product, source, left_weight, init_cond=k0 == 0)
+                middle_offset = left_offset + hidden
+                middle_weight = pl.load(
+                    gate_up_weight, [middle_offset, 0], [gate_k_tile, 64], target_memory=pl.MemorySpace.Mat,
+                )
+                middle_product = pl.tile.matmul_acc(middle_product, source, middle_weight, init_cond=k0 == 0)
+                right_offset = middle_offset + hidden
+                right_weight = pl.load(
+                    gate_up_weight, [right_offset, 0], [gate_k_tile, 64], target_memory=pl.MemorySpace.Mat,
+                )
+                right_product = pl.tile.matmul_acc(right_product, source, right_weight, init_cond=k0 == 0)
+            pl.store(left_product, [gate_row, nb * 64], gate_acc)
+            pl.store(middle_product, [gate_row, (nb + 1) * 64], gate_acc)
+            pl.store(right_product, [gate_row, (nb + 2) * 64], gate_acc)
 
         activated = pl.create_tensor([scratch_rows, intermediate], dtype=pl.INT8)
         for block in pl.spmd(active_rows, name_hint="grouped_activation_quant"):

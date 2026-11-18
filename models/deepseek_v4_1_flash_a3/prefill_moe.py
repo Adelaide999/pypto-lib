@@ -56,6 +56,7 @@ ROUTER_TOPK_TILE = 8
 DISPATCH_RECV_MAX = 64
 DISPATCH_D_TILE = 512
 DISPATCH_MAP_PAD = 8
+DISPATCH_SOURCE_MAP_PAD = 16
 
 
 def w8a8_expert_linear(
@@ -337,11 +338,11 @@ def make_ep_dispatch_pack(capacity, hidden, experts, topk, world):
         sent_routes: pl.InOut[pl.Tensor[[packet_rows, 4], pl.INT64]],
         sent_hidden: pl.InOut[pl.Tensor[[packet_rows, hidden], pl.BF16]],
         sent_counts: pl.InOut[pl.Tensor[[world, DISPATCH_MAP_PAD], pl.INT32]],
+        source_map: pl.InOut[pl.Tensor[[routes, DISPATCH_SOURCE_MAP_PAD], pl.INT32]],
         active: pl.Scalar[pl.INT32],
         source_rank: pl.Scalar[pl.INT32],
     ):
         # Each route map row and each pair of count rows occupy whole scalar-store cache lines.
-        route_map = pl.create_tensor([routes, 16], dtype=pl.INT32)
         for peer_pair in pl.spmd((world + 1) // 2, name_hint="moe_ep_pack_metadata"):
             first_peer = peer_pair * 2
             for peer in pl.range(first_peer, pl.min(world, first_peer + 2)):
@@ -356,7 +357,7 @@ def make_ep_dispatch_pack(capacity, hidden, experts, topk, world):
                             pl.write(sent_routes, [packet_index, 2], pl.cast(slot, pl.INT64))
                             pl.write(sent_routes, [packet_index, 3], pl.cast(expert, pl.INT64))
                             original_route = token * topk + slot
-                            pl.write(route_map, [original_route, 0], pl.cast(packet_index, pl.INT32))
+                            pl.write(source_map, [original_route, 0], pl.cast(packet_index, pl.INT32))
                             bucket_count = bucket_count + 1
                 pl.write(sent_counts, [peer, 0], pl.cast(bucket_count, pl.INT32))
 
@@ -364,9 +365,9 @@ def make_ep_dispatch_pack(capacity, hidden, experts, topk, world):
             source_row = x[token : token + 1, :]
             first_route = token * topk
             for route in pl.range(first_route, first_route + topk):
-                target = pl.cast(pl.read(route_map, [route, 0]), pl.INDEX)
+                target = pl.cast(pl.read(source_map, [route, 0]), pl.INDEX)
                 sent_hidden[target : target + 1, :] = source_row
-        return x, sent_routes, sent_hidden, sent_counts
+        return x, sent_routes, sent_hidden, sent_counts, source_map
 
     return ep_dispatch_pack
 
@@ -430,8 +431,6 @@ def make_ep_dispatch_unpack(capacity, hidden, experts, topk, world, expert_capac
                         target = local * expert_capacity + index
                         pl.write(packet_map, [packet, 0], pl.cast(target, pl.INT32))
                         pl.write(packet_map, [packet, 1], pl.cast(compact, pl.INT32))
-                        for field in pl.range(4):
-                            pl.write(recv_routes, [compact, field], pl.read(packet_routes, [packet, field]))
                         counts[local] = counts[local] + 1
 
         for block in pl.spmd(world * copy_workers, name_hint="moe_ep_unpack_hidden"):
@@ -442,6 +441,8 @@ def make_ep_dispatch_unpack(capacity, hidden, experts, topk, world, expert_capac
                 packet = peer * routes + row
                 target = pl.cast(pl.read(packet_map, [packet, 0]), pl.INDEX)
                 compact = pl.cast(pl.read(packet_map, [packet, 1]), pl.INDEX)
+                metadata = packet_routes[packet : packet + 1, :]
+                recv_routes[compact : compact + 1, :] = metadata
                 value = packet_hidden[packet : packet + 1, :]
                 expert_x[target : target + 1, :] = value
                 recv_hidden[compact : compact + 1, :] = value
@@ -557,6 +558,7 @@ def make_moe_combine(capacity, hidden=COMBINE_D, topk=COMBINE_TOPK, world=2, *, 
     restore_route_tile = restore_token_tile * topk
     if weight_dtype not in (pl.FP32, pl.BF16):
         raise ValueError("Route weights require FP32 or BF16 multiplication boundaries")
+    round_weights = weight_dtype == pl.BF16
 
     @pl.jit
     def moe_combine(
@@ -576,8 +578,10 @@ def make_moe_combine(capacity, hidden=COMBINE_D, topk=COMBINE_TOPK, world=2, *, 
             rows = pl.min(8, active - token_begin)
             source = pl.slice(route_weights, [8, 16], [token_begin, 0], valid_shape=[rows, topk])
             padded = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 8, 16)
-            rounded = pl.cast(padded, weight_dtype, mode="rint")
-            widened = pl.cast(rounded, pl.FP32)
+            widened = padded
+            if round_weights:
+                rounded = pl.cast(padded, pl.BF16, mode="rint")
+                widened = pl.cast(rounded, pl.FP32)
             rounded_weights[token_begin : token_begin + 8, :] = pl.set_validshape(widened, rows, 16)
         route_map = pl.create_tensor([routes, 8], dtype=pl.INT32)
         for block in pl.spmd((capacity + restore_token_tile - 1) // restore_token_tile, name_hint="moe_ep_restore_metadata"):
@@ -623,6 +627,52 @@ def make_moe_combine(capacity, hidden=COMBINE_D, topk=COMBINE_TOPK, world=2, *, 
         return routed, output, returned_routes
 
     return moe_combine
+
+
+def make_moe_combine_from_dispatch(capacity, hidden, topk, world):
+    """Combine returned buckets that retain their source dispatch order."""
+    routes = capacity * topk
+    packet_rows = world * routes
+    weight_tile = ((topk + 15) // 16) * 16
+
+    @pl.jit
+    def moe_combine_from_dispatch(
+        packet_routes: pl.Tensor[[packet_rows, 4], pl.INT64],
+        packet_hidden: pl.Tensor[[packet_rows, hidden], pl.BF16],
+        source_map: pl.Tensor[[routes, DISPATCH_SOURCE_MAP_PAD], pl.INT32],
+        route_weights: pl.Tensor[[capacity, topk], pl.FP32],
+        shared: pl.Tensor[[capacity, hidden], pl.BF16],
+        routed: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
+        output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
+        returned_routes: pl.InOut[pl.Tensor[[routes, 4], pl.INT64]],
+        active: pl.Scalar[pl.INT32],
+        valid: pl.Scalar[pl.INT32],
+    ):
+        for token in pl.spmd(active, name_hint="moe_ep_source_combine_indexed"):
+            acc = pl.full([1, hidden], dtype=pl.FP32, value=0.0)
+            if token < valid:
+                source = pl.tile.load(route_weights, [token, 0], [1, weight_tile], valid_shape=[1, topk])
+                filled = pl.tile.fillpad(source, pad_value=pl.PadValue.zero)
+                padded = pl.tile.set_validshape(filled, 1, weight_tile)
+                rounded = pl.tile.cast(padded, pl.BF16, mode="rint")
+                weights = pl.tile.cast(rounded, pl.FP32)
+                for slot in pl.range(topk):
+                    original = token * topk + slot
+                    packet = pl.cast(pl.read(source_map, [original, 0]), pl.INDEX)
+                    metadata = packet_routes[packet : packet + 1, :]
+                    returned_routes[original : original + 1, :] = metadata
+                    value = pl.cast(packet_hidden[packet : packet + 1, :], pl.FP32)
+                    weight = pl.tile.read(weights, [0, slot])
+                    weighted = pl.mul(value, weight)
+                    acc = pl.add(acc, weighted)
+            narrowed = pl.cast(acc, pl.BF16, mode="rint")
+            routed[token : token + 1, :] = narrowed
+            shared_row = pl.cast(shared[token : token + 1, :], pl.FP32)
+            total = pl.add(pl.cast(narrowed, pl.FP32), shared_row)
+            output[token : token + 1, :] = pl.cast(total, pl.BF16, mode="rint")
+        return routed, output, returned_routes
+
+    return moe_combine_from_dispatch
 
 
 def _make_shared_activation(
@@ -1123,6 +1173,7 @@ def golden_ep_dispatch_pack(tensors):
                     for field, value in enumerate((source, token, slot, expert)):
                         tensors["sent_routes"][target, field] = value
                     tensors["sent_hidden"][target] = tensors["x"][token]
+                    tensors["source_map"][token * topk + slot, 0] = target
                     count += 1
         tensors["sent_counts"][peer, 0] = count
 
@@ -1371,6 +1422,7 @@ def validate_ep_dispatch(*, device=0, compile_only=False, platform="a2a3", sim=F
                 TensorSpec("sent_routes", [packet_rows, 4], torch.int64, init_value=-1),
                 TensorSpec("sent_hidden", [packet_rows, hidden], torch.bfloat16, init_value=0.0),
                 TensorSpec("sent_counts", [world, DISPATCH_MAP_PAD], torch.int32, init_value=0),
+                TensorSpec("source_map", [routes, DISPATCH_SOURCE_MAP_PAD], torch.int32, init_value=-1),
                 ScalarSpec("active", torch.int32, active),
                 ScalarSpec("source_rank", torch.int32, 0),
             ]
@@ -1449,11 +1501,13 @@ def validate_moe_combine(*, device=0, compile_only=False, platform="a2a3", sim=F
         routes = capacity * topk
         metadata = torch.full((world * routes, 4), -1, dtype=torch.int64)
         counts = torch.zeros((world, 8), dtype=torch.int32)
+        source_map = torch.full((routes, DISPATCH_SOURCE_MAP_PAD), -1, dtype=torch.int32)
         for token in range(valid):
             for slot in range(topk):
                 peer = slot % world
                 row = int(counts[peer, 0])
                 metadata[peer * routes + row] = torch.tensor([0, token, slot, peer * 192 + slot])
+                source_map[token * topk + slot, 0] = peer * routes + row
                 counts[peer, 0] += 1
         specs = [
             TensorSpec("packet_routes", [world * routes, 4], torch.int64, init_value=metadata),
@@ -1477,6 +1531,25 @@ def validate_moe_combine(*, device=0, compile_only=False, platform="a2a3", sim=F
         )
         if not result.passed:
             raise RuntimeError(f"Combine validation failed: active={active}, valid={valid}: {result.error}")
+        indexed_specs = list(specs)
+        indexed_specs[2] = TensorSpec("source_map", list(source_map.shape), torch.int32, init_value=source_map)
+        indexed_specs.append(ScalarSpec("valid", torch.int32, valid))
+
+        def indexed_golden(tensors):
+            tensors["packet_counts"] = counts
+            golden_moe_combine(tensors, weight_dtype=torch.bfloat16)
+
+        result = run(
+            compile_only=compile_only,
+            fn=make_moe_combine_from_dispatch(capacity, hidden, topk, world),
+            specs=indexed_specs,
+            golden_fn=indexed_golden,
+            config={"backend_type": platform, "execution_mode": sim, "device_id": device},
+            rtol=0.05,
+            atol=0.05,
+        )
+        if not result.passed:
+            raise RuntimeError(f"Indexed combine validation failed: active={active}, valid={valid}: {result.error}")
 
 
 def shared_moe_golden_cases(*, build=True):
