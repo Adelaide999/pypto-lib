@@ -16,6 +16,7 @@ import torch
 # tiling
 ROPE_WIDE_HEAD_ROWS_TILE = 32
 ROPE_NARROW_HEAD_ROWS_TILE = 64
+ROPE_PIPELINED_TOKEN_ROWS_TILE = 16
 ROPE_WORKER_LIMIT = 48
 ROPE_TABLE_ROWS_TILE = 64
 
@@ -125,8 +126,10 @@ def make_rope_tables(capacity, rope_dim, theta, scaling=None):
     ):
         blocks = (active + rows - 1) // rows
         workers = pl.min(blocks, worker_limit)
-        if rows > 1:
-            position_rows = pl.reshape(positions, [1, capacity])
+        # Keep the view in the function scope for the vectorized branch. A
+        # Python-time constant branch otherwise leaves the SSA view undefined
+        # when the compiled capacity selects batched rows.
+        position_rows = pl.reshape(positions, [1, capacity])
         for worker in pl.spmd(workers, name_hint="prefill_rope_tables"):
             dimension_ids = pl.tile.arange(0, [1, pairs], dtype=pl.INT32)
             dimensions = pl.cast(dimension_ids, pl.FP32)
@@ -174,13 +177,68 @@ def make_rope_tables(capacity, rope_dim, theta, scaling=None):
     return rope_tables
 
 
-def _make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow_early_resolve):
+def _make_pipelined_token_rope(capacity, head_dim, *, inverse, name_hint, allow_early_resolve):
+    """Rotate a double-buffered tile of single-head tokens into a separate output."""
+    nope = head_dim - 64
+    rows = math.gcd(capacity, ROPE_PIPELINED_TOKEN_ROWS_TILE)
+    elements = rows * 64
+    direction = -1.0 if inverse else 1.0
+
+    @pl.jit.inline
+    def rope(
+        x: pl.Tensor[[capacity, head_dim], pl.BF16],
+        cosine: pl.Tensor[[capacity, 32], pl.FP32],
+        sine: pl.Tensor[[capacity, 32], pl.FP32],
+        output: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        blocks = (active + rows - 1) // rows
+        workers = pl.min(blocks, ROPE_WORKER_LIMIT)
+        source = pl.reshape(x, [capacity, head_dim])
+        target = pl.reshape(output, [capacity, head_dim])
+        for worker in pl.spmd(workers, name_hint=name_hint, allow_early_resolve=allow_early_resolve):
+            lanes = pl.cast(pl.tile.arange(0, [1, elements], dtype=pl.INT32), pl.FP32)
+            pairs = pl.cast(pl.mul(lanes, 0.5), pl.INT32, mode="trunc")
+            parity = pl.sub(lanes, pl.mul(pl.cast(pairs, pl.FP32), 2.0))
+            swap_idx = pl.cast(pl.sub(pl.add(lanes, 1.0), pl.mul(parity, 2.0)), pl.INT32)
+            sign = pl.mul(pl.sub(pl.mul(parity, 2.0), 1.0), direction)
+            start = worker * blocks // workers
+            end = (worker + 1) * blocks // workers
+            for block in pl.pipeline(start, end, stage=2):
+                row = block * rows
+                valid = pl.min(rows, active - row)
+                loaded = pl.load(source, [row, 0], [rows, head_dim], valid_shape=[valid, head_dim])
+                block_value = pl.set_validshape(loaded, rows, head_dim)
+                tail = pl.tile.slice(block_value, [rows, 64], [0, nope])
+                value = pl.cast(tail, pl.FP32)
+                flat = pl.reshape(value, [1, elements])
+                swap_tmp = pl.create_tile([1, elements], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+                swapped = pl.tile.gather(flat, swap_idx, swap_tmp)
+                c_table = pl.reshape(pl.load(cosine, [row, 0], [rows, 32]), [1, rows * 32])
+                s_table = pl.reshape(pl.load(sine, [row, 0], [rows, 32]), [1, rows * 32])
+                cos = pl.tile.gather(c_table, pairs, swap_tmp)
+                sin = pl.mul(pl.tile.gather(s_table, pairs, swap_tmp), sign)
+                direct = pl.mul(flat, cos)
+                cross = pl.mul(swapped, sin)
+                result = pl.reshape(pl.add(direct, cross), [rows, 64])
+                rotated = pl.cast(result, pl.BF16, mode="rint")
+                combined = pl.tile.assemble(block_value, rotated, [0, nope])
+                pl.store(pl.set_validshape(combined, valid, head_dim), [row, 0], target)
+        return output
+
+    return rope
+
+
+def _make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow_early_resolve, inplace=False):
     """Rotate groups of heads sharing one token's coefficients."""
     width = heads * head_dim
     nope = head_dim - 64
-    rows = min(heads, 32)
+    rows = min(heads, 64 if inplace else 32)
     elements = rows * 64
     direction = -1.0 if inverse else 1.0
+    load_start = nope if inplace else 0
+    load_width = 64 if inplace else head_dim
+    tail_start = nope - load_start
 
     @pl.jit.inline
     def rope(
@@ -209,8 +267,8 @@ def _make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow
             for block in pl.pipeline(start, end, stage=2):
                 row = block * rows
                 token = row // heads
-                block_value = pl.load(source, [row, 0], [rows, head_dim])
-                value = pl.cast(pl.tile.slice(block_value, [rows, 64], [0, nope]), pl.FP32)
+                block_value = pl.load(source, [row, load_start], [rows, load_width])
+                value = pl.cast(pl.tile.slice(block_value, [rows, 64], [0, tail_start]), pl.FP32)
                 swap_tmp = pl.create_tile([1, elements], dtype=pl.INT32, target_memory=pl.Mem.Vec)
                 swapped = pl.tile.gather(pl.reshape(value, [1, elements]), swap_idx, swap_tmp)
                 coeff_tmp = pl.create_tile([1, 64], dtype=pl.INT32, target_memory=pl.Mem.Vec)
@@ -219,8 +277,11 @@ def _make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow
                 direct = pl.col_expand_mul(value, c)
                 cross = pl.col_expand_mul(pl.reshape(swapped, [rows, 64]), s)
                 rotated = pl.cast(pl.add(direct, cross), pl.BF16, mode="rint")
-                combined = pl.tile.assemble(block_value, rotated, [0, nope])
-                pl.store(combined, [row, 0], target)
+                if inplace:
+                    pl.store(rotated, [row, nope], target)
+                else:
+                    combined = pl.tile.assemble(block_value, rotated, [0, tail_start])
+                    pl.store(combined, [row, 0], target)
         return output
 
     return rope
@@ -228,13 +289,21 @@ def _make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow
 
 def make_adjacent_rope(
     capacity, heads, head_dim, rope_dim, *, inverse=False, name_hint="a2_adjacent_rope",
-    allow_early_resolve=False,
+    allow_early_resolve=False, inplace=False,
 ):
     """Rotate the final channels of each head in adjacent pairs."""
-    if capacity >= 1024 and rope_dim == 64 and (heads, head_dim) in {(16, 512), (64, 512), (32, 128)}:
-        return _make_pipelined_rope(
-            capacity, heads, head_dim, inverse=inverse, name_hint=name_hint, allow_early_resolve=allow_early_resolve,
-        )
+    wide_separate = (heads, head_dim) == (1, 512) and not inplace
+    multihead = (heads, head_dim) in {(16, 512), (64, 512), (32, 128)}
+    if capacity >= 1024 and rope_dim == 64:
+        if wide_separate:
+            return _make_pipelined_token_rope(
+                capacity, head_dim, inverse=inverse, name_hint=name_hint, allow_early_resolve=allow_early_resolve,
+            )
+        if multihead:
+            return _make_pipelined_rope(
+                capacity, heads, head_dim, inverse=inverse, name_hint=name_hint,
+                allow_early_resolve=allow_early_resolve, inplace=inplace,
+            )
     output_width = heads * head_dim
     nope_dim = head_dim - rope_dim
     pair_width = rope_dim // 2
@@ -298,12 +367,38 @@ def make_adjacent_rope(
                 cross = pl.mul(swapped, pl.mul(s, sign))
                 rotated = pl.cast(pl.add(direct, cross), pl.BF16, mode="rint")
                 result = pl.reshape(rotated, [row_tile, rope_dim])
-                prefix = pl.slice(x_heads, [row_tile, nope_dim], [h0, 0], valid_shape=[rows, nope_dim])
-                combined = pl.concat(prefix, result)
-                output_heads[h0 : h0 + row_tile, :] = pl.set_validshape(combined, rows, head_dim)
+                if inplace:
+                    output_heads[h0 : h0 + row_tile, nope_dim : nope_dim + rope_dim] = pl.set_validshape(
+                        result, rows, rope_dim,
+                    )
+                else:
+                    prefix = pl.slice(x_heads, [row_tile, nope_dim], [h0, 0], valid_shape=[rows, nope_dim])
+                    combined = pl.concat(prefix, result)
+                    output_heads[h0 : h0 + row_tile, :] = pl.set_validshape(combined, rows, head_dim)
         return output
 
     return rope
+
+
+def make_prefill_rope_update(capacity, heads, head_dim, rope_dim, *, inverse=False, name_hint="a2_adjacent_rope"):
+    """Rotate a caller-owned buffer in place, writing only the rotary channels."""
+    rotate = make_adjacent_rope(
+        capacity, heads, head_dim, rope_dim, inverse=inverse, name_hint=name_hint, inplace=True,
+    )
+    width = heads * head_dim
+    pairs = rope_dim // 2
+
+    @pl.jit
+    def update(
+        x: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        cosine: pl.Tensor[[capacity, pairs], pl.FP32],
+        sine: pl.Tensor[[capacity, pairs], pl.FP32],
+        active: pl.Scalar[pl.INT32],
+    ):
+        rotate(x, cosine, sine, x, active)
+        return x
+
+    return update
 
 
 def make_rope_kernel(capacity: int, heads: int, head_dim: int, rope_dim: int):

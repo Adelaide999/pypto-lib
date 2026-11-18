@@ -1206,7 +1206,10 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
         if packed and contract["capacity"] == 512:
             ring_heap = tuple(max(current, required) for current, required in
                               zip(ring_heap or (0, 0, 0, 0), (0, 512 * 1024**2, 1024**3, 0)))
-        resident = stack.enter_context(ResidentNetworkRuntime(assigned, topology, profiling=profiling, ring_heap=ring_heap))
+        resident = stack.enter_context(ResidentNetworkRuntime(
+            assigned, topology, profiling=profiling, ring_heap=ring_heap,
+            direct_rope=contract.get("prefill_direct_rope", False),
+        ))
         for phase_program in phase_programs.values():
             resident.register(phase_program)
         weights = A3ResidentWeights(contract["checkpoint"], topology, contract["model_config"], resident)

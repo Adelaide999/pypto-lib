@@ -289,7 +289,7 @@ class ResidentNetworkRuntime:
     """Own one worker, program registry and allocation bank per logical rank."""
 
     def __init__(self, devices, topology, *, worker_factory=None, device_copy=None, device_readback=None,
-                 device_fill=None, profiling=None, ring_heap=None):
+                 device_fill=None, profiling=None, ring_heap=None, direct_rope=False):
         begin = perf_counter()
         self.devices, self.topology = tuple(devices), dict(topology)
         os.environ.setdefault("HCCL_EXEC_TIMEOUT", "180")
@@ -297,6 +297,8 @@ class ResidentNetworkRuntime:
         if len(self.devices) != topology["ep"] or len(set(self.devices)) != len(self.devices):
             raise ValueError("Resident runtime requires the exact complete distinct device mapping")
         self.profiling = NetworkProfiler(self.devices, **(profiling or {}))
+        if type(direct_rope) is not bool or (direct_rope and worker_factory is not None):
+            raise ValueError("Direct RoPE requires a boolean option and native workers")
         from pypto.runtime import RunConfig
 
         self.ring_heap = ring_heap
@@ -320,6 +322,8 @@ class ResidentNetworkRuntime:
         self._device_readback = device_readback or self._copy_from_device
         self._device_fill = device_fill or self._fill_device
         self._memory = None
+        self._rope_launches = {}
+        self._rope_streams = None
         self.allocations = [[] for _ in devices]
         self.failed_ranks = set()
         self.rank_locks = [RLock() for _ in devices]
@@ -346,7 +350,8 @@ class ResidentNetworkRuntime:
                           device_weight_upload_seconds=0.0,
                           dynamic_allocations=0, cache_h2d_bytes=0, control_d2h_bytes=0, output_d2h_bytes=0,
                           activation_d2h_bytes=0, d2d_bytes=0, program_evictions=0, staging_worker_initializations=0,
-                          workspace_fill_bytes=0, workspace_requests=0, workspace_reuses=0)
+                          workspace_fill_bytes=0, workspace_requests=0, workspace_reuses=0,
+                          direct_rope_dispatches=0)
         try:
             if worker_factory is None:
                 from pypto.backend import BackendType
@@ -365,6 +370,10 @@ class ResidentNetworkRuntime:
                 memory = CANNMemory(diagnostics=False)
                 self._memory = memory
                 self._select = memory.select
+                if direct_rope and not self.profiling.level:
+                    from .rope_launch import RopeStreams
+
+                    self._rope_streams = RopeStreams(memory.library)
 
             self._worker_factory = worker_factory
             for rank in range(len(devices)):
@@ -442,6 +451,8 @@ class ResidentNetworkRuntime:
             if errors:
                 raise errors[0]
             self.channels.clear()
+            if self._rope_streams is not None:
+                self._rope_streams.close(self._select)
             self._stack.close()
             for owners in (self._staging_owners, self._worker_owners):
                 for rank in reversed(range(len(owners))):
@@ -472,6 +483,7 @@ class ResidentNetworkRuntime:
             self.free_workspaces.clear()
             self._device_views.clear()
             self._dispatch_cache.clear()
+            self._rope_launches.clear()
 
     def map_ranks(self, function):
         """Submit independent ranks before joining their ordered per-rank queues."""
@@ -597,10 +609,22 @@ class ResidentNetworkRuntime:
         phase_entries = {}
         for entries in program.stages.values():
             for name, entry in entries.items():
-                phase_entries[id(entry.compiled)] = entry.compiled
-                if self._native_dispatch and id(entry.compiled) not in self.programs:
+                key = id(entry.compiled)
+                phase_entries[key] = entry.compiled
+                if self._native_dispatch and key not in self.programs:
                     entry.compiled.chip_callable
-                self.programs[id(entry.compiled)] = entry.compiled
+                if self._rope_streams is not None and key not in self._rope_launches:
+                    from .rope_launch import ROPE_DIRECT_ENTRIES, DirectRope
+
+                    if name in ROPE_DIRECT_ENTRIES:
+                        from .network import network_parameter_abi
+
+                        abi = self.parameter_abis.get(key)
+                        if abi is None:
+                            abi = network_parameter_abi(entry.compiled)
+                            self.parameter_abis[key] = abi
+                        self._rope_launches[key] = DirectRope.from_compiled(name, entry.compiled, abi)
+                self.programs[key] = entry.compiled
                 names = static_names | {"gate"} if name == "ffn_dispatch_l2" else static_names
                 self.static_parameters[id(entry.compiled)] = names.intersection(entry.compiled.param_names)
         if len(phase_entries) > 64:
@@ -707,8 +731,9 @@ class ResidentNetworkRuntime:
         capture, call_config = self.profiling.prepare_call(compiled, rank, staged, bound, abi["params"],
                                                          empty_capture=empty_capture, ring_heap=self.ring_heap)
         try:
+            direct = self._rope_launches.get(id(compiled)) if not staged and capture is None else None
             # Retire completed callable slots; tensor allocations belong to the worker.
-            if self._native_dispatch:
+            if self._native_dispatch and direct is None:
                 cache = worker._cid_cache
                 key = id(compiled.chip_callable)
                 if key not in cache and len(cache) >= 64:
@@ -716,7 +741,15 @@ class ResidentNetworkRuntime:
                     worker._impl.unregister(cache[oldest])
                     del cache[oldest]
                     self.stats["program_evictions"] += 1
-            self._run_compiled(compiled, rank, staged, worker, bound, call_config=call_config)
+            if direct is None:
+                self._run_compiled(compiled, rank, staged, worker, bound, call_config=call_config)
+            else:
+                if rank in self.failed_ranks:
+                    raise RuntimeError("A failed rank cannot launch RoPE")
+                for value in bound[:-1]:
+                    worker._require_owned_resident_tensor(value, "Direct RoPE argument")
+                direct.run(bound, self._rope_streams.stream(rank), self._rope_streams.synchronize)
+                self.stats["direct_rope_dispatches"] += 1
             if capture is not None:
                 capture["status"] = "completed"
         except BaseException as error:

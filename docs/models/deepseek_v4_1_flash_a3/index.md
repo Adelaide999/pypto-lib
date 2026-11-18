@@ -582,6 +582,22 @@ checks ownership, shape, dtype, and output overlap, waits for completion,
 and leaves rows beyond the active prefix untouched. Use the standard
 PyPTO path for profiling or unsupported artifacts.
 
+## Prefill RoPE launch
+
+Pass `--prefill-direct-rope` to `generate` (or set
+`config["prefill_direct_rope"] = True` for Python callers) to enable the
+experimental A3 launch path. It applies to the standalone Compressed KV,
+Indexer Key, and Indexer Q RoPE entries at capacity 8192 when their
+compiled signatures and single-vector-task layout match. It builds a
+CANN stream adapter around the same generated kernel body; a matching
+CANN compiler and PTO ISA installation are required.
+
+Resident tensor ownership checks still apply, and the rank waits for
+the direct stream before its next stage can consume or recycle outputs.
+Profiling, unsupported shapes and layouts, and multi-task regions keep
+the normal PyPTO launch. The runtime summary reports
+`direct_rope_dispatches`. The option is disabled by default.
+
 ## Network profiling
 
 The persistent generation runtime supports optional chip swimlane capture

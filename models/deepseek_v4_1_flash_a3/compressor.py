@@ -526,7 +526,7 @@ def make_c2_index_publish_projected_inline(capacity, config, cache_blocks=2):
         make_bf16_projection_staged(COMPRESSOR_PROJECTION_HEAD_DIM, INDEX_WIDTH)._func
     )
     norm_index = make_norm(capacity, INDEX_WIDTH, eps)
-    rope_index = make_rope(capacity, 1, INDEX_WIDTH, config["qk_rope_head_dim"])
+    rope_index = make_rope(capacity, 1, INDEX_WIDTH, config["qk_rope_head_dim"], inplace=True)
     rope_compressed = make_rope(capacity, 1, COMPRESSOR_PROJECTION_HEAD_DIM, config["qk_rope_head_dim"])
     publish_compressed = make_compressed_cache_publish(capacity, cache_blocks, COMPRESSOR_PROJECTION_HEAD_DIM)
     publish_index = make_indexer_cache_publish_128(capacity, cache_blocks)
@@ -1388,7 +1388,7 @@ def make_ratio1_compress_publish(capacity, config, cache_blocks=2, request_count
     project_index = pl.jit.inline(make_bf16_projection_staged(head_dim, index_width)._func)
     norm_index = make_norm(capacity, index_width, config["rms_norm_eps"])
     rope_compressed = make_rope(capacity, 1, head_dim, rope_dim)
-    rope_index = make_rope(capacity, 1, index_width, rope_dim)
+    rope_index = make_rope(capacity, 1, index_width, rope_dim, inplace=True)
     publish_compressed = make_compressed_cache_publish(capacity, cache_blocks, head_dim)
     publish_index = make_indexer_cache_publish_128(capacity, cache_blocks)
 

@@ -71,7 +71,7 @@ def make_prefill_layer_entries(
     from .prefill_moe import make_moe_router
     from .prefill_moe import make_shared_moe_w8a8
     from .grouped_moe import make_grouped_routed_experts
-    from .rope import make_rope_tables
+    from .rope import make_prefill_rope_update, make_rope_tables
     from .input_pack import make_head_pack, make_sp_gather_unpack, make_sp_masked_zero, make_sp_reduce_pack
     from .rmsnorm import make_prefill_norm_cast
     from .cache import resolve_layer_role
@@ -90,6 +90,9 @@ def make_prefill_layer_entries(
         hc_post=pl.jit(make_hc_post_inline(capacity, config)._func),
         norm_cast=make_prefill_norm_cast(capacity, 5120),
         rope_tables=make_rope_tables(capacity, 64, config["rope_theta"]),
+        q_rope=make_prefill_rope_update(capacity, 64, 512, 64),
+        kv_rope=make_prefill_rope_update(capacity, 1, 512, 64),
+        inverse_rope=make_prefill_rope_update(capacity, 64, 512, 64, inverse=True, name_hint="attention_rope"),
         head_pack=make_head_pack(capacity, 64, 512, tp),
         head_unpack=make_sp_gather_unpack(capacity, 32768 // tp, tp),
         sp_unpack=make_sp_gather_unpack(capacity, 5120, tp),
@@ -326,13 +329,12 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             )
             q_cos = pad(cosine[start:start + query_rows], rank)
             q_sin = pad(sine[start:start + query_rows], rank)
-            wqa, latent, qb, query = (
+            wqa, latent, query = (
                 zeros(rank, capacity, 1280),
                 zeros(rank, capacity, 1280),
-                zeros(rank, capacity, 32768),
                 zeros(rank, capacity, 32768),
             )
-            kv_raw, kv_norm, kv_rope = zeros(rank, capacity, 512), zeros(rank, capacity, 512), zeros(rank, capacity, 512)
+            kv_raw, kv_rope = zeros(rank, capacity, 512), zeros(rank, capacity, 512)
             execute_region(
                 runtime,
                 "qkv_l2",
@@ -348,19 +350,19 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                     ("q_norm", [wqa, operands["q_norm"], latent, query_rows], {"latent": latent}, "qkv"),
                     (
                         "wq_b",
-                        [latent, operands["wq_b"], operands["wq_b_scale"], qb, query_rows],
-                        {"qb": qb},
+                        [latent, operands["wq_b"], operands["wq_b_scale"], query, query_rows],
+                        {},
                         "qkv",
                     ),
-                    ("q_rope", [qb, q_cos, q_sin, query, query_rows], {"query": query}, "rope"),
+                    ("q_rope", [query, q_cos, q_sin, query_rows], {"query": query}, "rope"),
                     (
                         "wkv",
                         [full_norm, operands["wkv"], operands["wkv_scale"], kv_raw, total],
                         {"kv_raw": kv_raw},
                         "qkv",
                     ),
-                    ("kv_norm", [kv_raw, operands["kv_norm"], kv_norm, total], {"kv_norm": kv_norm}, "qkv"),
-                    ("kv_rope", [kv_norm, cosine, sine, kv_rope, total], {"kv": kv_rope}, "rope"),
+                    ("kv_norm", [kv_raw, operands["kv_norm"], kv_rope, total], {}, "qkv"),
+                    ("kv_rope", [kv_rope, cosine, sine, total], {"kv": kv_rope}, "rope"),
                 ],
             )
             state["kv_rope"] = kv_rope
@@ -383,7 +385,6 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                     table_pages,
                     layer_id,
                 )
-                inverse = zeros(rank, capacity, 32768)
             elif role["mode"] in ("reuse", "reindex"):
                 context, cache = run_consumer_attention(
                     state,
@@ -402,7 +403,6 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                     cosine=cosine,
                     sine=sine,
                 )
-                inverse = zeros(rank, capacity, 32768)
             else:
                 controls = original["metadata"]
                 request_count = len(original["request_slots"]) if "request_slots" in original else len(controls["seq_lens"])
@@ -430,7 +430,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                     {"cache": cache},
                     "cache_publish",
                 )
-                context, inverse = zeros(rank, capacity, 32768), zeros(rank, capacity, 32768)
+                context = zeros(rank, capacity, 32768)
                 execute(
                     "swa_read",
                     rank,
@@ -449,11 +449,11 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 [
                     (
                         "inverse_rope",
-                        [context, q_cos, q_sin, inverse, query_rows],
-                        {"inverse": inverse},
+                        [context, q_cos, q_sin, query_rows],
+                        {"inverse": context},
                         "rope",
                     ),
-                    ("head_pack", [inverse, packet, query_rows], {"packet": packet}, "output_projection"),
+                    ("head_pack", [context, packet, query_rows], {"packet": packet}, "output_projection"),
                 ],
             )
             state.update(cache=cache, per_rank=per_rank, positions=positions)
@@ -718,15 +718,15 @@ REGIONS = {
     "qkv_l2": (
         ("wq_a", ("q_input", "wq_a", "wq_a_scale", "wqa", "query_rows")),
         ("q_norm", ("wqa", "q_norm", "latent", "query_rows")),
-        ("wq_b", ("latent", "wq_b", "wq_b_scale", "qb", "query_rows")),
-        ("q_rope", ("qb", "q_cos", "q_sin", "query", "query_rows")),
+        ("wq_b", ("latent", "wq_b", "wq_b_scale", "query", "query_rows")),
+        ("q_rope", ("query", "q_cos", "q_sin", "query_rows")),
         ("wkv", ("full_norm", "wkv", "wkv_scale", "kv_raw", "total")),
-        ("kv_norm", ("kv_raw", "kv_norm", "kv_normalized", "total")),
-        ("kv_rope", ("kv_normalized", "cosine", "sine", "kv_rope", "total")),
+        ("kv_norm", ("kv_raw", "kv_norm", "kv_rope", "total")),
+        ("kv_rope", ("kv_rope", "cosine", "sine", "total")),
     ),
     "attention_pack_l2": (
-        ("inverse_rope", ("context", "q_cos", "q_sin", "inverse", "query_rows")),
-        ("head_pack", ("inverse", "packet", "query_rows")),
+        ("inverse_rope", ("context", "q_cos", "q_sin", "query_rows")),
+        ("head_pack", ("context", "packet", "query_rows")),
     ),
     "output_projection_l2": (
         ("head_unpack", ("exchanged", "heads", "per_rank", "total")),

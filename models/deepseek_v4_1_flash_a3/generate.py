@@ -51,6 +51,8 @@ def main(argv=None):
                         help="Opt into experimental packed requests with this new-token budget")
     parser.add_argument("--tp", type=int, choices=(1, 2, 4), default=4)
     parser.add_argument("--hbm-budget", type=Path, help="JSON per-rank HBM budget for expanded token/history runs")
+    parser.add_argument("--prefill-direct-rope", action="store_true",
+                        help="Enable experimental direct launch for eligible standalone Prefill RoPE")
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--logits-mode", choices=("last", "all"), default="last",
                         help="Project the last active position or every position in each chunk")
@@ -98,7 +100,7 @@ def main(argv=None):
     checkpoint_contract_seconds = perf_counter() - preparation_started
     config.update(chunk_size=args.chunk_size, context_capacity=len(tokens) + args.max_new_tokens,
                   logits_mode=args.logits_mode, dump_logits=args.dump_logits,
-                  prefill_moe_slab_rows=args.prefill_moe_slab_rows)
+                  prefill_moe_slab_rows=args.prefill_moe_slab_rows, prefill_direct_rope=args.prefill_direct_rope)
     profiling = dict(level=args.enable_chip_swimlane, phase=args.profile_phase,
                      output_dir=str((args.profile_output or args.output / "profiling").resolve()))
     config["profiling"] = profiling

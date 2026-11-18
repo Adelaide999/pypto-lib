@@ -549,7 +549,7 @@ def make_c2_index_publish_projected_observed_inline(capacity, config, cache_bloc
     eps = config["rms_norm_eps"]
     project_index = make_wk_input_observed_inline(capacity)
     norm_index = make_norm(capacity, INDEX_WIDTH, eps)
-    rope_index = make_rope(capacity, 1, INDEX_WIDTH, config["qk_rope_head_dim"])
+    rope_index = make_rope(capacity, 1, INDEX_WIDTH, config["qk_rope_head_dim"], inplace=True)
     rope_compressed = make_rope(capacity, 1, HEAD_DIM, config["qk_rope_head_dim"])
     publish_compressed = make_compressed_cache_publish(capacity, cache_blocks, HEAD_DIM)
     publish_index = make_indexer_cache_publish_128_observed(capacity, cache_blocks)
