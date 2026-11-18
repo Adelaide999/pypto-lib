@@ -4,7 +4,12 @@ The 40-layer network uses DP4/TP4/EP16 and one persistent generation session.
 Prefill and one-token Decode share TP4 operators, a compiled program registry,
 static weight handles, HCCL groups and paged cache allocations. Prefill uses
 capacities from 16 through 8192; one-token Decode retains capacity 16.
-The scheduler remains on the host; model arithmetic runs on A3.
+The scheduler remains on the host; model arithmetic and intermediate activation
+payloads stay on A3. A single per-rank hidden/pre-mix boundary is reused through
+Decode layers. Stage consumers bind device storage aliases, and HCCL exchanges
+use device pointers directly. Integer routing/index/status controls and final
+logits are the explicit readback boundaries. Prefill uses alternating boundary
+buffers with the same resident execution and communication implementation.
 
 The compiled MoE packet slab follows the admitted SP row count, up to 16,
 while per-expert buffers retain 16-row alignment. A separately compiled one-token Decode phase
@@ -85,13 +90,19 @@ hashing and gathering the small dynamic lookup rows remain CPU input
 preparation. This mode does not claim that the complete tables reside in HBM.
 The LM head, normalization and vocabulary shard assembly run on A3.
 
-`generation/result.json` records the Prefill and Decode slab widths, both runtime identities, checkpoint and
-static upload counts, per-step zero-load checks, expert ownership, cache
-pointer aliases, cleanup status and measured host wall times.
-The `timings` object separates static weight initialization, Prefill forward,
-each Decode call, and time to first token including initialization. `prefill/network/weight-audit.json`
-records per-logical-weight reads and host preparation groups. Each Decode
-step writes `decode/step-N/decode.json` and the full execution receipt.
+`generation/result.json` records host wall-time measurements in `timings`: checkpoint
+contract preparation, compilation, static weight initialization (reads, host
+packing and device upload), complete Prefill chunks and each Decode step.
+`token_timings` records each emitted ID, time since script start and interval
+since the preceding token. The first interval includes cold setup and model
+initialization; these are execution timings rather than pure kernel latency.
+
+The result also records the Prefill and Decode slab widths, both runtime
+identities, checkpoint and static upload counts, per-step zero-load checks,
+expert ownership, cache pointer aliases and cleanup status.
+`prefill/network/weight-audit.json` records per-logical-weight reads and host
+preparation groups. Each Decode step writes `decode/step-N/decode.json` and
+the full execution receipt.
 `generation/answer.txt` and `generation/tokens.json` are updated after each
 generated token. Execution success does not establish independent accuracy.
 

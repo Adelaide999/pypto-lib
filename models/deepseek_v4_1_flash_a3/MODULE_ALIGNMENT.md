@@ -123,6 +123,10 @@ original Prefill cache aliases. Both phases execute device embedding, Engram
 and the vocabulary head; independent device accuracy remains separate validation work.
 
 Compute weights, workers and communication groups persist across Prefill
-chunks and one-token Decode steps. Engram tables stay on the host; device kernels consume prepared rows.
+chunks and one-token Decode steps. Stage activations retain device allocations,
+with one Decode or two alternating Prefill boundary buffers per rank. HCCL
+reads and writes these device allocations directly; integer control validation
+and final vocabulary output are the explicit device-to-host boundaries.
+Engram tables stay on the host; device kernels consume prepared rows.
 Runtime shape, dtype, alias, version and lifecycle checks are production
 interface requirements and remain in place.
