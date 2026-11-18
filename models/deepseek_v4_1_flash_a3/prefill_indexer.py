@@ -120,37 +120,11 @@ def make_indexer_query_quantize(capacity):
 
 
 def make_indexer_query_rope(capacity):
-    """Rotate four adjacent heads together, reusing each token's tables."""
-    HEADS_TILE = 4
-
-    @pl.jit
-    def indexer_query_rope(
-        x: pl.Tensor[[capacity, 4096], pl.BF16],
-        cosine: pl.Tensor[[capacity, 32], pl.FP32],
-        sine: pl.Tensor[[capacity, 32], pl.FP32],
-        output: pl.InOut[pl.Tensor[[capacity, 4096], pl.BF16]],
-        active: pl.Scalar[pl.INT32],
-    ):
-        source = pl.reshape(x, [capacity * INDEX_HEADS, INDEX_WIDTH])
-        target = pl.reshape(output, [capacity * INDEX_HEADS, INDEX_WIDTH])
-        with pl.spmd(active * (INDEX_HEADS // HEADS_TILE), name_hint="index_query_rope_heads", allow_early_resolve=True):
-            row = pl.tile.get_block_idx() * HEADS_TILE
-            token = row // INDEX_HEADS
-            target[row:row + HEADS_TILE, :64] = source[row:row + HEADS_TILE, :64]
-            tail = pl.cast(source[row:row + HEADS_TILE, 64:128], pl.FP32)
-            even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-            c = cosine[token:token + 1, :]
-            s = sine[token:token + 1, :]
-            real = pl.sub(pl.col_expand_mul(even, c), pl.col_expand_mul(odd, s))
-            imag = pl.add(pl.col_expand_mul(odd, c), pl.col_expand_mul(even, s))
-            rotated = pl.full([HEADS_TILE, 64], dtype=pl.FP32, value=0.0)
-            rotated = pl.tensor.scatter(real, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-            rotated = pl.tensor.scatter(imag, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-            target[row:row + HEADS_TILE, 64:128] = pl.cast(rotated, pl.BF16, mode="rint")
-        return output
-
-    return indexer_query_rope
+    """Rotate the trailing channels of the Indexer query heads."""
+    rotate = make_rope(
+        capacity, INDEX_HEADS, INDEX_WIDTH, 64, name_hint="index_query_rope_heads", allow_early_resolve=True,
+    )
+    return pl.jit(rotate._func)
 
 
 def make_index_query_projection(capacity):
