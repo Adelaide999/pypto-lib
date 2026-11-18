@@ -29,6 +29,7 @@ SHARED_PROJ_K_TILE = 512
 SHARED_PREP_K_TILE = 4096
 SHARED_PREP_N_TILE = 8
 SHARED_MERGE_D_TILE = 1024
+PREFILL_MERGE_T_TILE = 8
 
 
 def make_hc_collapse_inline(capacity, config):
@@ -36,6 +37,7 @@ def make_hc_collapse_inline(capacity, config):
     hidden = config["hidden_size"]
     hc = config["hc_mult"]
     merge_tile = min(SHARED_MERGE_D_TILE, hidden)
+    bulk = capacity >= 2048 and capacity % 2 == 0 and hc == 4 and hidden == 5120
 
     @pl.jit.inline
     def collapse(
@@ -44,21 +46,42 @@ def make_hc_collapse_inline(capacity, config):
         collapsed: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        flat = pl.reshape(x, [capacity, hc * hidden])
-        for block in pl.spmd(active * (hidden // merge_tile), name_hint="a2_hc_collapse"):
-            token = block // (hidden // merge_tile)
-            offset = block % (hidden // merge_tile) * merge_tile
-            collapsed_tile = pl.full([1, merge_tile], dtype=pl.FP32, value=0.0)
-            for stream in pl.unroll(hc):
-                source_offset = stream * hidden + offset
-                source_bf16 = flat[token : token + 1, source_offset : source_offset + merge_tile]
-                source_fp32 = pl.cast(source_bf16, pl.FP32)
-                coefficient = pl.read(incoming, [token, stream])
-                term = pl.mul(source_fp32, coefficient)
-                collapsed_tile = pl.add(collapsed_tile, term)
-            collapsed[token : token + 1, offset : offset + merge_tile] = pl.cast(
-                collapsed_tile, pl.BF16, mode="rint"
-            )
+        if bulk:
+            streams = pl.reshape(x, [capacity * hc, hidden])
+            weights_by_pair = pl.reshape(incoming, [capacity // 2, 2 * hc])
+            for worker in pl.spmd((active + PREFILL_MERGE_T_TILE - 1) // PREFILL_MERGE_T_TILE, name_hint="a2_hc_collapse"):
+                first_pair = worker * (PREFILL_MERGE_T_TILE // 2)
+                last_pair = pl.min(first_pair + PREFILL_MERGE_T_TILE // 2, (active + 1) // 2)
+                for pair in pl.range(first_pair, last_pair):
+                    weights = pl.load(weights_by_pair, [pair, 0], [1, 2 * hc])
+                    for row in pl.range(0, pl.min(2, active - pair * 2)):
+                        token = pair * 2 + row
+                        values = pl.load(streams, [token * hc, 0], [hc, hidden])
+                        accumulated = pl.tile.full([1, hidden], dtype=pl.FP32, value=0.0)
+                        for stream in pl.unroll(hc):
+                            stream_bf16 = pl.slice(values, [1, hidden], [stream, 0])
+                            stream_fp32 = pl.cast(stream_bf16, pl.FP32)
+                            weight = pl.tile.read(weights, [0, row * hc + stream])
+                            weighted_stream = pl.mul(stream_fp32, weight)
+                            accumulated = pl.add(accumulated, weighted_stream)
+                        value = pl.cast(accumulated, pl.BF16, mode="rint")
+                        pl.store(value, [token, 0], collapsed)
+        else:
+            flat = pl.reshape(x, [capacity, hc * hidden])
+            for block in pl.spmd(active * (hidden // merge_tile), name_hint="a2_hc_collapse"):
+                token = block // (hidden // merge_tile)
+                offset = block % (hidden // merge_tile) * merge_tile
+                collapsed_tile = pl.full([1, merge_tile], dtype=pl.FP32, value=0.0)
+                for stream in pl.unroll(hc):
+                    source_offset = stream * hidden + offset
+                    source_bf16 = flat[token : token + 1, source_offset : source_offset + merge_tile]
+                    source_fp32 = pl.cast(source_bf16, pl.FP32)
+                    coefficient = pl.read(incoming, [token, stream])
+                    term = pl.mul(source_fp32, coefficient)
+                    collapsed_tile = pl.add(collapsed_tile, term)
+                collapsed[token : token + 1, offset : offset + merge_tile] = pl.cast(
+                    collapsed_tile, pl.BF16, mode="rint"
+                )
         return collapsed
 
     return collapse
