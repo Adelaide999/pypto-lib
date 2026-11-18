@@ -1471,17 +1471,48 @@ def make_sparse_controls(
                     window_physical = pl.cast(window_block * WINDOW_SIZE + window_offset, pl.INT32)
                     pl.tile.write(window_ids, [0, lane], window_physical)
             pl.store(window_ids, [token, 0], window_indices)
-        with pl.spmd(1, name_hint="a2_sparse_lengths_publish", deps=[controls_tid]):
-            _worker = pl.tile.get_block_idx()
-            for token in pl.range(active):
-                count = 0
-                for lane in pl.range(INDEX_TOPK):
-                    if pl.read(selected, [token, lane]) >= 0:
-                        count = count + 1
-                pl.write(selected_lengths, [token, 0], pl.cast(count, pl.INT32))
+        lengths_flat = pl.reshape(selected_lengths, [1, capacity])
+        for block in pl.spmd((active + 7) // 8, name_hint="a2_sparse_lengths_publish", deps=[controls_tid]):
+            first = block * 8
+            rows = pl.min(8, active - first)
+            ids = pl.slice(selected, [8, INDEX_TOPK], [first, 0], valid_shape=[rows, INDEX_TOPK])
+            values = pl.cast(ids, pl.FP32)
+            valid = pl.cmp(values, 0.0, cmp_type=5)
+            counts = pl.cast(pl.row_sum(valid), pl.INT32, mode="rint")
+            flat_counts = pl.reshape(counts, [1, 8])
+            lengths_flat[0:1, first:first + 8] = pl.set_validshape(flat_counts, 1, rows)
         return selected, selected_lengths, compressed_indices, window_indices
 
     return sparse_controls
+
+
+def golden_sparse_controls(args, *, compress_ratio=2, long_page_rows=64, long_page_stride=None,
+                           selection_ready=False):
+    """Filter logical IDs, count valid lanes and map compressed and window pages."""
+    active = int(args["active"])
+    stride = long_page_rows if long_page_stride is None else long_page_stride
+    for token in range(active):
+        position = int(args["positions"][token])
+        request = int(args["request_ids"][token])
+        logical = args["raw_selected"][token].clone()
+        if not selection_ready:
+            valid = logical.ge(0) & logical.lt((position + 1) // compress_ratio)
+            sentinel = torch.iinfo(torch.int32).max
+            logical = torch.where(valid, logical, sentinel).sort(stable=True).values
+            logical.masked_fill_(logical.eq(sentinel), -1)
+        args["selected"][token].copy_(logical)
+        valid = logical.ge(0)
+        args["selected_lengths"][token, 0] = int(valid.sum())
+        physical = torch.full_like(logical, -1)
+        indices = logical[valid].long()
+        pages = args["long_block_table"][request, indices // long_page_rows]
+        physical[valid] = (pages * stride + indices % long_page_rows).to(torch.int32)
+        args["compressed_indices"][token].copy_(physical)
+        left = max(0, position + 1 - WINDOW_SIZE)
+        window = torch.arange(left, position + 1)
+        pages = args["window_block_table"][request, window // WINDOW_SIZE]
+        args["window_indices"][token].fill_(-1)
+        args["window_indices"][token, :window.numel()] = pages * WINDOW_SIZE + window % WINDOW_SIZE
 
 
 def prepare_indexer_indices_reference(

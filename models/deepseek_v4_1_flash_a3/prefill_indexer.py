@@ -286,14 +286,16 @@ def make_sparse_controls(capacity, requests, long_pages, window_pages, long_page
                     window_physical = pl.cast(window_block * WINDOW_SIZE + window_offset, pl.INT32)
                     pl.tile.write(window_ids, [0, lane], window_physical)
             pl.store(window_ids, [token, 0], window_indices)
-        with pl.spmd(1, name_hint="a2_sparse_lengths_publish", deps=[controls_tid]):
-            _worker = pl.tile.get_block_idx()
-            for token in pl.range(active):
-                count = 0
-                for lane in pl.range(INDEX_TOPK):
-                    if pl.read(selected, [token, lane]) >= 0:
-                        count = count + 1
-                pl.write(selected_lengths, [token, 0], pl.cast(count, pl.INT32))
+        lengths_flat = pl.reshape(selected_lengths, [1, capacity])
+        for block in pl.spmd((active + 7) // 8, name_hint="a2_sparse_lengths_publish", deps=[controls_tid]):
+            first = block * 8
+            rows = pl.min(8, active - first)
+            ids = pl.slice(selected, [8, INDEX_TOPK], [first, 0], valid_shape=[rows, INDEX_TOPK])
+            values = pl.cast(ids, pl.FP32)
+            valid = pl.cmp(values, 0.0, cmp_type=5)
+            counts = pl.cast(pl.row_sum(valid), pl.INT32, mode="rint")
+            flat_counts = pl.reshape(counts, [1, 8])
+            lengths_flat[0:1, first:first + 8] = pl.set_validshape(flat_counts, 1, rows)
         return selected, selected_lengths, compressed_indices, window_indices
 
     return sparse_controls
@@ -491,6 +493,38 @@ def golden_index_key_gather(args):
     pages = args["table"][request, logical // rows].long()
     args["key"][:length] = args["cache"][pages, logical % rows, 0]
     args["key_scale"][:length] = args["scales"][pages, logical % rows, 0, 0]
+
+
+def build_sparse_controls_specs(capacity=16, active=16, *, compress_ratio=2, selection_ready=False):
+    """Build paged, causal and inactive sparse-control fixtures."""
+    from golden import ScalarSpec, TensorSpec
+
+    if not 0 <= active <= capacity:
+        raise ValueError("Active rows must fit the sparse-control capacity")
+    positions = torch.arange(capacity, dtype=torch.int64) * 37 % 1024
+    positions[:min(capacity, 4)] = torch.tensor([0, 1, 127, 1023])[:min(capacity, 4)]
+    requests = torch.arange(capacity, dtype=torch.int32) % 2
+    ids = torch.arange(INDEX_TOPK, dtype=torch.int32).flip(0).repeat(capacity, 1)
+    ids[:, ::7] = -1
+    if selection_ready:
+        visible = (positions + 1) // compress_ratio
+        ids.masked_fill_(ids.ge(visible[:, None]), -1)
+        ids = ids.sort(stable=True).values.flip(1).contiguous()
+    long_pages, window_pages = 16, 8
+    long_table = torch.stack((torch.arange(long_pages), torch.arange(long_pages).flip(0))).int()
+    window_table = torch.stack((torch.arange(window_pages).flip(0), torch.arange(window_pages))).int()
+    return [
+        TensorSpec("raw_selected", [capacity, INDEX_TOPK], torch.int32, init_value=ids),
+        TensorSpec("positions", [capacity], torch.int64, init_value=positions),
+        TensorSpec("request_ids", [capacity], torch.int32, init_value=requests),
+        TensorSpec("long_block_table", [2, long_pages], torch.int32, init_value=long_table),
+        TensorSpec("window_block_table", [2, window_pages], torch.int32, init_value=window_table),
+        TensorSpec("selected", [capacity, INDEX_TOPK], torch.int32, init_value=-71),
+        TensorSpec("selected_lengths", [capacity, 1], torch.int32, init_value=-73),
+        TensorSpec("compressed_indices", [capacity, INDEX_TOPK], torch.int32, init_value=-79),
+        TensorSpec("window_indices", [capacity, WINDOW_SIZE], torch.int32, init_value=-83),
+        ScalarSpec("active", torch.int32, active, compile_runtime=True),
+    ]
 
 
 def validate_key_gather(*, device=0, sim=False, compile_only=False, cpu_only=False):
