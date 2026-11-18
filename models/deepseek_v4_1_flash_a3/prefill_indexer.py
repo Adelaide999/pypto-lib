@@ -380,7 +380,7 @@ def make_shared_index_publish(capacity, shared_rows=8192):
 
 
 def make_physical_index_query_entries(capacity, config, cache_blocks, requests, table_pages, compress_ratio=2,
-                                      *, key_capacity=KEY_CAPACITY):
+                                      *, key_capacity=KEY_CAPACITY, packed_keys=False):
     """Build index query, quantization, paged scoring and selection publication entries."""
     from .gemm import make_bf16_linear
     from .indexer import make_prefill_indexer_select as make_indexer_select
@@ -393,7 +393,9 @@ def make_physical_index_query_entries(capacity, config, cache_blocks, requests, 
         index_weights_scale=make_index_weights(capacity),
         index_key_gather=make_index_key_gather(cache_blocks, requests, table_pages,
                                               page_rows=128 // compress_ratio, key_capacity=key_capacity),
-        index_select=make_indexer_select(capacity, key_capacity, compress_ratio=compress_ratio),
+        index_select=make_indexer_select(
+            capacity, key_capacity, compress_ratio=compress_ratio, packed_keys=packed_keys,
+        ),
         sparse_controls=make_sparse_controls(capacity, requests, table_pages, table_pages,
                                             long_page_rows=128 // compress_ratio, compress_ratio=compress_ratio,
                                             long_page_stride=128),

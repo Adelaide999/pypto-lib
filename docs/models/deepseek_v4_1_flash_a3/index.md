@@ -631,6 +631,9 @@ comparing the existing host-wall-time reports with vLLM-Ascend.
 
 ## Correctness scope
 
+See [Indexer and MoE operator timings](kernel-timings.md) for isolated A3
+measurements and the corresponding baseline and shapes.
+
 The generation network shares its Prefill and Decode numerical boundaries,
 including native TP shared-expert partitions and routed-expert rounding;
 see [accuracy comparison](accuracy.md#numerical-boundaries). Cache layouts and
