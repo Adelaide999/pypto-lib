@@ -210,6 +210,23 @@ Omitting `compiled` compiles inside the forward.
 
 L2 denotes PyPTO orchestration, not physical layer 2. The network retains host
 scheduling and HCCL boundaries; it is not a single fused 40-layer device graph.
+Intermediate activations remain in device allocations across these boundaries.
+CPU tensors in the scheduler describe shapes, storage aliases and initial values;
+a written activation is authoritative only on the device. Host arithmetic or
+cloning must not consume its stale descriptor. Contiguous activation padding and
+request stitching use device-to-device copies. Decode reuses one hidden/pre-mix
+boundary per rank, while Prefill alternates two boundaries. Completed layer
+scratch is recycled without releasing live cache or boundary aliases.
+
+Activation HCCL collectives consume the producer device pointer and write
+directly to the consumer device allocation without CPU payload staging buffers.
+Only startup checks, integer routing/index/status controls and final vocabulary
+outputs are read back. Finite checks run on A3 and return integer row flags;
+route-capacity and sparse-page validation still run on the explicit controls.
+Runtime accounting separates `control_d2h_bytes`, `output_d2h_bytes`,
+`activation_d2h_bytes` and `d2d_bytes`. Complete forwards keep
+`activation_d2h_bytes` at zero; this does not imply zero control traffic or
+establish a latency improvement.
 No loading, compilation or token-latency guarantee follows from this organization.
 
 Execution uses persistent ChipWorkers, preloaded compute weights, cache
@@ -224,8 +241,9 @@ source-version and lifecycle checks remain in force.
 If a synchronous device run fails, its transient allocations remain owned by
 the public worker until worker teardown drains or reclaims the failed run.
 Cleanup failures are logged without replacing the original dispatch error.
-After a completed dispatch, cleanup attempts every transient allocation;
-a cleanup error is propagated when there is no earlier failure.
+After a completed layer, scratch allocations return to the session pool.
+Session teardown frees each owning allocation once; device aliases do not own
+additional buffers.
 
 ### Concurrent execution and bounded MoE storage
 

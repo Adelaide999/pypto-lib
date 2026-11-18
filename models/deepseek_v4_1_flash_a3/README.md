@@ -18,6 +18,9 @@ owners for linear algebra, quantization, normalization, RoPE and cache operation
 - `decode_fwd.py --network` / `decode_network.py`: host-scheduled 40-layer
   DP4/TP4/EP16 Decode with resident weights, persistent state, Engram stages and the
   vocabulary head.
+- Intermediate activations stay in device storage across stages and layers;
+  HCCL exchanges use device pointers. Decode reuses one boundary, Prefill two.
+  Integer controls and final logits remain explicit host readbacks.
 - `prefill_moe.py` / `decode_moe.py`: phase routing, dispatch, shared experts,
   Torch goldens and standalone validation.
 - `grouped_moe.py`: blocked-INT8 grouped experts for the resident generation network.
