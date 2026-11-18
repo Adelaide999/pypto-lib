@@ -1265,7 +1265,11 @@ def validate_prefill_select(*, device=0, sim=False, compile_only=False, cpu_only
                 for token in range(active):
                     visible = min(len(values["key"]), max(0, (int(values["positions"][token]) + 1) // ratio))
                     count = min(visible, INDEX_TOPK)
-                    expected[token, :count] = torch.arange(visible - 1, visible - count - 1, -1).int()
+                    if len(values["key"]) > 2048:
+                        order = torch.argsort(values["key_scale"][:visible], descending=True)
+                        expected[token, :count] = order[:count].int()
+                    else:
+                        expected[token, :count] = torch.arange(visible - 1, visible - count - 1, -1).int()
                 if not torch.equal(values["indices"][:active], expected):
                     raise RuntimeError("Causal Top-512 selection changed its exact score ordering")
                 if not torch.isfinite(scores).all():
