@@ -95,8 +95,8 @@ class CANNMemory:
             raise ValueError("CANN fill requires positive bytes and an unsigned byte value")
         _check(self.library.aclrtMemset(destination, nbytes, value, nbytes), "aclrtMemset/workspace")
 
-    def sample(self, rank, stage):
-        if not self.diagnostics:
+    def sample(self, rank, stage, *, force=False):
+        if not self.diagnostics and not force:
             return None
         self.select(rank)
         free, total = ctypes.c_size_t(), ctypes.c_size_t()
