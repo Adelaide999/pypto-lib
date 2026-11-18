@@ -345,21 +345,27 @@ def make_ep_dispatch_pack(capacity, hidden, experts, topk, world):
         # Each route map row and each pair of count rows occupy whole scalar-store cache lines.
         for peer_pair in pl.spmd((world + 1) // 2, name_hint="moe_ep_pack_metadata"):
             first_peer = peer_pair * 2
-            for peer in pl.range(first_peer, pl.min(world, first_peer + 2)):
-                bucket_count = pl.cast(0, pl.INDEX)
-                for token in pl.range(active):
-                    for slot in pl.range(topk):
-                        expert = pl.read(route_ids, [token, slot])
-                        if expert // local_experts == peer:
-                            packet_index = peer * routes + bucket_count
-                            pl.write(sent_routes, [packet_index, 0], pl.cast(source_rank, pl.INT64))
-                            pl.write(sent_routes, [packet_index, 1], pl.cast(token, pl.INT64))
-                            pl.write(sent_routes, [packet_index, 2], pl.cast(slot, pl.INT64))
-                            pl.write(sent_routes, [packet_index, 3], pl.cast(expert, pl.INT64))
-                            original_route = token * topk + slot
-                            pl.write(source_map, [original_route, 0], pl.cast(packet_index, pl.INT32))
-                            bucket_count = bucket_count + 1
-                pl.write(sent_counts, [peer, 0], pl.cast(bucket_count, pl.INT32))
+            bucket_counts = pl.array.create(2, pl.INT32)
+            bucket_counts[0] = pl.cast(0, pl.INT32)
+            bucket_counts[1] = pl.cast(0, pl.INT32)
+            for token in pl.range(active):
+                for slot in pl.range(topk):
+                    expert = pl.read(route_ids, [token, slot])
+                    peer = pl.cast(expert // local_experts, pl.INDEX)
+                    lane = peer - first_peer
+                    if lane >= 0 and lane < 2 and peer < world:
+                        count = bucket_counts[lane]
+                        packet_index = peer * routes + pl.cast(count, pl.INDEX)
+                        pl.write(sent_routes, [packet_index, 0], pl.cast(source_rank, pl.INT64))
+                        pl.write(sent_routes, [packet_index, 1], pl.cast(token, pl.INT64))
+                        pl.write(sent_routes, [packet_index, 2], pl.cast(slot, pl.INT64))
+                        pl.write(sent_routes, [packet_index, 3], pl.cast(expert, pl.INT64))
+                        original_route = token * topk + slot
+                        pl.write(source_map, [original_route, 0], pl.cast(packet_index, pl.INT32))
+                        bucket_counts[lane] = count + 1
+            pl.write(sent_counts, [first_peer, 0], bucket_counts[0])
+            if first_peer + 1 < world:
+                pl.write(sent_counts, [first_peer + 1, 0], bucket_counts[1])
 
         for token in pl.spmd(active, name_hint="moe_ep_pack_hidden"):
             source_row = x[token : token + 1, :]
