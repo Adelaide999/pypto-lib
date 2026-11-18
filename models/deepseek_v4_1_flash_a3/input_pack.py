@@ -340,10 +340,10 @@ def make_sp_gather_unpack(capacity, width, tp, dtype=pl.BF16, tile=D_TILE, *, la
         active: pl.Scalar[pl.INT32],
     ):
         rows = active
-        token_offset = 0
+        token_offset = pl.cast(0, pl.INT32)
         if last_row:
-            rows = pl.min(active, 1)
-            token_offset = active - 1
+            rows = pl.cast(pl.min(active, 1), pl.INT32)
+            token_offset = pl.cast(active - 1, pl.INT32)
         if scalar_rows:
             for _block in pl.spmd(1, name_hint="prefill_sp_state_unpack"):
                 for token in pl.range(rows):
