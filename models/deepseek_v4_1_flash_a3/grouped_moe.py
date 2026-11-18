@@ -75,6 +75,7 @@ def make_grouped_routed_experts(capacity, config, local_experts):
 
         gate_acc = pl.create_tensor([scratch_rows, width], dtype=pl.INT32)
         for block in pl.spmd(active_tiles * (width // 192), name_hint="grouped_gate_up"):
+            pl.set_cache_policy(gate_up_weight, pl.CachePolicy.BYPASS)
             tile = block // (width // 192)
             expert = pl.cast(pl.read(tile_map, [tile, 0]), pl.INDEX)
             nb = block % (width // 192) * 3
