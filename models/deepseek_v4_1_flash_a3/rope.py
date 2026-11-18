@@ -13,12 +13,10 @@ import pypto.language as pl
 import torch as decode_torch
 import torch
 
-from .runtime_config import SPMD_WORKER_LIMIT
-
-
 # tiling
-ROPE_HEAD_TILE = 16
-ROPE_TOKEN_TILE = 16
+ROPE_WIDE_HEAD_ROWS_TILE = 32
+ROPE_NARROW_HEAD_ROWS_TILE = 64
+ROPE_WORKER_LIMIT = 48
 
 
 def make_decode_adjacent_rope(capacity, heads, head_dim, rope_dim):
@@ -149,9 +147,17 @@ def make_adjacent_rope(
     output_width = heads * head_dim
     nope_dim = head_dim - rope_dim
     pair_width = rope_dim // 2
-    token_tiled = heads == 1
-    row_tile = math.gcd(capacity, ROPE_TOKEN_TILE) if token_tiled else math.gcd(heads, ROPE_HEAD_TILE)
-    coefficient_rows = row_tile if token_tiled else 1
+    max_rows_tile = ROPE_NARROW_HEAD_ROWS_TILE if head_dim <= 128 else ROPE_WIDE_HEAD_ROWS_TILE
+    if max_rows_tile % heads == 0:
+        row_tile = math.gcd(capacity * heads, max_rows_tile)
+    else:
+        row_tile = math.gcd(heads, max_rows_tile)
+    heads_per_tile_token = min(heads, row_tile)
+    token_tile = row_tile // heads_per_tile_token
+    table_elements = token_tile * pair_width
+    elements = row_tile * rope_dim
+    token_elements = heads_per_tile_token * rope_dim
+    pair_stride = float(pair_width)
     direction = -1.0 if inverse else 1.0
 
     @pl.jit.inline
@@ -165,39 +171,42 @@ def make_adjacent_rope(
         x_heads = pl.reshape(x, [capacity * heads, head_dim])
         output_heads = pl.reshape(output, [capacity * heads, head_dim])
         blocks = (active * heads + row_tile - 1) // row_tile
-        workers = pl.min(blocks, SPMD_WORKER_LIMIT)
+        workers = pl.min(blocks, ROPE_WORKER_LIMIT)
+        blocks_per_worker = (blocks + ROPE_WORKER_LIMIT - 1) // ROPE_WORKER_LIMIT
         for worker in pl.spmd(workers, name_hint=name_hint, allow_early_resolve=allow_early_resolve):
-            lanes = pl.cast(pl.arange(0, [1, rope_dim], dtype=pl.INT32), pl.FP32)
+            # Map the flattened tile lanes to adjacent values and their shared token tables.
+            lanes = pl.cast(pl.arange(0, [1, elements], dtype=pl.INT32), pl.FP32)
             pairs = pl.cast(pl.mul(lanes, 0.5), pl.INT32, mode="trunc")
-            pair_starts = pl.mul(pl.cast(pairs, pl.FP32), 2.0)
+            pair_ids = pl.cast(pairs, pl.FP32)
+            pair_starts = pl.mul(pair_ids, 2.0)
             parity = pl.sub(lanes, pair_starts)
             sign = pl.mul(pl.sub(pl.mul(parity, 2.0), 1.0), direction)
             swap = pl.sub(pl.add(lanes, 1.0), pl.mul(parity, 2.0))
-            swap_rows = pl.full([row_tile, rope_dim], dtype=pl.FP32, value=1.0)
-            swap_index = pl.cast(pl.col_expand_mul(swap_rows, swap), pl.INT32)
-            coefficient_lanes = pl.full([coefficient_rows, rope_dim], dtype=pl.FP32, value=1.0)
-            dup_index = pl.cast(pl.col_expand_mul(coefficient_lanes, pl.cast(pairs, pl.FP32)), pl.INT32)
-            for block in pl.range(worker, blocks, SPMD_WORKER_LIMIT):
+            swap_index = pl.cast(swap, pl.INT32)
+            head_row = pl.cast(pl.mul(lanes, 1.0 / rope_dim), pl.INT32, mode="trunc")
+            token_row = pl.cast(pl.mul(lanes, 1.0 / token_elements), pl.INT32, mode="trunc")
+            head_offset = pl.mul(pl.cast(head_row, pl.FP32), pair_stride)
+            token_offset = pl.mul(pl.cast(token_row, pl.FP32), pair_stride)
+            pair_in_head = pl.sub(pair_ids, head_offset)
+            coefficient_index = pl.cast(pl.add(pair_in_head, token_offset), pl.INT32)
+            start = worker * blocks_per_worker
+            end = pl.min(blocks, start + blocks_per_worker)
+            for block in pl.range(start, end):
                 h0 = block * row_tile
                 rows = pl.min(row_tile, active * heads - h0)
                 tail = pl.slice(x_heads, [row_tile, rope_dim], [h0, nope_dim], valid_shape=[rows, rope_dim])
-                values = pl.cast(tail, pl.FP32)
+                tail = pl.set_validshape(tail, row_tile, rope_dim)
+                values = pl.cast(pl.reshape(tail, [1, elements]), pl.FP32)
                 swapped = pl.gather(values, dim=-1, index=swap_index)
-                if token_tiled:
-                    t = h0
-                else:
-                    t = h0 // heads
-                c = pl.gather(cosine[t : t + coefficient_rows, :], dim=-1, index=dup_index)
-                s = pl.gather(sine[t : t + coefficient_rows, :], dim=-1, index=dup_index)
-                signed_s = pl.col_expand_mul(s, sign)
-                if token_tiled:
-                    direct = pl.mul(values, c)
-                    cross = pl.mul(swapped, signed_s)
-                else:
-                    direct = pl.col_expand_mul(values, c[0:1, :])
-                    cross = pl.col_expand_mul(swapped, signed_s[0:1, :])
-                rotated = pl.add(direct, cross)
-                result = pl.cast(rotated, pl.BF16, mode="rint")
+                t = h0 // heads
+                c_table = pl.reshape(cosine[t:t + token_tile, :], [1, table_elements])
+                s_table = pl.reshape(sine[t:t + token_tile, :], [1, table_elements])
+                c = pl.gather(c_table, dim=-1, index=coefficient_index)
+                s = pl.gather(s_table, dim=-1, index=coefficient_index)
+                direct = pl.mul(values, c)
+                cross = pl.mul(swapped, pl.mul(s, sign))
+                rotated = pl.cast(pl.add(direct, cross), pl.BF16, mode="rint")
+                result = pl.reshape(rotated, [row_tile, rope_dim])
                 prefix = pl.slice(x_heads, [row_tile, nope_dim], [h0, 0], valid_shape=[rows, nope_dim])
                 combined = pl.concat(prefix, result)
                 output_heads[h0 : h0 + row_tile, :] = pl.set_validshape(combined, rows, head_dim)
