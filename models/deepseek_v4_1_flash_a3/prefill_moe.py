@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """A3 W8A8 Prefill routing, dispatch, experts and Torch validation."""
 
+import math
 import sys
 from pathlib import Path
 
@@ -15,7 +16,6 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
 import pypto.language as pl
-from .runtime_config import SPMD_WORKER_LIMIT
 import torch
 
 from .gemm import (
@@ -51,7 +51,9 @@ COMBINE_D = 5120
 MOE_VEC_M_TILE = 8
 MOE_ACT_TILE = 256
 ROUTER_D_TILE = 256
-ROUTER_EXPERT_TILE = 8
+ROUTER_EXPERT_TILE = 32
+ROUTER_TOKEN_TILE = 16
+ROUTER_GATE_WORKERS = 64
 ROUTER_TOPK_TILE = 8
 DISPATCH_RECV_MAX = 64
 DISPATCH_D_TILE = 512
@@ -200,6 +202,48 @@ def make_routed_expert_w8a8(capacity: int, hidden: int, intermediate: int, clamp
     return make_shared_expert_w8a8(capacity, hidden, intermediate, clamp_limit)
 
 
+def _make_router_gate(capacity, hidden, experts, input_dtype):
+    """Reuse each FP32 weight tile across a block of source tokens."""
+    token_tile = math.gcd(capacity, ROUTER_TOKEN_TILE)
+    expert_blocks = experts // ROUTER_EXPERT_TILE
+    needs_widen = input_dtype != pl.FP32
+    widen = _router_make_cast_tile(1, ROUTER_D_TILE, input_dtype, pl.FP32)
+
+    @pl.jit.inline
+    def project(
+        x: pl.Tensor[[capacity, hidden], input_dtype],
+        gate_weight: pl.Tensor[[experts, hidden], pl.FP32],
+        logits: pl.Tensor[[capacity, experts], pl.FP32],
+        active: pl.Scalar[pl.INT32],
+    ):
+        block_count = ((active + token_tile - 1) // token_tile) * expert_blocks
+        for worker in pl.spmd(pl.min(block_count, ROUTER_GATE_WORKERS), name_hint="a2_moe_gate_fp32"):
+            for block in pl.range(worker, block_count, ROUTER_GATE_WORKERS):
+                token = (block // expert_blocks) * token_tile
+                expert = (block % expert_blocks) * ROUTER_EXPERT_TILE
+                dot_sum = pl.full([token_tile, ROUTER_EXPERT_TILE], dtype=pl.FP32, value=0.0)
+                for inner in pl.range(0, hidden, ROUTER_D_TILE):
+                    weight = gate_weight[expert : expert + ROUTER_EXPERT_TILE, inner : inner + ROUTER_D_TILE]
+                    for row in pl.unroll(token_tile):
+                        source = x[token + row : token + row + 1, inner : inner + ROUTER_D_TILE]
+                        if needs_widen:
+                            source_storage = pl.create_tensor([1, ROUTER_D_TILE], dtype=input_dtype)
+                            source_storage[:, :] = source
+                            source_fp32 = widen(source_storage)
+                        else:
+                            source_fp32 = source
+                        product = pl.col_expand_mul(weight, source_fp32)
+                        partial = pl.reshape(pl.row_sum(product), [1, ROUTER_EXPERT_TILE])
+                        dot_sum[row : row + 1, :] = pl.add(dot_sum[row : row + 1, :], partial)
+                rows = pl.min(token_tile, active - token)
+                logits[token : token + token_tile, expert : expert + ROUTER_EXPERT_TILE] = pl.set_validshape(
+                    dot_sum, rows, ROUTER_EXPERT_TILE
+                )
+        return logits
+
+    return project
+
+
 def make_moe_router_inline(capacity, config, input_dtype=pl.BF16):
     """Build full-precision gate projection and 384-expert top-six routing."""
     hidden = config["hidden_size"]
@@ -209,11 +253,11 @@ def make_moe_router_inline(capacity, config, input_dtype=pl.BF16):
     sentinel_base = config["image_sentinel_base_id"]
     sentinel_end = sentinel_base + 5
     controlled = bool(config.get("controlled_routing", False))
-    widen = _router_make_cast_tile(1, ROUTER_D_TILE, input_dtype, pl.FP32)
     if experts != 384 or topk != 6:
         raise ValueError("The A2 router requires 384 experts and six selected experts")
     if hidden % ROUTER_D_TILE:
         raise ValueError("The gate hidden size must be divisible by D_TILE")
+    project = _make_router_gate(capacity, hidden, experts, input_dtype)
 
     @pl.jit.inline
     def moe_router_inline(
@@ -227,21 +271,7 @@ def make_moe_router_inline(capacity, config, input_dtype=pl.BF16):
         route_weights: pl.Tensor[[capacity, topk], pl.FP32],
         active: pl.Scalar[pl.INT32],
     ):
-        block_count = active * (experts // ROUTER_EXPERT_TILE)
-        for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='a2_moe_gate_fp32'):
-            for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
-                token = block // (experts // ROUTER_EXPERT_TILE)
-                expert = block % (experts // ROUTER_EXPERT_TILE) * ROUTER_EXPERT_TILE
-                dot_sum = pl.full([1, ROUTER_EXPERT_TILE], dtype=pl.FP32, value=0.0)
-                for inner in pl.range(0, hidden, ROUTER_D_TILE):
-                    source_storage = pl.create_tensor([1, ROUTER_D_TILE], dtype=input_dtype)
-                    source_storage[:, :] = x[token : token + 1, inner : inner + ROUTER_D_TILE]
-                    source = widen(source_storage)
-                    weight = gate_weight[expert : expert + ROUTER_EXPERT_TILE, inner : inner + ROUTER_D_TILE]
-                    product = pl.col_expand_mul(weight, source)
-                    partial = pl.reshape(pl.row_sum(product), [1, ROUTER_EXPERT_TILE])
-                    dot_sum = pl.add(dot_sum, partial)
-                logits[token : token + 1, expert : expert + ROUTER_EXPERT_TILE] = dot_sum
+        logits = project(x, gate_weight, logits, active)
 
         raw_scores = pl.create_tensor([capacity, experts], dtype=pl.FP32)
         selected_ids = pl.create_tensor([capacity, ROUTER_TOPK_TILE], dtype=pl.INT32)
