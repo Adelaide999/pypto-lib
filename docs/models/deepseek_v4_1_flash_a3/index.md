@@ -252,14 +252,29 @@ unpack. All ranks execute the same number of slab collectives, including
 empty ranks. Slab token IDs are local to the current slice; combine writes
 into the original SP slice at the corresponding slab offset.
 
-Each compiled phase freezes a MoE slab width of 1, 2, 4, 8 or 16 from its
-initial valid SP row counts. The per-peer bucket holds `slab * TopK` rows.
+Set `--prefill-moe-slab-rows` on the generation command, or
+`prefill_moe_slab_rows` in the Python forward configuration, to 16, 64 or
+128 to cap the number of source rows per rank in each round. The default cap is 64 at
+Prefill capacity 8192 and 16 for the smaller capacities. The compiler rounds
+the initial valid SP row count up to a power of two and caps it at that limit.
+The per-peer bucket holds `slab * TopK` rows.
 Per-expert storage rounds `min(DP * capacity, EP * slab)` up to a multiple of
 16. Later admissions reuse these bounds and execute as many rounds as their
 physical SP rows require; all ranks retain the same collective count.
 The separately compiled one-token Decode phase uses a one-row slab, a 960 KiB
 hidden packet per rank and direction, and 16 rows per expert. A full 128-token Prefill chunk retains
-16-row slabs, 15 MiB packets and 256 rows per expert. Shared computation
+16-row slabs by default, 15 MiB packets and 256 rows per expert. For a single
+8192-token request on TP4/DP4/EP16, the busiest source rank has 2048 rows:
+
+| Slab cap | Rounds per layer | Dispatch and return stages, 40 layers | Hidden packet per rank | Reserved rows per expert |
+|---:|---:|---:|---:|---:|
+| 16 | 128 | 10240 | 15 MiB | 256 |
+| 64 | 32 | 2560 | 60 MiB | 1024 |
+| 128 | 16 | 1280 | 120 MiB | 2048 |
+
+Wide packet copies use complete hidden rows to fit the A3 SPMD block count.
+The runtime sizes the grouped-expert scratch heap from the compiled number
+of expert rows and checks received route counts before unpack. Shared computation
 retains the phase capacity. These are communication workspace bounds, not
 total HBM measurements.
 
@@ -292,6 +307,37 @@ creating initialized CPU payloads or uploading them. Host-prepared metadata,
 static weights, persistent caches and layer-boundary buffers retain their
 existing ownership. Other completed allocations return to the size-based pool.
 Host descriptors must not be mutated after the device becomes authoritative.
+
+Indexer codes and scales transfer all selected owner pages in one invocation
+per plane and direction. The device copy consumes a bounded page-ID list;
+unselected pages and bytes outside the typed payload remain unchanged. Prefill
+and Decode use the same copy implementation and retain the original page,
+reserved-page and cache-alias checks.
+
+The generation command defaults to `--logits-mode last`: final normalization
+and vocabulary projection consume only the last active position of each DP
+engine. A 16-row device buffer retains the GEMM alignment; only its valid row
+is returned to the host. One TP rank unpacks and reads the full vocabulary,
+and the host result is replicated across the TP result slots. Empty DP groups
+return empty tensors. Each Prefill chunk still computes its final-position
+distribution, and Decode uses the same output policy.
+
+Logit tensor files are opt-in for the generation command with `--dump-logits`.
+Use `--logits-mode all --dump-logits` to retain every position and the full
+diagnostic files. The Python forward API retains `logits_mode="all"` and
+`dump_logits=True` when these keys are absent from `config`; set them explicitly
+to select compact output. The compiled program freezes the output mode, which
+cannot change during a generation session.
+
+Bounded byte-copy and output-selection checks use the shared Golden Harness
+and compare both written values and untouched regions exactly:
+
+```bash
+python -m models.deepseek_v4_1_flash_a3.cache -p a2a3 -d 0
+python -m models.deepseek_v4_1_flash_a3.input_pack -p a2a3 -d 0 --output-unpack
+```
+
+Run these device commands through the site's device allocator.
 
 Runtime receipts include per-rank transfer totals, workspace requests, reuse
 counts and device fill bytes. Device fill bytes are separate from H2D bytes;

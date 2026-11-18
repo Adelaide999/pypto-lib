@@ -29,7 +29,7 @@ from .cache import attach_network_cache_geometry, network_cache_geometry, resolv
 from .engram import make_prefill_engram_entries
 from .input_pack import make_input_entries
 from .lm_head import make_output_entries
-from .runtime_config import PREFILL_CAPACITIES, network_ring_heap
+from .runtime_config import PREFILL_CAPACITIES, PREFILL_MOE_SLAB_ROWS, network_ring_heap, prefill_moe_slab_limit
 from .prefill_layer import (
     REGIONS, execute_region, region_arguments, make_network_l2_entries,
     make_prefill_layer_entries, run_prefill_layer_inmemory,
@@ -132,7 +132,7 @@ def _merge_inputs(inputs, cache):
     return dict(inputs, **cache)
 
 
-def network_layer_geometry(provider, topology, layer_id, moe_geometry=None):
+def network_layer_geometry(provider, topology, layer_id, moe_geometry=None, *, slab_limit=16):
     """Check the live routed row bound without rebuilding any operator IR."""
     geometry = provider.runtime_geometry()
     batch = provider.batch_for_layer(layer_id)
@@ -141,10 +141,10 @@ def network_layer_geometry(provider, topology, layer_id, moe_geometry=None):
     if total > bound:
         raise ValueError("Actual routed token rows exceed the compiled per-DP chunk capacity")
     max_rows = max(record["SP_valid_rows"] for records in batch["cases"].values() for record in records)
-    slab = min(16, 1 << (max(1, max_rows) - 1).bit_length())
+    slab = min(slab_limit, 1 << (max(1, max_rows) - 1).bit_length())
     if moe_geometry is not None:
         slab = moe_geometry["slab_rows"]
-    if not 1 <= slab <= min(16, geometry["capacity"]) or geometry["capacity"] % slab:
+    if not 1 <= slab <= min(PREFILL_MOE_SLAB_ROWS[-1], geometry["capacity"]) or geometry["capacity"] % slab:
         raise ValueError("Routed packet slab exceeds the compiled row capacity")
     rounds = max(1, (max_rows + slab - 1) // slab)
     routed_bound = max(
@@ -162,9 +162,9 @@ def network_layer_geometry(provider, topology, layer_id, moe_geometry=None):
     return geometry, expert_capacity
 
 
-def make_network_layer_entries(provider, config, topology, layer_id, definitions_cache=None):
+def make_network_layer_entries(provider, config, topology, layer_id, definitions_cache=None, *, slab_limit=16):
     """Build the exact layer specialization from its validated request/cache geometry."""
-    geometry, expert_capacity = network_layer_geometry(provider, topology, layer_id)
+    geometry, expert_capacity = network_layer_geometry(provider, topology, layer_id, slab_limit=slab_limit)
     batch = provider.batch_for_layer(layer_id)
     layout = provider.layouts[0][next(iter(batch["cases"]))]
     role = resolve_layer_role(layer_id)
@@ -205,7 +205,7 @@ def make_network_layer_entries(provider, config, topology, layer_id, definitions
     return definitions, geometry, expert_capacity
 
 
-def _compile_signature(provider, model_config, topology, engram_contracts, moe_geometry):
+def _compile_signature(provider, model_config, topology, engram_contracts, moe_geometry, logits_mode):
     """Freeze all compile-time geometry and constants, excluding token values and live cache bytes."""
 
     def encode(value):
@@ -225,6 +225,7 @@ def _compile_signature(provider, model_config, topology, engram_contracts, moe_g
     signature = dict(
         geometry=provider.runtime_geometry(),
         moe_geometry=moe_geometry,
+        logits_mode=logits_mode,
         layouts=provider.layouts,
         model=model_config,
         topology=topology,
@@ -301,18 +302,28 @@ class NetworkProgram:
             raise ValueError("The compiled network does not cover stage: " + stage)
         return self.stages[stage]
 
-    def compile(self, provider, model_config, topology, engram_contracts):
+    def compile(self, provider, model_config, topology, engram_contracts, *, logits_mode="all",
+                prefill_moe_slab_rows=None):
         """Compile embedding, forty complete layers, both Engram slots and the final head."""
+        if logits_mode not in ("all", "last"):
+            raise ValueError("Output logits mode must be all or last")
+        geometry = provider.runtime_geometry()
+        slab_limit = prefill_moe_slab_limit(geometry["capacity"], prefill_moe_slab_rows)
         if self.ready:
+            if slab_limit != self.moe_slab_limit:
+                raise ValueError("The compiled Prefill MoE slab limit changed")
             for layer, moe_geometry in self.moe_geometry.items():
                 network_layer_geometry(provider, topology, layer, moe_geometry)
-            signature = _compile_signature(provider, model_config, topology, engram_contracts, self.moe_geometry)
+            signature = _compile_signature(
+                provider, model_config, topology, engram_contracts, self.moe_geometry, logits_mode,
+            )
             if signature != self._signature:
                 raise ValueError("The compiled network geometry or constants changed")
             return self
         begin = perf_counter()
+        self.logits_mode = logits_mode
+        self.moe_slab_limit = slab_limit
         text = dict(model_config["text_config"], image_sentinel_base_id=model_config["image_token_id"])
-        geometry = provider.runtime_geometry()
         try:
             self.bind(
                 "embedding",
@@ -325,7 +336,7 @@ class NetworkProgram:
             self.bind("validation", {"finite": make_finite_check(geometry["capacity"])})
             for layer in range(40):
                 definitions, layer_geometry, expert_capacity = make_network_layer_entries(
-                    provider, text, topology, layer, self._layer_definitions
+                    provider, text, topology, layer, self._layer_definitions, slab_limit=slab_limit
                 )
                 if "moe_slab_rows" in layer_geometry:
                     self.moe_geometry[layer] = dict(
@@ -365,12 +376,14 @@ class NetworkProgram:
             self.bind(
                 "output",
                 make_network_l2_entries(
-                    make_output_entries(geometry["capacity"], text, topology["tp"]),
+                    make_output_entries(geometry["capacity"], text, topology["tp"], logits_mode=logits_mode),
                     geometry["capacity"],
                     "output",
                 ),
             )
-            self._signature = _compile_signature(provider, model_config, topology, engram_contracts, self.moe_geometry)
+            self._signature = _compile_signature(
+                provider, model_config, topology, engram_contracts, self.moe_geometry, logits_mode,
+            )
             self.ready = True
         finally:
             self.prepare_seconds = perf_counter() - begin
@@ -394,6 +407,7 @@ class NetworkProgram:
             layers=[layer for layer in range(40) if f"layer{layer}" in self.stages],
             execution_model="host_hccl_with_l2_compute_regions",
             single_l2=False,
+            logits_mode=getattr(self, "logits_mode", None),
             l2_regions={name: [child for child, _ in steps] for name, steps in REGIONS.items()},
             stages={stage: list(entries) for stage, entries in self.stages.items()},
             unique_entries=len(self.records),
@@ -718,9 +732,11 @@ def embed_network_input(input_contract, weights, executor, config, output):
     return hidden, premix
 
 
-def run_output_boundary(result, *, batch, topology, config, weights, executor, output):
+def run_output_boundary(result, *, batch, topology, config, weights, executor, output, dump_logits=True):
     """Consume actual layer39 local delayed HC state and restore complete SP/TP vocabulary output."""
     capacity, world, tp = executor.provider.capacity, topology["ep"], topology["tp"]
+    last_row = executor.program.logits_mode == "last"
+    output_capacity = 16 if last_row else capacity
     directory = Path(output)
     directory.mkdir(exist_ok=False)
     entries = executor.program.entries_for_stage("output")
@@ -757,9 +773,10 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
         def run_output_boundary_rank_1(rank):
             record = records[rank]
             physical, active = record["SP_physical_rows"], len(record["positions"])
-            collapsed = torch.full((capacity, 5120), -17, dtype=torch.bfloat16)
-            normalized = torch.full((capacity, 5120), -19, dtype=torch.bfloat16)
-            local_logits = torch.full((capacity, config["vocab_size"] // tp), -23, dtype=torch.bfloat16)
+            output_active = min(active, 1) if last_row else active
+            collapsed = torch.full((output_capacity, 5120), -17, dtype=torch.bfloat16)
+            normalized = torch.full((output_capacity, 5120), -19, dtype=torch.bfloat16)
+            local_logits = torch.full((output_capacity, config["vocab_size"] // tp), -23, dtype=torch.bfloat16)
             count = config["vocab_size"] // tp
             weight = weights.head_for_rank(rank)
             if tuple(weight.shape) != (5120, count):
@@ -776,10 +793,10 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
                         dict(collapsed=collapsed),
                         "output",
                     ),
-                    ("norm", [collapsed, norm, normalized, active], dict(normalized=normalized), "output"),
+                    ("norm", [collapsed, norm, normalized, output_active], dict(normalized=normalized), "output"),
                     (
                         "projection",
-                        [normalized, weight, local_logits, active],
+                        [normalized, weight, local_logits, output_active],
                         dict(local_logits=local_logits),
                         "output",
                     ),
@@ -794,28 +811,31 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
     for case, records in batch["cases"].items():
         def run_output_boundary_rank_2(rank):
             record = records[rank]
-            logits = torch.full((capacity, config["vocab_size"]), -29, dtype=torch.bfloat16)
+            active = min(len(record["positions"]), 1) if last_row else len(record["positions"])
+            if (last_row and rank % tp) or (not active and (last_row or not dump_logits)):
+                actual_logits[rank][case] = torch.empty((0, config["vocab_size"]), dtype=torch.bfloat16)
+                return
+            logits = torch.full((output_capacity, config["vocab_size"]), -29, dtype=torch.bfloat16)
             execute(
                 "vocab_unpack",
                 rank,
                 case,
-                [gathered_logits[rank][case], logits, len(record["positions"])],
+                [gathered_logits[rank][case], logits, active],
                 dict(logits=logits),
             )
-            logits = executor.resident.read_output(logits, rank)
-            path = directory / f"rank-{rank}-{case}-network-logits.pt"
-            torch.save(
-                dict(
-                    logits=logits,
-                    active=len(record["positions"]),
-                    positions=record["positions"],
-                    DP_rank=rank // tp,
-                ),
-                path,
-            )
-            files[str(path)] = file_sha(path)
-            actual_logits[rank][case] = logits[: len(record["positions"])].clone()
+            readback = logits if dump_logits and not last_row else logits[:active]
+            logits = executor.resident.read_output(readback, rank)
+            if dump_logits:
+                path = directory / f"rank-{rank}-{case}-network-logits.pt"
+                positions = record["positions"][-1:] if last_row else record["positions"]
+                torch.save(dict(logits=logits, active=active, positions=positions, DP_rank=rank // tp), path)
+                files[str(path)] = file_sha(path)
+            actual_logits[rank][case] = logits[:active].clone()
         executor.resident.map_ranks(run_output_boundary_rank_2)
+        if last_row:
+            for rank in range(world):
+                if rank % tp:
+                    actual_logits[rank][case] = actual_logits[rank - rank % tp][case].clone()
     write_json(
         directory / "execution.json",
         dict(
@@ -971,7 +991,9 @@ class GenerationSession:
             if before != after:
                 raise RuntimeError("Chunk admission replaced a persistent cache or history allocation")
             validate_host_lookup(following["engram_lookup"], self.engram_contracts[1], self.provider.hash_batch())
-            self.program.compile(self.provider, contract["model_config"], contract["topology"], self.engram_contracts)
+            self.program.compile(self.provider, contract["model_config"], contract["topology"], self.engram_contracts,
+                                 logits_mode=contract.get("logits_mode", "all"),
+                                 prefill_moe_slab_rows=contract.get("prefill_moe_slab_rows"))
             output = Path(output)
             output.mkdir(parents=True, exist_ok=False)
             result = run_network_chunk(following, contract=contract, output=output, provider=self.provider,
@@ -1021,7 +1043,9 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
     provider = prepare_network_provider(inputs, contract, output.name, geometry_only=True)
     validate_host_lookup(inputs["engram_lookup"], inputs["engram_contracts"][1], provider.hash_batch())
     program = compiled if compiled is not None else NetworkProgram(output / "compiled")
-    program.compile(provider, contract["model_config"], topology, inputs["engram_contracts"])
+    program.compile(provider, contract["model_config"], topology, inputs["engram_contracts"],
+                    logits_mode=contract.get("logits_mode", "all"),
+                    prefill_moe_slab_rows=contract.get("prefill_moe_slab_rows"))
     phase_programs = {contract["capacity"]: program}
     if contract["capacity"] != 16 and request_inputs is not None:
         from tempfile import TemporaryDirectory
@@ -1039,7 +1063,9 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
                 decode_program = NetworkProgram(output / "compiled-decode")
                 decode_program._buckets = program._buckets
                 decode_program.compile(decode_provider, contract["model_config"], topology,
-                                       decode_chunk["cache"]["engram_contracts"])
+                                       decode_chunk["cache"]["engram_contracts"],
+                                       logits_mode=contract.get("logits_mode", "all"),
+                                       prefill_moe_slab_rows=contract.get("prefill_moe_slab_rows"))
                 phase_programs[16] = decode_program
             finally:
                 request.close()
@@ -1047,7 +1073,10 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
     with ExitStack() as stack:
         profiling = dict(contract.get("profiling", {}))
         profiling.setdefault("output_dir", str(output / "profiling"))
-        ring_heap = network_ring_heap(contract["capacity"], contract["model_config"]["text_config"], topology["tp"])
+        text_config = contract["model_config"]["text_config"]
+        expert_capacity = max(moe["expert_capacity"] for p in phase_programs.values() for moe in p.moe_geometry.values())
+        routed_rows = (text_config["n_routed_experts"] // topology["ep"]) * expert_capacity
+        ring_heap = network_ring_heap(contract["capacity"], text_config, topology["tp"], routed_rows=routed_rows)
         resident = stack.enter_context(ResidentNetworkRuntime(assigned, topology, profiling=profiling, ring_heap=ring_heap))
         for phase_program in phase_programs.values():
             resident.register(phase_program)
@@ -1246,6 +1275,7 @@ def run_network_chunk(
             weights=weights,
             executor=executor,
             output=output / "actual-layer39-output",
+            dump_logits=contract.get("dump_logits", True),
         )
         if any(not torch.isfinite(value).all() for row in output_result["logits"] for value in row.values()):
             raise RuntimeError(f"Non-finite {phase} vocabulary logits")
@@ -1255,6 +1285,8 @@ def run_network_chunk(
             completed_layers=list(range(40)),
             actual_Layer39_boundary=True,
             final_output_files=output_result["files"],
+            logits_mode=program.logits_mode,
+            dump_logits=contract.get("dump_logits", True),
             formal_accuracy="not_run",
         )
         resident.release_values()

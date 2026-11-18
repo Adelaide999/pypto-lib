@@ -20,7 +20,7 @@ from .input_pack import make_sp_gather_unpack
 from .rmsnorm import D, EPS, NORM_T_TILE, make_prefill_norm, rms_norm_tiled
 
 
-def make_output_entries(capacity, config, tp):
+def make_output_entries(capacity, config, tp, *, logits_mode="all"):
     """Build bounded output chunks with a vocabulary-axis TP shard."""
     if tp not in (1, 2, 4) or capacity <= 0 or capacity % 16:
         raise ValueError("Require TP1/2/4 and complete 16-row output chunks")
@@ -29,12 +29,16 @@ def make_output_entries(capacity, config, tp):
         raise ValueError("Final normalization must match the actual shared model configuration")
     if vocabulary % tp or vocabulary // tp % 64:
         raise ValueError("Freeze the actual vocabulary padding before output construction")
+    if logits_mode not in ("all", "last"):
+        raise ValueError("Output logits mode must be all or last")
+    last_row = logits_mode == "last"
+    output_capacity = 16 if last_row else capacity
     return dict(
         collapse=pl.jit(make_hc_collapse_inline(capacity, config)._func),
-        norm=make_prefill_norm(capacity, hidden),
-        projection=make_bf16_linear(capacity, hidden, vocabulary // tp),
-        sp_unpack=make_sp_gather_unpack(capacity, hidden, tp),
-        vocab_unpack=make_output_vocab_unpack(capacity, vocabulary, tp),
+        norm=make_prefill_norm(output_capacity, hidden),
+        projection=make_bf16_linear(output_capacity, hidden, vocabulary // tp),
+        sp_unpack=make_sp_gather_unpack(capacity, hidden, tp, last_row=last_row),
+        vocab_unpack=make_output_vocab_unpack(output_capacity, vocabulary, tp),
     )
 
 

@@ -83,10 +83,9 @@ def make_paged_cache_copy(
     source_offset=0,
     destination_offset=0,
     dtype=pl.BF16,
-    first_page=0,
     copy_tile=COPY_TILE,
 ):
-    """Copy one contiguous payload per page while preserving unrelated bytes."""
+    """Copy selected page payloads in one dispatch while preserving unrelated bytes."""
     if blocks < 1 or payload < 1 or copy_tile not in (64, 128) or payload % copy_tile:
         raise ValueError("Require positive pages with aligned contiguous payloads")
     if not 0 <= source_offset <= source_stride - payload:
@@ -94,26 +93,36 @@ def make_paged_cache_copy(
     if not 0 <= destination_offset <= destination_stride - payload:
         raise ValueError("Destination cache payload exceeds its physical page")
 
-    if not 0 <= first_page < blocks:
-        raise ValueError("Require a nonempty owned page range")
-
     @pl.jit
     def paged_cache_copy(
         source: pl.Tensor[[blocks, source_stride], dtype],
         destination: pl.InOut[pl.Tensor[[blocks, destination_stride], dtype]],
+        pages: pl.Tensor[[blocks], pl.INT32],
+        active_pages: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd(
-            (blocks - first_page) * (payload // copy_tile), name_hint="prefill_paged_cache_copy"
-        ):
-            page = first_page + block // (payload // copy_tile)
-            offset = block % (payload // copy_tile) * copy_tile
-            source_column = source_offset + offset
-            destination_column = destination_offset + offset
-            value = source[page : page + 1, source_column : source_column + copy_tile]
-            destination[page : page + 1, destination_column : destination_column + copy_tile] = value
+        block_count = active_pages * (payload // copy_tile)
+        for worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint="prefill_paged_cache_copy"):
+            for block in pl.range(worker, block_count, SPMD_WORKER_LIMIT):
+                page_index = block // (payload // copy_tile)
+                page = pl.cast(pl.read(pages, [page_index]), pl.INDEX)
+                offset = block % (payload // copy_tile) * copy_tile
+                source_column = source_offset + offset
+                destination_column = destination_offset + offset
+                value = source[page:page + 1, source_column:source_column + copy_tile]
+                destination[page:page + 1, destination_column:destination_column + copy_tile] = value
         return destination
 
     return paged_cache_copy
+
+
+def cache_copy_pages(blocks, pages):
+    """Build a bounded page list with unique in-range physical indices."""
+    pages = tuple(pages)
+    if len(pages) != len(set(pages)) or any(type(page) is not int or not 0 <= page < blocks for page in pages):
+        raise ValueError("Cache copy pages must be unique physical indices inside the allocation")
+    indices = torch.full((blocks,), -1, dtype=torch.int32)
+    indices[:len(pages)] = torch.tensor(pages, dtype=torch.int32)
+    return indices, len(pages)
 
 
 def physical_page_geometry(layout, prefix, blocks):
@@ -517,11 +526,11 @@ def make_network_cache_entries(capacity, config, geometry, role):
         tile = min(128, payload)
         dtype = PTO_DTYPES[plane["dtype"]]
         entries["network_load_" + name] = make_paged_cache_copy(
-            1, payload, stride, payload, source_offset=offset, dtype=dtype, copy_tile=tile
+            plane["blocks"], payload, stride, payload, source_offset=offset, dtype=dtype, copy_tile=tile
         )
         if role["mode"] == "full":
             entries["network_store_" + name] = make_paged_cache_copy(
-                1, payload, payload, stride, destination_offset=offset, dtype=dtype, copy_tile=tile
+                plane["blocks"], payload, payload, stride, destination_offset=offset, dtype=dtype, copy_tile=tile
             )
     return entries
 
@@ -529,40 +538,28 @@ def make_network_cache_entries(capacity, config, geometry, role):
 def load_network_index(raw, geometry, pages, execute, rank, case):
     """Stage actual index-owner pages in their native64/128-row typed shapes."""
     result = {}
+    page_ids, active_pages = cache_copy_pages(geometry["codes"]["blocks"], pages)
     for name in ("codes", "scales"):
         plane = geometry[name]
         dense = torch.empty((plane["blocks"], plane["payload"]), dtype=DTYPES[plane["dtype"]])
         physical = raw_cache_matrix(raw, plane)
-        for page in pages:
-            value = dense[page : page + 1]
-            execute(
-                "network_load_" + name,
-                rank,
-                case + f"-page-{page}",
-                [physical[page : page + 1], value],
-                {"payload": value},
-                "physical_cache_load",
-            )
+        if active_pages:
+            execute("network_load_" + name, rank, case, [physical, dense, page_ids, active_pages],
+                    {"payload": dense}, "physical_cache_load")
         result[name] = dense.reshape(plane["blocks"], plane["rows"], 1, plane["width"])
     return result
 
 
 def store_network_index(raw, geometry, pages, dense, execute, rank, case):
     """Store only real index-owner pages and preserve aliased ring/SWA pages."""
+    page_ids, active_pages = cache_copy_pages(geometry["codes"]["blocks"], pages)
     for name in ("codes", "scales"):
         plane = geometry[name]
         physical = raw_cache_matrix(raw, plane)
         source = dense[name].reshape(plane["blocks"], plane["payload"])
-        for page in pages:
-            value = physical[page : page + 1]
-            execute(
-                "network_store_" + name,
-                rank,
-                case + f"-page-{page}",
-                [source[page : page + 1], value],
-                {"raw": value},
-                "physical_cache_store",
-            )
+        if active_pages:
+            execute("network_store_" + name, rank, case, [source, physical, page_ids, active_pages],
+                    {"raw": physical}, "physical_cache_store")
 
 
 def validate_network_sparse_indices(indices, original, geometry, active):
@@ -634,3 +631,71 @@ def validate_live_refresh_candidates(original, shared, source_id):
         available = set(candidates[local].reshape(-1).tolist())
         if not set(range((visible + 7) // 8)).issubset(available):
             raise ValueError("This input requires candidate pruning; no dense substitute is supported")
+
+def golden_paged_cache_copy(tensors, *, payload, source_offset=0, destination_offset=0):
+    """Copy selected payloads and retain all unselected pages and padding."""
+    pages = tensors["pages"][:int(tensors["active_pages"])].long()
+    tensors["destination"][pages, destination_offset:destination_offset + payload] = (
+        tensors["source"][pages, source_offset:source_offset + payload]
+    )
+
+
+def paged_cache_copy_cases():
+    """Cover sparse owner lists, empty work and both raw/dense transfer directions."""
+    from functools import partial
+    from golden import ScalarSpec, TensorSpec
+
+    blocks = 8
+    for dtype, payload in ((torch.int8, 128 * 128), (torch.float16, 64),
+                           (torch.float16, 128), (torch.bfloat16, 512)):
+        for store in (False, True):
+            source_stride = payload if store else payload + 256
+            destination_stride = payload + 256 if store else payload
+            source_offset, destination_offset = (0, 128) if store else (128, 0)
+            pages, active = cache_copy_pages(blocks, [6, 1, 4] if store else [1, 6])
+            dtype_name = str(dtype).split(".")[-1]
+            specs = [
+                TensorSpec("source", [blocks, source_stride], dtype,
+                           init_value=lambda s=source_stride: torch.arange(blocks * s).reshape(blocks, s) % 127),
+                TensorSpec("destination", [blocks, destination_stride], dtype, init_value=-17),
+                TensorSpec("pages", [blocks], torch.int32, init_value=pages),
+                ScalarSpec("active_pages", torch.int32, active, compile_runtime=True),
+            ]
+            golden = partial(golden_paged_cache_copy, payload=payload,
+                             source_offset=source_offset, destination_offset=destination_offset)
+            yield dict(name=f"paged-{dtype_name}-{payload}-{'store' if store else 'load'}",
+                       fn=make_paged_cache_copy(blocks, payload, source_stride, destination_stride,
+                                               source_offset, destination_offset, dtype=PTO_DTYPES[str(dtype)],
+                                               copy_tile=min(128, payload)),
+                       specs=specs, golden_fn=golden)
+    pages, active = cache_copy_pages(blocks, [])
+    yield dict(name="paged-empty", fn=make_paged_cache_copy(blocks, 128, 256, 256), specs=[
+        TensorSpec("source", [blocks, 256], torch.bfloat16, init_value=3),
+        TensorSpec("destination", [blocks, 256], torch.bfloat16, init_value=-17),
+        TensorSpec("pages", [blocks], torch.int32, init_value=pages),
+        ScalarSpec("active_pages", torch.int32, active, compile_runtime=True),
+    ], golden_fn=partial(golden_paged_cache_copy, payload=128))
+
+
+if __name__ == "__main__":
+    import argparse
+    from golden import run
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", choices=("a2a3",), default="a2a3")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--sim", action="store_true")
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
+    for case in paged_cache_copy_cases():
+        name = case.pop("name")
+        result = run(
+            **case,
+            config={"backend_type": args.platform, "execution_mode": args.sim, "device_id": args.device},
+            compile_only=args.compile_only,
+            rtol=0.0,
+            atol=0.0,
+        )
+        if not result.passed:
+            raise RuntimeError(f"{name}: {result.error}")
+        print(f"[cache-copy] {name} PASS", flush=True)

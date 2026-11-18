@@ -213,7 +213,6 @@ def make_physical_consumer_entries(
             geometry["payload"],
             geometry["stride"],
             destination_offset=geometry["offset"],
-            first_page=geometry["first_owned"],
         )
     if role["mode"] == "reindex":
         from .cache import physical_index_geometry

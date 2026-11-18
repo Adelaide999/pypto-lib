@@ -20,7 +20,9 @@ from tokenizers import Tokenizer
 from .decode_network import DecodeNetwork, TOPOLOGY
 from .prefill_fwd import prefill_fwd
 from .prefill_prepare import checkpoint_cache, tokenize_prompt
-from .runtime_config import MAX_CONTEXT_TOKENS, MAX_PREFILL_CHUNK_SIZE, configure_devices, prefill_execution_capacity
+from .runtime_config import (
+    MAX_CONTEXT_TOKENS, MAX_PREFILL_CHUNK_SIZE, PREFILL_MOE_SLAB_ROWS, configure_devices, prefill_execution_capacity,
+)
 from .utils import write_json
 
 
@@ -37,7 +39,12 @@ def main(argv=None):
     parser.add_argument("--result", type=Path)
     parser.add_argument("--max-new-tokens", type=int, default=3)
     parser.add_argument("--chunk-size", type=int, default=128)
+    parser.add_argument("--prefill-moe-slab-rows", choices=PREFILL_MOE_SLAB_ROWS, type=int,
+                        help="Maximum source rows per rank in one Prefill expert dispatch/return round")
     parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--logits-mode", choices=("last", "all"), default="last",
+                        help="Project the last active position or every position in each chunk")
+    parser.add_argument("--dump-logits", action="store_true", help="Save vocabulary tensors for diagnostics")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5),
                         help="Device capture level: 0 disables capture; the bare flag selects 1")
     parser.add_argument("--profile-phase", choices=("all", "prefill", "decode"), default="all",
@@ -66,15 +73,18 @@ def main(argv=None):
     preparation_started = perf_counter()
     cache, config = checkpoint_cache(args.checkpoint, TOPOLOGY, capacity=prefill_execution_capacity(args.chunk_size))
     checkpoint_contract_seconds = perf_counter() - preparation_started
-    config.update(chunk_size=args.chunk_size, context_capacity=len(tokens) + args.max_new_tokens)
+    config.update(chunk_size=args.chunk_size, context_capacity=len(tokens) + args.max_new_tokens,
+                  logits_mode=args.logits_mode, dump_logits=args.dump_logits,
+                  prefill_moe_slab_rows=args.prefill_moe_slab_rows)
     profiling = dict(level=args.enable_chip_swimlane, phase=args.profile_phase,
                      output_dir=str((args.profile_output or args.output / "profiling").resolve()))
     config["profiling"] = profiling
     eos = model.get("eos_token_id", model["text_config"].get("eos_token_id"))
     report = dict(status="executing", checkpoint=str(args.checkpoint), topology=TOPOLOGY,
                   devices=devices, chunk_size=args.chunk_size, prefill_capacity=config["capacity"],
-                  decode_capacity=16, moe_slab_rows=16, prompt_token_ids=tokens, generated_token_ids=[], phases=[],
-                  profiling=profiling, accuracy="not_run")
+                  decode_capacity=16, requested_prefill_moe_slab_rows=args.prefill_moe_slab_rows,
+                  prompt_token_ids=tokens, generated_token_ids=[], phases=[],
+                  profiling=profiling, logits_mode=args.logits_mode, dump_logits=args.dump_logits, accuracy="not_run")
     write_json(result_dir / "prompt.json", report)
     session, network = None, None
     generated, decode_timings, token_timings = [], [], []
@@ -115,8 +125,10 @@ def main(argv=None):
         before_decode = session.weights.counters()
         chunks = prefill.get("completed_prefill_chunks", [prefill])
         prefill_forward_seconds = sum(chunk["timings"]["chunk_seconds"] for chunk in chunks)
-        report.update(moe_slab_rows=session.program.moe_geometry[0]["slab_rows"],
-                      decode_moe_slab_rows=session.phase_programs[16].moe_geometry[0]["slab_rows"])
+        prefill_moe = session.program.moe_geometry[0]
+        decode_moe = session.phase_programs[16].moe_geometry[0]
+        report.update(moe_slab_rows=prefill_moe["slab_rows"], prefill_expert_capacity=prefill_moe["expert_capacity"],
+                      decode_moe_slab_rows=decode_moe["slab_rows"], decode_expert_capacity=decode_moe["expert_capacity"])
         report["timings"].update(
             prefill_call_seconds=prefill_call_seconds,
             compilation=prefill["compilation"],

@@ -256,12 +256,13 @@ def embedding_golden_cases(checkpoint=None):
         )
 
 
-def validate(*, device=0, compile_only=False, checkpoint=None, platform="a2a3", sim=False):
+def validate(*, device=0, compile_only=False, checkpoint=None, platform="a2a3", sim=False, output_unpack=False):
     """Run exact embedding and HC initialization boundaries through Golden Harness."""
     from golden import run
 
     records = []
-    for case in embedding_golden_cases(checkpoint):
+    cases = sp_unpack_golden_cases() if output_unpack else embedding_golden_cases(checkpoint)
+    for case in cases:
         name = case.pop("name")
         result = run(
             **case,
@@ -324,8 +325,9 @@ def make_head_pack(capacity, heads, head_dim, tp):
     return head_pack
 
 
-def make_sp_gather_unpack(capacity, width, tp, dtype=pl.BF16, tile=D_TILE):
-    """Compact fixed peer buckets into contiguous physical token order."""
+def make_sp_gather_unpack(capacity, width, tp, dtype=pl.BF16, tile=D_TILE, *, last_row=False):
+    """Compact fixed peer buckets into all token rows or the last active row."""
+    output_capacity = 16 if last_row else capacity
     scalar_rows = width < 8
     while tile < 4096 and width % (2 * tile) == 0:
         tile *= 2
@@ -333,24 +335,31 @@ def make_sp_gather_unpack(capacity, width, tp, dtype=pl.BF16, tile=D_TILE):
     @pl.jit
     def gather_unpack(
         packet: pl.Tensor[[tp * capacity, width], dtype],
-        output: pl.InOut[pl.Tensor[[capacity, width], dtype]],
+        output: pl.InOut[pl.Tensor[[output_capacity, width], dtype]],
         physical: pl.Scalar[pl.INT32],
         active: pl.Scalar[pl.INT32],
     ):
+        rows = active
+        token_offset = 0
+        if last_row:
+            rows = pl.min(active, 1)
+            token_offset = active - 1
         if scalar_rows:
             for _block in pl.spmd(1, name_hint="prefill_sp_state_unpack"):
-                for token in pl.range(active):
-                    source = token // physical * capacity + token % physical
+                for token in pl.range(rows):
+                    input_token = token + token_offset
+                    source = input_token // physical * capacity + input_token % physical
                     for column in pl.range(width):
                         state_value = pl.read(packet, [source, column])
                         pl.write(output, [token, column], state_value)
         else:
-            block_count = active * (width // tile)
+            block_count = rows * (width // tile)
             for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='prefill_sp_gather_unpack'):
                 for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
                     token = block // (width // tile)
                     column = block % (width // tile) * tile
-                    source = token // physical * capacity + token % physical
+                    input_token = token + token_offset
+                    source = input_token // physical * capacity + input_token % physical
                     vector_value = packet[source : source + 1, column : column + tile]
                     output[token : token + 1, column : column + tile] = vector_value
         return output
@@ -384,6 +393,43 @@ def make_sp_reduce_pack(capacity, hidden, tp):
     return reduce_pack
 
 
+def golden_sp_gather_unpack(tensors, *, tp, last_row):
+    """Concatenate active SP shards and select the requested output rows."""
+    import torch
+
+    active, physical = int(tensors["active"]), int(tensors["physical"])
+    if not active:
+        return
+    packet = tensors["packet"].reshape(tp, -1, tensors["output"].shape[1])
+    tokens = torch.cat([shard[:physical] for shard in packet])[:active]
+    selected = tokens[-1:] if last_row else tokens
+    tensors["output"][:len(selected)].copy_(selected)
+
+
+def sp_unpack_golden_cases():
+    """Cover full and last-row output across empty, partial and complete TP shards."""
+    from functools import partial
+    import torch
+    from golden import ScalarSpec, TensorSpec
+
+    for capacity, tp, active in ((16, 1, 0), (16, 1, 1), (16, 2, 7), (16, 4, 1),
+                                 (16, 4, 3), (16, 4, 16), (1024, 4, 1023), (1024, 4, 1024)):
+        width = 5120
+        physical = max(1, (active + tp - 1) // tp)
+        for last_row in (False, True):
+            output_rows = 16 if last_row else capacity
+            specs = [
+                TensorSpec("packet", [tp * capacity, width], torch.bfloat16,
+                           init_value=lambda n=tp * capacity: (torch.arange(n * width).reshape(n, width) % 127)),
+                TensorSpec("output", [output_rows, width], torch.bfloat16, init_value=-17),
+                ScalarSpec("physical", torch.int32, physical, compile_runtime=True),
+                ScalarSpec("active", torch.int32, active, compile_runtime=True),
+            ]
+            yield dict(name=f"sp-unpack-tp{tp}-capacity{capacity}-active{active}-last{last_row}",
+                       fn=make_sp_gather_unpack(capacity, width, tp, last_row=last_row), specs=specs,
+                       golden_fn=partial(golden_sp_gather_unpack, tp=tp, last_row=last_row))
+
+
 if __name__ == "__main__":
     import argparse
     import json
@@ -394,6 +440,7 @@ if __name__ == "__main__":
     parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--output-unpack", action="store_true", help="Validate all-row and last-row SP output")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
@@ -403,6 +450,7 @@ if __name__ == "__main__":
         checkpoint=args.checkpoint,
         platform=args.platform,
         sim=args.sim,
+        output_unpack=args.output_unpack,
     )
     if args.report is not None:
         args.report.write_text(

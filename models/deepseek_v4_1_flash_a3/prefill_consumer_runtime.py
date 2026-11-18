@@ -56,12 +56,14 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
         source_cache = raw_cache_matrix(raw, network["long"])
         cache = raw_cache_matrix(raw, network["own"])
     elif role["ratio"] == 1:
-        from .cache import physical_consumer_geometry
+        from .cache import cache_copy_pages, physical_consumer_geometry
 
         geometry = physical_consumer_geometry(live["layout"], own_prefix, source_prefix, cache_blocks)
         raw_cache = raw[geometry["storage_key"]].view(torch.bfloat16).reshape(cache_blocks, geometry["stride"])
         dense = torch.empty((cache_blocks, geometry["payload"]), dtype=torch.bfloat16)
-        execute("consumer_cache_load", rank, case, [raw_cache, dense], {"payload": dense}, "physical_cache_load")
+        copy_pages, copy_count = cache_copy_pages(cache_blocks, range(cache_blocks))
+        execute("consumer_cache_load", rank, case, [raw_cache, dense, copy_pages, copy_count],
+                {"payload": dense}, "physical_cache_load")
         cache = dense.reshape(cache_blocks, 128, 1, 512)
     else:
         cache = raw[own_descriptor["storage_key"]].view(torch.bfloat16).reshape(cache_blocks, 128, 1, 512)
@@ -91,7 +93,7 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
     positions = pad(original["positions"][start:start + query_rows])
     query_requests = pad(request_ids[start:start + query_rows], -1)
     if role["mode"] == "reindex":
-        from .cache import physical_index_geometry
+        from .cache import cache_copy_pages, physical_index_geometry
         from .prefill_indexer import run_index_query_selection
 
         if network is not None:
@@ -102,12 +104,14 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
             codes, scales = dense_index["codes"], dense_index["scales"]
         else:
             geometry = physical_index_geometry(live["layout"], source_prefix, cache_blocks)
+            copy_pages, copy_count = cache_copy_pages(cache_blocks, range(cache_blocks))
             dense_index = {}
             for name, descriptor in geometry.items():
                 dtype = torch.int8 if name == "codes" else torch.float16
                 source = raw[descriptor["storage_key"]].view(dtype).reshape(cache_blocks, descriptor["stride"])
                 payload = torch.empty((cache_blocks, descriptor["payload"]), dtype=dtype)
-                execute("refresh_cache_load_" + name, rank, case, [source, payload], {"payload": payload}, "physical_cache_load")
+                execute("refresh_cache_load_" + name, rank, case, [source, payload, copy_pages, copy_count],
+                        {"payload": payload}, "physical_cache_load")
                 dense_index[name] = payload
             codes = dense_index["codes"].reshape(cache_blocks, 128, 1, 128)
             scales = dense_index["scales"].reshape(cache_blocks, 128, 1, 1)
@@ -142,6 +146,9 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
         execute("compressed_attention", rank, case, [query, indices, operands["sink"], cache, context, query_rows],
                 dict(context=context), ("swa", "compressed_attention"))
     if role["ratio"] == 1 and network is None:
-        execute("consumer_cache_store", rank, case, [dense, raw_cache], {"raw": raw_cache}, "physical_cache_store")
+        own_geometry = physical_consumer_geometry(live["layout"], own_prefix, source_prefix, cache_blocks)
+        own_pages, own_count = cache_copy_pages(cache_blocks, range(own_geometry["first_owned"], cache_blocks))
+        execute("consumer_cache_store", rank, case, [dense, raw_cache, own_pages, own_count],
+                {"raw": raw_cache}, "physical_cache_store")
     state.update(raw_cache_after=raw, shared_state_after=shared)
     return context, views[own_name] if network is not None else cache

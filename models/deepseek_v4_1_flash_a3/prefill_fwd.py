@@ -58,7 +58,8 @@ def compile_prefill(inputs, *, cache, config, output, weights=None):
     directory = Path(output).resolve()
     provider = prepare_network_provider(operands, config, directory.name, geometry_only=True)
     return PrefillProgram(directory).compile(
-        provider, config["model_config"], config["topology"], operands["engram_contracts"]
+        provider, config["model_config"], config["topology"], operands["engram_contracts"],
+        logits_mode=config.get("logits_mode", "all"), prefill_moe_slab_rows=config.get("prefill_moe_slab_rows"),
     )
 
 

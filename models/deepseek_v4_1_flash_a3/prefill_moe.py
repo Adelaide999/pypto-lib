@@ -370,6 +370,15 @@ def make_ep_dispatch_pack(capacity, hidden, experts, topk, world):
     return ep_dispatch_pack
 
 
+def _ep_payload_tile(packet_rows, hidden):
+    """Fit the complete packet copy within A3's signed 16-bit SPMD block count."""
+    if packet_rows > 32767:
+        raise ValueError("EP packet has too many rows for a single A3 copy launch")
+    if packet_rows * (hidden // DISPATCH_D_TILE) > 32767:
+        return hidden
+    return DISPATCH_D_TILE
+
+
 def make_ep_dispatch_unpack(capacity, hidden, experts, topk, world, expert_capacity=None):
     """Unpack received buckets into owned expert slabs and compact audit payloads."""
     routes = capacity * topk
@@ -378,6 +387,7 @@ def make_ep_dispatch_unpack(capacity, hidden, experts, topk, world, expert_capac
     if expert_capacity is None:
         expert_capacity = ((capacity * world + 15) // 16) * 16
     slab_rows = local_experts * expert_capacity
+    copy_tile = _ep_payload_tile(packet_rows, hidden)
 
     @pl.jit
     def ep_dispatch_unpack(
@@ -415,17 +425,17 @@ def make_ep_dispatch_unpack(capacity, hidden, experts, topk, world, expert_capac
                 compact_begin = compact_begin + owned_count
             pl.write(received_total, [0], pl.cast(compact_begin, pl.INT32))
 
-        for block in pl.spmd(packet_rows * (hidden // DISPATCH_D_TILE), name_hint="moe_ep_unpack_hidden"):
-            packet = block // (hidden // DISPATCH_D_TILE)
-            column = block % (hidden // DISPATCH_D_TILE) * DISPATCH_D_TILE
+        for block in pl.spmd(packet_rows * (hidden // copy_tile), name_hint="moe_ep_unpack_hidden"):
+            packet = block // (hidden // copy_tile)
+            column = block % (hidden // copy_tile) * copy_tile
             source_peer = packet // routes
             bucket_rows = pl.read(packet_counts, [source_peer, 0])
             if packet % routes < bucket_rows:
                 target = pl.cast(pl.read(packet_map, [packet, 0]), pl.INDEX)
                 compact = pl.cast(pl.read(packet_map, [packet, 1]), pl.INDEX)
-                value = packet_hidden[packet : packet + 1, column : column + DISPATCH_D_TILE]
-                expert_x[target : target + 1, column : column + DISPATCH_D_TILE] = value
-                recv_hidden[compact : compact + 1, column : column + DISPATCH_D_TILE] = value
+                value = packet_hidden[packet:packet + 1, column:column + copy_tile]
+                expert_x[target:target + 1, column:column + copy_tile] = value
+                recv_hidden[compact:compact + 1, column:column + copy_tile] = value
         return packet_hidden, recv_routes, recv_hidden, expert_x, expert_counts, packet_map, received_total
 
     return ep_dispatch_unpack
@@ -438,6 +448,7 @@ def make_ep_return_pack(capacity, hidden, experts, topk, world, expert_capacity=
     if expert_capacity is None:
         expert_capacity = ((capacity * world + 15) // 16) * 16
     slab_rows = (experts // world) * expert_capacity
+    copy_tile = _ep_payload_tile(packet_rows, hidden)
 
     @pl.jit
     def ep_return_pack(
@@ -446,14 +457,14 @@ def make_ep_return_pack(capacity, hidden, experts, topk, world, expert_capacity=
         packet_map: pl.Tensor[[packet_rows, DISPATCH_MAP_PAD], pl.INT32],
         sent_hidden: pl.InOut[pl.Tensor[[packet_rows, hidden], pl.BF16]],
     ):
-        for block in pl.spmd(packet_rows * (hidden // DISPATCH_D_TILE), name_hint="moe_ep_return_pack"):
-            packet = block // (hidden // DISPATCH_D_TILE)
-            column = block % (hidden // DISPATCH_D_TILE) * DISPATCH_D_TILE
+        for block in pl.spmd(packet_rows * (hidden // copy_tile), name_hint="moe_ep_return_pack"):
+            packet = block // (hidden // copy_tile)
+            column = block % (hidden // copy_tile) * copy_tile
             count = pl.read(packet_counts, [packet // routes, 0])
             if packet % routes < count:
                 source = pl.cast(pl.read(packet_map, [packet, 0]), pl.INDEX)
-                expert_row = expert_y[source : source + 1, column : column + DISPATCH_D_TILE]
-                sent_hidden[packet : packet + 1, column : column + DISPATCH_D_TILE] = expert_row
+                expert_row = expert_y[source:source + 1, column:column + copy_tile]
+                sent_hidden[packet:packet + 1, column:column + copy_tile] = expert_row
         return sent_hidden
 
     return ep_return_pack
@@ -1321,13 +1332,16 @@ def validate_ep_dispatch(*, device=0, compile_only=False, platform="a2a3", sim=F
     import torch
     from golden import ScalarSpec, TensorSpec, run
 
-    capacity, hidden, experts, topk = 16, 512, 384, 6
-    for world in (2, 16):
+    experts, topk = 384, 6
+    cases = [(world, 16, 512, (0, 1, 7, 16)) for world in (2, 16)]
+    # A wide EP packet exercises full-row copies with nonempty buckets and untouched padding.
+    cases.append((16, 64, 3072, (5,)))
+    for world, capacity, hidden, active_rows in cases:
         routes, local_experts = capacity * topk, experts // world
         packet_rows = world * routes
         expert_capacity = ((capacity * world + 15) // 16) * 16
         slab_rows = local_experts * expert_capacity
-        for active in (0, 1, 7, 16):
+        for active in active_rows:
             ids = torch.tensor([0, 1, 2, experts - 3, experts - 2, experts - 1], dtype=torch.int32)
             ids = ids.expand(capacity, -1).clone()
             pack_specs = [

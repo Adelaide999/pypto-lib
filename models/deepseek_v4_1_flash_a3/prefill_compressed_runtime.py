@@ -134,16 +134,18 @@ def run_compressed_attention(
         if ratio == 2:
             ring = raw_cache_matrix(raw, network["ring"]).reshape(cache_blocks, 32, 1024)
     elif ratio == 1:
-        from .cache import physical_page_geometry
+        from .cache import cache_copy_pages, physical_page_geometry
 
         geometry = physical_page_geometry(live["layout"], prefix, cache_blocks)
+        copy_pages, copy_count = cache_copy_pages(cache_blocks, range(cache_blocks))
         dense = {}
         for name, descriptor in geometry.items():
             dtype = DTYPES[descriptor["dtype"]]
             source = raw[descriptor["storage_key"]].view(dtype).reshape(cache_blocks, descriptor["stride"])
             value = torch.empty((cache_blocks, descriptor["payload"]), dtype=dtype)
             execute(
-                "cache_load_" + name, rank, case, [source, value], {"payload": value}, "physical_cache_load"
+                "cache_load_" + name, rank, case, [source, value, copy_pages, copy_count],
+                {"payload": value}, "physical_cache_load"
             )
             dense[name] = value
         cache = dense["long"].reshape(cache_blocks, 128, 1, 512)
@@ -297,7 +299,7 @@ def run_compressed_attention(
                 "cache_store_" + name,
                 rank,
                 case,
-                [dense[name], target],
+                [dense[name], target, copy_pages, copy_count],
                 {"raw": target},
                 "physical_cache_store",
             )

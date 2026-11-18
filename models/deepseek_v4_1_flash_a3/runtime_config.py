@@ -14,6 +14,7 @@ from dataclasses import dataclass
 MAX_CONTEXT_TOKENS = 16384
 PREFILL_CAPACITIES = (16, 128, 256, 512, 1024, 2048, 4096, 8192)
 MAX_PREFILL_CHUNK_SIZE = PREFILL_CAPACITIES[-1]
+PREFILL_MOE_SLAB_ROWS = (16, 64, 128)
 SPMD_WORKER_LIMIT = 256
 
 
@@ -24,8 +25,17 @@ def prefill_execution_capacity(chunk_size):
     return next(capacity for capacity in PREFILL_CAPACITIES if chunk_size <= capacity)
 
 
-def network_ring_heap(capacity, config, tp):
-    """Size sparse-gather and mixed-kernel pipeline heaps for a network admission."""
+def prefill_moe_slab_limit(capacity, requested=None):
+    """Select the source rows per rank allowed in one expert exchange."""
+    if requested is None:
+        requested = 64 if capacity == MAX_PREFILL_CHUNK_SIZE else 16
+    if type(requested) is not int or requested not in PREFILL_MOE_SLAB_ROWS:
+        raise ValueError(f"Prefill MoE slab rows must be one of {PREFILL_MOE_SLAB_ROWS}")
+    return min(requested, capacity)
+
+
+def network_ring_heap(capacity, config, tp, *, routed_rows=0):
+    """Size attention, shared and grouped expert workspaces for a network admission."""
     if capacity not in PREFILL_CAPACITIES:
         raise ValueError("Unsupported network execution capacity")
     validate_tp(tp)
@@ -39,9 +49,13 @@ def network_ring_heap(capacity, config, tp):
     # HC preparation, inverse scale, rounded function and function accumulation.
     hc_width = hc * (hc + 2)
     hc_bytes = capacity * (hidden * hc * 4 + 32 + hc_width * 4) + hc_width * hidden * hc * 4
-    outer_bytes = max(selected_bytes, shared_bytes, hc_bytes)
+    # Grouped expert input codes, gate/up INT32, activated codes, scales and scheduling maps.
+    routed_bytes = routed_rows * (hidden + 9 * config["moe_intermediate_size"] + 32 + 8 + 4) + 64
+    outer_bytes = max(selected_bytes, shared_bytes, hc_bytes, routed_bytes)
     # Index selection keeps one 16384-element FP32 pipeline per query row.
-    pipe_bytes = capacity * 16384 * 4
+    # Grouped down uses two 16-by-64 FP32 pipeline tiles per active row tile and 256 output columns.
+    routed_pipe_bytes = (routed_rows // 16) * (hidden // 256) * 2 * 16 * 64 * 4
+    pipe_bytes = max(capacity * 16384 * 4, routed_pipe_bytes)
     if max(outer_bytes, pipe_bytes) <= default:
         return None
     outer_heap = 1 << (outer_bytes + 1024 * 1024 - 1).bit_length() if outer_bytes > default else 0

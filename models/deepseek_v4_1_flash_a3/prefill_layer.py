@@ -693,7 +693,7 @@ REGIONS = {
         ("initial_hc", ("embedding", "streams", "premix", "tp_rank", "physical", "active")),
     ),
     "head_l2": (
-        ("sp_unpack", ("gathered", "collapsed", "physical", "active")),
+        ("sp_unpack", ("gathered", "collapsed", "physical", "input_active")),
         ("norm", ("collapsed", "norm_weight", "normalized", "active")),
         ("projection", ("normalized", "weight", "local_logits", "active")),
     ),
