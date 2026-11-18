@@ -14,10 +14,10 @@ from copy import deepcopy
 from functools import lru_cache
 from pathlib import Path
 import pypto.language as pl
-from .runtime_config import SPMD_WORKER_LIMIT
 import torch
+from .indexer import INDEXER_SELECT_KEY_CAPACITY
+from .runtime_config import MAX_MODEL_CONTEXT_TOKENS, SPMD_WORKER_LIMIT
 from .swa import GATHER_TILE, make_swa_leaves
-from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY
 
 
 # tiling
@@ -285,7 +285,9 @@ def validate_live_state(role, original, live, epoch, token_map_id):
             if tuple(live["versions"].get(name, ())) != (owner, epoch, token_map_id):
                 raise ValueError("Missing or stale live " + name + " ownership for this token map")
     if role["candidate_filter"]:
-        validate_live_refresh_candidates(original, live["shared"], role["kv_source"])
+        validate_live_refresh_candidates(
+            original, live["shared"], role["kv_source"], packed_requests=live.get("packed_requests", False)
+        )
 
 
 def publish_live_versions(role, live, epoch, token_map_id):
@@ -509,7 +511,7 @@ def make_network_sparse_read(capacity, config, geometry):
     return sparse_read
 
 
-def make_network_cache_entries(capacity, config, geometry, role):
+def make_network_cache_entries(capacity, config, geometry, role, requests=1, table_pages=1):
     """Build only actual cache-addressing and owner-page transfer entries."""
     role = resolve_layer_role(role["physical_layer"], role)
     entries = dict(
@@ -519,6 +521,11 @@ def make_network_cache_entries(capacity, config, geometry, role):
     if role["mode"] == "full":
         entries["network_compressed_publish"] = make_network_cache_publish(capacity, geometry["long"])
     if role["mode"] == "reuse":
+        return entries
+    if config.get("packed_requests", False):
+        from .paged_indexer import make_paged_index_entries
+
+        entries.update(make_paged_index_entries(capacity, geometry, role, requests, table_pages))
         return entries
     for name in ("codes", "scales"):
         plane = geometry[name]
@@ -597,7 +604,9 @@ def attach_network_cache_geometry(provider):
     for rank in range(provider.topology["ep"]):
         for case, layout in provider.layouts[rank].items():
             for layer in range(40):
-                provider.state_handles_for_layer(layer)[rank][case]["shared"] = provider.shared[rank][case]
+                live = provider.state_handles_for_layer(layer)[rank][case]
+                live["shared"] = provider.shared[rank][case]
+                live["packed_requests"] = provider.packed_requests
             for layer in range(2, 40):
                 role = resolve_layer_role(layer)
                 blocks = layout["views"][f"model.layers.{layer}.self_attn.swa_cache"]["shape"][0]
@@ -614,13 +623,14 @@ def attach_network_cache_geometry(provider):
     )
 
 
-def validate_live_refresh_candidates(original, shared, source_id):
-    """Preserve the short full-coverage guard against the actual live candidate buffer."""
+def validate_live_refresh_candidates(original, shared, source_id, *, packed_requests=False):
+    """Validate full short-history coverage or an actual bounded, pinned global source pool."""
     starts = original["metadata"]["query_start_loc"].tolist()
     metadata = original["cache_metadata"]["actual_metadata"]
     prefix = f"model.layers.{source_id}.self_attn."
     lengths = metadata[prefix + "indexer.k_cache"]["global_metadata"]["cache_seq_lens"].tolist()
-    if any(length < 0 or length > KEY_CAPACITY for length in lengths):
+    limit = MAX_MODEL_CONTEXT_TOKENS if packed_requests else INDEXER_SELECT_KEY_CAPACITY
+    if any(length < 0 or length > limit for length in lengths):
         raise ValueError("Refresh history exceeds the supported index-key capacity")
     start = original["cp_token_range"][0]
     candidates = shared["candidates"]
@@ -628,9 +638,21 @@ def validate_live_refresh_candidates(original, shared, source_id):
         token = start + local
         request = next(i for i in range(len(starts) - 1) if starts[i] <= token < starts[i + 1])
         visible = min(lengths[request], int(original["positions"][token]) + 1)
-        available = set(candidates[local].reshape(-1).tolist())
-        if not set(range((visible + 7) // 8)).issubset(available):
-            raise ValueError("This input requires candidate pruning; no dense substitute is supported")
+        values = candidates[local].reshape(-1).tolist()
+        blocks = (visible + 7) // 8
+        if not packed_requests:
+            if not set(range(blocks)).issubset(values):
+                raise ValueError("This input requires candidate pruning; no dense substitute is supported")
+            continue
+        available = [value for value in values if value >= 0]
+        if (len(available) != min(blocks, 2048) or len(available) != len(set(available))
+                or values != available + [-1] * (len(values) - len(available))
+                or any(value >= blocks for value in available)
+                or (blocks and available[0] != blocks - 1)):
+            raise ValueError("Candidate pool is stale, unpinned, duplicated or outside its request history")
+        if blocks <= 2048 and set(available) != set(range(blocks)):
+            raise ValueError("Short-history candidate publication lost full block coverage")
+
 
 def golden_paged_cache_copy(tensors, *, payload, source_offset=0, destination_offset=0):
     """Copy selected payloads and retain all unselected pages and padding."""

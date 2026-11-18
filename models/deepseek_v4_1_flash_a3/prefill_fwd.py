@@ -18,7 +18,20 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
 from .network import NetworkProgram as PrefillProgram, _merge_inputs, prepare_network_provider, run_network_runtime
-from .runtime_config import MAX_CONTEXT_TOKENS, MAX_PREFILL_CHUNK_SIZE
+from .runtime_config import MAX_CONTEXT_TOKENS, MAX_PREFILL_CHUNK_SIZE, RuntimeLimits, prefill_execution_capacity
+
+
+def _prefill_chunk_size(config):
+    limits = config.get("runtime_limits")
+    if limits is None:
+        chunk_size = config.get("chunk_size", 16)
+        prefill_execution_capacity(chunk_size)
+    else:
+        budget = min(RuntimeLimits(**limits).max_num_batched_tokens, 512)
+        chunk_size = config.get("chunk_size", min(16, budget))
+        if type(chunk_size) is not int or not 1 <= chunk_size <= budget:
+            raise ValueError(f"Chunk size must fit the experimental new-token budget ({budget})")
+    return chunk_size
 
 
 def compile_prefill(inputs, *, cache, config, output, weights=None):
@@ -44,7 +57,7 @@ def compile_prefill(inputs, *, cache, config, output, weights=None):
                 cache=cache,
                 config=config,
                 output=Path(temporary) / "prepared",
-                chunk_size=config.get("chunk_size", 16),
+                chunk_size=_prefill_chunk_size(config),
                 dp_rank=config.get("dp_rank", 0),
             )
             try:
@@ -81,7 +94,9 @@ def prefill_fwd(
 
     ``inputs`` accepts raw completion text, 1..16384 token IDs, or prepared
     backbone tensors and their input contract. Automatic inputs use one DP
-    engine and chunks of up to 8192 tokens; config may set chunk_size/dp_rank.
+    engine and chunks of up to 8192 tokens by default; config may set
+    chunk_size/dp_rank. Explicit experimental runtime_limits raise the model
+    context ceiling to 1048576 positions and bound chunks by the new-token budget.
     Embedding and initial HC execute inside this forward unless explicit
     prepared backbone tensors are supplied.
     ``cache`` supplies the canonical all-rank cache ABI, source descriptors and
@@ -102,21 +117,23 @@ def prefill_fwd(
     try:
         configure_devices(devices, world=config["topology"]["ep"])
         if isinstance(inputs, (str, list, tuple)):
-            from .prefill_prepare import TokenChunkInputs, tokenize_prompt
+            from .prefill_prepare import PackedTokenChunkInputs, TokenChunkInputs, tokenize_prompt
 
             if continuation is not None or Path(output).exists():
                 raise ValueError(
                     "Automatic Prefill needs a new output directory and owns its continuation stream"
                 )
-            tokens = tokenize_prompt(inputs, weights, config["model_config"]["text_config"]["vocab_size"])
-            chunk_size = config.get("chunk_size", 16)
-            from .runtime_config import prefill_execution_capacity
-
-            prefill_execution_capacity(chunk_size)
-            request_inputs = TokenChunkInputs(
+            limits = config.get("runtime_limits")
+            request_type = TokenChunkInputs if limits is None else PackedTokenChunkInputs
+            max_tokens = MAX_CONTEXT_TOKENS if limits is None else RuntimeLimits(**limits).max_model_len
+            tokens = tokenize_prompt(inputs, weights, config["model_config"]["text_config"]["vocab_size"],
+                                     max_tokens=max_tokens)
+            chunk_size = _prefill_chunk_size(config)
+            request_inputs = request_type(
                 checkpoint=weights,
                 cache=cache,
-                config=config,
+                config=dict(config, prompt_length=len(tokens),
+                            metadata_transport=config.get("metadata_transport", "memory")),
                 output=Path(output) / "prepared",
                 context_capacity=config.get("context_capacity", len(tokens)),
                 prepare_engram=True,
@@ -152,6 +169,25 @@ def prefill_fwd(
             request_inputs.close()
 
 
+def prefill_batch(queries, *, weights, cache, config, devices, output, progress=None):
+    """Start an experimental packed session; the caller retains its scheduler."""
+    from .prefill_prepare import PackedTokenChunkInputs
+
+    if config.get("runtime_limits") is None:
+        raise ValueError("Packed Prefill requires explicit experimental runtime_limits")
+    request = PackedTokenChunkInputs(checkpoint=weights, cache=cache,
+        config=dict(config, metadata_transport=config.get("metadata_transport", "memory")),
+        output=Path(output) / "prepared", context_capacity=config["context_capacity"], prepare_engram=True)
+    try:
+        first = request.batch(queries, phase="prefill")
+        return run_network_runtime(_merge_inputs(first["inputs"], first["cache"]),
+            contract=first["contract"], checkpoint=weights, devices=devices, output=Path(output) / "network",
+            progress=progress, keep_runtime=True, request_inputs=request)
+    except BaseException:
+        request.close()
+        raise
+
+
 def load_configuration(path):
     """Read paths relative to a JSON configuration without importing the device runtime."""
     path = Path(path).resolve()
@@ -159,24 +195,6 @@ def load_configuration(path):
     automatic = set(settings) & {"prompt", "token_ids"}
     if len(automatic) > 1:
         raise ValueError("Choose either prompt or token_ids for automatic Prefill")
-    if automatic:
-        if "inputs" in settings:
-            raise ValueError("Automatic Prefill cannot also supply prepared inputs")
-        if "prompt" in settings and (not isinstance(settings["prompt"], str) or not settings["prompt"]):
-            raise ValueError("prompt must contain raw completion text")
-        if "token_ids" in settings and (
-            not isinstance(settings["token_ids"], list)
-            or not 1 <= len(settings["token_ids"]) <= MAX_CONTEXT_TOKENS
-            or any(type(token) is not int or token < 0 for token in settings["token_ids"])
-        ):
-            raise ValueError(f"token_ids must contain 1..{MAX_CONTEXT_TOKENS} nonnegative integers")
-        if settings.get("continuations"):
-            raise ValueError("Automatic Prefill owns its continuation descriptors")
-        for name, default, lower, upper in (("chunk_size", 16, 1, MAX_PREFILL_CHUNK_SIZE), ("dp_rank", 0, 0, 3)):
-            value = settings.get(name, default)
-            if type(value) is not int or not lower <= value <= upper:
-                raise ValueError(f"{name} must be an integer in {lower}..{upper}")
-            settings[name] = value
     required = {"checkpoint", "cache_state", "contract", "devices", "output"}
     if not automatic:
         required.add("inputs")
@@ -188,6 +206,34 @@ def load_configuration(path):
             continue
         value = Path(settings[name])
         settings[name] = value if value.is_absolute() else (path.parent / value).resolve()
+    if automatic:
+        contract_path = settings["contract"]
+        contract = json.loads(contract_path.read_text(encoding="utf-8")) if contract_path.is_file() else {}
+        limits = contract.get("runtime_limits")
+        max_context, max_chunk, max_dp_rank = MAX_CONTEXT_TOKENS, MAX_PREFILL_CHUNK_SIZE, 3
+        if limits is not None:
+            limits = RuntimeLimits(**limits)
+            max_context = limits.max_model_len
+            max_chunk = min(limits.max_num_batched_tokens, 512)
+            max_dp_rank = contract.get("topology", {}).get("dp", 4) - 1
+        if "inputs" in settings:
+            raise ValueError("Automatic Prefill cannot also supply prepared inputs")
+        if "prompt" in settings and (not isinstance(settings["prompt"], str) or not settings["prompt"]):
+            raise ValueError("prompt must contain raw completion text")
+        if "token_ids" in settings and (
+            not isinstance(settings["token_ids"], list)
+            or not 1 <= len(settings["token_ids"]) <= max_context
+            or any(type(token) is not int or token < 0 for token in settings["token_ids"])
+        ):
+            raise ValueError(f"token_ids must contain 1..{max_context} nonnegative integers")
+        if settings.get("continuations"):
+            raise ValueError("Automatic Prefill owns its continuation descriptors")
+        for name, default, lower, upper in (("chunk_size", min(16, max_chunk), 1, max_chunk),
+                                            ("dp_rank", 0, 0, max_dp_rank)):
+            value = settings.get(name, default)
+            if type(value) is not int or not lower <= value <= upper:
+                raise ValueError(f"{name} must be an integer in {lower}..{upper}")
+            settings[name] = value
     chunks = settings.get("continuations", [])
     if not isinstance(chunks, list):
         raise ValueError("continuations must be a list of prepared chunk descriptors")

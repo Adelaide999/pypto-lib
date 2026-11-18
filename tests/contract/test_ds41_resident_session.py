@@ -23,7 +23,7 @@ from pypto.runtime import DeviceTensor
 from safetensors.torch import save_file
 
 from models.deepseek_v4_1_flash_a3.cache import decode_cache_views
-from models.deepseek_v4_1_flash_a3.prefill_prepare import TokenChunkInputs, cache_templates
+from models.deepseek_v4_1_flash_a3.prefill_prepare import PackedTokenChunkInputs, TokenChunkInputs, cache_templates
 from models.deepseek_v4_1_flash_a3.prefill_resident import ResidentNetworkRuntime
 from models.deepseek_v4_1_flash_a3.runtime_config import ExpertParallelConfig
 from models.deepseek_v4_1_flash_a3.weights import ResidentCheckpointOperands
@@ -90,16 +90,44 @@ def test_dispatch_reuses_dynamic_buffers_and_never_reuploads_static_or_cache_vie
         program = object()
         static_uploads = runtime.stats["device_weight_upload_calls"]
         cache_uploads = runtime.stats["cache_h2d_bytes"]
-        for _ in range(3):
-            runtime.execute(program, 0, [weight, cache[:8], torch.zeros(8)], abi)
+        first, second = torch.zeros(8), torch.zeros(8)
+        runtime.execute(program, 0, [weight, cache[:8], first], abi)
+        first_allocations = set(worker.live)
+        runtime.execute(program, 0, [weight, cache[:8], second], abi)
+        overlapping_allocations = set(worker.live)
+        assert len(overlapping_allocations - first_allocations) == 1
+        runtime.release_values()
+        runtime.execute(program, 0, [weight, cache[:8], torch.zeros(8)], abi)
+        assert set(worker.live) == overlapping_allocations
         assert runtime.stats["device_weight_upload_calls"] == static_uploads
         assert runtime.stats["cache_h2d_bytes"] == cache_uploads
-        assert runtime.stats["dynamic_allocations"] == 1
+        assert runtime.stats["dynamic_allocations"] == 2
         assert worker.runs == 3
         weight.add_(1)
-        with pytest.raises(ValueError, match="Immutable"):
+        with pytest.raises(ValueError, match="changed on the host: weight"):
             runtime.execute(program, 0, [weight, cache[:8], torch.zeros(8)], abi)
+        assert worker.runs == 3
     assert worker.closed
+
+
+def test_retired_page_reset_preserves_other_pages_and_resident_weight_identity():
+    worker = HostWorker()
+    with ResidentNetworkRuntime([0], dict(dp=1, tp=1, ep=1), worker_factory=lambda rank: worker) as runtime:
+        raw, weight = torch.arange(64, dtype=torch.int8), torch.ones(4)
+        runtime.pin(raw, [0], readonly=False, name="raw/0/fresh/shared")
+        runtime.pin(weight, [0], readonly=True, name="weight")
+        before = runtime.handle(raw, 0)
+        runtime.reset_ranges(raw, 0, [(16, 16), (48, 16)])
+        assert runtime.handle(raw, 0).data_ptr == before.data_ptr
+        expected = torch.arange(64, dtype=torch.int8)
+        expected[16:32] = expected[48:64] = 0
+        assert torch.equal(raw, expected)
+        assert torch.equal(worker.live[before.data_ptr], expected)
+        with pytest.raises(ValueError, match="weights"):
+            runtime.reset_ranges(weight, 0, [(0, 4)])
+        with pytest.raises(ValueError, match="escapes"):
+            runtime.reset_ranges(raw, 0, [(0, 16), (60, 16)])
+        assert torch.equal(raw, expected)
 
 
 def test_resident_checkpoint_reads_are_once_per_name_and_sealed_after_preload(tmp_path):
@@ -127,7 +155,8 @@ def test_dp4_tp4_ep16_expert_ownership_is_complete_and_disjoint():
     assert all(topology.owner(expert) == rank for rank, row in enumerate(owners) for expert, _ in row)
 
 
-def test_token_feedback_preserves_reserved_pages_and_original_positions(tmp_path):
+@pytest.mark.parametrize("packed", [False, True], ids=["legacy", "packed"])
+def test_token_feedback_preserves_reserved_pages_and_original_positions(tmp_path, packed):
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     model = dict(text_config=dict(vocab_size=128))
@@ -135,12 +164,24 @@ def test_token_feedback_preserves_reserved_pages_and_original_positions(tmp_path
     constants = {"token_map": torch.arange(128)}
     cache = dict(cache_ABI=cache_templates(constants), engram_contracts={})
     config = dict(model_config=model, topology=dict(dp=4, tp=4, ep=16, pp=1, pcp=1, dcp=1))
-    request = TokenChunkInputs(checkpoint=checkpoint, cache=cache, config=config,
-                               output=tmp_path / "prepared", context_capacity=130)
+    request_type = TokenChunkInputs
+    if packed:
+        config["runtime_limits"] = dict(max_model_len=130, max_num_seqs=1, max_seqs_per_dp=1)
+        request_type = PackedTokenChunkInputs
+    request = request_type(checkpoint=checkpoint, cache=cache, config=config,
+                           output=tmp_path / "prepared", context_capacity=130)
     first = request.chunk([1, 2])
+    assert first["contract"].get("packed_requests", False) is packed
+    first_case = first["inputs"]["input_contract"]
+    assert first_case.get("packed_requests") is (True if packed else None)
+    if packed:
+        with pytest.raises(RuntimeError, match="in flight"):
+            request.chunk([3])
+        request.commit()
     second = request.chunk([3])
     assert first["inputs"]["input_contract"]["epoch"] == 0
     actual = second["inputs"]["input_contract"]
+    assert actual.get("packed_requests") is (True if packed else None)
     assert actual["epoch"] == 1
     assert actual["predecessor_input_sha256"] == first["contract"]["input_contract_sha256"]
     assert actual["DP_engines"][0]["requests"][0]["position_ids"] == [2]
