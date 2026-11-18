@@ -340,9 +340,11 @@ def make_ep_dispatch_pack(capacity, hidden, experts, topk, world):
         active: pl.Scalar[pl.INT32],
         source_rank: pl.Scalar[pl.INT32],
     ):
-        route_map = pl.create_tensor([routes, DISPATCH_MAP_PAD], dtype=pl.INT32)
-        for _block in pl.spmd(1, name_hint="moe_ep_pack_metadata"):
-            for peer in pl.range(world):
+        # Each route map row and each pair of count rows occupy whole scalar-store cache lines.
+        route_map = pl.create_tensor([routes, 16], dtype=pl.INT32)
+        for peer_pair in pl.spmd((world + 1) // 2, name_hint="moe_ep_pack_metadata"):
+            first_peer = peer_pair * 2
+            for peer in pl.range(first_peer, pl.min(world, first_peer + 2)):
                 bucket_count = pl.cast(0, pl.INDEX)
                 for token in pl.range(active):
                     for slot in pl.range(topk):
@@ -358,25 +360,15 @@ def make_ep_dispatch_pack(capacity, hidden, experts, topk, world):
                             bucket_count = bucket_count + 1
                 pl.write(sent_counts, [peer, 0], pl.cast(bucket_count, pl.INT32))
 
-        for block in pl.spmd(active * topk * (hidden // DISPATCH_D_TILE), name_hint="moe_ep_pack_hidden"):
-            route_index = block // (hidden // DISPATCH_D_TILE)
-            column = block % (hidden // DISPATCH_D_TILE) * DISPATCH_D_TILE
-            source_token = route_index // topk
-            target_index = pl.cast(pl.read(route_map, [route_index, 0]), pl.INDEX)
-            source_row = x[source_token : source_token + 1, column : column + DISPATCH_D_TILE]
-            sent_hidden[target_index : target_index + 1, column : column + DISPATCH_D_TILE] = source_row
+        for token in pl.spmd(active, name_hint="moe_ep_pack_hidden"):
+            source_row = x[token : token + 1, :]
+            first_route = token * topk
+            for route in pl.range(first_route, first_route + topk):
+                target = pl.cast(pl.read(route_map, [route, 0]), pl.INDEX)
+                sent_hidden[target : target + 1, :] = source_row
         return x, sent_routes, sent_hidden, sent_counts
 
     return ep_dispatch_pack
-
-
-def _ep_payload_tile(packet_rows, hidden):
-    """Fit the complete packet copy within A3's signed 16-bit SPMD block count."""
-    if packet_rows > 32767:
-        raise ValueError("EP packet has too many rows for a single A3 copy launch")
-    if packet_rows * (hidden // DISPATCH_D_TILE) > 32767:
-        return hidden
-    return DISPATCH_D_TILE
 
 
 def make_ep_dispatch_unpack(capacity, hidden, experts, topk, world, expert_capacity=None):
@@ -387,7 +379,7 @@ def make_ep_dispatch_unpack(capacity, hidden, experts, topk, world, expert_capac
     if expert_capacity is None:
         expert_capacity = ((capacity * world + 15) // 16) * 16
     slab_rows = local_experts * expert_capacity
-    copy_tile = _ep_payload_tile(packet_rows, hidden)
+    copy_workers = min(routes, 8)
 
     @pl.jit
     def ep_dispatch_unpack(
@@ -403,39 +395,56 @@ def make_ep_dispatch_unpack(capacity, hidden, experts, topk, world, expert_capac
         owner_rank: pl.Scalar[pl.INT32],
     ):
         for _block in pl.spmd(1, name_hint="moe_ep_unpack_metadata"):
+            expert_begin = owner_rank * local_experts
+            counts = pl.array.create(local_experts, pl.INT32)
+            starts = pl.array.create(local_experts, pl.INT32)
+            for local in pl.range(local_experts):
+                counts[local] = pl.cast(0, pl.INT32)
+            for peer in pl.range(world):
+                peer_count = pl.cast(pl.read(packet_counts, [peer, 0]), pl.INDEX)
+                for row in pl.range(peer_count):
+                    packet = peer * routes + row
+                    expert = pl.read(packet_routes, [packet, 3])
+                    if expert >= expert_begin and expert < expert_begin + local_experts:
+                        local = pl.cast(expert - expert_begin, pl.INDEX)
+                        counts[local] = counts[local] + 1
+
             compact_begin = pl.cast(0, pl.INDEX)
             for local in pl.range(local_experts):
-                expert = owner_rank * local_experts + local
-                owned_count = pl.cast(0, pl.INDEX)
-                for peer in pl.range(world):
-                    peer_count = pl.cast(pl.read(packet_counts, [peer, 0]), pl.INDEX)
-                    for row in pl.range(peer_count):
-                        received_packet = peer * routes + row
-                        global_expert = pl.read(packet_routes, [received_packet, 3])
-                        if global_expert == expert:
-                            compact_row = compact_begin + owned_count
-                            slab_row = local * expert_capacity + owned_count
-                            pl.write(packet_map, [received_packet, 0], pl.cast(slab_row, pl.INT32))
-                            pl.write(packet_map, [received_packet, 1], pl.cast(compact_row, pl.INT32))
-                            for field in pl.range(4):
-                                field_value = pl.read(packet_routes, [received_packet, field])
-                                pl.write(recv_routes, [compact_row, field], field_value)
-                            owned_count = owned_count + 1
-                pl.write(expert_counts, [local], pl.cast(owned_count, pl.INT64))
-                compact_begin = compact_begin + owned_count
+                starts[local] = pl.cast(compact_begin, pl.INT32)
+                count = counts[local]
+                pl.write(expert_counts, [local], pl.cast(count, pl.INT64))
+                compact_begin = compact_begin + pl.cast(count, pl.INDEX)
+                counts[local] = pl.cast(0, pl.INT32)
             pl.write(received_total, [0], pl.cast(compact_begin, pl.INT32))
 
-        for block in pl.spmd(packet_rows * (hidden // copy_tile), name_hint="moe_ep_unpack_hidden"):
-            packet = block // (hidden // copy_tile)
-            column = block % (hidden // copy_tile) * copy_tile
-            source_peer = packet // routes
-            bucket_rows = pl.read(packet_counts, [source_peer, 0])
-            if packet % routes < bucket_rows:
+            for peer in pl.range(world):
+                peer_count = pl.cast(pl.read(packet_counts, [peer, 0]), pl.INDEX)
+                for row in pl.range(peer_count):
+                    packet = peer * routes + row
+                    expert = pl.read(packet_routes, [packet, 3])
+                    if expert >= expert_begin and expert < expert_begin + local_experts:
+                        local = pl.cast(expert - expert_begin, pl.INDEX)
+                        index = pl.cast(counts[local], pl.INDEX)
+                        compact = pl.cast(starts[local], pl.INDEX) + index
+                        target = local * expert_capacity + index
+                        pl.write(packet_map, [packet, 0], pl.cast(target, pl.INT32))
+                        pl.write(packet_map, [packet, 1], pl.cast(compact, pl.INT32))
+                        for field in pl.range(4):
+                            pl.write(recv_routes, [compact, field], pl.read(packet_routes, [packet, field]))
+                        counts[local] = counts[local] + 1
+
+        for block in pl.spmd(world * copy_workers, name_hint="moe_ep_unpack_hidden"):
+            peer = block // copy_workers
+            lane = block % copy_workers
+            bucket_rows = pl.cast(pl.read(packet_counts, [peer, 0]), pl.INDEX)
+            for row in pl.range(lane, bucket_rows, copy_workers):
+                packet = peer * routes + row
                 target = pl.cast(pl.read(packet_map, [packet, 0]), pl.INDEX)
                 compact = pl.cast(pl.read(packet_map, [packet, 1]), pl.INDEX)
-                value = packet_hidden[packet:packet + 1, column:column + copy_tile]
-                expert_x[target:target + 1, column:column + copy_tile] = value
-                recv_hidden[compact:compact + 1, column:column + copy_tile] = value
+                value = packet_hidden[packet : packet + 1, :]
+                expert_x[target : target + 1, :] = value
+                recv_hidden[compact : compact + 1, :] = value
         return packet_hidden, recv_routes, recv_hidden, expert_x, expert_counts, packet_map, received_total
 
     return ep_dispatch_unpack
@@ -448,7 +457,7 @@ def make_ep_return_pack(capacity, hidden, experts, topk, world, expert_capacity=
     if expert_capacity is None:
         expert_capacity = ((capacity * world + 15) // 16) * 16
     slab_rows = (experts // world) * expert_capacity
-    copy_tile = _ep_payload_tile(packet_rows, hidden)
+    copy_workers = min(routes, 8)
 
     @pl.jit
     def ep_return_pack(
@@ -457,14 +466,14 @@ def make_ep_return_pack(capacity, hidden, experts, topk, world, expert_capacity=
         packet_map: pl.Tensor[[packet_rows, DISPATCH_MAP_PAD], pl.INT32],
         sent_hidden: pl.InOut[pl.Tensor[[packet_rows, hidden], pl.BF16]],
     ):
-        for block in pl.spmd(packet_rows * (hidden // copy_tile), name_hint="moe_ep_return_pack"):
-            packet = block // (hidden // copy_tile)
-            column = block % (hidden // copy_tile) * copy_tile
-            count = pl.read(packet_counts, [packet // routes, 0])
-            if packet % routes < count:
+        for block in pl.spmd(world * copy_workers, name_hint="moe_ep_return_pack"):
+            peer = block // copy_workers
+            lane = block % copy_workers
+            bucket_rows = pl.cast(pl.read(packet_counts, [peer, 0]), pl.INDEX)
+            for row in pl.range(lane, bucket_rows, copy_workers):
+                packet = peer * routes + row
                 source = pl.cast(pl.read(packet_map, [packet, 0]), pl.INDEX)
-                expert_row = expert_y[source:source + 1, column:column + copy_tile]
-                sent_hidden[packet:packet + 1, column:column + copy_tile] = expert_row
+                sent_hidden[packet : packet + 1, :] = expert_y[source : source + 1, :]
         return sent_hidden
 
     return ep_return_pack
@@ -544,6 +553,8 @@ def make_moe_combine(capacity, hidden=COMBINE_D, topk=COMBINE_TOPK, world=2, *, 
     """Restore returned token/top-k rows, weight experts, and add the shared result."""
     routes = capacity * topk
     packet_rows = world * routes
+    restore_token_tile = min(8, capacity)
+    restore_route_tile = restore_token_tile * topk
     if weight_dtype not in (pl.FP32, pl.BF16):
         raise ValueError("Route weights require FP32 or BF16 multiplication boundaries")
 
@@ -569,20 +580,30 @@ def make_moe_combine(capacity, hidden=COMBINE_D, topk=COMBINE_TOPK, world=2, *, 
             widened = pl.cast(rounded, pl.FP32)
             rounded_weights[token_begin : token_begin + 8, :] = pl.set_validshape(widened, rows, 16)
         route_map = pl.create_tensor([routes, 8], dtype=pl.INT32)
-        for _block in pl.spmd(1, name_hint="moe_ep_restore_metadata"):
-            for original in pl.range(routes):
-                pl.write(route_map, [original, 0], pl.cast(-1, pl.INT32))
+        for block in pl.spmd((capacity + restore_token_tile - 1) // restore_token_tile, name_hint="moe_ep_restore_metadata"):
+            route_begin = block * restore_route_tile
+            route_count = pl.min(restore_route_tile, routes - route_begin)
+            mapping = pl.tile.full([restore_route_tile, 8], dtype=pl.INT32, value=-1)
+            restored = pl.tile.load(returned_routes, [route_begin, 0], [restore_route_tile, 4],
+                                    valid_shape=[route_count, 4])
             for peer in pl.range(world):
                 count = pl.cast(pl.read(packet_counts, [peer, 0]), pl.INDEX)
-                for row in pl.range(count):
-                    metadata_packet = peer * routes + row
-                    source_token = pl.cast(pl.read(packet_routes, [metadata_packet, 1]), pl.INDEX)
-                    source_slot = pl.cast(pl.read(packet_routes, [metadata_packet, 2]), pl.INDEX)
-                    original = source_token * topk + source_slot
-                    pl.write(route_map, [original, 0], pl.cast(metadata_packet, pl.INT32))
-                    for field in pl.range(4):
-                        field_value = pl.read(packet_routes, [metadata_packet, field])
-                        pl.write(returned_routes, [original, field], field_value)
+                if count > 0:
+                    peer_begin = peer * routes
+                    metadata = pl.tile.load(packet_routes, [peer_begin, 0], [routes, 4], valid_shape=[count, 4])
+                    for row in pl.range(count):
+                        source_token = pl.cast(pl.tile.read(metadata, [row, 1]), pl.INDEX)
+                        token_route = source_token * topk - route_begin
+                        if token_route >= 0 and token_route < route_count:
+                            source_slot = pl.cast(pl.tile.read(metadata, [row, 2]), pl.INDEX)
+                            original = token_route + source_slot
+                            pl.tile.write(mapping, [original, 0], pl.cast(peer_begin + row, pl.INT32))
+                            for field in pl.range(4):
+                                field_value = pl.tile.read(metadata, [row, field])
+                                pl.tile.write(restored, [original, field], field_value)
+            valid_mapping = pl.set_validshape(mapping, route_count, 8)
+            pl.tile.store(valid_mapping, [route_begin, 0], route_map)
+            pl.tile.store(restored, [route_begin, 0], returned_routes)
 
         for token in pl.spmd(active, name_hint="moe_ep_source_combine"):
             acc = pl.full([1, hidden], dtype=pl.FP32, value=0.0)
