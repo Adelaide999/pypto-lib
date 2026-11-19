@@ -58,6 +58,7 @@ ROUTER_D_TILE = 256
 ROUTER_EXPERT_TILE = 32
 ROUTER_TOKEN_TILE = 16
 ROUTER_GATE_WORKERS = 512
+ROUTER_GATE_CUBE_WORKERS = 512
 ROUTER_TOPK_TILE = 8
 ROUTER_SELECT_TOKEN_TILE = 16
 ROUTER_SELECT_WORKERS = 48
@@ -251,11 +252,54 @@ def _make_router_gate_vector(capacity, hidden, experts, input_dtype):
     return project
 
 
+def _make_router_gate_cube(capacity, hidden, experts, input_dtype):
+    """Use AIC cube matmul for the large Prefill gate projection."""
+
+    token_tile = math.gcd(capacity, ROUTER_TOKEN_TILE)
+    expert_tile = ROUTER_EXPERT_TILE
+    expert_blocks = experts // expert_tile
+    k_tile = 512 if hidden % 512 == 0 else ROUTER_D_TILE
+    worker_limit = ROUTER_GATE_CUBE_WORKERS
+    widen = _router_make_cast_tile(token_tile, k_tile, input_dtype, pl.FP32)
+
+    @pl.jit.inline
+    def project(
+        x: pl.Tensor[[capacity, hidden], input_dtype],
+        gate_weight: pl.Tensor[[experts, hidden], pl.FP32],
+        logits: pl.Tensor[[capacity, experts], pl.FP32],
+        active: pl.Scalar[pl.INT32],
+    ):
+        block_count = ((active + token_tile - 1) // token_tile) * expert_blocks
+        for worker in pl.spmd(pl.min(block_count, worker_limit), name_hint="a2_moe_gate_cube"):
+            for block in pl.range(worker, block_count, worker_limit):
+                token = (block // expert_blocks) * token_tile
+                expert = (block % expert_blocks) * expert_tile
+                source = x[token : token + token_tile, 0:k_tile]
+                source_storage = pl.create_tensor([token_tile, k_tile], dtype=input_dtype)
+                source_storage[:, :] = source
+                source_fp32 = widen(source_storage)
+                weight = gate_weight[expert : expert + expert_tile, 0:k_tile]
+                acc = pl.matmul(source_fp32, weight, out_dtype=pl.FP32, b_trans=True)
+                for k0 in pl.range(k_tile, hidden, k_tile):
+                    source = x[token : token + token_tile, k0 : k0 + k_tile]
+                    source_storage[:, :] = source
+                    source_fp32 = widen(source_storage)
+                    weight = gate_weight[expert : expert + expert_tile, k0 : k0 + k_tile]
+                    acc = pl.matmul_acc(acc, source_fp32, weight, b_trans=True)
+                rows = pl.min(token_tile, active - token)
+                logits[token : token + token_tile, expert : expert + expert_tile] = pl.set_validshape(
+                    acc, rows, expert_tile
+                )
+        return logits
+
+    return project
+
+
 def _make_router_gate(capacity, hidden, experts, input_dtype):
-    """Use cube tiles for Prefill and one-token vector tiles for Decode."""
+    """Use cube tiles for large Prefill and vector tiles for Decode."""
     small_capacity = capacity <= SMALL_TOKEN_CAPACITY
     if not small_capacity:
-        return _make_router_gate_vector(capacity, hidden, experts, input_dtype)
+        return _make_router_gate_cube(capacity, hidden, experts, input_dtype)
     token_tile = 1
     expert_tile = 8
     expert_blocks = experts // expert_tile
