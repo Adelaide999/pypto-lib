@@ -546,6 +546,39 @@ class ResidentNetworkRuntime:
         self.alias_leases[id(result)] = result
         return result
 
+    def reset_ranges(self, value, rank, ranges):
+        """Synchronously zero bounded byte spans without replacing their owning allocation."""
+        if self._closed or rank in self.failed_ranks:
+            raise RuntimeError("Cannot certify a page reset on a failed resident worker")
+        owner = self.pinned[rank, value.untyped_storage()._cdata]
+        if owner["readonly"]:
+            raise ValueError("Request reset cannot modify resident weights")
+        host = _host_bytes(value)
+        allocation = owner["allocation"]
+        buffer, base = allocation.buffer, allocation.byte_offset
+        if (buffer is None or type(base) is not int or base < 0
+                or int(buffer.base) + base != allocation.data_ptr
+                or base + allocation.nbytes > int(buffer.nbytes)
+                or host.numel() != allocation.nbytes):
+            raise ValueError("Page reset requires a live, bounded owning byte allocation")
+        ranges = tuple(ranges)
+        for offset, length in ranges:
+            if (type(offset) is not int or type(length) is not int
+                    or offset < 0 or length <= 0 or offset + length > host.numel()):
+                raise ValueError("Page reset escapes its owning byte allocation")
+        self._select(rank)
+        worker = self.workers[rank]
+        for offset, length in ranges:
+            zeros = host.narrow(0, offset, length).zero_()
+            if self._native_dispatch:
+                worker._impl.copy_to(buffer, zeros.numpy(),
+                                     dst_offset=base + offset, src_offset=0, nbytes=length)
+            else:
+                self._copy(worker, allocation.data_ptr + offset, zeros.data_ptr(), length, 1)
+            self.stats["page_reset_bytes"] = self.stats.get("page_reset_bytes", 0) + length
+        for tensor, _version in list(owner["versions"].values()):
+            owner["versions"][id(tensor)] = (tensor, tensor._version)
+
     def register(self, program):
         """Admit every phase and boundary entry to the same worker registry."""
         if self._closed:

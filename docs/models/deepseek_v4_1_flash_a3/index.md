@@ -7,6 +7,8 @@ remaining work.
 
 See [Native vLLM-Ascend accuracy comparison](accuracy.md) for fixed
 TP4/DP4/EP16 prompt/Decode traces, full-vocabulary captures and CPU metrics.
+See [Experimental packed requests and paged history](dynamic-runtime.md) for
+request admission, independent limits, TP plans, HBM estimates and device validation status.
 
 ## Development priorities
 
@@ -18,7 +20,7 @@ TP4/DP4/EP16 prompt/Decode traces, full-vocabulary captures and CPU metrics.
   measurements on an allocated device group.
 - Compatibility requirements: preserve original layer roles, byte aliases,
   cache/source lifetime, quantization, dtypes, and explicit DP/TP/EP mappings.
-  TP1/TP2 fixed-16 full-network compatibility remains unvalidated.
+  TP1/TP2 full-network device compatibility remains unvalidated.
 
 ## Structure
 
@@ -148,9 +150,12 @@ NPU accuracy, distributed communication, whole-network accuracy or performance.
 
 `prefill_fwd.prefill_fwd` executes embedding, initial HC, layers 0 through 39,
 final HC collapse, RMSNorm and the vocabulary head. Each layer consumes the
-previous layer's actual activations. The implemented topology is
-DP4/TP4/EP16, PP1/PCP1/DCP1, with Prefill capacities up to 8192 and Decode capacity 16. Physical devices are explicit
-and ordered by logical rank. Duplicate IDs, rank-count mismatches and a
+previous layer's actual activations. The default DP4/TP4/EP16, PP1/PCP1/DCP1
+path retains Prefill capacities up to 8192 and Decode capacity 16. The separate
+experimental packed path adds DP8/TP2/EP16 and DP16/TP1/EP16 plans and supports
+new-token budgets up to 512 in its entry points. See the packed runtime guide
+for the limits of device coverage. Physical devices are explicit and ordered
+by logical rank. Duplicate IDs, rank-count mismatches and a
 conflicting `ASCEND_RT_VISIBLE_DEVICES` mapping are rejected before initialization.
 
 ```python

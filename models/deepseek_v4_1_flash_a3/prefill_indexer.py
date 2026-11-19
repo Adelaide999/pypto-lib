@@ -602,9 +602,20 @@ def run_index_query_selection(state, q_input, latent, cosine, sine, operands,
     q_positions, q_requests = pad(positions[start:start + query_rows]), pad(request_ids[start:start + query_rows], fill=-1)
     long_table, window_table = table(source_prefix + "long_kv_cache"), table(own_prefix + "swa_cache")
     cache_lengths = global_meta[source_prefix + "indexer.k_cache"]["cache_seq_lens"].tolist()
-    if any(length < 0 or length > KEY_CAPACITY for length in cache_lengths):
+    live = state["live"]
+    paged_index = live.get("network_geometry") is not None and live.get("packed_requests", False)
+    paged_candidates = None
+    if paged_index:
+        from .paged_indexer import run_paged_selection
+
+        raw_selected, paged_candidates = run_paged_selection(
+            query_codes, query_scales, weights, q_positions, actual_starts, cache_lengths,
+            codes, scales, long_table, state, execute, rank, case, capacity, start, query_rows)
+    elif any(length < 0 or length > KEY_CAPACITY for length in cache_lengths):
         raise ValueError("Physical QLI history exceeds the supported index-key capacity")
-    for request, (begin, finish) in enumerate(zip(actual_starts.tolist(), actual_starts.tolist()[1:])):
+    starts_list = actual_starts.tolist()
+    intervals = () if paged_index else zip(starts_list, starts_list[1:])
+    for request, (begin, finish) in enumerate(intervals):
         left, right = max(begin, start), min(finish, start + query_rows)
         if left >= right:
             continue
@@ -641,7 +652,7 @@ def run_index_query_selection(state, q_input, latent, cosine, sine, operands,
     ratio = state["role"]["ratio"]
     visible = [(position + 1) // ratio for position in q_positions[:query_rows].tolist()]
     visible_lengths[:query_rows].copy_(torch.tensor(visible, dtype=torch.int32))
-    return dict(selected=selected, lengths=lengths, compressed=compressed_indices,
+    return dict(selected=selected, lengths=lengths, compressed=compressed_indices, candidate_blocks=paged_candidates,
                 window=window_indices, scores=candidate_scores, visible_lengths=visible_lengths)
 
 

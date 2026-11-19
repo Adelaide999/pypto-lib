@@ -168,7 +168,8 @@ def _schedule_integer(value, *, minimum=0):
     return value
 
 
-def build_window_schedule(query_lengths, prefix_lengths, block_table, *, cache_blocks, capacity):
+def build_window_schedule(query_lengths, prefix_lengths, block_table, *, cache_blocks, capacity,
+                          rolling_pages=False):
     """Derive physical windows and publications for every request and active row."""
     _schedule_integer(cache_blocks, minimum=1)
     _require_schedule(
@@ -201,7 +202,8 @@ def build_window_schedule(query_lengths, prefix_lengths, block_table, *, cache_b
             all(type(page) is int and -1 <= page < cache_blocks for page in pages),
             "Own page IDs must be valid physical pages or unused -1 padding",
         )
-        used = pages[:required_pages]
+        first_page = max(0, prefix - WINDOW_SIZE + 1) // WINDOW_PAGE_ROWS if rolling_pages else 0
+        used = pages[first_page:required_pages]
         _require_schedule(
             all(page >= 0 for page in used)
             and len(set(used)) == len(used)
@@ -267,7 +269,8 @@ def build_window_schedule(query_lengths, prefix_lengths, block_table, *, cache_b
     )
 
 
-def window_schedule_from_controls(starts, seq_lens, block_table, *, cache_blocks, capacity):
+def window_schedule_from_controls(starts, seq_lens, block_table, *, cache_blocks, capacity,
+                                  rolling_pages=False):
     _require_schedule(
         type(starts) is list
         and len(starts) >= 1
@@ -283,4 +286,5 @@ def window_schedule_from_controls(starts, seq_lens, block_table, *, cache_blocks
         _schedule_integer(value, minimum=1)
     lengths = [right - left for left, right in zip(starts[:-1], starts[1:], strict=True)]
     prefixes = [end - count for end, count in zip(seq_lens, lengths, strict=True)]
-    return build_window_schedule(lengths, prefixes, block_table, cache_blocks=cache_blocks, capacity=capacity)
+    return build_window_schedule(lengths, prefixes, block_table, cache_blocks=cache_blocks, capacity=capacity,
+                                 rolling_pages=rolling_pages)

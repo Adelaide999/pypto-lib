@@ -29,7 +29,9 @@ from .cache import attach_network_cache_geometry, network_cache_geometry, resolv
 from .engram import make_prefill_engram_entries
 from .input_pack import make_input_entries
 from .lm_head import make_output_entries
-from .runtime_config import PREFILL_CAPACITIES, PREFILL_MOE_SLAB_ROWS, network_ring_heap, prefill_moe_slab_limit
+from .runtime_config import (
+    PREFILL_CAPACITIES, PREFILL_MOE_SLAB_ROWS, network_ring_heap, prefill_execution_capacity, prefill_moe_slab_limit,
+)
 from .prefill_layer import (
     REGIONS, execute_region, region_arguments, make_network_l2_entries,
     make_prefill_layer_entries, run_prefill_layer_inmemory,
@@ -165,6 +167,7 @@ def network_layer_geometry(provider, topology, layer_id, moe_geometry=None, *, s
 def make_network_layer_entries(provider, config, topology, layer_id, definitions_cache=None, *, slab_limit=16):
     """Build the exact layer specialization from its validated request/cache geometry."""
     geometry, expert_capacity = network_layer_geometry(provider, topology, layer_id, slab_limit=slab_limit)
+    config = dict(config, packed_requests=geometry.get("packed_requests", False))
     batch = provider.batch_for_layer(layer_id)
     layout = provider.layouts[0][next(iter(batch["cases"]))]
     role = resolve_layer_role(layer_id)
@@ -308,6 +311,9 @@ class NetworkProgram:
         if logits_mode not in ("all", "last"):
             raise ValueError("Output logits mode must be all or last")
         geometry = provider.runtime_geometry()
+        sampled = geometry.get("sample_outputs", False)
+        if sampled:
+            logits_mode = "all"
         slab_limit = prefill_moe_slab_limit(geometry["capacity"], prefill_moe_slab_rows)
         if self.ready:
             if slab_limit != self.moe_slab_limit:
@@ -373,12 +379,14 @@ class NetworkProgram:
                     f"engram{layer}",
                     {name: definitions[name] for name in ("engram_projection", "engram_gate")},
                 )
+            head_options = ({"sample_rows": True} if sampled else
+                            {"logits_mode": "last"} if logits_mode == "last" else {})
             self.bind(
                 "output",
                 make_network_l2_entries(
-                    make_output_entries(geometry["capacity"], text, topology["tp"], logits_mode=logits_mode),
+                    make_output_entries(geometry["capacity"], text, topology["tp"], **head_options),
                     geometry["capacity"],
-                    "output",
+                    "sample_output" if sampled else "output",
                 ),
             )
             self._signature = _compile_signature(
@@ -735,11 +743,16 @@ def embed_network_input(input_contract, weights, executor, config, output):
 def run_output_boundary(result, *, batch, topology, config, weights, executor, output, dump_logits=True):
     """Consume actual layer39 local delayed HC state and restore complete SP/TP vocabulary output."""
     capacity, world, tp = executor.provider.capacity, topology["ep"], topology["tp"]
-    last_row = executor.program.logits_mode == "last"
+    sampled = executor.provider.sample_outputs
+    last_row = not sampled and executor.program.logits_mode == "last"
     output_capacity = 16 if last_row else capacity
     directory = Path(output)
     directory.mkdir(exist_ok=False)
     entries = executor.program.entries_for_stage("output")
+    if sampled and not any(record["output_rows"] for rows in batch["cases"].values() for record in rows):
+        write_json(directory / "execution.json", dict(outcome="no_request_requires_sampling"))
+        return dict(files={}, logits=[{case: torch.empty((0, config["vocab_size"]), dtype=torch.bfloat16)
+                                      for case in cases} for cases in result["hidden"]])
     norm = weights.reader.load("norm.weight")
     head = weights.reader.load("head.weight")
     if (
@@ -772,7 +785,11 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
     for case, records in batch["cases"].items():
         def run_output_boundary_rank_1(rank):
             record = records[rank]
-            physical, active = record["SP_physical_rows"], len(record["positions"])
+            physical = record["SP_physical_rows"]
+            active = len(record["output_rows"]) if sampled else len(record["positions"])
+            if sampled:
+                sample_rows = torch.zeros(capacity, dtype=torch.int32)
+                sample_rows[:active] = torch.tensor(record["output_rows"], dtype=torch.int32)
             output_active = min(active, 1) if last_row else active
             collapsed = torch.full((output_capacity, 5120), -17, dtype=torch.bfloat16)
             normalized = torch.full((output_capacity, 5120), -19, dtype=torch.bfloat16)
@@ -783,13 +800,14 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
                 raise ValueError("Output head must use canonical KN vocabulary shard layout")
             execute_region(
                 {"execute_l2": execute},
-                "head_l2",
+                "sample_head_l2" if sampled else "head_l2",
                 rank,
                 case,
                 (
                     (
                         "sp_unpack",
-                        [gathered[rank][case], collapsed, max(physical, 1), active],
+                        ([gathered[rank][case], collapsed, sample_rows, max(physical, 1), active] if sampled
+                         else [gathered[rank][case], collapsed, max(physical, 1), active]),
                         dict(collapsed=collapsed),
                         "output",
                     ),
@@ -811,7 +829,9 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
     for case, records in batch["cases"].items():
         def run_output_boundary_rank_2(rank):
             record = records[rank]
-            active = min(len(record["positions"]), 1) if last_row else len(record["positions"])
+            active = len(record["output_rows"]) if sampled else len(record["positions"])
+            if last_row:
+                active = min(active, 1)
             if (last_row and rank % tp) or (not active and (last_row or not dump_logits)):
                 actual_logits[rank][case] = torch.empty((0, config["vocab_size"]), dtype=torch.bfloat16)
                 return
@@ -823,11 +843,13 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
                 [gathered_logits[rank][case], logits, active],
                 dict(logits=logits),
             )
-            readback = logits if dump_logits and not last_row else logits[:active]
-            logits = executor.resident.read_output(readback, rank)
+            readback = logits if dump_logits and not last_row and not sampled else logits[:active]
+            logits = executor.resident.read_output(readback, rank) if readback.numel() else readback.clone()
             if dump_logits:
                 path = directory / f"rank-{rank}-{case}-network-logits.pt"
                 positions = record["positions"][-1:] if last_row else record["positions"]
+                if sampled:
+                    positions = positions[record["output_rows"]]
                 torch.save(dict(logits=logits, active=active, positions=positions, DP_rank=rank // tp), path)
                 files[str(path)] = file_sha(path)
             actual_logits[rank][case] = logits[:active].clone()
@@ -878,9 +900,13 @@ def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=F
             or topology.get("dp") * topology.get("tp") != 16
             or any(topology.get(name) != 1 for name in ("pp", "pcp", "dcp"))):
         raise ValueError("The network runtime requires EP16 with TP1/2/4 and PP1/PCP1/DCP1")
+    capacity = contract["capacity"]
+    packed = contract.get("packed_requests", False)
+    supported_capacity = (type(capacity) is int and 16 <= capacity <= 512 and capacity % 16 == 0
+                          if packed else capacity in PREFILL_CAPACITIES)
     if (
         not all(contract["required_modes"].values())
-        or contract["capacity"] not in PREFILL_CAPACITIES
+        or not supported_capacity
         or contract["scheduler_capacity"] != 8192
     ):
         raise ValueError("Retain the original model modes and bounded actual scheduler ABI")
@@ -905,12 +931,20 @@ def prepare_network_provider(inputs, contract, allocation_id, *, geometry_only=F
         sources_by_case={"fresh": inputs["cache_ABI_sources"]},
         geometry_only=geometry_only,
     )
+    if provider.packed_requests != packed:
+        raise ValueError("Network inputs disagree with the configured request execution mode")
     attach_network_cache_geometry(provider)
     provider.require_network_geometry()
     for cases in provider.shared:
         cases["fresh"]["topk_indices"].fill_(-1)
     provider.begin_chunk(epoch=0, token_map_id=contract["input_contract_sha256"])
     return provider
+
+
+def request_outputs(logits, contract):
+    """Expose each finished query's final row without depending on packed order."""
+    return [dict(row, logits=logits[row["rank"]]["fresh"][row.get("logit_row", row["row"])].clone())
+            for row in contract.get("output_map", []) if row["sample"]]
 
 
 class GenerationSession:
@@ -946,16 +980,90 @@ class GenerationSession:
         """End the session explicitly; generation never releases a worker between phases."""
         self.close()
 
+    def request_handle(self, request_id):
+        ledger = self._request_ledger()
+        if request_id not in ledger.owners:
+            raise ValueError("Unknown request owner")
+        return ledger.owners[request_id].handle
+
+    def _request_ledger(self):
+        if self.closed or self.failed or getattr(self.request_inputs, "ledger", None) is None:
+            raise RuntimeError("Require a live packed session with its request metadata owner")
+        return self.request_inputs.ledger
+
+    def pause_request(self, handle):
+        self._request_ledger().pause(handle)
+
+    def resume_request(self, handle):
+        self._request_ledger().resume(handle)
+
+    def finish_request(self, handle):
+        self._request_ledger().finish(handle)
+        self.release_request(handle)
+
+    def cancel_request(self, handle):
+        self.release_request(handle)
+
+    def advance_batch(self, queries, *, phase, output, progress=None):
+        """Run a homogeneous packed dispatch over the session's shared scheduler."""
+        self._request_ledger()
+        chunk = self.request_inputs.batch(queries, phase=phase)
+        try:
+            return self.advance(chunk, output=output, progress=progress, phase=phase)
+        except BaseException:
+            if not self.failed:
+                self.request_inputs.rollback()
+            raise
+
+    def _reset_request(self, handle, pages):
+        """Clear retired cache pages and first-SWA history on every TP owner."""
+        if self.closed or self.failed:
+            raise RuntimeError("A failed worker cannot certify reset; close this session")
+        from .cache_pool import cache_page_bytes
+
+        for lane in range(self.contract["topology"]["tp"]):
+            rank = handle.dp_rank * self.contract["topology"]["tp"] + lane
+            all_pages = sorted(page for group in pages for page in group)
+            strides = cache_page_bytes(self.request_inputs.layouts[rank])
+            for key, raw in self.provider.arenas[rank]["fresh"].items():
+                self.runtime.reset_ranges(raw, rank, [(page * strides[key], strides[key])
+                                                      for page in all_pages])
+            templates = self.request_inputs.cache["cache_ABI"][rank]["groups"]
+            index = next(i for i, group in enumerate(templates)
+                         if "model.layers.1.self_attn.swa_cache" in group["names"])
+            history = self.provider.history.caches[rank]["fresh"]
+            for page in pages[index]:
+                history[page * 128:(page + 1) * 128].zero_()
+
+    def release_request(self, handle):
+        """Finish or cancel an owner only after its device pages have been reset."""
+        ledger = self._request_ledger()
+        ledger.get(handle)
+        ledger._idle()
+        try:
+            self.request_inputs.release(handle, self._reset_request)
+            self.provider.confirm_request_reset(handle)
+        except BaseException:
+            self.failed = True
+            raise
+
     def advance(self, chunk, *, output, progress=None, phase="prefill"):
         """Admit fresh controls and run the next chunk over the existing weights and caches."""
         if self.closed or self.failed:
             raise RuntimeError("A closed or failed generation session cannot advance")
         following, contract = chunk["inputs"], chunk["contract"]
+        packed = self.contract.get("packed_requests", False)
+        if contract.get("packed_requests", False) != packed:
+            raise ValueError("Continuation cannot change the request execution mode")
+        if following["input_contract"].get("phase", phase) != phase:
+            raise ValueError("The dispatch phase differs from the request transaction")
         fixed = ("topology", "checkpoint", "model_config", "required_modes", "scheduler_capacity")
+        if packed:
+            fixed += ("capacity",)
         if any(contract[name] != self.contract[name] for name in fixed):
             raise ValueError("Continuation cannot change the session's model or topology")
         capacity = contract["capacity"]
-        if capacity not in self.phase_programs or (phase == "decode" and capacity != 16):
+        if capacity not in self.phase_programs or (not packed and phase == "decode" and capacity != 16):
             raise ValueError("Continuation requires a precompiled phase execution capacity")
         actual, epoch = following["input_contract"], self.epoch + 1
         input_path = Path(contract["input_contract_path"])
@@ -968,8 +1076,14 @@ class GenerationSession:
         if len(sources) != self.weights.world:
             raise ValueError("Continuation metadata must cover every active and empty rank")
         metadata, receipts = [], []
+        memory_owned = (packed and self.request_inputs is not None
+                        and chunk.get("metadata_owner") is self.request_inputs
+                        and self.request_inputs.pending is not None
+                        and self.request_inputs.pending["chunk"] is chunk)
         for rank, record in enumerate(sources):
-            if record["rank"] != rank or file_sha(record["path"]) != record["sha256"]:
+            memory_source = record.get("transport") == "memory"
+            if (record["rank"] != rank or (memory_source and not memory_owned)
+                    or (not memory_source and file_sha(record["path"]) != record["sha256"])):
                 raise ValueError("Continuation metadata source changed")
             metadata.append(chunk["cache"]["cache_ABI"][rank] if "cache" in chunk else
                             torch.load(record["path"], map_location="cpu", weights_only=True))
@@ -980,7 +1094,8 @@ class GenerationSession:
         cache_uploads = self.runtime.stats["cache_h2d_bytes"]
         before = _network_owner_snapshot(self.provider)
         try:
-            self.provider.set_execution_capacity(capacity)
+            if self.provider.capacity != capacity:
+                self.provider.set_execution_capacity(capacity)
             self.engram_contracts = {slot: dict(item, capacity=capacity)
                                      for slot, item in self.engram_contracts.items()}
             self.program = self.phase_programs[capacity]
@@ -1007,6 +1122,9 @@ class GenerationSession:
             self.failed = True
             raise
         self.epoch, self.contract = epoch, contract
+        if packed and self.request_inputs is not None:
+            self.request_inputs.commit(contract["input_contract_sha256"])
+        result["request_outputs"] = request_outputs(result["logits"], actual)
         return result
 
     def summary(self):
@@ -1041,13 +1159,17 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
     if progress is not None:
         progress(dict(stage="compiling_network", epoch=0))
     provider = prepare_network_provider(inputs, contract, output.name, geometry_only=True)
+    geometry = provider.runtime_geometry()
+    packed = contract.get("packed_requests", False)
+    if packed and (geometry["capacity"] > 16 or geometry["table_pages"] > 16) and "hbm_budget" not in contract:
+        raise ValueError("Expanded token/history execution requires an explicit per-rank hbm_budget")
     validate_host_lookup(inputs["engram_lookup"], inputs["engram_contracts"][1], provider.hash_batch())
     program = compiled if compiled is not None else NetworkProgram(output / "compiled")
     program.compile(provider, contract["model_config"], topology, inputs["engram_contracts"],
                     logits_mode=contract.get("logits_mode", "all"),
                     prefill_moe_slab_rows=contract.get("prefill_moe_slab_rows"))
     phase_programs = {contract["capacity"]: program}
-    if contract["capacity"] != 16 and request_inputs is not None:
+    if not packed and contract["capacity"] != 16 and request_inputs is not None:
         from tempfile import TemporaryDirectory
         from .prefill_prepare import TokenChunkInputs
 
@@ -1074,9 +1196,16 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
         profiling = dict(contract.get("profiling", {}))
         profiling.setdefault("output_dir", str(output / "profiling"))
         text_config = contract["model_config"]["text_config"]
-        expert_capacity = max(moe["expert_capacity"] for p in phase_programs.values() for moe in p.moe_geometry.values())
+        expert_capacity = max((moe["expert_capacity"] for p in phase_programs.values()
+                               for moe in p.moe_geometry.values()), default=0)
         routed_rows = (text_config["n_routed_experts"] // topology["ep"]) * expert_capacity
-        ring_heap = network_ring_heap(contract["capacity"], text_config, topology["tp"], routed_rows=routed_rows)
+        ring_capacity = contract["capacity"]
+        if packed and ring_capacity != 64:
+            ring_capacity = prefill_execution_capacity(ring_capacity)
+        ring_heap = network_ring_heap(ring_capacity, text_config, topology["tp"], routed_rows=routed_rows)
+        if packed and contract["capacity"] == 512:
+            ring_heap = tuple(max(current, required) for current, required in
+                              zip(ring_heap or (0, 0, 0, 0), (0, 512 * 1024**2, 1024**3, 0)))
         resident = stack.enter_context(ResidentNetworkRuntime(assigned, topology, profiling=profiling, ring_heap=ring_heap))
         for phase_program in phase_programs.values():
             resident.register(phase_program)
@@ -1084,6 +1213,24 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
         stack.callback(weights.close)
         weights.preload_once(progress)
         weights.write_audit(output / "weight-audit.json")
+        if packed:
+            observer = CANNMemory(diagnostics=False)
+            samples = [observer.sample(rank, "resident_weights_loaded", force=True) for rank in range(topology["ep"])]
+            budget = contract.get("hbm_budget")
+            admission = []
+            for rank, sample in enumerate(samples):
+                state_bytes = sum(value.numel() * value.element_size()
+                                  for family in (provider.arenas[rank], provider.shared[rank])
+                                  for tensors in family.values() for value in tensors.values())
+                reserve = (sum(budget[name][rank] for name in
+                               ("scratch_bytes", "communication_bytes", "runtime_reserve_bytes"))
+                           if budget is not None else 2 * 1024**3)
+                admission.append(dict(rank=rank, free_after_weights=sample["free_bytes"],
+                                      cache_and_shared_bytes=state_bytes, reserved_bytes=reserve))
+            write_json(output / "hbm-admission.json", admission)
+            if any(row["cache_and_shared_bytes"] + row["reserved_bytes"] > row["free_after_weights"]
+                   for row in admission):
+                raise MemoryError("The tightest rank cannot admit the fixed cache pool plus peak scratch/reserves")
         for family, values in (("raw", provider.arenas), ("shared", provider.shared)):
             for rank, cases in enumerate(values):
                 for case, tensors in cases.items():
@@ -1098,6 +1245,9 @@ def run_network_runtime(inputs, *, contract, output, devices, checkpoint=None, c
             memory=session.memory, ownership=session.ownership, assigned=assigned,
             engram_contracts=session.engram_contracts, program=program, epoch=0, progress=progress, resident=resident)
         weights.assert_static_unchanged()
+        if packed and request_inputs is not None:
+            request_inputs.commit(contract["input_contract_sha256"])
+        first["request_outputs"] = request_outputs(first["logits"], inputs["input_contract"])
         completed = [first]
         chunks = (continuation,) if isinstance(continuation, Mapping) else continuation
         if chunks is not None:
