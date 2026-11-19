@@ -44,12 +44,14 @@ def _abi(leaf, width):
             active,
         ), (2, 3), 8
     if leaf == "projection_quantize" and width in (1280, _D):
+        from .quant import VEC_M_TILE
+
         return "prefill_token_quantize_whole_row", (
             ("x", "In", matrix, "bfloat16", "ND"),
             ("payload", "InOut", matrix, "int8", "ND"),
             ("scales", "InOut", [_CAPACITY, 8], "fp32", "ND"),
             active,
-        ), (1, 2), 1
+        ), (1, 2), VEC_M_TILE
     if leaf == "rope_tables" and width == 32:
         from .rope import ROPE_TABLE_ROWS_TILE
 
@@ -92,7 +94,7 @@ def _matches_orchestration(source, symbol, params, aliases, tile):
     suffix = "}}else{SIMPLER_SCOPE(){"
     actual = code.partition("voidaicpu_orchestration_entry")[2]
     close = "}}}}}"
-    if is_table and actual == prefix + grid + task + suffix + close:
+    if actual == prefix + grid + task + suffix + close:
         return True
     initial = f"Tensorret={first};Tensorret__tmp_v0_guarded_1={first};"
     returned = f"ret={ret};ret__tmp_v0_guarded_1={aux};"
@@ -137,7 +139,7 @@ def _compile(root, body, leaf, tile, cann):
                 str(compiler), "-xcce", "-O2", "-std=c++17", "-shared", "-fPIC", "--cce-fatobj-link",
                 "--cce-aicore-arch=dav-c220-vec", "-fenable-matrix", "--cce-auto-infer-kernel-type=true",
                 "-DREGISTER_BASE", f'-DPYPTO_VECTOR_BODY="{body.name}"',
-                f"-DPYPTO_VECTOR_QUANT={int(leaf == 'projection_quantize')}",
+                f"-DPYPTO_VECTOR_QUANT_ROWS={tile if leaf == 'projection_quantize' else 0}",
                 f"-DPYPTO_VECTOR_ROPE_TABLE_ROWS={tile if leaf == 'rope_tables' else 0}",
                 "-Wno-ignored-attributes", "-Wno-macro-redefined",
                 "-mllvm", "-cce-aicore-stack-size=0x8000", "-mllvm", "-cce-aicore-function-stack-size=0x8000",

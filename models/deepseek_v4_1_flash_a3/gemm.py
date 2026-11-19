@@ -254,9 +254,43 @@ def make_blocked_weight_pack(width, output_width):
     return pack_weight
 
 
-def make_dot(capacity, width, output_width, *, full_k_reuse=False, column_group=1, column_stages=1, row_tile=M_TILE):
+def make_dot(capacity, width, output_width, *, full_k_reuse=False, column_group=1, column_stages=1,
+             row_tile=M_TILE, paired_columns=False):
     """Accumulate complete blocked INT8 products in INT32."""
     packed_rows = width * (output_width // N_TILE)
+
+    if paired_columns:
+        if output_width % (2 * N_TILE) or capacity % row_tile or width % K_TILE:
+            raise ValueError("Paired-column GEMM requires aligned M, N and K tiles")
+
+        @pl.jit.inline
+        def dot_paired_columns(
+            payload: pl.Tensor[[capacity, width], pl.INT8],
+            packed: pl.Tensor[[packed_rows, N_TILE], pl.INT8],
+            accumulator: pl.Tensor[[capacity, output_width], pl.INT32],
+            active: pl.Scalar[pl.INT32],
+        ):
+            tiles = (active + row_tile - 1) // row_tile
+            for block in pl.spmd(tiles * (output_width // (2 * N_TILE)), name_hint="prefill_dot_paired_columns"):
+                nb = block % (output_width // (2 * N_TILE)) * 2
+                t0 = block // (output_width // (2 * N_TILE)) * row_tile
+                rows = pl.min(row_tile, active - t0)
+                first = pl.create_tensor([row_tile, N_TILE], dtype=pl.INT32)
+                second = pl.create_tensor([row_tile, N_TILE], dtype=pl.INT32)
+                for k0 in pl.pipeline(0, width, K_TILE, stage=2):
+                    source = payload[t0 : t0 + row_tile, k0 : k0 + K_TILE]
+                    offset = nb * width + k0
+                    w0 = packed[offset : offset + K_TILE, :]
+                    w1 = packed[offset + width : offset + width + K_TILE, :]
+                    first = pl.matmul_acc(first, source, w0, init_cond=(k0 == 0))
+                    second = pl.matmul_acc(second, source, w1, init_cond=(k0 == 0))
+                n0 = nb * N_TILE
+                n1 = n0 + N_TILE
+                accumulator[t0 : t0 + row_tile, n0 : n1] = pl.set_validshape(first, rows, N_TILE)
+                accumulator[t0 : t0 + row_tile, n1 : n1 + N_TILE] = pl.set_validshape(second, rows, N_TILE)
+            return accumulator
+
+        return dot_paired_columns
 
     if full_k_reuse and width <= FULL_K_TILE:
         row_tile = math.gcd(capacity, row_tile)

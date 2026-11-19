@@ -288,10 +288,10 @@ def make_quantize(
 
 def make_prefill_projection_quantize(capacity, width):
     """Quantize contiguous groups of BF16 projection inputs to INT8."""
-    if capacity < 1024 or width not in (1280, 5120):
+    if capacity < 1024 or capacity % VEC_M_TILE or width not in (1280, 5120):
         return make_quantize(capacity, width, whole_row=True)
-    widen = make_cast_tile(1, width, pl.BF16, pl.FP32)
-    quantize_row = make_quantize_row(width)
+    column_tile = 1280
+    stages = 2 if width == column_tile else 1
 
     @pl.jit.inline
     def quantize(
@@ -300,17 +300,38 @@ def make_prefill_projection_quantize(capacity, width):
         scales: pl.Tensor[[capacity, 8], pl.FP32],
         active: pl.Scalar[pl.INT32],
     ):
-        workers = pl.min(active, PREFILL_QUANT_WORKERS)
+        tiles = (active + VEC_M_TILE - 1) // VEC_M_TILE
+        workers = pl.min(tiles, PREFILL_QUANT_WORKERS)
         for worker in pl.spmd(workers, name_hint="prefill_token_quantize_whole_row"):
-            start = worker * active // workers
-            end = (worker + 1) * active // workers
-            for token in pl.range(start, end):
-                source = pl.slice(x, [1, width], [token, 0])
-                value = pl.create_tensor([1, width], dtype=pl.FP32)
-                value[:, :] = widen(source)
-                codes, scale = quantize_row(value)
-                scales[token : token + 1, :] = scale
-                payload[token : token + 1, :] = codes
+            start = worker * tiles // workers
+            end = (worker + 1) * tiles // workers
+            for block in pl.pipeline(start, end, stage=stages):
+                token = block * VEC_M_TILE
+                rows = pl.min(VEC_M_TILE, active - token)
+                source = x[token : token + VEC_M_TILE, :]
+                if width == column_tile:
+                    values = pl.cast(source, pl.FP32)
+                    peak = pl.reshape(pl.row_max(pl.abs(values)), [1, VEC_M_TILE])
+                else:
+                    peak = pl.full([1, VEC_M_TILE], dtype=pl.FP32, value=0.0)
+                    for col in pl.range(0, width, column_tile):
+                        part = pl.cast(source[:, col : col + column_tile], pl.FP32)
+                        peak = pl.maximum(peak, pl.reshape(pl.row_max(pl.abs(part)), [1, VEC_M_TILE]))
+                numerator = pl.full([1, VEC_M_TILE], dtype=pl.FP32, value=127.0)
+                inverse = pl.reshape(pl.div(numerator, pl.maximum(peak, 1e-30)), [VEC_M_TILE, 1])
+                scale = pl.reshape(pl.mul(peak, 1.0 / 127.0), [VEC_M_TILE, 1])
+                ones = pl.full([VEC_M_TILE, 8], dtype=pl.FP32, value=1.0)
+                scales[token : token + VEC_M_TILE, :] = pl.set_validshape(pl.row_expand_mul(ones, scale), rows, 8)
+                if width == column_tile:
+                    rounded = pl.cast(pl.row_expand_mul(values, inverse), pl.INT32, mode="rint")
+                    codes = pl.cast(rounded, pl.INT8, mode="trunc")
+                    payload[token : token + VEC_M_TILE, :] = pl.set_validshape(codes, rows, width)
+                else:
+                    for col in pl.range(0, width, column_tile):
+                        part = pl.cast(source[:, col : col + column_tile], pl.FP32)
+                        rounded = pl.cast(pl.row_expand_mul(part, inverse), pl.INT32, mode="rint")
+                        codes = pl.cast(rounded, pl.INT8, mode="trunc")
+                        payload[token : token + VEC_M_TILE, col : col + column_tile] = pl.set_validshape(codes, rows, column_tile)
         return payload, scales
 
     return quantize
@@ -416,8 +437,40 @@ def make_decode_quantize(capacity, width, input_dtype=pl.BF16):
     return quantize
 
 
-def make_dequantize(capacity, output_width, combine_scales=False, channel_dtype=pl.FP32):
+def make_dequantize(capacity, output_width, combine_scales=False, channel_dtype=pl.FP32, *, reuse_workers=False):
     """Apply channel-first or combined scales with the selected channel rounding."""
+    if reuse_workers and not combine_scales and channel_dtype == pl.FP32 and output_width == 5120:
+        column_tile = 1280
+
+        @pl.jit.inline
+        def dequantize_shared(
+            accumulator: pl.Tensor[[capacity, output_width], pl.INT32],
+            channel_scale: pl.Tensor[[output_width], pl.FP32],
+            token_scale: pl.Tensor[[capacity, 8], pl.FP32],
+            output: pl.Tensor[[capacity, output_width], pl.BF16],
+            active: pl.Scalar[pl.INT32],
+        ):
+            tiles = (active + VEC_M_TILE - 1) // VEC_M_TILE
+            groups = pl.min(48 // (output_width // column_tile), tiles)
+            for worker in pl.spmd(groups * (output_width // column_tile), name_hint="shared_down_dequant_stream"):
+                column = worker % (output_width // column_tile) * column_tile
+                group = worker // (output_width // column_tile)
+                channels = pl.reshape(channel_scale[column : column + column_tile], [1, column_tile])
+                begin = group * tiles // groups
+                end = (group + 1) * tiles // groups
+                for block in pl.range(begin, end):
+                    token = block * VEC_M_TILE
+                    rows = pl.min(VEC_M_TILE, active - token)
+                    integer = accumulator[token : token + VEC_M_TILE, column : column + column_tile]
+                    value = pl.col_expand_mul(pl.cast(integer, pl.FP32, mode="rint"), channels)
+                    scale = pl.row_min(token_scale[token : token + VEC_M_TILE, :])
+                    result = pl.cast(pl.row_expand_mul(value, scale), pl.BF16, mode="rint")
+                    narrowed = pl.set_validshape(result, rows, column_tile)
+                    output[token : token + VEC_M_TILE, column : column + column_tile] = narrowed
+            return output
+
+        return dequantize_shared
+
     column_tile = 1280 if output_width == 5120 else 1024
     while column_tile > N_TILE and output_width % column_tile:
         column_tile //= 2

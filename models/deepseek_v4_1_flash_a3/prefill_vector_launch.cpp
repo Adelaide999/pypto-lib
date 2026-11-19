@@ -23,7 +23,7 @@ typedef struct { unsigned char v; } float4_e2m1x2_t;
 #include "acl/acl.h"
 #include PYPTO_VECTOR_BODY
 
-extern "C" __global__ AICORE void prefill_vector_leaf(
+extern "C" __global__ AICORE __attribute__((aiv)) void prefill_vector_leaf(
     __gm__ uint8_t *a, __gm__ uint8_t *b, __gm__ uint8_t *c, __gm__ uint8_t *d,
     int32_t active, int32_t workers) {
 #if defined(__DAV_VEC__)
@@ -32,9 +32,11 @@ extern "C" __global__ AICORE void prefill_vector_leaf(
         return;
     }
     set_atomic_none();
-#if PYPTO_VECTOR_QUANT
+#if PYPTO_VECTOR_QUANT_ROWS
+    constexpr auto rows = PYPTO_VECTOR_QUANT_ROWS;
+    const int64_t tiles = (static_cast<int64_t>(active) + rows - 1) / rows;
     prefill_token_quantize_whole_row((__gm__ int8_t *)b, (__gm__ float *)c, (__gm__ bfloat16_t *)a,
-                                    active, static_cast<int64_t>(workers), block, workers);
+                                    tiles, static_cast<int64_t>(workers), active, block, workers);
 #elif PYPTO_VECTOR_ROPE_TABLE_ROWS
     constexpr auto rows = PYPTO_VECTOR_ROPE_TABLE_ROWS;
     const int64_t tiles = (static_cast<int64_t>(active) + rows - 1) / rows;

@@ -742,7 +742,10 @@ def _make_shared_activation(
     """Select fused channel precision or standalone BF16 activation rounding."""
     width = intermediate * 2
     tile = intermediate if quantize_output else 256
-    row_tile = 1 if quantize_output else SHARED_VEC_M_TILE
+    batch_rows = capacity > SMALL_TOKEN_CAPACITY and capacity % SHARED_VEC_M_TILE == 0
+    batched_quant = quantize_output and intermediate <= 768 and batch_rows
+    stages = 2 if batched_quant else 1
+    row_tile = 1 if quantize_output and not batched_quant else SHARED_VEC_M_TILE
     dequantize = _shared_make_dequantize(capacity, width)
 
     if not fused_activation:
@@ -806,26 +809,35 @@ def _make_shared_activation(
         blocks = row_blocks * (intermediate // tile)
         workers = pl.min(blocks, 48)
         for worker in pl.spmd(workers, name_hint="a2_moe_swiglu_fused"):
-            for block in pl.range(worker, blocks, workers):
+            if batched_quant:
+                all_gate_channels = pl.reshape(channels[:tile], [1, tile])
+                all_up_channels = pl.reshape(channels[tile : 2 * tile], [1, tile])
+            begin = worker * blocks // workers
+            end = (worker + 1) * blocks // workers
+            for block in pl.pipeline(begin, end, stage=stages):
                 token = block // (intermediate // tile) * row_tile
                 column = block % (intermediate // tile) * tile
                 rows = pl.min(row_tile, active - token)
                 up_column = intermediate + column
-                gate_i32 = pl.slice(
-                    accumulator, [row_tile, tile], [token, column], valid_shape=[rows, tile]
-                )
-                up_i32 = pl.slice(
-                    accumulator, [row_tile, tile], [token, up_column], valid_shape=[rows, tile]
-                )
-                gate_channels = pl.reshape(channels[column : column + tile], [1, tile])
-                up_channels = pl.reshape(channels[up_column : up_column + tile], [1, tile])
+                if batched_quant:
+                    gate_i32 = accumulator[token : token + row_tile, :tile]
+                    up_i32 = accumulator[token : token + row_tile, tile : 2 * tile]
+                    gate_channels = all_gate_channels
+                    up_channels = all_up_channels
+                    row_scale = pl.row_min(scales[token : token + row_tile, :])
+                else:
+                    gate_i32 = pl.slice(accumulator, [row_tile, tile], [token, column], valid_shape=[rows, tile])
+                    up_i32 = pl.slice(accumulator, [row_tile, tile], [token, up_column], valid_shape=[rows, tile])
+                    gate_channels = pl.reshape(channels[column : column + tile], [1, tile])
+                    up_channels = pl.reshape(channels[up_column : up_column + tile], [1, tile])
+                    if row_tile != 1:
+                        row_scale = pl.row_min(scales[token : token + row_tile, :])
                 if token_first:
-                    if quantize_output:
+                    if row_tile == 1:
                         scalar_scale = pl.read(scales, [token, 0])
                         gate_token = pl.mul(pl.cast(gate_i32, pl.FP32), scalar_scale)
                         up_token = pl.mul(pl.cast(up_i32, pl.FP32), scalar_scale)
                     else:
-                        row_scale = pl.row_min(scales[token : token + row_tile, :])
                         gate_token = pl.row_expand_mul(pl.cast(gate_i32, pl.FP32), row_scale)
                         up_token = pl.row_expand_mul(pl.cast(up_i32, pl.FP32), row_scale)
                     gate = pl.col_expand_mul(gate_token, gate_channels)
@@ -838,12 +850,11 @@ def _make_shared_activation(
                         up_half = pl.cast(up_channel, pl.FP16, mode="rint")
                         gate_channel = pl.cast(gate_half, pl.FP32)
                         up_channel = pl.cast(up_half, pl.FP32)
-                    if quantize_output:
+                    if row_tile == 1:
                         scalar_scale = pl.read(scales, [token, 0])
                         gate = pl.mul(gate_channel, scalar_scale)
                         up = pl.mul(up_channel, scalar_scale)
                     else:
-                        row_scale = pl.row_min(scales[token : token + row_tile, :])
                         gate = pl.row_expand_mul(gate_channel, row_scale)
                         up = pl.row_expand_mul(up_channel, row_scale)
                 gate = pl.minimum(gate, limit)
@@ -851,7 +862,27 @@ def _make_shared_activation(
                 denominator = pl.add(pl.exp(pl.neg(gate)), 1.0)
                 silu = pl.div(gate, denominator)
                 activated = pl.mul(silu, up)
-                if quantize_output:
+                if batched_quant:
+                    maximum = pl.row_max(pl.abs(activated))
+                    peak = pl.reshape(maximum, [1, row_tile])
+                    if fused_requantize:
+                        scale = pl.div(peak, 127.0)
+                        inverse = pl.recip(pl.maximum(scale, 1e-30))
+                    else:
+                        scale = pl.mul(peak, 1.0 / 127.0)
+                        numerator = pl.full([1, row_tile], dtype=pl.FP32, value=127.0)
+                        inverse = pl.div(numerator, pl.maximum(peak, 1e-30))
+                    normalized = pl.row_expand_mul(activated, pl.reshape(inverse, [row_tile, 1]))
+                    if fused_requantize:
+                        normalized = pl.cast(pl.cast(normalized, pl.FP16, mode="rint"), pl.FP32)
+                    bounded = pl.minimum(pl.maximum(normalized, -127.0), 127.0)
+                    rounded = pl.cast(bounded, pl.INT32, mode="rint")
+                    codes = pl.cast(pl.cast(rounded, pl.FP16, mode="rint"), pl.INT8, mode="trunc")
+                    ones = pl.full([row_tile, 8], dtype=pl.FP32, value=1.0)
+                    factors = pl.row_expand_mul(ones, pl.reshape(scale, [row_tile, 1]))
+                    output[token : token + row_tile, :] = pl.set_validshape(codes, rows, tile)
+                    output_scale[token : token + row_tile, :] = pl.set_validshape(factors, rows, 8)
+                elif quantize_output:
                     quant_value = pl.create_tensor([1, intermediate], dtype=pl.FP32)
                     quant_value[:, :] = activated
                     codes, activation_scale = quantize_row(quant_value)
@@ -884,15 +915,19 @@ def _make_shared_moe_partition(
     quant_hidden = _shared_make_quantize(
         capacity, intermediate, activation_dtype, fused_requantize=fused_requantize, whole_row=True,
     )
-    dot_gate_up = _shared_make_dot(capacity, hidden, gate_up_width, full_k_reuse=True, column_group=3, row_tile=32)
+    wide_prefill = capacity >= 2048 and capacity % 256 == 0 and hidden == 5120 and intermediate == 768
+    dot_gate_up = _shared_make_dot(
+        capacity, hidden, gate_up_width, full_k_reuse=not wide_prefill, column_group=3,
+        row_tile=256 if wide_prefill else 32, paired_columns=wide_prefill,
+    )
     down_row_tile = 256 if capacity > SMALL_TOKEN_CAPACITY and intermediate <= 768 else 16
     down_stages = 1 if down_row_tile > 16 else 2
     dot_down = _shared_make_dot(
-        capacity, intermediate, hidden, full_k_reuse=True, column_group=4,
+        capacity, intermediate, hidden, full_k_reuse=True, column_group=16 if wide_prefill else 4,
         row_tile=down_row_tile, column_stages=down_stages,
     )
     channel_dtype = fused_channel_dtype if fused_activation else pl.FP32
-    dequant_down = _shared_make_dequantize(capacity, hidden, channel_dtype=channel_dtype)
+    dequant_down = _shared_make_dequantize(capacity, hidden, channel_dtype=channel_dtype, reuse_workers=wide_prefill)
 
     @pl.jit.inline
     def shared_moe_partition(
@@ -963,6 +998,7 @@ def make_shared_moe_w8a8(
     local_width = config["moe_intermediate_size"] // partitions
     intermediate = (local_width + 255) // 256 * 256
     local_config = dict(config, moe_intermediate_size=intermediate)
+    reduce_tile = math.gcd(hidden, 1280 if capacity >= 2048 and hidden == 5120 else 640)
     gate_up_width = intermediate * 2
     quantize = make_prefill_projection_quantize(capacity, hidden)
     compute = _make_shared_moe_partition(
@@ -1001,22 +1037,24 @@ def make_shared_moe_w8a8(
                 local_down = down_weight[down_begin : down_end, :]
                 local_output = partials[peer * capacity : (peer + 1) * capacity, :]
                 compute(payload, input_scale, local_gate, local_scale, local_down, down_scale, local_output, active)
-            for block in pl.spmd(((active + 7) // 8) * (hidden // 256), name_hint="shared_tp_reduce"):
-                token = block // (hidden // 256) * 8
-                column = block % (hidden // 256) * 256
-                rows = pl.min(8, active - token)
-                a = pl.cast(partials[token : token + 8, column : column + 256], pl.FP32)
-                b = pl.cast(partials[capacity + token : capacity + token + 8, column : column + 256], pl.FP32)
-                pair = pl.cast(pl.add(a, b), pl.BF16, mode="rint")
-                if partitions == 4:
-                    third = 2 * capacity + token
-                    fourth = 3 * capacity + token
-                    c = pl.cast(partials[third : third + 8, column : column + 256], pl.FP32)
-                    d = pl.cast(partials[fourth : fourth + 8, column : column + 256], pl.FP32)
-                    other = pl.cast(pl.add(c, d), pl.BF16, mode="rint")
-                    total = pl.add(pl.cast(pair, pl.FP32), pl.cast(other, pl.FP32))
-                    pair = pl.cast(total, pl.BF16, mode="rint")
-                output[token : token + 8, column : column + 256] = pl.set_validshape(pair, rows, 256)
+            blocks = ((active + 7) // 8) * (hidden // reduce_tile)
+            workers = pl.min(blocks, 48)
+            for worker in pl.spmd(workers, name_hint="shared_tp_reduce"):
+                for block in pl.range(worker, blocks, workers):
+                    token = block // (hidden // reduce_tile) * 8
+                    column = block % (hidden // reduce_tile) * reduce_tile
+                    rows = pl.min(8, active - token)
+                    a = pl.cast(partials[token : token + 8, column : column + reduce_tile], pl.FP32)
+                    b = pl.cast(partials[capacity + token : capacity + token + 8, column : column + reduce_tile], pl.FP32)
+                    pair = pl.add(a, b)
+                    if partitions == 4:
+                        third = 2 * capacity + token
+                        fourth = 3 * capacity + token
+                        c = pl.cast(partials[third : third + 8, column : column + reduce_tile], pl.FP32)
+                        d = pl.cast(partials[fourth : fourth + 8, column : column + reduce_tile], pl.FP32)
+                        pair = pl.add(pair, pl.add(c, d))
+                    pair = pl.cast(pair, pl.BF16, mode="rint")
+                    output[token : token + 8, column : column + reduce_tile] = pl.set_validshape(pair, rows, reduce_tile)
         return x, output
 
     return shared_moe_w8a8
