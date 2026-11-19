@@ -157,9 +157,11 @@ class HostEngram:
                         type(token) is not int or not 0 <= token < len(self.constants["token_map"])
                         for token in [*prefix, *current]
                     )
-                    or request["initial_context_length"] != len(prefix)
+                    or request["initial_context_length"] != request.get("history_start", 0) + len(prefix)
+                    or len(prefix) < min(3, request["initial_context_length"])
                     or request["live_token_mask"] != [1] * len(current)
-                    or request["position_ids"] != list(range(len(prefix), len(prefix) + len(current)))
+                    or request["position_ids"] != list(range(request["initial_context_length"],
+                                                            request["initial_context_length"] + len(current)))
                 ):
                     raise ValueError("Host lookup requires complete contiguous request coordinates")
                 tokens.extend(current)
@@ -168,6 +170,11 @@ class HostEngram:
                 lookback.append((list(reversed(prefix[-3:])) + [-1] * 3)[:3])
             if engine["dp_rank"] != dp or engine["active"] != len(tokens) or len(tokens) > capacity:
                 raise ValueError("Host input does not match the bounded DP engine")
+            request_count = len(engine["requests"])
+            request_capacity = config.get("request_capacity", request_count)
+            if type(request_capacity) is not int or request_capacity < request_count:
+                raise ValueError("Host request slots do not cover the packed requests")
+            padded_starts = starts + [len(tokens)] * (request_capacity - request_count)
             ids = torch.tensor(tokens, dtype=torch.int64)
             pos = torch.tensor(positions, dtype=torch.int64)
             if torch.any(ids < 0) or torch.any(ids >= len(self.constants["token_map"])):
@@ -204,8 +211,8 @@ class HostEngram:
                 metadata = native["global_metadata"]
                 if (
                     not torch.equal(payload["positions"], pos)
-                    or payload["query_start_loc"].tolist() != starts
-                    or metadata["query_start_loc"].tolist() != starts
+                    or payload["query_start_loc"].tolist() != padded_starts
+                    or metadata["query_start_loc"].tolist() != padded_starts
                 ):
                     raise ValueError("Host row coordinates differ from the original cache metadata")
                 span = tuple(native["cp_token_range"])

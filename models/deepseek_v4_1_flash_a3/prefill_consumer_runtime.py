@@ -100,8 +100,11 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
             index_pages = owned_cache_pages(original, source_prefix + "indexer.k_cache", network["codes"])
             if index_pages != source_pages:
                 raise ValueError("Refresh source index and long cache owner pages differ")
-            dense_index = load_network_index(raw, network, index_pages, execute, rank, case)
-            codes, scales = dense_index["codes"], dense_index["scales"]
+            if live.get("packed_requests", False):
+                codes, scales = (raw_cache_matrix(raw, network[name]) for name in ("codes", "scales"))
+            else:
+                dense_index = load_network_index(raw, network, index_pages, execute, rank, case)
+                codes, scales = dense_index["codes"], dense_index["scales"]
         else:
             geometry = physical_index_geometry(live["layout"], source_prefix, cache_blocks)
             copy_pages, copy_count = cache_copy_pages(cache_blocks, range(cache_blocks))

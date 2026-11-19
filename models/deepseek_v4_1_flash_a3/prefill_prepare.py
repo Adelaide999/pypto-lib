@@ -6,15 +6,19 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Prepare single-request chunk inputs and persistent paged-cache coordinates."""
+"""Lower transactional request batches into persistent paged-cache coordinates."""
 
+import hashlib
 import json
 from copy import deepcopy
 from pathlib import Path
 import torch
 from .cache import resolve_layer_role
+from .cache_pool import CachePagePool
+from .metadata import RequestLedger, RequestQuery
+from .runtime_config import ParallelPlan, RuntimeLimits, prefill_execution_capacity
 from .utils import file_sha, write_json
-from .runtime_config import MAX_CONTEXT_TOKENS as MAX_CONTEXT, prefill_execution_capacity
+from .runtime_config import MAX_CONTEXT_TOKENS as MAX_CONTEXT
 
 
 PAGE_ROWS = 128
@@ -72,7 +76,7 @@ def checkpoint_cache(checkpoint, topology, *, capacity=16):
     return cache, config
 
 
-def tokenize_prompt(inputs, checkpoint, vocabulary):
+def tokenize_prompt(inputs, checkpoint, vocabulary, *, max_tokens=MAX_CONTEXT):
     """Encode raw completion text or validate explicit original token IDs."""
     if isinstance(inputs, str):
         from tokenizers import Tokenizer
@@ -81,9 +85,9 @@ def tokenize_prompt(inputs, checkpoint, vocabulary):
         tokenizer.no_truncation()
         tokenizer.no_padding()
         inputs = tokenizer.encode(inputs).ids
-    if (not isinstance(inputs, (list, tuple)) or not 1 <= len(inputs) <= MAX_CONTEXT
+    if (not isinstance(inputs, (list, tuple)) or not 1 <= len(inputs) <= max_tokens
             or any(type(token) is not int or not 0 <= token < vocabulary for token in inputs)):
-        raise ValueError(f"Require 1..{MAX_CONTEXT} integer token IDs within the checkpoint vocabulary")
+        raise ValueError(f"Require 1..{max_tokens} integer token IDs within the checkpoint vocabulary")
     return list(inputs)
 
 
@@ -300,15 +304,260 @@ class TokenChunkInputs:
         return dict(inputs=inputs, contract=contract, metadata_sources=sources, cache=cache)
 
 
+def build_packed_chunk_metadata(template, layout, pool, *, batch, rank):
+    """Lower packed requests, original positions, C2 pairs and stable ring ownership."""
+    dp_rank = rank // batch.plan.tp
+    rows = batch.for_dp(dp_rank)
+    coordinates = batch.coordinates(dp_rank)
+    total, requests = len(coordinates["token_ids"]), batch.request_capacity
+    positions = torch.tensor(coordinates["positions"], dtype=torch.int64)
+    span = list(batch.plan.token_range(rank, total))
+    valid = max(0, min(span[1], total) - min(span[0], total))
+    lengths = torch.zeros(requests, dtype=torch.int32)
+    lengths[:len(rows)] = torch.tensor(coordinates["seq_lens"], dtype=torch.int32)
+    starts = torch.full((requests + 1,), total, dtype=torch.int32)
+    starts[:len(rows) + 1] = torch.tensor(coordinates["query_start_loc"], dtype=torch.int32)
+    metadata, groups = {}, []
+    for index, source in enumerate(template["groups"]):
+        ring_group = all(name.endswith("compressor.state_cache") for name in source["names"])
+        swa_group = all(name.endswith("swa_cache") for name in source["names"])
+        width = 1 if ring_group else pool.table_pages
+        table = torch.full((requests, width), -1, dtype=torch.int32)
+        raw_slots, live = [], []
+        for request, row in enumerate(rows):
+            pages = pool.group_pages(row.handle, index)
+            if swa_group:
+                first = max(0, row.context_length - 127) // PAGE_ROWS
+                last = (row.sequence_length + PAGE_ROWS - 1) // PAGE_ROWS
+                for logical in range(first, last):
+                    table[request, logical] = pool.physical_page(row.handle, index, logical)
+            else:
+                table[request, :len(pages)] = torch.tensor(pages, dtype=torch.int32)
+            live.extend(pages)
+            for position in range(row.context_length, row.sequence_length):
+                raw_slots.append([-1, -1] if ring_group else
+                                 [pool.physical_page(row.handle, index, position // PAGE_ROWS),
+                                  position % PAGE_ROWS])
+        group = dict(group_id=source["group_id"], names=list(source["names"]), block_table=table,
+            slot_mapping=torch.tensor(raw_slots, dtype=torch.int64).reshape(total, 2),
+            live_block_ids=sorted(set(live)), reserved_untouched_block_id=pool.reserved)
+        groups.append(group)
+        for name in source["names"]:
+            role = resolve_layer_role(int(name.split(".")[2]))
+            compressed = name.endswith(("long_kv_cache", "indexer.k_cache"))
+            ring = name.endswith("compressor.state_cache")
+            ratio = role["ratio"] if compressed else 1
+            slots = []
+            for row in rows:
+                for position in range(row.context_length, row.sequence_length):
+                    if ring or (position + 1) % ratio:
+                        slots.append([-1, -1])
+                    else:
+                        slots.append([pool.physical_page(row.handle, index, position // PAGE_ROWS),
+                                      position % PAGE_ROWS // ratio])
+            global_metadata = dict(block_table=table,
+                query_start_loc=starts.clone(), seq_lens=lengths.clone(), positions=positions.clone(),
+                slot_mapping=torch.tensor(slots, dtype=torch.int64).reshape(total, 2),
+                cache_seq_lens=lengths // ratio, cmp_residual=lengths % ratio if ratio == 2 else None,
+                num_actual_tokens=total, num_reqs=len(rows), max_query_len=coordinates["max_query_len"],
+                max_cache_seq_len=int((lengths // ratio).max()))
+            if ring:
+                global_metadata["c2_source_positions"] = torch.where(positions % 2 == 1, positions - 1, 0)
+            metadata[name] = dict(cp_token_range=span, num_actual_tokens=valid, global_metadata=global_metadata)
+    return dict(layout=layout, metadata=metadata, groups=groups, positions=positions, lengths=lengths,
+                query_start_loc=starts, hash_constants=template["hash_constants"])
+
+
+class PackedTokenChunkInputs:
+    """Own request transactions, fixed physical page pools and incremental host lookup inputs."""
+
+    def __init__(self, *, checkpoint, cache, config, output, context_capacity, prepare_engram=False):
+        from .engram_host import HostEngram
+
+        self.checkpoint, self.output = Path(checkpoint).resolve(), Path(output).resolve()
+        self.config = dict(config, packed_requests=True)
+        self.topology = config["topology"]
+        self.plan = ParallelPlan.from_topology(self.topology)
+        model = json.loads((self.checkpoint / "config.json").read_text())
+        if model != config["model_config"]:
+            raise ValueError("Prepared model configuration differs from the selected checkpoint")
+        self.capacity = context_capacity
+        self.limits = RuntimeLimits(**config["runtime_limits"])
+        if not 1 <= context_capacity <= self.limits.max_model_len:
+            raise ValueError("Context reservation exceeds the configured model history limit")
+        self.config["capacity"] = self.limits.token_capacity(self.limits.max_num_batched_tokens)
+        self.cache = dict(cache, engram_contracts={
+            layer: dict(contract, capacity=self.config["capacity"])
+            for layer, contract in cache.get("engram_contracts", {}).items()
+        })
+        if self.config["capacity"] > 512:
+            raise ValueError("Network token buckets above 512 require separate operator and MoE validation")
+        self.plan.validate_model(model["text_config"])
+        self.config["request_capacity"] = self.limits.max_seqs_per_dp
+        self.ledger = RequestLedger(self.limits, self.plan)
+        pages = (context_capacity + PAGE_ROWS - 1) // PAGE_ROWS
+        groups = cache["cache_ABI"][0]["groups"]
+        swa_pages = min(pages, (self.limits.max_num_batched_tokens + 126) // PAGE_ROWS + 2)
+        default_pages = sum(1 if all(name.endswith("compressor.state_cache") for name in group["names"])
+                            else swa_pages if all(name.endswith("swa_cache") for name in group["names"])
+                            else pages for group in groups) * self.limits.max_seqs_per_dp
+        page_capacity = config.get("cache_page_capacity", default_pages)
+        if "hbm_budget" in config:
+            from .cache_pool import cache_capacity_from_hbm
+
+            budget = cache_capacity_from_hbm([item["layout"] for item in cache["cache_ABI"]],
+                                            **config["hbm_budget"])
+            page_capacity = min(page_capacity, budget["page_capacity"])
+            self.config["cache_budget"] = budget
+        self.pool = CachePagePool(cache["cache_ABI"], self.plan,
+            page_capacity=page_capacity, table_pages=pages, swa_pages=swa_pages)
+        self.layouts, self.reserved = self.pool.layouts, self.pool.reserved
+        self.layout_identity = hashlib.sha256(json.dumps(self.layouts, sort_keys=True).encode()).hexdigest()
+        self.metadata_transport = config.get("metadata_transport", "files")
+        if self.metadata_transport not in ("files", "memory"):
+            raise ValueError("metadata_transport must be files or memory")
+        self.identities = {name: file_sha(self.checkpoint / name) for name in
+                           ("config.json", "quant_model_weights.safetensors.index.json", "tokenizer.json")
+                           if (self.checkpoint / name).is_file()}
+        self.output.mkdir(parents=True, exist_ok=False)
+        self.host = (HostEngram(self.checkpoint, self.cache["engram_contracts"], self.output.parent.name)
+                     if prepare_engram else None)
+        self.epoch, self.predecessor = 0, None
+        self.retired = []
+        self.pending = None
+        self.closed = False
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            if self.host is not None:
+                self.host.close()
+
+    def chunk(self, tokens, *, dp_rank=0, phase=None):
+        """Prepare one request through the same transactional batch interface."""
+        owner = self.ledger.owners.get("default")
+        if phase is None:
+            phase = "prefill" if owner is None else owner.status
+        prompt = self.config.get("prompt_length", len(tokens)) if owner is None else owner.prompt_length
+        query = RequestQuery("default", dp_rank, tuple(tokens), prompt,
+                             None if owner is None else owner.handle.generation)
+        return self.batch([query], phase=phase)
+
+    def batch(self, queries, *, phase):
+        """Validate and lower a batch without committing any request history."""
+        if self.closed:
+            raise ValueError("Require a live session")
+        queries = tuple(queries)
+        if any(not isinstance(query, RequestQuery) for query in queries):
+            raise ValueError("Require explicit RequestQuery records")
+        vocabulary = self.config["model_config"]["text_config"]["vocab_size"]
+        for query in queries:
+            tokenize_prompt(query.token_ids, self.checkpoint, vocabulary, max_tokens=self.limits.max_model_len)
+        transaction = self.ledger.begin(queries, phase=phase)
+        previous = None
+        try:
+            previous = self.pool.reserve(transaction)
+            result = self._lower(transaction, previous)
+        except BaseException:
+            if previous is not None:
+                self.pool.rollback(previous)
+            self.ledger.rollback(transaction)
+            raise
+        self.pending = dict(transaction=transaction, previous_pool=previous,
+                            identity=result["contract"]["input_contract_sha256"], chunk=result)
+        return result
+
+    def _lower(self, transaction, changes):
+        directory = self.output / f"chunk-{self.epoch}"
+        directory.mkdir(exist_ok=True)
+        actual = dict(topology=self.topology, checkpoint=str(self.checkpoint), checkpoint_sha256=self.identities,
+                      epoch=self.epoch, phase=transaction.phase, predecessor_input_sha256=self.predecessor,
+                      DP_engines=transaction.contract_engines(), packed_requests=True,
+                      request_capacity=transaction.request_capacity,
+                      retired_requests=list(self.retired), output_map=transaction.output_map(),
+                      cache_layout_sha256=self.layout_identity,
+                      cache_page_updates=[dict(request_id=handle.request_id, dp_rank=handle.dp_rank,
+                          request_slot=handle.state_slot, generation=handle.generation, group=group,
+                          logical_start=start, pages=pages) for handle, group, start, pages in changes["updates"]])
+        input_path = directory / "input-contract.json"
+        write_json(input_path, actual)
+        identity = file_sha(input_path)
+        payloads, sources = [], []
+        for rank, template in enumerate(self.cache["cache_ABI"]):
+            payload = build_packed_chunk_metadata(template, self.layouts[rank], self.pool, batch=transaction, rank=rank)
+            if self.metadata_transport == "files":
+                path = directory / f"rank-{rank}-metadata.pt"
+                torch.save(payload, path)
+                sources.append(dict(rank=rank, path=str(path), sha256=file_sha(path)))
+            else:
+                receipt = hashlib.sha256(f"{identity}:{self.layout_identity}:{rank}".encode()).hexdigest()
+                sources.append(dict(rank=rank, transport="memory", sha256=receipt))
+            payloads.append(payload)
+        contract = dict(self.config, checkpoint=str(self.checkpoint), input_contract_path=str(input_path),
+                        input_contract_sha256=identity)
+        inputs = dict(input_contract=actual, prepare_input_stage=True)
+        cache = dict(self.cache, cache_ABI=payloads,
+                     cache_ABI_sources=[dict(rank=row["rank"], payload_sha256=row["sha256"],
+                                            report_sha256=row["sha256"]) for row in sources])
+        if self.host is not None:
+            inputs["engram_lookup"] = self.host.lookup(inputs, cache=cache, config=contract)
+        return dict(inputs=inputs, contract=contract, metadata_sources=sources, cache=cache,
+                    batch_metadata=transaction, metadata_owner=self)
+
+    def commit(self, identity=None):
+        if self.pending is None:
+            raise RuntimeError("No prepared request batch to commit")
+        if identity is not None and identity != self.pending["identity"]:
+            raise ValueError("Completed input does not identify the prepared request transaction")
+        self.ledger.commit(self.pending["transaction"])
+        self.predecessor = self.pending["identity"]
+        self.epoch += 1
+        self.pending = None
+        self.retired.clear()
+
+    def rollback(self):
+        if self.pending is not None:
+            self.pool.rollback(self.pending["previous_pool"])
+            self.ledger.rollback(self.pending["transaction"])
+            self.pending = None
+
+    def release(self, handle, reset):
+        self.ledger.release(handle, lambda owner: self.pool.release(owner, reset))
+        self.retired.append(dict(request_id=handle.request_id, dp_rank=handle.dp_rank,
+                                 request_slot=handle.state_slot, generation=handle.generation))
+
+    def abort(self, reset):
+        if self.pending is not None:
+            transaction = self.pending["transaction"]
+            try:
+                self.ledger.abort(transaction, lambda owner: self.pool.release(owner, reset))
+            finally:
+                self.pending = None
+
+
 def prepare_token_chunks(inputs, *, checkpoint, cache, config, output, chunk_size=16, dp_rank=0, prepare_engram=False):
     """Yield bounded request chunks using one metadata and host-table owner."""
-    prefill_execution_capacity(chunk_size)
-    tokens = tokenize_prompt(inputs, checkpoint, config["model_config"]["text_config"]["vocab_size"])
-    request = TokenChunkInputs(checkpoint=checkpoint, cache=cache, config=dict(config, chunk_size=chunk_size), output=output,
-                               context_capacity=config.get("context_capacity", len(tokens)),
-                               prepare_engram=prepare_engram)
+    vocabulary = config["model_config"]["text_config"]["vocab_size"]
+    packed = "runtime_limits" in config
+    if packed:
+        limits = RuntimeLimits(**config["runtime_limits"])
+        if type(chunk_size) is not int or not 1 <= chunk_size <= min(limits.max_num_batched_tokens, 512):
+            raise ValueError("Chunk size must fit the independent network new-token budget (at most 512)")
+        tokens = tokenize_prompt(inputs, checkpoint, vocabulary, max_tokens=limits.max_model_len)
+        request_type = PackedTokenChunkInputs
+        config = dict(config, prompt_length=len(tokens))
+    else:
+        prefill_execution_capacity(chunk_size)
+        tokens = tokenize_prompt(inputs, checkpoint, vocabulary)
+        request_type = TokenChunkInputs
+        config = dict(config, chunk_size=chunk_size)
+    request = request_type(checkpoint=checkpoint, cache=cache, config=config, output=output,
+                           context_capacity=config.get("context_capacity", len(tokens)),
+                           prepare_engram=prepare_engram)
     try:
         for begin in range(0, len(tokens), chunk_size):
             yield request.chunk(tokens[begin:begin + chunk_size], dp_rank=dp_rank)
+            if packed and request.pending is not None:
+                request.commit()
     finally:
         request.close()

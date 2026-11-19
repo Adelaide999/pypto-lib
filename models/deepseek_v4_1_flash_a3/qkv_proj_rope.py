@@ -22,7 +22,7 @@ from .runtime_config import SPMD_WORKER_LIMIT
 import torch
 from .config import FLASH as M
 from .gemm import make_dot, make_fp32_dequantize, make_int8_gemm
-from .operator_config import T_DYN
+from .operator_config import SMALL_TOKEN_CAPACITY, T_DYN
 from .quant import int8_matmul, make_decode_dequantize as decode_make_dequantize, make_decode_dynamic_int8_quantize as decode_make_dynamic_int8_quantize, make_decode_quantize as decode_make_quantize, make_dequantize, make_dynamic_int8_quantize, make_quantize, quantize_per_token_int8
 from .rmsnorm import decode_rms_norm_reference, make_blocked_rmsnorm as make_norm, make_decode_blocked_rmsnorm as decode_make_norm, make_decode_rmsnorm as decode_make_rmsnorm, make_rmsnorm, rms_norm_reference
 from .rope import decode_rope_reference, make_adjacent_rope as qkv_w8a8_make_rope, make_decode_adjacent_rope as decode_make_rope, make_decode_rope as decode_qkv_make_rope, make_rope as qkv_make_rope, rope_reference
@@ -209,7 +209,12 @@ def make_prefill_output_projection(capacity, tp, *, grouped):
         flat_shape = weight_shape
         hint = "prefill_bf16_projection_cube"
 
-    row_tile, n_tile, k_tile = 128, 256, 256
+    if capacity > SMALL_TOKEN_CAPACITY:
+        return _make_prefill_cube_output(capacity, groups * width, weight_shape, groups * columns, hint, grouped)
+
+    small_grouped = grouped and tp == 4 and capacity <= SMALL_TOKEN_CAPACITY
+    row_tile, n_tile = (16, 128) if small_grouped else (128, 256)
+    k_tile = 256
     workers = 24
     n_blocks = columns // n_tile
     row_blocks = groups * n_blocks
@@ -242,6 +247,36 @@ def make_prefill_output_projection(capacity, tp, *, grouped):
                     acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(kb == 0))
                 valid = pl.set_validshape(acc, rows, n_tile)
                 pl.store(valid, [row, col], output)
+        return output
+
+    return project
+
+
+def _make_prefill_cube_output(capacity, input_width, weight_shape, output_width, hint, grouped):
+    """Stream the local Wo-A or Wo-B weight panels through the Cube pipeline."""
+    from pypto.runtime import pto_isa_include_dir
+
+    kernel_path = Path(__file__).parent / "kernels" / "prefill_output_projection.cpp"
+
+    @pl.jit.extern(core_type="aic", source=kernel_path, include_dirs=(pto_isa_include_dir(),))
+    def projection(
+        x: pl.Tensor[[capacity, input_width], pl.BF16],
+        weight: pl.Tensor[weight_shape, pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
+        num_tokens: pl.Scalar[pl.INT32],
+    ) -> pl.Tensor:
+        ...
+
+    @pl.jit
+    def project(
+        x: pl.Tensor[[capacity, input_width], pl.BF16],
+        weight: pl.Tensor[weight_shape, pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        blocks = (num_tokens + 127) // 128 * (output_width // 256)
+        with pl.spmd(pl.min(24, blocks), name_hint=hint, allow_early_resolve=grouped):
+            output = projection(x, weight, output, num_tokens)
         return output
 
     return project

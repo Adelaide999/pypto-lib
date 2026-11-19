@@ -113,6 +113,8 @@ def rms_norm(
 
 def make_blocked_rmsnorm(capacity, width, eps):
     """Specialize weighted FP32 RMSNorm with a BF16 output."""
+    stream_rows = width == 512 and capacity >= 1024 and capacity % VEC_M_TILE == 0
+    stages = 2 if stream_rows else 1
 
     @pl.jit.inline
     def norm(
@@ -125,11 +127,22 @@ def make_blocked_rmsnorm(capacity, width, eps):
         workers = pl.min(tiles, PREFILL_NORM_WORKERS)
         for worker in pl.spmd(workers, name_hint="a2_rms_norm"):
             gamma = pl.reshape(pl.cast(weight[:], pl.FP32), [1, width])
-            for block in pl.range(worker, tiles, workers):
+            if stream_rows:
+                begin = worker * tiles // workers
+                end = (worker + 1) * tiles // workers
+                step = 1
+            else:
+                begin = worker
+                end = tiles
+                step = workers
+            for block in pl.pipeline(begin, end, step, stage=stages):
                 t0 = block * VEC_M_TILE
                 rows = pl.min(VEC_M_TILE, active - t0)
-                source = pl.slice(x, [VEC_M_TILE, width], [t0, 0], valid_shape=[rows, width])
-                source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), VEC_M_TILE, width)
+                if stream_rows:
+                    source = x[t0 : t0 + VEC_M_TILE, :]
+                else:
+                    source = pl.slice(x, [VEC_M_TILE, width], [t0, 0], valid_shape=[rows, width])
+                    source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), VEC_M_TILE, width)
                 value = pl.cast(source, pl.FP32)
                 square = pl.mul(value, value)
                 mean = pl.mul(pl.row_sum(square), 1.0 / width)

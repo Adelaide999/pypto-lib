@@ -15,10 +15,10 @@ from functools import lru_cache
 from pathlib import Path
 import numpy as np
 import pypto.language as pl
-from .runtime_config import SPMD_WORKER_LIMIT
 import torch
+from .indexer import INDEXER_SELECT_KEY_CAPACITY
+from .runtime_config import MAX_MODEL_CONTEXT_TOKENS, SPMD_WORKER_LIMIT
 from .swa import GATHER_TILE, make_swa_leaves
-from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY
 
 
 # tiling
@@ -286,7 +286,9 @@ def validate_live_state(role, original, live, epoch, token_map_id):
             if tuple(live["versions"].get(name, ())) != (owner, epoch, token_map_id):
                 raise ValueError("Missing or stale live " + name + " ownership for this token map")
     if role["candidate_filter"]:
-        validate_live_refresh_candidates(original, live["shared"], role["kv_source"])
+        validate_live_refresh_candidates(
+            original, live["shared"], role["kv_source"], packed_requests=live.get("packed_requests", False)
+        )
 
 
 def publish_live_versions(role, live, epoch, token_map_id):
@@ -463,7 +465,218 @@ def make_network_cache_publish(capacity, plane):
 
 
 def make_network_sparse_read(capacity, config, geometry):
-    """Gather buffered groups from distinct cache planes and attend640 slots."""
+    """Read the original cache planes and attend over selected KV rows."""
+    own, long = geometry["own"], geometry["long"]
+    heads, dim = config["num_attention_heads"], config["head_dim"]
+    own_stride, long_stride = own["stride"], long["stride"]
+    own_offset, long_offset = own["offset"], long["offset"]
+    if (heads, dim) != (64, 512) or any(v % dim for v in (own_stride, long_stride, own_offset, long_offset)):
+        return _make_general_network_sparse_read(capacity, config, geometry)
+
+    blocks = own["blocks"]
+    own_pitch, long_pitch = own_stride // dim, long_stride // dim
+    own_offset, long_offset = own_offset // dim, long_offset // dim
+    window = 640
+    width = heads * dim
+    scale = dim**-0.5
+    workers = 24
+    K_TILE = 128
+    GATHER_T_TILE = K_TILE // 2
+    D_TILE = dim // 2
+    lane_heads = heads // 2
+    pv_delay = 2
+    slots = pv_delay + 1
+    staging_rows = workers * slots * heads
+    kv_ready, score_ready, prob_ready, pv_ready = 0, 1, 2, 3
+
+    @pl.jit
+    def sparse_read(
+        query: pl.Tensor[[capacity, width], pl.BF16],
+        indices: pl.Tensor[[capacity, window], pl.INT32],
+        sink: pl.Tensor[[heads], pl.FP32],
+        long_raw: pl.Tensor[[blocks, long_stride], pl.BF16],
+        own_raw: pl.Tensor[[blocks, own_stride], pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        own_pool = pl.reshape(own_raw, [blocks * own_pitch, dim])
+        long_pool = pl.reshape(long_raw, [blocks * long_pitch, dim])
+        kv_transfer = pl.create_tensor([workers * slots * K_TILE, dim], dtype=pl.BF16)
+        qflat = pl.reshape(query, [capacity * heads, dim])
+        oflat = pl.reshape(output, [capacity * heads, dim])
+        sink_col = pl.reshape(sink, [heads, 1])
+        scores = pl.create_tensor([staging_rows, K_TILE], dtype=pl.FP32)
+        weights = pl.create_tensor([staging_rows, K_TILE], dtype=pl.BF16)
+        projections = pl.create_tensor([staging_rows, dim], dtype=pl.FP16)
+        ffts = pl.create_tensor([256], dtype=pl.INT64)
+        scheduled_parts = pl.create_tensor([capacity, 1], dtype=pl.INT32)
+        groups = (active + 7) // 8
+        for count_worker in pl.spmd(pl.min(groups, 48), name_hint="count_sparse_kv_parts"):
+            key_columns = pl.tile.arange(0, [1, window], dtype=pl.INT32)
+            part_ids = pl.cast(pl.add(pl.tile.shrs(key_columns, 7), 1), pl.FP32)
+            for group in pl.range(count_worker, groups, 48):
+                token_start = group * 8
+                rows = pl.min(active - token_start, 8)
+                sparse_ids = pl.tile.load(indices, [token_start, 0], [8, window], valid_shape=[rows, window])
+                float_ids = pl.cast(sparse_ids, pl.FP32)
+                valid_ids = pl.minimum(pl.maximum(pl.add(float_ids, 1.0), 0.0), 1.0)
+                marked = pl.col_expand_mul(valid_ids, part_ids)
+                mx_tmp = pl.create_tile([8, window], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                last_part = pl.cast(pl.row_max(marked, mx_tmp), pl.INT32)
+                pl.store(pl.set_validshape(last_part, rows, 1), [token_start, 0], scheduled_parts)
+        with pl.spmd(pl.min(workers, active), name_hint="prefill_sparse_qk_pv_pipe"):
+            worker = pl.tile.get_block_idx()
+            pl.system.set_ffts(ffts)
+            for token in pl.range(worker, active, workers):
+                live_parts = pl.read(scheduled_parts, [token, 0])
+                kv = pl.create_tile([slots * K_TILE, dim], dtype=pl.BF16, target_memory=pl.MemorySpace.Mat)
+                q = pl.load(qflat, [token * heads, 0], [heads, dim], target_memory=pl.MemorySpace.Mat)
+                for step in pl.range(live_parts + pv_delay):
+                    if step < live_parts:
+                        src_row = (worker * slots + step % slots) * K_TILE
+                        l1_row = step % slots * K_TILE
+                        stage_row = (worker * slots + step % slots) * heads
+                        pl.system.sync_wait(kv_ready, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
+                        kv = pl.gather_row(kv, kv_transfer, [l1_row, 0], [src_row, 0], [K_TILE, dim])
+                        kt = pl.tile.slice(pl.tile.transpose_view(kv), [dim, K_TILE], [0, l1_row])
+                        score = pl.matmul(q, kt, out_dtype=pl.FP32)
+                        pl.store(score, [stage_row, 0], scores)
+                        pl.system.sync_set(score_ready, pipe=pl.PipeType.FIX,
+                                           ffts_mode=2, core_type=pl.KernelType.AIC)
+                    if step >= pv_delay:
+                        part = step - pv_delay
+                        l1_row = part % slots * K_TILE
+                        stage_row = (worker * slots + part % slots) * heads
+                        pl.system.sync_wait(prob_ready, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
+                        p = pl.load(weights, [stage_row, 0], [heads, K_TILE], target_memory=pl.MemorySpace.Mat)
+                        v = pl.tile.slice(kv, [K_TILE, dim], [l1_row, 0])
+                        pv = pl.matmul(p, v, out_dtype=pl.FP32)
+                        pl.store(pv, [stage_row, 0], projections)
+                        pl.system.sync_set(pv_ready, pipe=pl.PipeType.FIX,
+                                           ffts_mode=2, core_type=pl.KernelType.AIC)
+
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                    pl.system.set_ffts(ffts)
+                    head = lane * lane_heads
+                    initial_m = pl.load(sink_col, [head, 0], [lane_heads, 1], target_memory=pl.MemorySpace.Vec)
+                    initial_l = pl.tile.adds(pl.tile.muls(initial_m, 0.0), 1.0)
+                    initial_left = pl.tile.full([lane_heads, D_TILE], dtype=pl.FP32, value=0.0)
+                    initial_right = pl.tile.full([lane_heads, D_TILE], dtype=pl.FP32, value=0.0)
+                    # The softmax stage leads the PV merge by two steps.
+                    for step, (m, l, left, right, alpha_old, alpha_new) in pl.range(
+                        live_parts + pv_delay + 1,
+                        init_values=(initial_m, initial_l, initial_left, initial_right, initial_l, initial_l),
+                    ):
+                        # After the final score, reuse GM slot zero for the next token.
+                        gather_current = step < live_parts and (step != 0 or token == worker)
+                        next_token = token + workers
+                        gather_next = False
+                        if step == live_parts + 1 and next_token < active:
+                            next_parts = pl.read(scheduled_parts, [next_token, 0])
+                            gather_next = next_parts > 0
+                        gather_part = step
+                        gather_token = token
+                        if gather_next:
+                            gather_part = 0
+                            gather_token = next_token
+                        do_gather = gather_current or gather_next
+                        if do_gather:
+                            gather_offset = lane * GATHER_T_TILE
+                            kv_row = (worker * slots + gather_part % slots) * K_TILE + gather_offset
+                            ids = pl.load(indices, [gather_token, gather_part * K_TILE + gather_offset], [1, GATHER_T_TILE])
+                            valid = pl.minimum(pl.maximum(pl.add(ids, 1), 0), 1)
+                            # Masked lanes use a selected row from the same plane.
+                            last_id = pl.tile.read(ids, [0, GATHER_T_TILE - 1])
+                            first_id = pl.tile.read(ids, [0, 0])
+                            picked_id = pl.max(last_id, first_id)
+                            if picked_id < 0:
+                                for column in pl.range(1, GATHER_T_TILE - 1):
+                                    picked_id = pl.max(picked_id, pl.tile.read(ids, [0, column]))
+                            if picked_id < 0:
+                                pad = pl.tile.full([GATHER_T_TILE, dim], dtype=pl.BF16, value=0.0)
+                                pl.store(pad, [kv_row, 0], kv_transfer)
+                            else:
+                                picked = pl.add(pl.maximum(ids, 0), pl.mul(pl.sub(valid, 1), -picked_id))
+                                picked_page = pl.tile.shrs(picked, 7)
+                                if gather_part == 0:
+                                    address = pl.add(pl.add(picked, own_offset), pl.mul(picked_page, own_pitch - 128))
+                                    own_kv = pl.tile.mgather(own_pool, address)
+                                    pl.store(own_kv, [kv_row, 0], kv_transfer)
+                                else:
+                                    address = pl.add(pl.add(picked, long_offset), pl.mul(picked_page, long_pitch - 128))
+                                    if last_id < 0:
+                                        # Gather the prefix through the last valid long-cache slot.
+                                        ends = pl.tile.arange(1, [1, GATHER_T_TILE], dtype=pl.INT32)
+                                        marked_ends = pl.mul(ends, valid)
+                                        reduce_ones = pl.tile.full([8, GATHER_T_TILE], dtype=pl.INT32, value=1)
+                                        end_matrix = pl.col_expand_mul(reduce_ones, marked_ends)
+                                        reduce_tmp = pl.tile.full([8, GATHER_T_TILE], dtype=pl.INT32, value=0)
+                                        end_tile = pl.row_max(end_matrix, reduce_tmp)
+                                        end = pl.cast(pl.tile.read(end_tile, [0, 0]), pl.INDEX)
+                                        bounded = pl.tile.set_validshape(address, 1, end)
+                                        partial_kv = pl.tile.mgather(long_pool, bounded)
+                                        zeroed_kv = pl.tile.fillpad_inplace(partial_kv)
+                                        full_kv = pl.tile.set_validshape(zeroed_kv, GATHER_T_TILE, dim)
+                                        pl.store(full_kv, [kv_row, 0], kv_transfer)
+                                    else:
+                                        long_kv = pl.tile.mgather(long_pool, address)
+                                        pl.store(long_kv, [kv_row, 0], kv_transfer)
+                            pl.system.sync_set(kv_ready, pipe=pl.PipeType.MTE3,
+                                               ffts_mode=2, core_type=pl.KernelType.AIV)
+                        if step > 0 and step <= live_parts:
+                            part = step - 1
+                            stage_row = (worker * slots + part % slots) * heads + head
+                            pl.system.sync_wait(score_ready, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
+                            s = pl.load(scores, [stage_row, 0], [lane_heads, K_TILE],
+                                        target_memory=pl.MemorySpace.Vec)
+                            ids = pl.load(indices, [token, part * K_TILE], [1, K_TILE],
+                                          target_memory=pl.MemorySpace.Vec)
+                            fids = pl.cast(ids, pl.FP32)
+                            valid = pl.minimum(pl.maximum(pl.add(fids, 1.0), 0.0), 1.0)
+                            bias = pl.mul(pl.sub(valid, 1.0), 1e30)
+                            logits = pl.col_expand_add(pl.mul(s, scale), bias)
+                            tmp = pl.create_tile([lane_heads, K_TILE], dtype=pl.FP32,
+                                                 target_memory=pl.MemorySpace.Vec)
+                            next_m = pl.maximum(pl.row_max(logits, tmp), m)
+                            alpha = pl.exp(pl.sub(m, next_m))
+                            exp = pl.exp(pl.row_expand_sub(logits, next_m))
+                            prob = pl.col_expand_mul(exp, valid)
+                            local_l = pl.row_sum(prob, tmp)
+                            pl.store(pl.cast(prob, pl.BF16, mode="rint"), [stage_row, 0], weights)
+                            next_l = pl.add(pl.mul(alpha, l), local_l)
+                            pl.system.sync_set(prob_ready, pipe=pl.PipeType.MTE3,
+                                               ffts_mode=2, core_type=pl.KernelType.AIV)
+                            softmax_m, softmax_l, softmax_alpha = pl.yield_(next_m, next_l, alpha)
+                        else:
+                            softmax_m, softmax_l, softmax_alpha = pl.yield_(m, l, initial_l)
+                        if step >= pv_delay + 1:
+                            part = step - pv_delay - 1
+                            stage_row = (worker * slots + part % slots) * heads + head
+                            pl.system.sync_wait(pv_ready, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
+                            pv_left = pl.load(projections, [stage_row, 0], [lane_heads, D_TILE])
+                            pv_left = pl.cast(pv_left, pl.FP32)
+                            next_left = pl.add(pl.row_expand_mul(left, alpha_old), pv_left)
+                            pv_right = pl.load(projections, [stage_row, D_TILE], [lane_heads, D_TILE])
+                            pv_right = pl.cast(pv_right, pl.FP32)
+                            next_right = pl.add(pl.row_expand_mul(right, alpha_old), pv_right)
+                            merge_left, merge_right = pl.yield_(next_left, next_right)
+                        else:
+                            merge_left, merge_right = pl.yield_(left, right)
+                        final_m, final_l, final_left, final_right, final_alpha_old, final_alpha_new = pl.yield_(
+                            softmax_m, softmax_l, merge_left, merge_right, alpha_new, softmax_alpha,
+                        )
+                    row = token * heads + head
+                    pl.store(pl.cast(pl.row_expand_div(final_left, final_l), pl.BF16, mode="rint"),
+                             [row, 0], oflat)
+                    pl.store(pl.cast(pl.row_expand_div(final_right, final_l), pl.BF16, mode="rint"),
+                             [row, D_TILE], oflat)
+        return output
+
+    return sparse_read
+
+
+def _make_general_network_sparse_read(capacity, config, geometry):
+    """Gather from cache layouts that cannot be viewed as contiguous KV rows."""
     long, own = geometry["long"], geometry["own"]
     blocks, long_stride, own_stride = long["blocks"], long["stride"], own["stride"]
     long_offset, own_offset = long["offset"], own["offset"]
@@ -531,7 +744,7 @@ def make_network_sparse_read(capacity, config, geometry):
     return sparse_read
 
 
-def make_network_cache_entries(capacity, config, geometry, role):
+def make_network_cache_entries(capacity, config, geometry, role, requests=1, table_pages=1):
     """Build only actual cache-addressing and owner-page transfer entries."""
     role = resolve_layer_role(role["physical_layer"], role)
     entries = dict(
@@ -541,6 +754,11 @@ def make_network_cache_entries(capacity, config, geometry, role):
     if role["mode"] == "full":
         entries["network_compressed_publish"] = make_network_cache_publish(capacity, geometry["long"])
     if role["mode"] == "reuse":
+        return entries
+    if config.get("packed_requests", False):
+        from .paged_indexer import make_paged_index_entries
+
+        entries.update(make_paged_index_entries(capacity, geometry, role, requests, table_pages))
         return entries
     for name in ("codes", "scales"):
         plane = geometry[name]
@@ -620,7 +838,9 @@ def attach_network_cache_geometry(provider):
     for rank in range(provider.topology["ep"]):
         for case, layout in provider.layouts[rank].items():
             for layer in range(40):
-                provider.state_handles_for_layer(layer)[rank][case]["shared"] = provider.shared[rank][case]
+                live = provider.state_handles_for_layer(layer)[rank][case]
+                live["shared"] = provider.shared[rank][case]
+                live["packed_requests"] = provider.packed_requests
             for layer in range(2, 40):
                 role = resolve_layer_role(layer)
                 blocks = layout["views"][f"model.layers.{layer}.self_attn.swa_cache"]["shape"][0]
@@ -637,13 +857,14 @@ def attach_network_cache_geometry(provider):
     )
 
 
-def validate_live_refresh_candidates(original, shared, source_id):
-    """Preserve the short full-coverage guard against the actual live candidate buffer."""
+def validate_live_refresh_candidates(original, shared, source_id, *, packed_requests=False):
+    """Validate full short-history coverage or an actual bounded, pinned global source pool."""
     starts = original["metadata"]["query_start_loc"].tolist()
     metadata = original["cache_metadata"]["actual_metadata"]
     prefix = f"model.layers.{source_id}.self_attn."
     lengths = metadata[prefix + "indexer.k_cache"]["global_metadata"]["cache_seq_lens"].tolist()
-    if any(length < 0 or length > KEY_CAPACITY for length in lengths):
+    limit = MAX_MODEL_CONTEXT_TOKENS if packed_requests else INDEXER_SELECT_KEY_CAPACITY
+    if any(length < 0 or length > limit for length in lengths):
         raise ValueError("Refresh history exceeds the supported index-key capacity")
     start = original["cp_token_range"][0]
     candidates = shared["candidates"]
@@ -651,9 +872,21 @@ def validate_live_refresh_candidates(original, shared, source_id):
         token = start + local
         request = next(i for i in range(len(starts) - 1) if starts[i] <= token < starts[i + 1])
         visible = min(lengths[request], int(original["positions"][token]) + 1)
-        available = set(candidates[local].reshape(-1).tolist())
-        if not set(range((visible + 7) // 8)).issubset(available):
-            raise ValueError("This input requires candidate pruning; no dense substitute is supported")
+        values = candidates[local].reshape(-1).tolist()
+        blocks = (visible + 7) // 8
+        if not packed_requests:
+            if not set(range(blocks)).issubset(values):
+                raise ValueError("This input requires candidate pruning; no dense substitute is supported")
+            continue
+        available = [value for value in values if value >= 0]
+        if (len(available) != min(blocks, 2048) or len(available) != len(set(available))
+                or values != available + [-1] * (len(values) - len(available))
+                or any(value >= blocks for value in available)
+                or (blocks and available[0] != blocks - 1)):
+            raise ValueError("Candidate pool is stale, unpinned, duplicated or outside its request history")
+        if blocks <= 2048 and set(available) != set(range(blocks)):
+            raise ValueError("Short-history candidate publication lost full block coverage")
+
 
 def golden_paged_cache_copy(tensors, *, payload, source_offset=0, destination_offset=0):
     """Copy selected payloads and retain all unselected pages and padding."""
@@ -700,6 +933,86 @@ def paged_cache_copy_cases():
     ], golden_fn=partial(golden_paged_cache_copy, payload=128))
 
 
+def golden_network_sparse_read(tensors, *, geometry):
+    """Evaluate two paged KV planes and a logit-only sink."""
+    active = int(tensors["active"])
+    indices = tensors["indices"][:active].long()
+    sink = tensors["sink"]
+    query = tensors["query"][:active].float().reshape(active, sink.numel(), 512)
+    planes = []
+    for name, part in (("own", indices[:, :128]), ("long", indices[:, 128:])):
+        layout = geometry[name]
+        offset, rows = layout["offset"], layout["rows"]
+        values = tensors[f"{name}_raw"][:, offset:offset + rows * 512].reshape(layout["blocks"], rows, 512)
+        address = part.clamp_min(0)
+        tile = values[address // 128, address % 128].float()
+        planes.append(tile.masked_fill(part[:, :, None] < 0, 0.0))
+    kv = torch.cat(planes, dim=1)
+    logits = (query @ kv.transpose(1, 2)) * (512**-0.5)
+    logits = logits.masked_fill(indices[:, None, :] < 0, -torch.inf)
+    logits = torch.cat((logits, sink[None, :, None].expand(active, -1, -1)), dim=-1)
+    result = logits.softmax(dim=-1)[..., :-1] @ kv
+    tensors["output"][:active] = result.flatten(1).to(torch.bfloat16)
+
+
+def network_sparse_read_cases():
+    """Cover padded/cache-aligned pages, sparse holes and slot reuse."""
+    from functools import partial
+    from golden import ScalarSpec, TensorSpec
+    from golden.validation import ratio_allclose
+
+    capacity, active, blocks, heads, dim = 32, 29, 4, 64, 512
+    config = dict(num_attention_heads=heads, head_dim=dim, sliding_window=128, index_topk=512)
+    numeric = ratio_allclose(atol=0.004, rtol=0.02, max_error_ratio=0.0, valid_rows=active)
+
+    def compare(actual, expected, **kwargs):
+        if not torch.equal(actual[active:], expected[active:]):
+            return False, "Inactive sparse attention output changed"
+        if torch.count_nonzero(actual[0]) or torch.count_nonzero(actual[24]):
+            return False, "Fully masked sparse attention output is nonzero"
+        return numeric(actual, expected, **kwargs)
+
+    for ratio, offset in ((1, 0), (2, dim), (2, 128)):
+        rng = torch.Generator().manual_seed(2411)
+        ids = torch.full((capacity, 640), -1, dtype=torch.int32)
+        specs = []
+        geometry = {}
+        for name, column, width, rows in (("long", 128, 512, 128 // ratio), ("own", 0, 128, 128)):
+            stride = 130 * dim + offset
+            geometry[name] = dict(blocks=blocks, stride=stride, offset=offset, rows=rows)
+            raw = torch.full((blocks, stride), 29, dtype=torch.bfloat16)
+            data = torch.randn(blocks, rows * dim, generator=rng, dtype=torch.bfloat16) * 0.5
+            raw[:, offset:offset + rows * dim] = data
+            page = torch.randint(blocks, (active, width), generator=rng)
+            row = torch.randint(rows, (active, width), generator=rng)
+            chosen = (page * 128 + row).int()
+            chosen[:, ::7] = -1
+            chosen[1, :4] = torch.tensor([rows - 1, 128, 128, -1], dtype=torch.int32)
+            chosen[2, 29:] = -1
+            chosen[3, :64] = -1
+            chosen[3, 8:10] = 1
+            chosen[0] = chosen[24] = -1
+            ids[:active, column:column + width] = chosen
+            specs.append(TensorSpec(f"{name}_raw", list(raw.shape), raw.dtype, init_value=raw))
+        query = torch.randn(capacity, heads * dim, generator=rng, dtype=torch.bfloat16) * 0.25
+        sink = torch.randn(heads, generator=rng)
+        inputs = [
+            TensorSpec("query", list(query.shape), query.dtype, init_value=query),
+            TensorSpec("indices", list(ids.shape), ids.dtype, init_value=ids),
+            TensorSpec("sink", [heads], sink.dtype, init_value=sink),
+            *specs,
+            TensorSpec("output", list(query.shape), query.dtype, init_value=-299),
+            ScalarSpec("active", torch.int32, active, compile_runtime=True),
+        ]
+        yield dict(
+            name=f"sparse-read-ratio{ratio}-offset{offset}",
+            fn=make_network_sparse_read(capacity, config, geometry),
+            specs=inputs,
+            golden_fn=partial(golden_network_sparse_read, geometry=geometry),
+            compare_fn={"output": compare},
+        )
+
+
 if __name__ == "__main__":
     import argparse
     from golden import run
@@ -709,8 +1022,10 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--sim", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--sparse-read", action="store_true", help="Validate the two-plane sparse attention reader")
     args = parser.parse_args()
-    for case in paged_cache_copy_cases():
+    cases = network_sparse_read_cases() if args.sparse_read else paged_cache_copy_cases()
+    for case in cases:
         name = case.pop("name")
         result = run(
             **case,
@@ -721,4 +1036,4 @@ if __name__ == "__main__":
         )
         if not result.passed:
             raise RuntimeError(f"{name}: {result.error}")
-        print(f"[cache-copy] {name} PASS", flush=True)
+        print(f"[cache] {name} PASS", flush=True)
