@@ -345,6 +345,9 @@ def make_sp_gather_unpack(capacity, width, tp, dtype=pl.BF16, tile=D_TILE, *, la
     while tile < 4096 and width % (2 * tile) == 0:
         tile *= 2
     row_tile = PACK_T_TILE if dtype == pl.BF16 and tile <= 8192 and width % tile == 0 and not last_row else 1
+    FULL_ROW_TILE = 4
+    full_row_workers = 48
+    full_row = row_tile > 1 and width == 5120
 
     @pl.jit
     def gather_unpack(
@@ -366,6 +369,14 @@ def make_sp_gather_unpack(capacity, width, tp, dtype=pl.BF16, tile=D_TILE, *, la
                     for column in pl.range(width):
                         state_value = pl.read(packet, [source, column])
                         pl.write(output, [token, column], state_value)
+        elif full_row and physical % FULL_ROW_TILE == 0 and rows % FULL_ROW_TILE == 0:
+            block_count = rows // FULL_ROW_TILE
+            for worker in pl.spmd(pl.min(block_count, full_row_workers), name_hint="prefill_sp_gather_unpack_full_row"):
+                for block in pl.pipeline(worker, block_count, full_row_workers, stage=3):
+                    token = block * FULL_ROW_TILE
+                    source = token // physical * capacity + token % physical
+                    block_data = pl.load(packet, [source, 0], [FULL_ROW_TILE, width], target_memory=pl.MemorySpace.Vec)
+                    pl.store(block_data, [token, 0], output)
         elif row_tile > 1 and physical % row_tile == 0 and rows % row_tile == 0:
             block_count = rows // row_tile * (width // tile)
             for worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint="prefill_sp_gather_unpack_tiled"):
