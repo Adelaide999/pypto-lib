@@ -255,8 +255,13 @@ def make_blocked_weight_pack(width, output_width):
 
 
 def make_dot(capacity, width, output_width, *, full_k_reuse=False, column_group=1, column_stages=1,
-             row_tile=M_TILE, paired_columns=False):
-    """Accumulate complete blocked INT8 products in INT32."""
+             row_tile=M_TILE, paired_columns=False, column_major=False):
+    """Accumulate complete blocked INT8 products in INT32.
+
+    ``column_major`` schedules output-panel groups before row tiles for the
+    wide full-K Prefill down projection, keeping each worker on one weight
+    panel while it advances through the active rows.
+    """
     packed_rows = width * (output_width // N_TILE)
 
     if paired_columns:
@@ -305,8 +310,12 @@ def make_dot(capacity, width, output_width, *, full_k_reuse=False, column_group=
             row_blocks = (active + row_tile - 1) // row_tile
             column_blocks = (output_width // N_TILE + column_group - 1) // column_group
             for block in pl.spmd(row_blocks * column_blocks, name_hint="prefill_int8_dot_full_k"):
-                t0 = block // column_blocks * row_tile
-                first_nb = block % column_blocks * column_group
+                if column_major:
+                    t0 = block % row_blocks * row_tile
+                    first_nb = block // row_blocks * column_group
+                else:
+                    t0 = block // column_blocks * row_tile
+                    first_nb = block % column_blocks * column_group
                 last_nb = pl.min(first_nb + column_group, output_width // N_TILE)
                 rows = pl.min(row_tile, active - t0)
                 source = pl.load(payload, [t0, 0], [row_tile, width], valid_shape=[rows, width], target_memory=pl.Mem.Mat)

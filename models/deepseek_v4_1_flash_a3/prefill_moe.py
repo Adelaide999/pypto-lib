@@ -1033,6 +1033,7 @@ def _make_shared_moe_partition(
         # At the 256-row tile, 16 output panels keeps enough independent
         # blocks for Cube occupancy while retaining the full-K input reuse.
         column_group=16 if down_wide else 4,
+        column_major=down_wide,
         row_tile=down_row_tile, column_stages=down_stages,
     )
     channel_dtype = fused_channel_dtype if fused_activation else pl.FP32
