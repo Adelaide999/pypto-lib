@@ -13,7 +13,7 @@ import torch
 from .gemm import make_dot
 from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY
 from .qkv_proj_rope import make_bf16_projection_staged
-from .quant import make_dequantize, make_quantize
+from .quant import make_dequantize, make_prefill_projection_quantize, make_quantize
 from .rope import make_adjacent_rope as make_rope
 from .utils import copy_runtime_tensor
 
@@ -131,7 +131,7 @@ def make_index_query_projection(capacity):
     """Project packed queries and apply combined scales in the same task."""
     if capacity <= 0 or capacity % 16:
         raise ValueError("Use a positive capacity divisible by 16")
-    quantize = make_quantize(capacity, 1280, whole_row=True)
+    quantize = make_prefill_projection_quantize(capacity, 1280)
     QUERY_ROWS_TILE = 16
     QUERY_COLUMNS_TILE = 64
     QUERY_GROUP_TILE = 4
