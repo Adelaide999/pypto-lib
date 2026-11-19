@@ -45,9 +45,11 @@ def validate_golden_active(golden_data, active):
 
 
 def allocate_runtime_tensor(runtime, shape, dtype, rank, *, fill=0):
-    """Allocate initialized scratch through its execution owner's workspace bank."""
+    """Allocate scratch through its owner, with no fill for complete overwrites."""
     allocate = runtime.get("workspace")
-    return torch.full(shape, fill, dtype=dtype) if allocate is None else allocate(shape, dtype, rank, fill=fill)
+    if allocate is not None:
+        return allocate(shape, dtype, rank, fill=fill)
+    return torch.empty(shape, dtype=dtype) if fill is None else torch.full(shape, fill, dtype=dtype)
 
 
 def copy_runtime_tensor(runtime, destination, source, rank):

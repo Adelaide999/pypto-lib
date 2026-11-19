@@ -1065,8 +1065,9 @@ def make_prefill_indexer_select(
     head_dim: int = INDEX_HEAD_DIM,
     topk: int = INDEX_TOPK,
     compress_ratio: int = 2,
+    packed_keys: bool = False,
 ):
-    """Build a fixed-bucket PyPTO QLI score/Top-K kernel."""
+    """Score causal key tiles and zero the remaining score tiles for packed cache inputs."""
 
     if capacity <= 0 or capacity % HEAD_TILE:
         raise ValueError("capacity must be a positive multiple of 16")
@@ -1102,7 +1103,10 @@ def make_prefill_indexer_select(
         combined = pl.mul(q_scale_row, weight_row)
         combined_half = pl.cast(combined, pl.FP16, mode="rint")
         weight_column = pl.reshape(pl.cast(combined_half, pl.FP32), [heads, 1])
-        for k0 in pl.range(0, key_capacity, KEY_ROWS_TILE):
+        score_end = key_capacity
+        if packed_keys:
+            score_end = ((visible + KEY_ROWS_TILE - 1) // KEY_ROWS_TILE) * KEY_ROWS_TILE
+        for k0 in pl.range(0, score_end, KEY_ROWS_TILE):
             key_tile = key[k0 : k0 + KEY_ROWS_TILE, :]
             scale_tile = pl.reshape(pl.cast(key_scale[k0 : k0 + KEY_ROWS_TILE], pl.FP32), [1, KEY_ROWS_TILE])
             dots = pl.matmul(q_tile, key_tile, b_trans=True, out_dtype=pl.INT32)
@@ -1113,6 +1117,11 @@ def make_prefill_indexer_select(
             reduced_row = pl.col_sum(weighted)
             total = pl.mul(reduced_row, scale_tile)
             scores[token : token + 1, k0 : k0 + KEY_ROWS_TILE] = total
+        if packed_keys:
+            for k0 in pl.range(score_end, key_capacity, KEY_ROWS_TILE):
+                scores[token : token + 1, k0 : k0 + KEY_ROWS_TILE] = pl.full(
+                    [1, KEY_ROWS_TILE], dtype=pl.FP32, value=0.0
+                )
 
         if visible <= 32:
             short_scores = pl.load(scores, [token, 0], [1, 32])
@@ -1137,7 +1146,10 @@ def make_prefill_indexer_select(
             padding_bits = pl.reinterpret_view(padding_ids, pl.UINT32)
             padding_pairs = pl.tile.sort32(padding_scores, padding_bits, tmp=padding_tmp)
             running_pairs = padding_pairs
-            for first in pl.range(0, key_capacity, LOAD_ROWS_TILE):
+            sort_end = key_capacity
+            if packed_keys:
+                sort_end = visible
+            for first in pl.range(0, sort_end, LOAD_ROWS_TILE):
                 actual_scores = pl.load(scores, [token, first], [1, LOAD_ROWS_TILE])
                 row_raw = pl.tile.full([1, SORT_ROWS_TILE], dtype=pl.FP32, value=NEGATIVE_INF)
                 row_raw = pl.tile.assemble(row_raw, actual_scores, [0, 0])

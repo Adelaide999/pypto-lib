@@ -488,21 +488,42 @@ def make_network_sparse_read(capacity, config, geometry):
             for block in pl.range(block_worker, block_count, SPMD_WORKER_LIMIT):
                 token = block // (640 // GATHER_TILE)
                 begin = block % (640 // GATHER_TILE) * GATHER_TILE
-                for group_lane in pl.pipeline(0, GATHER_TILE, stage=4):
-                    lane = begin + group_lane
-                    element = token * 640 + lane
-                    index = pl.read(indices, [token, lane])
-                    if index >= 0:
-                        page = pl.cast(index // 128, pl.INDEX)
-                        row = pl.cast(index % 128, pl.INDEX)
-                        if lane < 128:
-                            column = own_offset + row * head_dim
-                            selected[element : element + 1, :] = own_raw[page : page + 1, column : column + head_dim]
-                        else:
-                            column = long_offset + row * head_dim
-                            selected[element : element + 1, :] = long_raw[page : page + 1, column : column + head_dim]
+                element = token * 640 + begin
+                ids = pl.tile.load(indices, [token, begin], [1, GATHER_TILE])
+                head = pl.tile.read(ids, [0, 0])
+                tail = pl.tile.read(ids, [0, GATHER_TILE - 1])
+                page_row = pl.cast(head % 128, pl.INDEX)
+                is_run = False
+                if head >= 0 and tail - head == GATHER_TILE - 1 and page_row <= 128 - GATHER_TILE:
+                    is_run = True
+                    for group_lane in pl.unroll(1, GATHER_TILE - 1):
+                        is_run = is_run and pl.tile.read(ids, [0, group_lane]) == head + group_lane
+                if is_run:
+                    run_page = pl.cast(head // 128, pl.INDEX)
+                    run_offset = page_row * head_dim
+                    run_span = GATHER_TILE * head_dim
+                    if begin < 128:
+                        run = pl.tile.load(own_raw, [run_page, own_offset + run_offset], [1, run_span])
                     else:
-                        selected[element : element + 1, :] = pl.full([1, head_dim], dtype=pl.BF16, value=0.0)
+                        run = pl.tile.load(long_raw, [run_page, long_offset + run_offset], [1, run_span])
+                    run_rows = pl.tile.reshape(run, [GATHER_TILE, head_dim])
+                    pl.tile.store(run_rows, [element, 0], selected)
+                else:
+                    values = pl.tile.full([GATHER_TILE, head_dim], dtype=pl.BF16, value=0.0)
+                    for group_lane in pl.range(GATHER_TILE):
+                        index = pl.tile.read(ids, [0, group_lane])
+                        if index >= 0:
+                            page = pl.cast(index // 128, pl.INDEX)
+                            column_offset = pl.cast(index % 128, pl.INDEX) * head_dim
+                            if begin < 128:
+                                values = pl.tile.gather_row(
+                                    values, own_raw, [group_lane, 0], [page, own_offset + column_offset], [1, head_dim],
+                                )
+                            else:
+                                values = pl.tile.gather_row(
+                                    values, long_raw, [group_lane, 0], [page, long_offset + column_offset], [1, head_dim],
+                                )
+                    pl.tile.store(values, [element, 0], selected)
         attend(query, selected, indices, sink, output, active)
         return output
 

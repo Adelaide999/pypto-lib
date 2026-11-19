@@ -840,8 +840,12 @@ def make_decode_shared_moe_w8a8_inline(capacity, config, *, fused_activation=Fal
     quant_hidden = _decode_shared_make_quantize(capacity, intermediate, activation_dtype)
     pack_gate_up = _decode_shared_make_pack_weight(hidden, gate_up_width)
     pack_down = _decode_shared_make_pack_weight(intermediate, hidden)
-    dot_gate_up = _decode_shared_make_dot(capacity, hidden, gate_up_width)
-    dot_down = _decode_shared_make_dot(capacity, intermediate, hidden)
+    dot_gate_up = _decode_shared_make_dot(
+        capacity, hidden, gate_up_width, full_k_reuse=True, column_group=3, row_tile=16,
+    )
+    dot_down = _decode_shared_make_dot(
+        capacity, intermediate, hidden, full_k_reuse=True, column_group=2, column_stages=2, row_tile=16,
+    )
     # vLLM's quantized down projection emits BF16 before the shared/routed
     # combine. Keep the fused activation's FP32 intermediates, but preserve
     # that output boundary.

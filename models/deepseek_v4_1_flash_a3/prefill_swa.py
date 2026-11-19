@@ -36,15 +36,13 @@ GEOMETRY = dict(
 
 def make_builders(capacity=16, config=None, cache_blocks=2, *, tp=1):
     """Build twelve Prefill stages with explicit predecessor and cache buffers."""
-    from . import qkv_proj_rope as grouped
-    from . import qkv_proj_rope as shared
+    from .qkv_proj_rope import make_prefill_output_projection
 
     config = dict(GEOMETRY) if config is None else config
     if any(config.get(key) != value for key, value in GEOMETRY.items()):
         raise ValueError("Retain complete Eco-Tech SWA geometry")
     if capacity <= 0 or capacity % 16:
         raise ValueError("Capacity must cover complete 16-row tiles")
-    grouped_output = grouped.make_prefill_grouped_output(tp)
     publish, _gather, _attend = make_swa_leaves(capacity, cache_blocks, config)
     pre = make_hc_pre_inline(capacity, config)
     norm = pl.jit.inline(make_prefill_norm(capacity, 5120)._func)
@@ -84,6 +82,6 @@ def make_builders(capacity=16, config=None, cache_blocks=2, *, tp=1):
         swa_read=make_swa_read(capacity, cache_blocks, config),
         swa=standalone(make_swa_inline(capacity, cache_blocks, config)),
         inverse_rope=standalone(make_rope(capacity, 64, 512, 64, inverse=True, name_hint="attention_rope")),
-        grouped_wo_a=standalone(grouped_output),
-        wo_b=shared.make_bf16_projection_staged(8192 // tp, 5120, capacity=capacity),
+        grouped_wo_a=make_prefill_output_projection(capacity, tp, grouped=True),
+        wo_b=make_prefill_output_projection(capacity, tp, grouped=False),
     )

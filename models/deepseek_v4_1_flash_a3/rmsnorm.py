@@ -23,6 +23,7 @@ EPS = M.rms_norm_eps
 # tiling
 NORM_T_TILE = 8
 NORM_D_TILE = 512
+PREFILL_NORM_WORKERS = 48
 
 
 def make_rms_norm_tiled(output_dtype=pl.BF16):
@@ -120,20 +121,23 @@ def make_blocked_rmsnorm(capacity, width, eps):
         output: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd((active + VEC_M_TILE - 1) // VEC_M_TILE, name_hint="a2_rms_norm"):
-            t0 = block * VEC_M_TILE
-            rows = pl.min(VEC_M_TILE, active - t0)
-            source = pl.slice(x, [VEC_M_TILE, width], [t0, 0], valid_shape=[rows, width])
-            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), VEC_M_TILE, width)
-            value = pl.cast(source, pl.FP32)
-            square = pl.mul(value, value)
-            mean = pl.mul(pl.row_sum(square), 1.0 / width)
-            inverse = pl.rsqrt(pl.add(mean, eps), high_precision=True)
-            normalized = pl.row_expand_mul(value, inverse)
+        tiles = (active + VEC_M_TILE - 1) // VEC_M_TILE
+        workers = pl.min(tiles, PREFILL_NORM_WORKERS)
+        for worker in pl.spmd(workers, name_hint="a2_rms_norm"):
             gamma = pl.reshape(pl.cast(weight[:], pl.FP32), [1, width])
-            weighted = pl.col_expand_mul(normalized, gamma)
-            narrowed = pl.cast(weighted, pl.BF16, mode="rint")
-            output[t0 : t0 + VEC_M_TILE, :] = pl.set_validshape(narrowed, rows, width)
+            for block in pl.range(worker, tiles, workers):
+                t0 = block * VEC_M_TILE
+                rows = pl.min(VEC_M_TILE, active - t0)
+                source = pl.slice(x, [VEC_M_TILE, width], [t0, 0], valid_shape=[rows, width])
+                source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), VEC_M_TILE, width)
+                value = pl.cast(source, pl.FP32)
+                square = pl.mul(value, value)
+                mean = pl.mul(pl.row_sum(square), 1.0 / width)
+                inverse = pl.rsqrt(pl.add(mean, eps), high_precision=True)
+                normalized = pl.row_expand_mul(value, inverse)
+                weighted = pl.col_expand_mul(normalized, gamma)
+                narrowed = pl.cast(weighted, pl.BF16, mode="rint")
+                output[t0 : t0 + VEC_M_TILE, :] = pl.set_validshape(narrowed, rows, width)
         return output
 
     return norm
@@ -320,13 +324,37 @@ def make_prefill_norm_cast(capacity, hidden):
         router_input: pl.InOut[pl.Tensor[[capacity, hidden], pl.FP32]],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd((active + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="prefill_norm_bf16"):
-            prefill_rms_norm_tiled(collapsed, weight, normed, block, active)
-        for block in pl.spmd(active * (hidden // NORM_D_TILE), name_hint="prefill_norm_fp32"):
-            token = block // (hidden // NORM_D_TILE)
-            column = block % (hidden // NORM_D_TILE) * NORM_D_TILE
-            value = normed[token : token + 1, column : column + NORM_D_TILE]
-            router_input[token : token + 1, column : column + NORM_D_TILE] = pl.cast(value, pl.FP32)
+        tiles = (active + NORM_T_TILE - 1) // NORM_T_TILE
+        workers = pl.min(tiles, PREFILL_NORM_WORKERS)
+        for worker in pl.spmd(workers, name_hint="prefill_norm_dual_output"):
+            start = worker * tiles // workers
+            end = (worker + 1) * tiles // workers
+            for block in pl.range(start, end):
+                t0 = block * NORM_T_TILE
+                rows = pl.min(NORM_T_TILE, active - t0)
+                source = pl.slice(collapsed, [NORM_T_TILE, hidden], [t0, 0], valid_shape=[rows, hidden])
+                cached = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), NORM_T_TILE, hidden)
+                sq_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
+                for k0 in pl.range(0, hidden, NORM_D_TILE):
+                    value = pl.cast(cached[:, k0 : k0 + NORM_D_TILE], pl.FP32, mode="rint")
+                    square = pl.mul(value, value)
+                    partial = pl.reshape(pl.row_sum(square), [1, NORM_T_TILE])
+                    sq_sum = pl.add(sq_sum, partial)
+                mean = pl.mul(sq_sum, 1.0 / hidden)
+                inv_rms = pl.rsqrt(pl.add(mean, EPS), high_precision=True)
+                inverse = pl.reshape(inv_rms, [NORM_T_TILE, 1])
+                for k0 in pl.range(0, hidden, NORM_D_TILE):
+                    value = pl.cast(cached[:, k0 : k0 + NORM_D_TILE], pl.FP32, mode="rint")
+                    gamma = pl.reshape(pl.cast(weight[k0 : k0 + NORM_D_TILE], pl.FP32), [1, NORM_D_TILE])
+                    normalized = pl.col_expand_mul(pl.row_expand_mul(value, inverse), gamma)
+                    narrowed = pl.cast(normalized, pl.BF16, mode="rint")
+                    normed[t0 : t0 + NORM_T_TILE, k0 : k0 + NORM_D_TILE] = pl.set_validshape(
+                        narrowed, rows, NORM_D_TILE
+                    )
+                    widened = pl.cast(narrowed, pl.FP32)
+                    router_input[t0 : t0 + NORM_T_TILE, k0 : k0 + NORM_D_TILE] = pl.set_validshape(
+                        widened, rows, NORM_D_TILE
+                    )
         return normed, router_input
 
     return prefill_norm_cast

@@ -529,6 +529,38 @@ and the vocabulary head run on A3; dynamic Engram lookup rows are prepared
 from the persistent host tables. See [Decode](decode.md) for standalone
 commands and the read/upload/cache-alias audit fields.
 
+## Standalone Prefill vector launch
+
+`PrefillVectorLaunch` is an opt-in synchronous path for standalone A3
+RMSNormCast, BF16-to-INT8 projection quantization, and RoPE table generation
+at capacity 8192. A CANN stream adapter launches the generated PyPTO vector
+body after validating the generated task and tensor ABI.
+
+Compile `make_prefill_norm_cast(8192, 5120)` or
+`make_prefill_projection_quantize_entry(8192, width)` for onboard A3 with
+`save_kernels=True`. The quantization widths are 1280 and 5120. Use the
+CANN compiler and PTO ISA that match the compiled artifact. Build the
+adapter once, then reuse it and the stream for repeated calls:
+
+```python
+from models.deepseek_v4_1_flash_a3.prefill_vector_launch import PrefillVectorLaunch
+
+entry = PrefillVectorLaunch.build("projection_quantize", width, compiled)
+with entry.open(worker) as launch:
+    payload, scales = launch.run(x, payload, scales, active=active)
+```
+
+For `"rms_norm_cast"`, pass `collapsed, weight, normed, router_input` to
+`run` and receive the last two buffers back. For `"rope_tables"`, compile
+`make_rope_tables(8192, 64, theta, scaling)` and pass 32 as the width to
+`build`. Pass INT64 `positions` and two FP32 buffers `cosine` and `sine`
+to `run`, which returns both FP32 buffers. All buffers must be live,
+32-byte-aligned ND `DeviceTensor` operands owned by the same `ChipWorker`.
+Use the stream on one thread within the worker's lifetime. Each call
+checks ownership, shape, dtype, and output overlap, waits for completion,
+and leaves rows beyond the active prefix untouched. Use the standard
+PyPTO path for profiling or unsupported artifacts.
+
 ## Network profiling
 
 The persistent generation runtime supports optional chip swimlane capture
@@ -630,6 +662,9 @@ adds instrumentation and file I/O to forward execution, so disable it when
 comparing the existing host-wall-time reports with vLLM-Ascend.
 
 ## Correctness scope
+
+See [Indexer and MoE operator timings](kernel-timings.md) for isolated A3
+measurements and the corresponding baseline and shapes.
 
 The generation network shares its Prefill and Decode numerical boundaries,
 including native TP shared-expert partitions and routed-expert rounding;

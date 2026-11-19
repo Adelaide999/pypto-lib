@@ -13,7 +13,7 @@ import torch
 from .gemm import make_dot
 from .indexer import INDEXER_SELECT_KEY_CAPACITY as KEY_CAPACITY
 from .qkv_proj_rope import make_bf16_projection_staged
-from .quant import make_dequantize, make_quantize
+from .quant import make_dequantize, make_prefill_projection_quantize, make_quantize
 from .rope import make_adjacent_rope as make_rope
 from .utils import copy_runtime_tensor
 
@@ -131,7 +131,7 @@ def make_index_query_projection(capacity):
     """Project packed queries and apply combined scales in the same task."""
     if capacity <= 0 or capacity % 16:
         raise ValueError("Use a positive capacity divisible by 16")
-    quantize = make_quantize(capacity, 1280, whole_row=True)
+    quantize = make_prefill_projection_quantize(capacity, 1280)
     QUERY_ROWS_TILE = 16
     QUERY_COLUMNS_TILE = 64
     QUERY_GROUP_TILE = 4
@@ -380,7 +380,7 @@ def make_shared_index_publish(capacity, shared_rows=8192):
 
 
 def make_physical_index_query_entries(capacity, config, cache_blocks, requests, table_pages, compress_ratio=2,
-                                      *, key_capacity=KEY_CAPACITY):
+                                      *, key_capacity=KEY_CAPACITY, packed_keys=False):
     """Build index query, quantization, paged scoring and selection publication entries."""
     from .gemm import make_bf16_linear
     from .indexer import make_prefill_indexer_select as make_indexer_select
@@ -393,7 +393,9 @@ def make_physical_index_query_entries(capacity, config, cache_blocks, requests, 
         index_weights_scale=make_index_weights(capacity),
         index_key_gather=make_index_key_gather(cache_blocks, requests, table_pages,
                                               page_rows=128 // compress_ratio, key_capacity=key_capacity),
-        index_select=make_indexer_select(capacity, key_capacity, compress_ratio=compress_ratio),
+        index_select=make_indexer_select(
+            capacity, key_capacity, compress_ratio=compress_ratio, packed_keys=packed_keys,
+        ),
         sparse_controls=make_sparse_controls(capacity, requests, table_pages, table_pages,
                                             long_page_rows=128 // compress_ratio, compress_ratio=compress_ratio,
                                             long_page_stride=128),
@@ -607,20 +609,23 @@ def run_index_query_selection(state, q_input, latent, cosine, sine, operands,
         if left >= right:
             continue
         offset, count = left - start, right - left
+        covers_query_shard = offset == 0 and count == query_rows
         packed_key = zeros(KEY_CAPACITY, 128, dtype=torch.int8)
         packed_scale = zeros(KEY_CAPACITY, dtype=torch.float16)
         execute("index_key_gather", rank, case + f"-request-{request}",
                 [codes, scales, long_table, packed_key, packed_scale, request, cache_lengths[request]],
                 dict(key=packed_key, scales=packed_scale), "index_select")
-        scores = zeros(capacity, KEY_CAPACITY, dtype=torch.float32)
-        picked = torch.full((capacity, 512), -1, dtype=torch.int32)
+        # A complete shard can write into the final buffers at row zero.
+        scores = candidate_scores if covers_query_shard else zeros(capacity, KEY_CAPACITY, dtype=torch.float32)
+        picked = raw_selected if covers_query_shard else torch.full((capacity, 512), -1, dtype=torch.int32)
         selection_args = [pad(query_codes[offset:offset + count]), pad(query_scales[offset:offset + count]),
                           packed_key, packed_scale, pad(weights[offset:offset + count]),
                           pad(q_positions[offset:offset + count]).to(torch.int32), scores, picked, count]
         execute("index_select", rank, case + f"-request-{request}", selection_args,
                 dict(scores=scores, selected=picked), "index_select")
-        copy_runtime_tensor(state.get("runtime", {}), raw_selected[offset:offset + count], picked[:count], rank)
-        copy_runtime_tensor(state.get("runtime", {}), candidate_scores[offset:offset + count], scores[:count], rank)
+        if not covers_query_shard:
+            copy_runtime_tensor(state.get("runtime", {}), raw_selected[offset:offset + count], picked[:count], rank)
+            copy_runtime_tensor(state.get("runtime", {}), candidate_scores[offset:offset + count], scores[:count], rank)
     if not query_rows:
         # Empty CP ranks retain a recorded index-selection boundary.
         execute("index_weights_scale", rank, case + "-empty-selection", [weights_proj, weights, 0],

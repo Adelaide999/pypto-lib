@@ -102,6 +102,82 @@ def test_dispatch_reuses_dynamic_buffers_and_never_reuploads_static_or_cache_vie
     assert worker.closed
 
 
+def test_workspace_full_overwrite_can_skip_fill_without_affecting_other_leases():
+    worker = HostWorker()
+
+    def fill(destination, nbytes, value, rank):
+        assert rank == 0
+        ctypes.memset(destination, value, nbytes)
+
+    def copy(destination, source, nbytes, rank):
+        assert rank == 0
+        ctypes.memmove(destination, source, nbytes)
+
+    with ResidentNetworkRuntime([0], dict(dp=1, tp=1, ep=1), worker_factory=lambda rank: worker,
+                                device_fill=fill, device_copy=copy) as runtime:
+        first = runtime.workspace((8,), torch.int32, 0, fill=-1)
+        address = runtime.tensor(first, 0).data_ptr
+        assert torch.equal(runtime.read_output(first, 0), torch.full((8,), -1, dtype=torch.int32))
+        runtime.release_tensors([(0, first)])
+
+        output = runtime.workspace((8,), torch.int32, 0, fill=None)
+        assert runtime.tensor(output, 0).data_ptr == address
+        assert runtime.stats["workspace_fill_bytes"] == 32
+        assert torch.equal(runtime.read_output(output, 0), torch.full((8,), -1, dtype=torch.int32))
+        worker.live[address].view(torch.int32)[:] = torch.arange(8, dtype=torch.int32)
+        runtime.copy_tensor(output[4:6], output[1:3], 0)
+        assert runtime.stats["d2d_bytes"] == 8
+        assert runtime.read_output(output, 0).tolist() == [0, 1, 2, 3, 1, 2, 6, 7]
+        runtime.release_tensors([(0, output)])
+
+        zeroed = runtime.workspace((8,), torch.int32, 0)
+        assert runtime.tensor(zeroed, 0).data_ptr == address
+        assert runtime.stats["workspace_fill_bytes"] == 64
+        assert runtime.read_output(zeroed, 0).tolist() == [0] * 8
+
+
+@pytest.mark.parametrize("request_starts, expected_transfers", [([0, 8], 0), ([0, 4, 8], 4)])
+def test_index_selection_writes_final_buffers_for_a_complete_shard(monkeypatch, request_starts, expected_transfers):
+    from models.deepseek_v4_1_flash_a3 import prefill_indexer
+
+    capacity, key_capacity, start, end = 16, 128, 2, 8
+    monkeypatch.setattr(prefill_indexer, "KEY_CAPACITY", key_capacity)
+    transfers = []
+
+    def copy(destination, source, rank):
+        destination.copy_(source)
+        if source.ndim == 2 and source.shape[1] in (key_capacity, 512):
+            transfers.append(source.shape)
+
+    def execute(name, rank, case, arguments, outputs, responsibility):
+        if name != "index_select":
+            return
+        _, _, _, _, _, positions, scores, picked, count = arguments
+        scores[:count].copy_(positions[:count, None].float().expand(-1, key_capacity))
+        picked[:count].copy_(positions[:count, None].expand(-1, 512))
+
+    requests = len(request_starts) - 1
+    metadata = dict(block_table=torch.zeros(requests, 1, dtype=torch.int32), cache_seq_lens=torch.ones(requests))
+    original = dict(
+        cp_token_range=(start, end, end - start, 0),
+        positions=torch.arange(end, dtype=torch.int32),
+        metadata=dict(query_start_loc=torch.tensor(request_starts)),
+        cache_metadata=dict(actual_metadata={
+            name: {"global_metadata": metadata} for name in ("src.indexer.k_cache", "src.long_kv_cache", "own.swa_cache")
+        }),
+    )
+    state = dict(original=original, total=end, role=dict(ratio=2), runtime=dict(copy_tensor=copy))
+    tensor = torch.ones(end, 32)
+    result = prefill_indexer.run_index_query_selection(
+        state, tensor, tensor, tensor, tensor,
+        {name: tensor for name in ("index_wqb", "index_wqb_scale", "index_weights")},
+        execute, 0, "case", capacity, requests, 1, "src.", "own.", tensor, tensor,
+    )
+    torch.testing.assert_close(result["scores"][:end - start, 0], torch.arange(start, end, dtype=torch.float32))
+    assert torch.count_nonzero(result["scores"][end - start:]) == 0
+    assert len(transfers) == expected_transfers
+
+
 def test_resident_checkpoint_reads_are_once_per_name_and_sealed_after_preload(tmp_path):
     save_file({"a": torch.ones(4), "b": torch.zeros(4)}, tmp_path / "model.safetensors")
     (tmp_path / "quant_model_weights.safetensors.index.json").write_text(json.dumps(

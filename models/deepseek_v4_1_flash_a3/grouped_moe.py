@@ -24,6 +24,8 @@ def make_grouped_routed_experts(capacity, config, local_experts):
     down_rows = intermediate * (hidden // 64)
     row_tile = min(capacity, 64)
     gate_k_tile = hidden // 5
+    # Each A3 vector worker handles successive waves of compact rows.
+    vector_workers = 48
     max_tiles = local_experts * ((capacity + row_tile - 1) // row_tile)
     quantize_x = make_quantize_row(hidden)
     quantize_hidden = make_quantize_row(intermediate, fused_requantize=True)
@@ -64,14 +66,15 @@ def make_grouped_routed_experts(capacity, config, local_experts):
 
         payload = pl.create_tensor([scratch_rows, hidden], dtype=pl.INT8)
         scales = pl.create_tensor([scratch_rows, 8], dtype=pl.FP32)
-        for block in pl.spmd(active_rows, name_hint="grouped_input_quant"):
-            token = pl.cast(pl.read(row_map, [block]), pl.INDEX)
-            input_row = pl.slice(x, [1, hidden], [token, 0], valid_shape=[1, hidden])
-            input_value = pl.create_tensor([1, hidden], dtype=pl.FP32)
-            input_value[:, :] = widen_x(input_row)
-            input_codes, input_scale = quantize_x(input_value)
-            payload[block : block + 1, :] = input_codes
-            scales[block : block + 1, :] = input_scale
+        for worker in pl.spmd(pl.min(active_rows, vector_workers), name_hint="grouped_input_quant"):
+            for block in pl.range(worker, active_rows, vector_workers):
+                token = pl.cast(pl.read(row_map, [block]), pl.INDEX)
+                input_row = pl.slice(x, [1, hidden], [token, 0], valid_shape=[1, hidden])
+                input_value = pl.create_tensor([1, hidden], dtype=pl.FP32)
+                input_value[:, :] = widen_x(input_row)
+                input_codes, input_scale = quantize_x(input_value)
+                payload[block : block + 1, :] = input_codes
+                scales[block : block + 1, :] = input_scale
 
         gate_acc = pl.create_tensor([scratch_rows, width], dtype=pl.INT32)
         for block in pl.spmd(active_tiles * (width // 192), name_hint="grouped_gate_up"):
@@ -113,29 +116,30 @@ def make_grouped_routed_experts(capacity, config, local_experts):
             pl.store(right_product, [gate_row, (nb + 2) * 64], gate_acc)
 
         activated = pl.create_tensor([scratch_rows, intermediate], dtype=pl.INT8)
-        for block in pl.spmd(active_rows, name_hint="grouped_activation_quant"):
-            token = pl.cast(pl.read(row_map, [block]), pl.INDEX)
-            expert = token // capacity
-            scale = pl.read(scales, [block, 0])
-            gate = pl.cast(gate_acc[block : block + 1, :intermediate], pl.FP32)
-            up = pl.cast(gate_acc[block : block + 1, intermediate:], pl.FP32)
-            gate = pl.mul(gate, scale)
-            up = pl.mul(up, scale)
-            channel_begin = expert * width
-            gate_channel = pl.reshape(gate_up_scale[channel_begin : channel_begin + intermediate], [1, intermediate])
-            up_begin = channel_begin + intermediate
-            up_channel = pl.reshape(gate_up_scale[up_begin : up_begin + intermediate], [1, intermediate])
-            gate = pl.col_expand_mul(gate, gate_channel)
-            up = pl.col_expand_mul(up, up_channel)
-            gate = pl.minimum(gate, limit)
-            up = pl.maximum(pl.minimum(up, limit), -limit)
-            denominator = pl.add(pl.exp(pl.neg(gate)), 1.0)
-            silu = pl.div(gate, denominator)
-            activation_value = pl.create_tensor([1, intermediate], dtype=pl.FP32)
-            activation_value[:, :] = pl.mul(silu, up)
-            activation_codes, activation_scale = quantize_hidden(activation_value)
-            activated[block : block + 1, :] = activation_codes
-            scales[block : block + 1, :] = activation_scale
+        for worker in pl.spmd(pl.min(active_rows, vector_workers), name_hint="grouped_activation_quant"):
+            for block in pl.range(worker, active_rows, vector_workers):
+                token = pl.cast(pl.read(row_map, [block]), pl.INDEX)
+                expert = token // capacity
+                scale = pl.read(scales, [block, 0])
+                gate = pl.cast(gate_acc[block : block + 1, :intermediate], pl.FP32)
+                up = pl.cast(gate_acc[block : block + 1, intermediate:], pl.FP32)
+                gate = pl.mul(gate, scale)
+                up = pl.mul(up, scale)
+                channel_begin = expert * width
+                gate_channel = pl.reshape(gate_up_scale[channel_begin : channel_begin + intermediate], [1, intermediate])
+                up_begin = channel_begin + intermediate
+                up_channel = pl.reshape(gate_up_scale[up_begin : up_begin + intermediate], [1, intermediate])
+                gate = pl.col_expand_mul(gate, gate_channel)
+                up = pl.col_expand_mul(up, up_channel)
+                gate = pl.minimum(gate, limit)
+                up = pl.maximum(pl.minimum(up, limit), -limit)
+                denominator = pl.add(pl.exp(pl.neg(gate)), 1.0)
+                silu = pl.div(gate, denominator)
+                activation_value = pl.create_tensor([1, intermediate], dtype=pl.FP32)
+                activation_value[:, :] = pl.mul(silu, up)
+                activation_codes, activation_scale = quantize_hidden(activation_value)
+                activated[block : block + 1, :] = activation_codes
+                scales[block : block + 1, :] = activation_scale
 
         down_acc = pl.create_tensor([scratch_rows, hidden], dtype=pl.INT32)
         for block in pl.spmd(active_tiles * (hidden // 256), name_hint="grouped_down"):
@@ -152,16 +156,17 @@ def make_grouped_routed_experts(capacity, config, local_experts):
                 valid_product = pl.set_validshape(product, rows, 64)
                 down_acc[compact_row : compact_row + row_tile, nb * 64 : (nb + 1) * 64] = valid_product
 
-        for block in pl.spmd(active_rows, name_hint="grouped_down_epilogue"):
-            token = pl.cast(pl.read(row_map, [block]), pl.INDEX)
-            expert = token // capacity
-            channel_begin = expert * hidden
-            channels = pl.reshape(down_scale[channel_begin : channel_begin + hidden], [1, hidden])
-            value = pl.cast(down_acc[block : block + 1, :], pl.FP32, mode="rint")
-            value = pl.col_expand_mul(value, channels)
-            # The activation quantizer repeats its per-token scale across all eight lanes.
-            value = pl.mul(value, pl.read(scales, [block, 0]))
-            output[token : token + 1, :] = pl.cast(value, pl.BF16, mode="rint")
+        for worker in pl.spmd(pl.min(active_rows, vector_workers), name_hint="grouped_down_epilogue"):
+            for block in pl.range(worker, active_rows, vector_workers):
+                token = pl.cast(pl.read(row_map, [block]), pl.INDEX)
+                expert = token // capacity
+                channel_begin = expert * hidden
+                channels = pl.reshape(down_scale[channel_begin : channel_begin + hidden], [1, hidden])
+                value = pl.cast(down_acc[block : block + 1, :], pl.FP32, mode="rint")
+                value = pl.col_expand_mul(value, channels)
+                # The activation quantizer repeats its per-token scale across all eight lanes.
+                value = pl.mul(value, pl.read(scales, [block, 0]))
+                output[token : token + 1, :] = pl.cast(value, pl.BF16, mode="rint")
         return output
 
     return grouped_routed_experts

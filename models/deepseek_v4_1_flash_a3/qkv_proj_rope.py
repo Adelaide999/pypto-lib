@@ -190,62 +190,61 @@ def make_bf16_projection_staged(width, output_width, *, capacity=None):
     return project
 
 
-def make_prefill_grouped_output(tp=1):
-    """Specialize grouped Wo-A for an explicit TP1/2/4 shard."""
+def make_prefill_output_projection(capacity, tp, *, grouped):
+    """Build TP-local Wo-A (grouped NK weights) or Wo-B (dense KN weights)."""
     validate_tp(tp)
-    k_tile = 512
-    n_tile = 96
-    LOCAL_H = M.num_attention_heads // tp
+    local_groups = M.o_groups // tp
+    if grouped:
+        groups = local_groups
+        width = M.num_attention_heads * M.head_dim // M.o_groups
+        columns = M.o_lora_rank
+        weight_shape = [groups, columns, width]
+        flat_shape = [groups * columns, width]
+        hint = "prefill_grouped_o_a_cube"
+    else:
+        groups = 1
+        width = local_groups * M.o_lora_rank
+        columns = M.hidden_size
+        weight_shape = [width, columns]
+        flat_shape = weight_shape
+        hint = "prefill_bf16_projection_cube"
 
-    LOCAL_O_GROUPS = M.o_groups // tp
+    row_tile, n_tile, k_tile = 128, 256, 256
+    workers = 24
+    n_blocks = columns // n_tile
+    row_blocks = groups * n_blocks
 
-    LOCAL_O_WIDTH = M.o_groups // tp * M.o_lora_rank
-
-    HEAD_DIM = M.head_dim
-
-    O_LORA = M.o_lora_rank
-
-    O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
-    n_blocks = (O_LORA + n_tile - 1) // n_tile
-    row_blocks = LOCAL_O_GROUPS * n_blocks
-
-    @pl.jit.inline
-    def prefill_grouped_output(
-        x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-        weight: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-        output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
+    @pl.jit
+    def project(
+        x: pl.Tensor[[capacity, groups * width], pl.BF16],
+        weight: pl.Tensor[weight_shape, pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, groups * columns], pl.BF16]],
         num_tokens: pl.Scalar[pl.INT32],
     ):
-        """Stage Wo-A values with Vector startup and fused BF16 Vector stores."""
-        flat_weight = pl.reshape(weight, [LOCAL_O_WIDTH, O_GROUP_IN])
-        blocks = (num_tokens + M_TILE - 1) // M_TILE * row_blocks
-        with pl.spmd(pl.min(blocks, SPMD_WORKER_LIMIT), name_hint="prefill_grouped_o_a_cube", allow_early_resolve=True):
-            for block in pl.range(pl.tile.get_block_idx(), blocks, SPMD_WORKER_LIMIT):
-                t0 = block // row_blocks * M_TILE
-                owner = block % row_blocks
-                group = owner // n_blocks
-                local_n = owner % n_blocks * n_tile
-                n0 = group * O_LORA + local_n
-                rows = pl.min(M_TILE, num_tokens - t0)
-                columns = pl.min(n_tile, O_LORA - local_n)
-                acc = pl.create_tile([M_TILE, n_tile], dtype=pl.FP32)
-                initial_a = pl.load(x, [t0, group * O_GROUP_IN], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Vec)
-                initial_w = pl.load(flat_weight, [n0, 0], [n_tile, k_tile], valid_shape=[columns, k_tile], target_memory=pl.Mem.Mat)
-                initial_w = pl.tile.transpose_view(initial_w)
-                acc = pl.matmul_acc(acc, initial_a, initial_w, init_cond=True)
-                for kb in pl.pipeline(1, O_GROUP_IN // k_tile, stage=4):
-                    k0 = kb * k_tile
-                    x_offset = group * O_GROUP_IN + k0
-                    a = pl.load(x, [t0, x_offset], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Mat)
-                    w = pl.load(flat_weight, [n0, k0], [n_tile, k_tile], valid_shape=[columns, k_tile], target_memory=pl.Mem.Mat)
-                    w = pl.tile.transpose_view(w)
-                    acc = pl.matmul_acc(acc, a, w)
-                value = pl.set_validshape(pl.mul(acc, 1.0), rows, columns)
-                narrowed = pl.cast(value, pl.BF16, mode="rint")
-                pl.store(narrowed, [t0, n0], output)
+        weights = pl.reshape(weight, flat_shape)
+        blocks = (num_tokens + row_tile - 1) // row_tile * row_blocks
+        for worker in pl.spmd(pl.min(workers, blocks), name_hint=hint, allow_early_resolve=grouped):
+            for block in pl.range(worker, blocks, workers):
+                row = block // row_blocks * row_tile
+                col = block % row_blocks * n_tile
+                group = block % row_blocks // n_blocks
+                rows = pl.min(row_tile, num_tokens - row)
+                acc = pl.create_tile([row_tile, n_tile], dtype=pl.FP32, target_memory=pl.Mem.Acc, compact=True)
+                for kb in pl.pipeline(0, width // k_tile, stage=2):
+                    k = kb * k_tile
+                    start = group * width + k
+                    lhs = pl.load(x, [row, start], [row_tile, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Mat)
+                    if grouped:
+                        panel = pl.load(weights, [col, k], [n_tile, k_tile], target_memory=pl.Mem.Mat)
+                        rhs = pl.tile.transpose_view(panel)
+                    else:
+                        rhs = pl.load(weights, [k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                    acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(kb == 0))
+                valid = pl.set_validshape(acc, rows, n_tile)
+                pl.store(valid, [row, col], output)
         return output
 
-    return prefill_grouped_output
+    return project
 
 
 def make_qkv_w8a8_inline(capacity, config):

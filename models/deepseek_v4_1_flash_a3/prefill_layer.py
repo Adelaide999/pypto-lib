@@ -437,7 +437,8 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                     {"context": context},
                     "swa",
                 )
-            packet = zeros(rank, tp * capacity, head_width)
+            # Head-pack writes every peer bucket, including the inactive rows.
+            packet = allocate_runtime_tensor(runtime, (tp * capacity, head_width), torch.bfloat16, rank, fill=None)
             execute_region(
                 runtime,
                 "attention_pack_l2",
@@ -474,7 +475,8 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 tp_rank * local_groups : (tp_rank + 1) * local_groups
             ].contiguous()
             weight_b = operands["wo_b"][tp_rank * output_width : (tp_rank + 1) * output_width].contiguous()
-            packed = zeros(rank, tp * capacity, 5120)
+            # Reduce-pack writes every peer bucket before the collective.
+            packed = allocate_runtime_tensor(runtime, (tp * capacity, 5120), torch.bfloat16, rank, fill=None)
             execute_region(
                 runtime,
                 "output_projection_l2",

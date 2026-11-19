@@ -17,6 +17,7 @@ import torch
 ROPE_WIDE_HEAD_ROWS_TILE = 32
 ROPE_NARROW_HEAD_ROWS_TILE = 64
 ROPE_WORKER_LIMIT = 48
+ROPE_TABLE_ROWS_TILE = 64
 
 
 def make_decode_adjacent_rope(capacity, heads, head_dim, rope_dim):
@@ -111,6 +112,9 @@ def make_rope_tables(capacity, rope_dim, theta, scaling=None):
     ramp_start = float(low)
     inverse_ramp_width = 1.0 / max(high - low, 0.001)
     interpolation_delta = 1.0 / factor - 1.0
+    tile_rows = math.gcd(capacity, ROPE_TABLE_ROWS_TILE)
+    rows = tile_rows if pairs == 32 and capacity >= 128 and tile_rows >= 8 else 1
+    worker_limit = ROPE_WORKER_LIMIT if rows > 1 else capacity
 
     @pl.jit
     def rope_tables(
@@ -119,21 +123,52 @@ def make_rope_tables(capacity, rope_dim, theta, scaling=None):
         sine: pl.InOut[pl.Tensor[[capacity, pairs], pl.FP32]],
         active: pl.Scalar[pl.INT32],
     ):
-        for token in pl.spmd(active, name_hint="prefill_rope_tables"):
-            dimension_ids = pl.arange(0, [1, pairs], dtype=pl.INT32)
+        blocks = (active + rows - 1) // rows
+        workers = pl.min(blocks, worker_limit)
+        if rows > 1:
+            position_rows = pl.reshape(positions, [1, capacity])
+        for worker in pl.spmd(workers, name_hint="prefill_rope_tables"):
+            dimension_ids = pl.tile.arange(0, [1, pairs], dtype=pl.INT32)
             dimensions = pl.cast(dimension_ids, pl.FP32)
-            powers = pl.exp(pl.mul(dimensions, exponent_scale))
-            ones = pl.full([1, pairs], dtype=pl.FP32, value=1.0)
+            exponents = pl.mul(dimensions, exponent_scale)
+            powers = pl.exp(exponents)
+            ones = pl.tile.full([1, pairs], dtype=pl.FP32, value=1.0)
             frequencies = pl.div(ones, powers, high_precision=True)
             if use_yarn:
-                ramp_unbounded = pl.mul(pl.sub(dimensions, ramp_start), inverse_ramp_width)
-                ramp = pl.minimum(pl.maximum(ramp_unbounded, 0.0), 1.0)
-                multiplier = pl.add(pl.mul(ramp, interpolation_delta), 1.0)
+                ramp_offset = pl.sub(dimensions, ramp_start)
+                ramp_unbounded = pl.mul(ramp_offset, inverse_ramp_width)
+                ramp_nonnegative = pl.maximum(ramp_unbounded, 0.0)
+                ramp = pl.minimum(ramp_nonnegative, 1.0)
+                interpolation = pl.mul(ramp, interpolation_delta)
+                multiplier = pl.add(interpolation, 1.0)
                 frequencies = pl.mul(frequencies, multiplier)
-            position = pl.cast(pl.read(positions, [token]), pl.FP32)
-            angles = pl.mul(frequencies, position)
-            cosine[token : token + 1, :] = pl.cos(angles)
-            sine[token : token + 1, :] = pl.sin(angles)
+            if rows == 1:
+                position = pl.cast(pl.read(positions, [worker]), pl.FP32)
+                angles = pl.mul(frequencies, position)
+                pl.store(pl.cos(angles), [worker, 0], cosine)
+                pl.store(pl.sin(angles), [worker, 0], sine)
+            else:
+                first = worker * blocks // workers
+                last = (worker + 1) * blocks // workers
+                template = pl.tile.full([rows, pairs], dtype=pl.FP32, value=1.0)
+                frequency_tile = pl.col_expand_mul(template, frequencies)
+                for block in pl.range(first, last):
+                    offset = block * rows
+                    valid = pl.min(rows, active - offset)
+                    loaded_positions = pl.load(position_rows, [0, offset], [1, rows])
+                    packed_positions = pl.tile.full([1, rows], dtype=pl.FP32, value=0.0)
+                    for row in pl.range(valid):
+                        position_i64 = pl.tile.read(loaded_positions, [0, row])
+                        position_fp32 = pl.cast(position_i64, pl.FP32)
+                        pl.tile.write(packed_positions, [0, row], position_fp32)
+                    row_positions = pl.reshape(packed_positions, [rows, 1])
+                    angle_tile = pl.row_expand_mul(frequency_tile, row_positions)
+                    cos_block = pl.cos(angle_tile)
+                    sin_block = pl.sin(angle_tile)
+                    cos_tile = pl.set_validshape(cos_block, valid, pairs)
+                    sin_tile = pl.set_validshape(sin_block, valid, pairs)
+                    pl.store(cos_tile, [offset, 0], cosine)
+                    pl.store(sin_tile, [offset, 0], sine)
         return cosine, sine
 
     return rope_tables

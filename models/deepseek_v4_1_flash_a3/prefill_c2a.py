@@ -932,7 +932,9 @@ def make_physical_compressed_entries(
         sparse_index_pack=make_sparse_index_pack(capacity),
         compressed_attention=make_swa_read(capacity, cache_blocks, sparse_config),
     )
-    entries.update(make_physical_index_query_entries(capacity, config, cache_blocks, requests, table_pages))
+    entries.update(make_physical_index_query_entries(
+        capacity, config, cache_blocks, requests, table_pages, compress_ratio, packed_keys=network_cache,
+    ))
     if compress_ratio not in (1, 2):
         raise ValueError("Physical compressed attention supports ratio1 or ratio2")
     if compress_ratio == 1:
@@ -951,7 +953,9 @@ def make_physical_compressed_entries(
             compressor_norm=pl.jit(make_norm(capacity, 512, config["rms_norm_eps"])._func),
             index_publish=make_index_cache_publish_observed(capacity, cache_blocks, page_rows=128),
             index_key_gather=make_index_key_gather(cache_blocks, requests, table_pages, page_rows=128),
-            index_select=make_indexer_select(capacity, KEY_CAPACITY, compress_ratio=1),
+            index_select=make_indexer_select(
+                capacity, KEY_CAPACITY, compress_ratio=1, packed_keys=network_cache,
+            ),
             sparse_controls=make_sparse_controls(
                 capacity, requests, table_pages, table_pages, long_page_rows=128, compress_ratio=1
             ),
