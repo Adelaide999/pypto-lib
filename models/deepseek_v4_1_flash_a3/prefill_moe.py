@@ -860,9 +860,12 @@ def make_shared_moe_w8a8_inline(
     quant_hidden = _shared_make_quantize(
         capacity, intermediate, activation_dtype, fused_requantize=fused_requantize, whole_row=True,
     )
-    dot_gate_up = _shared_make_dot(capacity, hidden, gate_up_width, full_k_reuse=True, column_group=3)
+    dot_gate_up = _shared_make_dot(capacity, hidden, gate_up_width, full_k_reuse=True, column_group=3, row_tile=32)
+    down_row_tile = 256 if intermediate <= 768 else 16
+    down_stages = 1 if down_row_tile > 16 else 2
     dot_down = _shared_make_dot(
-        capacity, intermediate, hidden, full_k_reuse=True, column_group=4, column_stages=2,
+        capacity, intermediate, hidden, full_k_reuse=True, column_group=4,
+        row_tile=down_row_tile, column_stages=down_stages,
     )
     channel_dtype = fused_channel_dtype if fused_activation else pl.FP32
     dequant_down = _shared_make_dequantize(capacity, hidden, channel_dtype=channel_dtype)
