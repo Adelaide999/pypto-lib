@@ -543,8 +543,10 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                             token_ids, logits, ids, weights, routing_rows],
                  dict(logits=logits, route_ids=ids, route_weights=weights), "router"),
             ])
+            host_route_ids = read_runtime_control(runtime, ids[:state["valid"]], rank)
             state.update(changed=changed, ffn_pre=pre, ffn_post=post, ffn_comb=comb, weights=weights,
-                         route_ids=ids, normed=normed, shared=zeros(rank, capacity, 5120), output_hidden=output,
+                         route_ids=ids, host_route_ids=host_route_ids, normed=normed,
+                         shared=zeros(rank, capacity, 5120), output_hidden=output,
                          combined=zeros(rank, capacity, 5120))
         map_ranks(route_rank)
     slab_work = [{} for _ in range(world)]
@@ -569,12 +571,16 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
     rounds = max(1, (max_physical + slab - 1) // slab)
     for round_id in range(rounds):
         base = round_id * slab
+        valid_by_case = {
+            case: [max(0, min(slab, state[case]["valid"] - base)) for state in states]
+            for case in batch["cases"]
+        }
         dispatch_packets = [{} for _ in range(world)]
         def pack_rank_slab(rank):
             for case in batch["cases"]:
                 state, work = states[rank][case], slab_work[rank][case]
                 packet = {name: work[name] for name in ("routes", "hidden", "counts")}
-                valid = max(0, min(slab, state["valid"] - base))
+                valid = valid_by_case[case][rank]
                 if state["valid"]:
                     arguments = [state["normed"][base:base + slab], state["route_ids"][base:base + slab],
                                  packet["routes"], packet["hidden"], packet["counts"], work["source_map"], valid, rank]
@@ -605,11 +611,10 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
         returns = [{} for _ in range(world)]
         def execute_rank_experts(rank):
             for case, packet in received[rank].items():
-                state, work = states[rank][case], slab_work[rank][case]
-                valid_by_rank = [max(0, min(slab, states[source][case]["valid"] - base)) for source in range(world)]
+                work = slab_work[rank][case]
                 controls = {name: read_runtime_control(runtime, packet[name], rank) for name in ("routes", "counts")}
                 expected_total = validate_received_routes(
-                    controls, rank, layout, routes, valid_by_rank, expert_capacity=expert_capacity,
+                    controls, rank, layout, routes, valid_by_case[case], expert_capacity=expert_capacity,
                 )
                 returns[rank][case] = dict(routes=packet["routes"], hidden=work["sent"], counts=packet["counts"])
                 if expected_total == 0:
@@ -641,7 +646,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
         def combine_rank_slab(rank):
             for case, packet in returned[rank].items():
                 state, work = states[rank][case], slab_work[rank][case]
-                valid = max(0, min(slab, state["valid"] - base))
+                valid = valid_by_case[case][rank]
                 physical = max(0, min(slab, state["physical"] - base))
                 if valid == 0:
                     counts = read_runtime_control(runtime, packet["counts"], rank)
@@ -649,7 +654,7 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                         raise RuntimeError("HCCL returned routes to an empty source slab")
                     continue
                 controls = {name: read_runtime_control(runtime, packet[name], rank) for name in ("routes", "counts")}
-                route_ids = read_runtime_control(runtime, state["route_ids"][base:base + slab], rank)
+                route_ids = state["host_route_ids"][base:base + valid]
                 validate_returned_routes(controls, rank, routes, route_ids, valid)
                 # The return exchange preserves row order within each dispatch bucket.
                 arguments = [packet["routes"], packet["hidden"], work["source_map"],

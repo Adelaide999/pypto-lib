@@ -305,7 +305,7 @@ class ResidentNetworkRuntime:
         self.device_owners = {}
         self.device_readonly = {}
         self.device_active = {}
-        self.alias_leases = {}
+        self._aliases_by_buffer = {}
         self.rotations = {}
         self.programs = {}
         self.static_parameters = {}
@@ -465,7 +465,7 @@ class ResidentNetworkRuntime:
             self.dynamic.clear()
             self.staging_workers.clear()
             self.device_active.clear()
-            self.alias_leases.clear()
+            self._aliases_by_buffer.clear()
             self.parameter_abis.clear()
             self.values.clear()
             self.free_values.clear()
@@ -537,14 +537,18 @@ class ResidentNetworkRuntime:
             elif name.startswith("raw/"):
                 self._record_transfer(rank, "cache_h2d_bytes", allocation.nbytes)
 
+    def retain_alias(self, value):
+        """Retain an exported device view for the lifetime of its current buffer lease."""
+        self._aliases_by_buffer.setdefault(id(value.buffer), {})[id(value)] = value
+        return value
+
     def handle(self, value, rank):
         """Return a typed alias of an already uploaded host allocation."""
         if self._closed:
             raise RuntimeError("Resident runtime is closed")
         owner = self.pinned[rank, value.untyped_storage()._cdata]
         result = _device_view(owner["allocation"], value, owner["base_offset"])
-        self.alias_leases[id(result)] = result
-        return result
+        return self.retain_alias(result)
 
     def register(self, program):
         """Admit every phase and boundary entry to the same worker registry."""
@@ -569,24 +573,46 @@ class ResidentNetworkRuntime:
         if len(phase_entries) > 64:
             raise ValueError("One execution shape exceeds the worker's 64 program slots")
 
-    def weight(self, value, rank):
-        """Upload a complete immutable owned expert operand without retaining host payloads."""
+    def allocate_weight(self, shape, dtype, rank, *, init=None):
+        """Track an immutable weight owner and its full device allocation."""
         if self._closed:
             raise RuntimeError("Resident runtime is closed")
         self._select(rank)
-        value = value.contiguous()
-        upload_begin = perf_counter()
-        result = self.workers[rank].alloc_tensor(value.shape, value.dtype, init=value)
+        begin = perf_counter()
+        result = self.workers[rank].alloc_tensor(shape, dtype, init=init)
         self.allocations[rank].append(result)
         self.device_owners[id(result.buffer)] = rank
         self.device_readonly[id(result.buffer)] = True
         self.device_active[id(result.buffer)] = True
         self.stats["weight_bytes"][rank] += result.nbytes
-        self._record_transfer(rank, "h2d_bytes", result.nbytes)
-        self.stats["device_weight_upload_calls"] += 1
-        self.stats["device_weight_upload_seconds"] += perf_counter() - upload_begin
-        self.alias_leases[id(result)] = result
+        self.stats["device_weight_upload_seconds"] += perf_counter() - begin
+        if init is not None:
+            self._record_transfer(rank, "h2d_bytes", result.nbytes)
+            self.stats["device_weight_upload_calls"] += 1
         return result
+
+    def weight(self, value, rank):
+        """Upload a complete immutable owned expert operand without retaining host payloads."""
+        value = value.contiguous()
+        owner = self.allocate_weight(value.shape, value.dtype, rank, init=value)
+        return self.retain_alias(owner)
+
+    def upload_weight_layer(self, bank, layer, value, rank):
+        """Fill one complete layer of a routed weight bank and return its typed view."""
+        if self._closed:
+            raise RuntimeError("Resident runtime is closed")
+        if value.dtype != bank.dtype or tuple(value.shape) != bank.shape[1:] or not 0 <= layer < bank.shape[0]:
+            raise ValueError("Routed weight layer does not match its preallocated bank")
+        self._select(rank)
+        worker = self.workers[rank]
+        view = worker.view_tensor(bank, value.shape, byte_offset=layer * value.nbytes)
+        begin = perf_counter()
+        source = value.contiguous()
+        self._copy(worker, view.data_ptr, source.data_ptr(), view.nbytes, 1)
+        self.stats["device_weight_upload_seconds"] += perf_counter() - begin
+        self._record_transfer(rank, "h2d_bytes", view.nbytes)
+        self.stats["device_weight_upload_calls"] += 1
+        return self.retain_alias(view)
 
     def staging_worker(self, rank):
         """Create a separate public worker whose buffers never alias resident allocations."""
@@ -623,11 +649,12 @@ class ResidentNetworkRuntime:
                 bound.append(value)
                 continue
             if isinstance(value, DeviceTensor):
-                if self.device_owners.get(id(value.buffer)) != rank:
+                buffer_id = id(value.buffer)
+                if self.device_owners.get(buffer_id) != rank:
                     raise ValueError("Resident device operand belongs to another rank or runtime")
-                if not self.device_active.get(id(value.buffer)) or id(value) not in self.alias_leases:
+                if not self.device_active.get(buffer_id) or id(value) not in self._aliases_by_buffer.get(buffer_id, ()):
                     raise ValueError("Resident device operand is retired or released")
-                if direction != "In" and self.device_readonly[id(value.buffer)]:
+                if direction != "In" and self.device_readonly[buffer_id]:
                     raise ValueError("A compiled entry writes an immutable resident weight")
                 bound.append(value)
                 continue
@@ -848,8 +875,7 @@ class ResidentNetworkRuntime:
         self._select(rank)
         owner = self._value_owner(value, rank)
         result = _device_view(owner["allocation"], value, owner.get("base_offset", 0))
-        self.alias_leases[id(result)] = result
-        return result
+        return self.retain_alias(result)
 
     def _readback(self, value, rank, kind):
         """Copy an explicitly requested host boundary without changing device authority."""
@@ -944,25 +970,26 @@ class ResidentNetworkRuntime:
         if self._closed:
             raise RuntimeError("Resident runtime is closed")
         keys = {(rank, value.untyped_storage()._cdata) for rank, value in values}
-        if keys.intersection(self.pinned):
+        if any(key in self.pinned for key in keys):
             raise ValueError("Cannot recycle pinned weights or cache storage")
-        self._retire_values(keys.intersection(self.values))
+        self._retire_values(keys)
 
     def _retire_values(self, keys):
         """Return retired allocations to their owning rank's reuse pool."""
-        retired = set()
         for key in keys:
-            owner = self.values.pop(key)
+            owner = self.values.pop(key, None)
+            if owner is None:
+                continue
             allocation = owner["allocation"]
-            retired.add(id(allocation.buffer))
-            self.device_active[id(allocation.buffer)] = False
+            buffer_id = id(allocation.buffer)
+            self.device_active[buffer_id] = False
+            self._aliases_by_buffer.pop(buffer_id, None)
             if owner.get("workspace"):
                 value = owner["source"]
                 shape_key = key[0], tuple(value.shape), value.dtype
                 self.free_workspaces.setdefault(shape_key, []).append(owner)
             else:
                 self.free_values.setdefault((key[0], allocation.nbytes), []).append(allocation)
-        self.alias_leases = {key: value for key, value in self.alias_leases.items() if id(value.buffer) not in retired}
 
     def _group_ranks(self, group):
         world, tp = self.topology["ep"], self.topology["tp"]

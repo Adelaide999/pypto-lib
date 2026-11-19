@@ -13,7 +13,6 @@ import json
 import mmap
 import os
 import struct
-import tempfile
 from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import dataclass
@@ -32,19 +31,20 @@ def lookup_columns(codes, scales, rows):
 
 
 class HostEngram:
-    """Retain both complete host tables and return only the current chunk's rows."""
+    """Share read-only checkpoint mappings across DP peers and gather current rows."""
 
     def __init__(self, checkpoint, contracts, namespace):
         if set(contracts) != {1, 14} or not namespace or "/" in namespace or ".." in namespace:
             raise ValueError("Require both original Engram slots and a private host-storage namespace")
         self.checkpoint = str(Path(checkpoint).resolve())
         self.contracts = deepcopy(contracts)
-        self.namespace = namespace
+        self.regions = engram_regions(self.checkpoint)
         self.arrays = {}
         self._stack = ExitStack()
         self._closed = False
         self.constants = self.contracts[1]["hash_constants"]
-        for layer, contract in self.contracts.items():
+        for slot, layer in enumerate((1, 14)):
+            contract = self.contracts[layer]
             if str(Path(contract["checkpoint"]).resolve()) != self.checkpoint:
                 raise ValueError("Host lookup and forward must use the same checkpoint")
             if contract["topology"] != self.contracts[1]["topology"]:
@@ -72,11 +72,19 @@ class HostEngram:
             tp = contract["topology"]["tp"]
             if len(contract["engram_shards"]) != tp or tp not in (1, 2, 4):
                 raise ValueError("Require complete original TP1/2/4 table ownership")
+            offsets = self.constants["offsets"][slot].reshape(-1)
+            table_rows = int(offsets[-1] + self.constants["primes"].reshape(2, 24)[slot, -1])
+            if self.regions[layer, "codes"].rows != table_rows:
+                raise ValueError("Host table size differs from the Engram hash layout")
+            boundaries = [int(offsets[rank * 24 // tp]) for rank in range(tp)] + [table_rows]
             for rank, shard in enumerate(contract["engram_shards"]):
+                if list(shard["row_range"]) != boundaries[rank:rank + 2]:
+                    raise ValueError("Host table row range differs from its assigned hash columns")
                 if shard["head_range"] != [rank * 24 // tp, (rank + 1) * 24 // tp]:
                     raise ValueError("Host table shards must preserve original column order")
                 if shard["DP_sharing_ranks"] != list(range(rank, contract["topology"]["ep"], tp)):
                     raise ValueError("Host tables must be shared by matching DP peers")
+        bind_engram_files(self.contracts, self.regions)
         self.layout = HashLayout(
             (1, 14),
             self.constants["multipliers"],
@@ -96,7 +104,7 @@ class HostEngram:
         self.close()
 
     def close(self):
-        """Release full host tables; already prepared row tensors remain independent."""
+        """Close checkpoint mappings; materialized rows own their storage."""
         if not self._closed:
             self._closed = True
             self._stack.close()
@@ -107,17 +115,9 @@ class HostEngram:
             raise RuntimeError("Host Engram is closed")
         key = layer, rank, kind
         if key not in self.arrays:
-            suffix, width, dtype = {"codes": ("weight", 256, "I8"), "scales": ("scale", 8, "F32")}[kind]
             shard = self.contracts[layer]["engram_shards"][rank]
-            array = SharedEngramArray(
-                self.checkpoint,
-                f"layers.{layer}.engram.embed.{suffix}",
-                shard["row_range"],
-                width,
-                dtype,
-                shard["host_payload_sha256"][kind],
-                f"{self.namespace}-L{layer}-tp{rank}-{kind}",
-            )
+            region = self.regions[layer, kind]
+            array = MappedEngramArray(region, shard["row_range"])
             self._stack.callback(array.close)
             self.arrays[key] = array
         return self.arrays[key]
@@ -705,115 +705,138 @@ def token_map_from_tokenizer(tokenizer, *, expected_size: int = 99092) -> torch.
     return torch.tensor(values, dtype=torch.int32)
 
 
-# Host byte-copy chunk.
-COPY_TILE = 16 * 1024 * 1024
+def _file_identity(stat):
+    return dict(device=stat.st_dev, inode=stat.st_ino, size=stat.st_size,
+                mtime_ns=stat.st_mtime_ns, ctime_ns=stat.st_ctime_ns)
 
 
-def checkpoint_region(checkpoint, name):
-    """Resolve an original complete safetensors payload without tensor arithmetic."""
+@dataclass(frozen=True)
+class EngramRegion:
+    name: str
+    path: Path
+    offset: int
+    rows: int
+    width: int
+    dtype: np.dtype
+    identity: dict
+
+
+def engram_regions(checkpoint):
+    """Read the four Engram tensor descriptors and bind them to their checkpoint files."""
     root = Path(checkpoint)
     index = json.loads((root / "quant_model_weights.safetensors.index.json").read_text())["weight_map"]
-    path = root / index[name]
-    with path.open("rb") as stream:
-        header_size = struct.unpack("<Q", stream.read(8))[0]
-        header = json.loads(stream.read(header_size))
-    item = header[name]
-    return path, 8 + header_size + item["data_offsets"][0], item
+    regions = {}
+    for layer in (1, 14):
+        for kind, suffix, width, tag, dtype in (("codes", "weight", 256, "I8", np.int8),
+                                               ("scales", "scale", 8, "F32", np.float32)):
+            name = f"layers.{layer}.engram.embed.{suffix}"
+            path = root / index[name]
+            with path.open("rb") as stream:
+                identity = _file_identity(os.fstat(stream.fileno()))
+                header_size, = struct.unpack("<Q", stream.read(8))
+                if header_size > min(100_000_000, identity["size"] - 8):
+                    raise ValueError(f"Invalid Engram safetensors header size for {name}")
+                spec = json.loads(stream.read(header_size))[name]
+            if spec["dtype"] != tag or len(spec["shape"]) != 2 or spec["shape"][1] != width:
+                raise ValueError(f"Invalid Engram dtype or shape for {name}")
+            rows = spec["shape"][0]
+            begin, end = spec["data_offsets"]
+            dtype = np.dtype(dtype)
+            if rows <= 0 or begin < 0 or end - begin != rows * width * dtype.itemsize:
+                raise ValueError(f"Invalid Engram payload span for {name}")
+            if 8 + header_size + end > identity["size"]:
+                raise EOFError(f"Truncated Engram checkpoint payload for {name}")
+            regions[layer, kind] = EngramRegion(name, path, 8 + header_size + begin, rows, width, dtype, identity)
+        if regions[layer, "codes"].rows != regions[layer, "scales"].rows:
+            raise ValueError(f"Engram codes and scales have different row counts at layer {layer}")
+    return regions
 
 
-class SharedEngramArray:
-    """Retain one complete TP array in a task-owned MAP_SHARED backing."""
+def bind_engram_files(contracts, regions):
+    """Verify legacy shard digests once and bind the contracts in place to these file identities."""
+    for layer, contract in contracts.items():
+        identities = {kind: regions[layer, kind].identity for kind in ("codes", "scales")}
+        if "engram_file_identity" in contract and contract["engram_file_identity"] != identities:
+            raise ValueError("Engram checkpoint files differ from the bound contract")
+        verified = []
+        for shard in contract["engram_shards"]:
+            expected = shard.get("host_payload_sha256")
+            if expected is None:
+                if "engram_file_identity" not in contract:
+                    raise ValueError("Engram contract lacks a file identity or a frozen shard digest")
+                continue
+            for kind in ("codes", "scales"):
+                region = regions[layer, kind]
+                with region.path.open("rb", buffering=0) as stream:
+                    begin, end = shard["row_range"]
+                    if not 0 <= begin < end <= region.rows:
+                        raise ValueError("Engram digest range exceeds its tensor")
+                    row_bytes = region.width * region.dtype.itemsize
+                    stream.seek(region.offset + begin * row_bytes)
+                    remaining = (end - begin) * row_bytes
+                    digest = hashlib.sha256()
+                    while remaining:
+                        block = stream.read(min(8 * 1024**2, remaining))
+                        if not block:
+                            raise EOFError(f"Incomplete Engram shard: {region.name}")
+                        digest.update(block)
+                        remaining -= len(block)
+                    if _file_identity(os.fstat(stream.fileno())) != region.identity:
+                        raise ValueError(f"Engram checkpoint changed during verification: {region.name}")
+                    if digest.hexdigest() != expected[kind]:
+                        raise ValueError(f"Engram shard differs from its frozen digest: {region.name}")
+            verified.append(shard)
+        for shard in verified:
+            shard["verified_payload_sha256"] = shard.pop("host_payload_sha256")
+        contract["engram_file_identity"] = identities
 
-    def __init__(self, checkpoint, name, row_range, width, dtype, expected_sha, owner):
-        path, payload, spec = checkpoint_region(checkpoint, name)
-        if spec["dtype"] != dtype or spec["shape"][1:] != [width]:
-            raise ValueError("Original Engram checkpoint dtype/shape differs: " + name)
+
+class MappedEngramArray:
+    """Map one TP shard directly from an immutable safetensors file."""
+
+    def __init__(self, region, row_range):
         begin, end = row_range
-        if not 0 <= begin < end <= spec["shape"][0]:
-            raise ValueError("Engram shard exceeds original complete checkpoint")
-        element_bytes = {"I8": 1, "F32": 4}[dtype]
-        self.shape = (end - begin, width)
-        self.byte_count = (end - begin) * width * element_bytes
-        self.path = None
-        self.mapping = None
-        self.view = None
-        self.tensor = None
+        if not 0 <= begin < end <= region.rows:
+            raise ValueError("Engram shard exceeds its checkpoint tensor")
+        row_bytes = region.width * region.dtype.itemsize
+        offset = region.offset + begin * row_bytes
+        size = (end - begin) * row_bytes
+        aligned = offset - offset % mmap.ALLOCATIONGRANULARITY
+        delta = offset - aligned
         self.row_start = begin
-        available = os.statvfs("/dev/shm")
-        if self.byte_count > available.f_bavail * available.f_frsize:
-            raise RuntimeError("Insufficient shared host capacity for complete Engram array")
-        fd, filename = tempfile.mkstemp(prefix=f"ds41-{owner}-", dir="/dev/shm")
-        self.path = Path(filename)
+        self.region = region
+        with region.path.open("rb") as stream:
+            actual = _file_identity(os.fstat(stream.fileno()))
+            if actual != region.identity:
+                raise ValueError(f"Engram checkpoint file changed: {region.name}")
+            self.mapping = mmap.mmap(stream.fileno(), delta + size, access=mmap.ACCESS_READ, offset=aligned)
+        self.array = None
         try:
-            os.ftruncate(fd, self.byte_count)
-            self.mapping = mmap.mmap(
-                fd, self.byte_count, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE
-            )
-        except BaseException:
-            self.path.unlink()
-            raise
-        finally:
-            os.close(fd)
-        try:
-            self.view = memoryview(self.mapping)
-            digest = hashlib.sha256()
-            with path.open("rb", buffering=0) as source:
-                source.seek(payload + begin * width * element_bytes)
-                for offset in range(0, self.byte_count, COPY_TILE):
-                    chunk = self.view[offset : min(offset + COPY_TILE, self.byte_count)]
-                    try:
-                        read = source.readinto(chunk)
-                        if read != len(chunk):
-                            raise EOFError("Incomplete original Engram checkpoint payload")
-                        digest.update(chunk)
-                    finally:
-                        chunk.release()
-            actual_sha = digest.hexdigest()
-            if actual_sha != expected_sha:
-                raise ValueError("Complete assigned Engram bytes differ from frozen checkpoint: " + name)
-            self.tensor = torch.frombuffer(
-                self.mapping, dtype={"I8": torch.int8, "F32": torch.float32}[dtype]
-            ).reshape(self.shape)
-            stat = self.path.stat()
-            self.receipt = {
-                "checkpoint_file": str(path),
-                "tensor": name,
-                "row_range": list(row_range),
-                "shape": list(self.shape),
-                "dtype": dtype,
-                "bytes": self.byte_count,
-                "payload_sha256": actual_sha,
-                "shared_path": str(self.path),
-                "inode": stat.st_ino,
-                "device": stat.st_dev,
-                "owner_pid": os.getpid(),
-            }
+            self.array = np.ndarray((end - begin, region.width), region.dtype, buffer=self.mapping, offset=delta)
+            self.mapping.madvise(mmap.MADV_RANDOM)
+            self.receipt = dict(checkpoint_file=str(region.path), tensor=region.name, row_range=[begin, end],
+                                shape=list(self.array.shape), dtype="I8" if region.dtype == np.int8 else "F32",
+                                byte_offset=offset, bytes=size, file_identity=actual, storage="readonly_file_mapping")
         except BaseException:
             self.close()
             raise
 
     def gather(self, rows):
-        """Copy selected global rows; returned tensors do not alias the host mapping."""
-        if self.tensor is None or rows.device.type != "cpu" or rows.dtype not in (torch.int32, torch.int64):
+        """Gather unique valid global rows and restore their order and multiplicity."""
+        if self.array is None or rows.device.type != "cpu" or rows.dtype not in (torch.int32, torch.int64):
             raise ValueError("Lookup requires an open host table and CPU integer row IDs")
-        local = rows.to(torch.int64) - self.row_start
-        valid = (local >= 0) & (local < self.shape[0])
-        result = torch.zeros((*rows.shape, self.shape[1]), dtype=self.tensor.dtype)
-        result[valid] = self.tensor[local[valid]]
-        return result
+        if _file_identity(self.region.path.stat()) != self.region.identity:
+            raise ValueError(f"Engram checkpoint file changed: {self.region.name}")
+        local = rows.numpy().astype(np.int64, copy=False) - self.row_start
+        valid = (local >= 0) & (local < self.array.shape[0])
+        unique, inverse = np.unique(local[valid], return_inverse=True)
+        result = np.zeros((*local.shape, self.array.shape[1]), dtype=self.array.dtype)
+        result[valid] = self.array[unique][inverse]
+        return torch.from_numpy(result)
 
     def close(self):
-        """Release CPU views and shared storage after the host lookup owner closes."""
-        self.tensor = None
-        if self.view is not None:
-            self.view.release()
-            self.view = None
-        if self.mapping is not None:
-            self.mapping.close()
-            self.mapping = None
-        if self.path is not None:
-            self.path.unlink(missing_ok=True)
-            self.path = None
+        self.array = None
+        self.mapping.close()
 
 
 def load_rotation(checkpoint, hidden_size):

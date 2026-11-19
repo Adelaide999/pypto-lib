@@ -68,11 +68,12 @@ def read_runtime_control(runtime, value, rank):
     return value if read is None or not value.numel() else read(value, rank)
 
 
-def pack_blocked_weight(weight_kn: torch.Tensor) -> torch.Tensor:
+def pack_blocked_weight(weight_kn: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
     """Pack CPU INT8 ``[K, N]`` into ``[N/64, K, 64]`` flattened to 2D.
 
     This is the A3 blocked GEMM operand, distinct from the NZ expert layout.
     Only byte order changes; checkpoint scales and offsets stay separate.
+    With `out`, a single-threaded strided copy fills the supplied CPU buffer.
     """
     if weight_kn.device.type != "cpu" or weight_kn.dtype != torch.int8 or weight_kn.ndim != 2:
         raise ValueError("Blocked weights require a CPU INT8 [K, N] tensor")
@@ -80,12 +81,14 @@ def pack_blocked_weight(weight_kn: torch.Tensor) -> torch.Tensor:
     if rows <= 0 or columns <= 0 or rows % 256 or columns % BLOCKED_INT8_COLUMNS:
         raise ValueError("Blocked weights require positive K/256 and N/64")
     blocks = columns // BLOCKED_INT8_COLUMNS
-    return (
-        weight_kn.reshape(rows, blocks, BLOCKED_INT8_COLUMNS)
-        .permute(1, 0, 2)
-        .contiguous()
-        .reshape(rows * blocks, BLOCKED_INT8_COLUMNS)
-    )
+    blocked = weight_kn.reshape(rows, blocks, BLOCKED_INT8_COLUMNS).permute(1, 0, 2)
+    shape = (rows * blocks, BLOCKED_INT8_COLUMNS)
+    if out is None:
+        return blocked.contiguous().view(shape)
+    if out.device.type != "cpu" or out.dtype != torch.int8 or out.shape != shape or not out.is_contiguous():
+        raise ValueError("Blocked weight destination must be a contiguous CPU INT8 tensor of the packed shape")
+    out.view_as(blocked).numpy()[...] = blocked.numpy()
+    return out
 
 
 def unpack_blocked_weight(packed: torch.Tensor, input_width: int, output_width: int) -> torch.Tensor:

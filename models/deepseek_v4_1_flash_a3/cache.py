@@ -13,6 +13,7 @@ import math
 from copy import deepcopy
 from functools import lru_cache
 from pathlib import Path
+import numpy as np
 import pypto.language as pl
 from .runtime_config import SPMD_WORKER_LIMIT
 import torch
@@ -592,22 +593,23 @@ def validate_network_sparse_indices(indices, original, geometry, active):
     root = f"model.layers.{role['kv_source']}.self_attn."
     own_root = f"model.layers.{layer}.self_attn."
     metadata = original["cache_metadata"]["actual_metadata"]
-    long_table = metadata[root + "long_kv_cache"]["global_metadata"]["block_table"].tolist()
-    own_table = metadata[own_root + "swa_cache"]["global_metadata"]["block_table"].tolist()
-    for local, values in enumerate(indices[:active].tolist()):
-        token = start + local
-        request = next(
-            index for index in range(len(starts) - 1) if starts[index] <= token < starts[index + 1]
-        )
-        for lane, value in enumerate(values):
-            if value < 0:
-                if value != -1:
-                    raise ValueError("Sparse padding ID must remain exactly -1")
-                continue
-            page, offset = divmod(value, 128)
-            kind = "own" if lane < 128 else "long"
-            table = own_table if lane < 128 else long_table
-            if page not in table[request] or not 0 <= offset < geometry[kind]["rows"]:
+    long_table = metadata[root + "long_kv_cache"]["global_metadata"]["block_table"].numpy()
+    own_table = metadata[own_root + "swa_cache"]["global_metadata"]["block_table"].numpy()
+    values = indices[:active].numpy()
+    if (values < -1).any():
+        raise ValueError("Sparse padding ID must remain exactly -1")
+    if len(values) and (start < starts[0] or start + len(values) > starts[-1]):
+        raise ValueError("Sparse query rows fall outside the original request ranges")
+    planes = ((values[:, :128], own_table, geometry["own"]["rows"]),
+              (values[:, 128:], long_table, geometry["long"]["rows"]))
+    for request, (begin, end) in enumerate(zip(starts, starts[1:])):
+        first, last = max(0, begin - start), min(len(values), end - start)
+        if first >= last:
+            continue
+        for lanes, table, rows in planes:
+            ids = lanes[first:last]
+            pages, offsets = np.divmod(ids[ids >= 0], 128)
+            if (offsets >= rows).any() or not np.isin(pages, table[request]).all():
                 raise ValueError("Sparse read would leave its original request-owned typed cache plane")
 
 

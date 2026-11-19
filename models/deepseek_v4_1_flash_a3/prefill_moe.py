@@ -12,6 +12,8 @@ import math
 import sys
 from pathlib import Path
 
+import numpy as np
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
@@ -1452,41 +1454,43 @@ def validate_moe_router(*, device=0, compile_only=False, platform="a2a3", sim=Fa
             raise RuntimeError(f"Router validation failed: {name}: {result.error}")
 
 
+def _active_packet_routes(packet, routes, count_error):
+    """Select the counted prefix of each peer's fixed-size route bucket."""
+    counts = packet["counts"].numpy()[:, 0]
+    if ((counts < 0) | (counts > routes)).any():
+        raise ValueError(count_error)
+    peers, rows = np.nonzero(np.arange(routes) < counts[:, None])
+    return peers, packet["routes"].numpy()[peers * routes + rows].T
+
+
 def validate_received_routes(packet, rank, layout, routes, valid_by_rank=None, *, expert_capacity=None):
     """Check transported source, expert ownership and bounded bucket metadata."""
-    counts = [int(packet["counts"][peer, 0]) for peer in range(layout.ep)]
-    if any(not 0 <= count <= routes for count in counts):
-        raise ValueError("HCCL received bucket count exceeds its fixed capacity")
-    expert_counts = {}
-    for peer, count in enumerate(counts):
-        for row in range(count):
-            source, token, slot, expert = packet["routes"][peer * routes + row].tolist()
-            if source != peer or layout.owner(expert) != rank or token < 0 or slot < 0:
-                raise RuntimeError("HCCL delivered inconsistent route metadata")
-            if valid_by_rank is not None and token >= valid_by_rank[peer]:
-                raise RuntimeError("HCCL dispatched a masked source row")
-            expert_counts[expert] = expert_counts.get(expert, 0) + 1
-    if expert_capacity is not None and any(count > expert_capacity for count in expert_counts.values()):
+    if packet["counts"].shape[0] != layout.ep:
+        raise ValueError("HCCL received bucket counts must cover the EP group")
+    peers, (source, token, slot, expert) = _active_packet_routes(
+        packet, routes, "HCCL received bucket count exceeds its fixed capacity",
+    )
+    if ((expert < 0) | (expert >= layout.experts)).any():
+        raise ValueError("Global expert ID is outside the checkpoint")
+    local_experts = layout.experts // layout.ep
+    if ((source != peers) | (expert // local_experts != rank) | (token < 0) | (slot < 0)).any():
+        raise RuntimeError("HCCL delivered inconsistent route metadata")
+    if valid_by_rank is not None and (token >= np.asarray(valid_by_rank)[peers]).any():
+        raise RuntimeError("HCCL dispatched a masked source row")
+    if expert_capacity is not None and (np.bincount(expert) > expert_capacity).any():
         raise RuntimeError("Received routes exceed the proven per-expert slab bound")
-    return sum(counts)
+    return len(expert)
 
 
 def validate_returned_routes(packet, rank, routes, route_ids, valid):
     """Require one returned result for every valid source token and top-k slot."""
-    seen = set()
+    _, (source, token, slot, expert) = _active_packet_routes(packet, routes, "Returned bucket count exceeds capacity")
     topk = route_ids.shape[1]
-    for peer in range(packet["counts"].shape[0]):
-        count = int(packet["counts"][peer, 0])
-        if not 0 <= count <= routes:
-            raise ValueError("Returned bucket count exceeds capacity")
-        for row in range(count):
-            source, token, slot, expert = packet["routes"][peer * routes + row].tolist()
-            if source != rank or not 0 <= token < valid or not 0 <= slot < topk:
-                raise RuntimeError("Returned source token or top-k slot is invalid")
-            if (token, slot) in seen or expert != int(route_ids[token, slot]):
-                raise RuntimeError("Duplicate or inconsistent returned expert route")
-            seen.add((token, slot))
-    if len(seen) != valid * topk:
+    if ((source != rank) | (token < 0) | (token >= valid) | (slot < 0) | (slot >= topk)).any():
+        raise RuntimeError("Returned source token or top-k slot is invalid")
+    if (expert != route_ids.numpy()[token, slot]).any() or (np.bincount(token * topk + slot) > 1).any():
+        raise RuntimeError("Duplicate or inconsistent returned expert route")
+    if len(token) != valid * topk:
         raise RuntimeError("HCCL did not return every valid top-k route")
 
 

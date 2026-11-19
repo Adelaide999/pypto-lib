@@ -14,17 +14,19 @@ import json
 import math
 import re
 import struct
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Iterator as decode_Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Iterator, Mapping
 import torch
 from .cache import resolve_layer_role
+from .config import FLASH
 from .gemm import prepare_ecotech_dynamic_weight
 from .runtime_config import ExpertParallelConfig
-from .utils import pack_blocked_weight, pack_nz
+from .utils import BLOCKED_INT8_COLUMNS, pack_blocked_weight, pack_nz
 
 
 _DTYPES = {
@@ -35,6 +37,8 @@ _DTYPES = {
     "BF16": torch.bfloat16,
     "F32": torch.float32,
 }
+
+ROUTED_PACK_WORKERS = 4
 
 
 def _shape(value: Any) -> tuple[int, ...]:
@@ -271,14 +275,19 @@ class CheckpointOperands:
         self.read_calls += 1
         return value
 
-    def expert(self, prefix, *, partitions=1):
-        """Pack gate/up and down once while retaining the true channel scales."""
+    def read_expert(self, prefix):
+        """Read one expert's original payloads, scales and symmetric offsets."""
         operands = {}
         for stem in ("w1", "w2", "w3"):
             for suffix in ("weight", "weight_scale", "weight_offset"):
                 operands[stem + "." + suffix] = self.load(prefix + "." + stem + "." + suffix)
-            if any(value != 0 for value in operands[stem + ".weight_offset"].reshape(-1).tolist()):
+            if torch.count_nonzero(operands[stem + ".weight_offset"]):
                 raise ValueError("W8A8 expert operands must have symmetric zero offsets")
+        return operands
+
+    def expert(self, prefix, *, partitions=1):
+        """Pack gate/up and down once while retaining the true channel scales."""
+        operands = self.read_expert(prefix)
         w1, w3 = operands["w1.weight"], operands["w3.weight"]
         gate_up = torch.cat((w1, w3), dim=0).transpose(0, 1).contiguous()
         gate_scale = torch.cat((operands["w1.weight_scale"], operands["w3.weight_scale"])).flatten().float()
@@ -1101,9 +1110,25 @@ class ResidentCheckpointOperands(CheckpointOperands):
             self.boundaries[name] = value
         return value
 
-    def expert(self, prefix, *, partitions=1):
+    def read_expert(self, prefix):
         self.preparations[prefix] = self.preparations.get(prefix, 0) + 1
-        return super().expert(prefix, partitions=partitions)
+        return super().read_expert(prefix)
+
+
+def _pack_routed_slot(operands, grouped, local):
+    """Write one expert directly into its rank-local blocked weights and channel scales."""
+    gate_up, gate_scale, down, down_scale = (value[local] for value in grouped)
+    gate, up = gate_up.chunk(2)
+    gate_channels, up_channels = gate_scale.chunk(2)
+    hidden = down_scale.numel()
+    intermediate = gate_channels.numel()
+    for stem, weight, scale in (("w1", gate, gate_channels), ("w3", up, up_channels), ("w2", down, down_scale)):
+        source = operands[stem + ".weight"]
+        expected = (hidden, intermediate) if stem == "w2" else (intermediate, hidden)
+        if source.shape != expected:
+            raise ValueError(f"Routed expert {stem} has shape {tuple(source.shape)}, expected {expected}")
+        pack_blocked_weight(source.T, out=weight)
+        scale.copy_(operands[stem + ".weight_scale"].reshape_as(scale))
 
 
 class ResidentNetworkWeights:
@@ -1115,6 +1140,7 @@ class ResidentNetworkWeights:
         self.model_config, self.runtime = model_config, runtime
         self.layers, self.experts, self.heads = {}, {}, {}
         self.grouped_experts = {}
+        self.routed_banks = {}
         self.layer_receipts = {}
         self.load_seconds, self.load_calls = 0.0, 0
         self.ready = False
@@ -1126,7 +1152,7 @@ class ResidentNetworkWeights:
         begin = perf_counter()
         world, tp = self.layout.ep, self.layout.tp
         ranks = range(world)
-        for layer in range(40):
+        for layer in range(FLASH.num_hidden_layers):
             if progress is not None:
                 progress(dict(stage="loading_resident_weights", layer=layer, epoch=0))
             prefix = f"layers.{layer}."
@@ -1180,8 +1206,9 @@ class ResidentNetworkWeights:
             for rank in ranks:
                 self.experts[layer, rank, None] = tuple(self.runtime.weight(value, rank) for value in shared)
             del shared
-            for rank in ranks:
-                self._preload_routed(layer, rank)
+            with ThreadPoolExecutor(max_workers=ROUTED_PACK_WORKERS, thread_name_prefix="routed-pack") as packers:
+                for rank in ranks:
+                    self._preload_routed(layer, rank, packers)
             self.layer_receipts[layer] = dict(
                 original_names=names,
                 policy="generation-scoped resident compute weights",
@@ -1205,34 +1232,49 @@ class ResidentNetworkWeights:
         self.load_seconds = perf_counter() - begin
         self.load_calls = self.reader.read_calls
         self.runtime.stats.update(
+            routed_weight_banks=sum(len(banks) for banks in self.routed_banks.values()),
+            routed_weight_layer_views=sum(len(views) for views in self.grouped_experts.values()),
             weight_preload_seconds=self.load_seconds,
             checkpoint_preload_read_calls=self.reader.read_calls,
             checkpoint_preload_read_seconds=self.reader.read_seconds,
         )
 
-    def _preload_routed(self, layer, rank):
-        """Upload four common owners and retain contiguous per-expert borrowed views."""
+    def _preload_routed(self, layer, rank, packers):
+        """Pack one rank's experts and fill the four layer slices of its resident banks."""
         grouped = None
-        shapes = None
+        pending = deque()
         ownership = self.layout.ownership(rank)
         for expert, local in ownership:
-            values = self.reader.expert(f"layers.{layer}.ffn.experts.{expert}")
+            if len(pending) == ROUTED_PACK_WORKERS:
+                pending.popleft().result()
+            operands = self.reader.read_expert(f"layers.{layer}.ffn.experts.{expert}")
             if grouped is None:
-                shapes = [tuple(value.shape) for value in values]
-                grouped = [torch.empty((len(ownership) * value.shape[0], *value.shape[1:]),
-                                       dtype=value.dtype) for value in values]
-            for full, value in zip(grouped, values):
-                full.narrow(0, local * value.shape[0], value.shape[0]).copy_(value)
-            del values
-        owners = tuple(self.runtime.weight(value, rank) for value in grouped)
-        self.grouped_experts[layer, rank] = owners
+                intermediate, hidden = operands["w1.weight"].shape
+                rows = hidden * intermediate // BLOCKED_INT8_COLUMNS
+                shapes = ((2 * rows, BLOCKED_INT8_COLUMNS), (2 * intermediate,), (rows, BLOCKED_INT8_COLUMNS), (hidden,))
+                dtypes = (torch.int8, torch.float32, torch.int8, torch.float32)
+                grouped = [torch.empty((len(ownership), *shape), dtype=dtype) for shape, dtype in zip(shapes, dtypes)]
+            pending.append(packers.submit(_pack_routed_slot, operands, grouped, local))
+            del operands
+        for future in pending:
+            future.result()
+        layers = [value.flatten(0, 1) for value in grouped]
+        if rank not in self.routed_banks:
+            self.routed_banks[rank] = tuple(
+                self.runtime.allocate_weight((FLASH.num_hidden_layers, *value.shape), value.dtype, rank)
+                for value in layers
+            )
+        layer_views = tuple(self.runtime.upload_weight_layer(bank, layer, value, rank)
+                            for bank, value in zip(self.routed_banks[rank], layers))
+        self.grouped_experts[layer, rank] = layer_views
         for expert, local in ownership:
             aliases = tuple(
                 self.runtime.workers[rank].view_tensor(
                     owner, shape, byte_offset=local * math.prod(shape) * owner.dtype.itemsize,
-                ) for owner, shape in zip(owners, shapes)
+                ) for owner, shape in zip(layer_views, shapes)
             )
-            self.runtime.alias_leases.update((id(value), value) for value in aliases)
+            for value in aliases:
+                self.runtime.retain_alias(value)
             self.experts[layer, rank, expert] = aliases
 
     def for_layer(self, layer):
@@ -1261,6 +1303,7 @@ class ResidentNetworkWeights:
         self.layers.clear()
         self.experts.clear()
         self.grouped_experts.clear()
+        self.routed_banks.clear()
         self.heads.clear()
         self.reader.close()
 

@@ -413,8 +413,13 @@ their separate NZ or blocked device operands are not interchangeable.
 `ResidentNetworkWeights.preload` prepares these operands once per generation.
 Layer and chunk calls reuse the pinned projection tensors and each EP owner's
 resident expert handles, without repacking or uploading the fixed weights.
-Each rank retains four expert-major weight owners and per-expert borrowed
-views of those same bytes. After each dispatch slab is unpacked,
+Each rank allocates four device tensors for all 40 layers: Gate/Up weights,
+Gate/Up scales, Down weights and Down scales. Each layer has a contiguous
+slice in each tensor, subdivided into the rank's 24 expert views at EP16.
+During preload, one reader streams the current
+rank's experts to at most four CPU packing workers. Each worker fills one
+expert's slice in the four host tensors. The loader uploads those tensors
+after all slices for the rank are ready. After each dispatch slab is unpacked,
 `grouped_moe.py` computes all nonempty local experts in one invocation.
 Empty ranks skip the routed invocation and its weight lookup.
 Activation quantization and routed-token dispatch packing still run per call.
@@ -432,11 +437,22 @@ and compilation alone do not establish a speedup.
 ### Engram and continuation
 
 Engram lookup runs on the host before the prepared forward call. `HostEngram`
-owns both complete CPU INT8/FP32 tables, hashes request history, gathers selected
-entries and applies group32 dequantization with BF16 rounding. Device kernels
+maps the original INT8 codes and FP32 scales read-only from the checkpoint.
+DP peers reuse each TP mapping. The host hashes the request history, gathers
+unique rows from the mapped shards, restores their order and applies group32
+dequantization with BF16 rounding. Device kernels
 consume only rank-local `[capacity, 6144]` BF16 rows for projection and gating.
 The NPU does not dereference the host table. Tables are not registered with
 CANN or counted as full HBM model residency.
+
+Automatic contract preparation reads the safetensors headers and binds each
+table to its filesystem identity, size and timestamps. Keep the checkpoint
+immutable for the session. Opening a changed source requires a fresh contract.
+Legacy contracts containing shard SHA-256 digests verify them before serving
+the first request. To move that scan to deployment, call
+`bind_engram_files(contracts, engram_regions(checkpoint))` and persist the
+updated contracts alongside that checkpoint. The verified digests remain in
+the shard records, and subsequent sessions check the bound file identities.
 
 Automatic inputs and the CLI prepare these rows. For prepared Python inputs:
 

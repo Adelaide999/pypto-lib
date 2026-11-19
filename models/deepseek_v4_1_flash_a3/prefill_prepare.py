@@ -9,8 +9,6 @@
 """Prepare single-request chunk inputs and persistent paged-cache coordinates."""
 
 import json
-import hashlib
-import os
 from copy import deepcopy
 from pathlib import Path
 import torch
@@ -24,7 +22,7 @@ PAGE_ROWS = 128
 
 def checkpoint_cache(checkpoint, topology, *, capacity=16):
     """Build cache and host Engram contracts directly from checkpoint metadata."""
-    from .engram_host import build_compressed_token_map, checkpoint_region, make_layout
+    from .engram_host import build_compressed_token_map, engram_regions, make_layout
     checkpoint = Path(checkpoint).resolve()
     model = json.loads((checkpoint / "config.json").read_text())
     from tokenizers import Tokenizer
@@ -39,52 +37,12 @@ def checkpoint_cache(checkpoint, topology, *, capacity=16):
                      primes=hashed.primes, offsets=hashed.offsets)
     contracts = {}
     tp, world = topology["tp"], topology["ep"]
-    cache_root = Path(os.environ.get("PYPTO_A3_STATE_DIR", Path.home() / ".cache")) / "engram-contracts"
-    cache_root.mkdir(parents=True, exist_ok=True)
-    identity = hashlib.sha256()
-    for metadata_name in ("config.json", "quant_model_weights.safetensors.index.json", "tokenizer.json"):
-        metadata_path = checkpoint / metadata_name
-        identity.update(metadata_name.encode())
-        identity.update(metadata_path.read_bytes())
-    digest_cache_path = cache_root / (hashlib.sha256(str(checkpoint).encode()).hexdigest() + ".json")
-    try:
-        digest_cache = json.loads(digest_cache_path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        digest_cache = {}
-    if digest_cache.get("identity") != identity.hexdigest():
-        digest_cache = {"identity": identity.hexdigest(), "payloads": {}}
-
-    def payload_sha256(name, row_range, *, width, element_bytes):
-        """Hash exactly one original Engram shard without materializing the table."""
-        path, payload, spec = checkpoint_region(checkpoint, name)
-        begin, end = row_range
-        if spec["shape"][1] != width:
-            raise ValueError(f"Unexpected Engram width for {name}")
-        cache_key = f"{name}:{row_range[0]}:{row_range[1]}:{width}:{element_bytes}"
-        cached = digest_cache["payloads"].get(cache_key)
-        if cached:
-            return cached
-        digest = hashlib.sha256()
-        byte_offset = payload + begin * width * element_bytes
-        byte_count = (end - begin) * width * element_bytes
-        with path.open("rb", buffering=0) as stream:
-            stream.seek(byte_offset)
-            remaining = byte_count
-            while remaining:
-                chunk = stream.read(min(8 * 1024 * 1024, remaining))
-                if not chunk:
-                    raise EOFError(f"Incomplete Engram payload while hashing {name}")
-                digest.update(chunk)
-                remaining -= len(chunk)
-        value = digest.hexdigest()
-        digest_cache["payloads"][cache_key] = value
-        return value
-
+    regions = engram_regions(checkpoint)
     for slot, layer in enumerate((1, 14)):
-        _, _, spec = checkpoint_region(checkpoint, f"layers.{layer}.engram.embed.weight")
+        rows = regions[layer, "codes"].rows
         primes, offsets = hashed.primes[slot], hashed.offsets[slot]
-        boundaries = [int(offsets[lane * 24 // tp]) for lane in range(tp)] + [spec["shape"][0]]
-        if spec["shape"][0] != int(offsets[-1] + primes[-1]):
+        boundaries = [int(offsets[lane * 24 // tp]) for lane in range(tp)] + [rows]
+        if rows != int(offsets[-1] + primes[-1]):
             raise ValueError("Checkpoint Engram rows differ from the original hash layout")
         shards = []
         for lane in range(tp):
@@ -93,20 +51,13 @@ def checkpoint_cache(checkpoint, topology, *, capacity=16):
                 head_range=[lane * 24 // tp, (lane + 1) * 24 // tp],
                 row_range=row_range,
                 DP_sharing_ranks=list(range(lane, world, tp)),
-                host_payload_sha256=dict(
-                    codes=payload_sha256(
-                        f"layers.{layer}.engram.embed.weight", row_range, width=256, element_bytes=1
-                    ),
-                    scales=payload_sha256(
-                        f"layers.{layer}.engram.embed.scale", row_range, width=8, element_bytes=4
-                    ),
-                ),
             ))
         contracts[layer] = dict(
             checkpoint=str(checkpoint), model_config=model, topology=deepcopy(topology), capacity=capacity,
             physical_layer_id=layer,
             hash_constants=dict(constants, layer_ids=[1, 14], pad_id=text["engram_pad_token_id"]),
             engram_shards=shards, host_storage="checkpoint_file_mapping",
+            engram_file_identity={kind: regions[layer, kind].identity for kind in ("codes", "scales")},
             engram_storage_contract=dict(dtype="INT8", scale_dtype="FP32", group_size=32,
                                          cpu_offload=True, dp_shared_memory=True, global_columns=24),
         )
@@ -118,7 +69,6 @@ def checkpoint_cache(checkpoint, topology, *, capacity=16):
         capacity=capacity, scheduler_capacity=8192, fresh_shared_initialization={"topk_indices": -1},
         weight_residency="session",
     )
-    digest_cache_path.write_text(json.dumps(digest_cache, indent=2) + "\n")
     return cache, config
 
 
