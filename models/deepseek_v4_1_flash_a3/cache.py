@@ -22,7 +22,10 @@ from .swa import GATHER_TILE, make_swa_leaves
 
 
 # tiling
-COPY_TILE = 128
+# A3 cache payloads are contiguous 128-row pages.  A 512-element transfer
+# reduces launch work for the large BF16 and INT8 planes while remaining
+# compatible with the smaller FP16 scale plane through the payload clamp.
+COPY_TILE = 512
 
 
 # Logical Decode pools are views over the Prefill allocation.  The map is
@@ -84,10 +87,14 @@ def make_paged_cache_copy(
     source_offset=0,
     destination_offset=0,
     dtype=pl.BF16,
-    copy_tile=COPY_TILE,
+    copy_tile=None,
 ):
     """Copy selected page payloads in one dispatch while preserving unrelated bytes."""
-    if blocks < 1 or payload < 1 or copy_tile not in (64, 128) or payload % copy_tile:
+    if blocks < 1 or payload < 1:
+        raise ValueError("Require positive pages and payload")
+    if copy_tile is None:
+        copy_tile = next((tile for tile in (COPY_TILE, 256, 128, 64) if payload % tile == 0), None)
+    if copy_tile not in (64, 128, 256, 512) or payload % copy_tile:
         raise ValueError("Require positive pages with aligned contiguous payloads")
     if not 0 <= source_offset <= source_stride - payload:
         raise ValueError("Source cache payload exceeds its physical page")
@@ -763,7 +770,7 @@ def make_network_cache_entries(capacity, config, geometry, role, requests=1, tab
     for name in ("codes", "scales"):
         plane = geometry[name]
         payload, stride, offset = plane["payload"], plane["stride"], plane["offset"]
-        tile = min(128, payload)
+        tile = min(COPY_TILE, payload)
         dtype = PTO_DTYPES[plane["dtype"]]
         entries["network_load_" + name] = make_paged_cache_copy(
             plane["blocks"], payload, stride, payload, source_offset=offset, dtype=dtype, copy_tile=tile
@@ -922,7 +929,7 @@ def paged_cache_copy_cases():
             yield dict(name=f"paged-{dtype_name}-{payload}-{'store' if store else 'load'}",
                        fn=make_paged_cache_copy(blocks, payload, source_stride, destination_stride,
                                                source_offset, destination_offset, dtype=PTO_DTYPES[str(dtype)],
-                                               copy_tile=min(128, payload)),
+                                               copy_tile=min(COPY_TILE, payload)),
                        specs=specs, golden_fn=golden)
     pages, active = cache_copy_pages(blocks, [])
     yield dict(name="paged-empty", fn=make_paged_cache_copy(blocks, 128, 256, 256), specs=[

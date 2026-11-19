@@ -838,6 +838,12 @@ def make_indexer_select(
         # enter the sort, and score padding stays at the hardware minimum.
         # Materialize that floor explicitly: dynamic ``valid_shape`` on a
         # sort32 input is not reliable on the A2/A3 backend for partial rows.
+        q_scale_row = pl.cast(query_scale[token : token + 1, :], pl.FP32)
+        weight_row = pl.cast(weights[token : token + 1, :], pl.FP32)
+        # Query scales and head weights are invariant across key tiles.  Fuse
+        # their broadcast before the key loop so each tile performs one head
+        # weighting instead of two independent broadcasts and casts.
+        head_weight = pl.mul(q_scale_row, weight_row)
         pl.store(
             pl.tile.full([1, key_capacity], dtype=pl.FP32, value=NEGATIVE_INF),
             [token, 0],
@@ -852,16 +858,10 @@ def make_indexer_select(
                 q_tile = pl.reshape(query[token : token + 1, h0 : h0 + HEAD_TILE, :], [HEAD_TILE, head_dim])
                 dots = pl.matmul(q_tile, key_tile, b_trans=True, out_dtype=pl.INT32)
                 dots = pl.cast(dots, pl.FP32, mode="none")
-                q_scale_tile = pl.reshape(
-                    pl.cast(query_scale[token, h0 : h0 + HEAD_TILE], pl.FP32), [HEAD_TILE, 1]
-                )
-                weight_tile = pl.reshape(
-                    pl.cast(weights[token, h0 : h0 + HEAD_TILE], pl.FP32), [HEAD_TILE, 1]
-                )
-                dots = pl.row_expand_mul(dots, q_scale_tile)
+                head_weight_tile = pl.reshape(head_weight[0:1, h0 : h0 + HEAD_TILE], [HEAD_TILE, 1])
+                dots = pl.row_expand_mul(dots, head_weight_tile)
                 dots = pl.col_expand_mul(dots, scale_tile)
                 dots = pl.maximum(dots, 0.0)
-                dots = pl.row_expand_mul(dots, weight_tile)
                 total = pl.add(total, pl.reshape(pl.col_sum(dots), [1, KEY_TILE]))
             scores[token : token + 1, k0 : k0 + KEY_TILE] = pl.fillpad(
                 pl.set_validshape(total, 1, valid), pad_value=pl.PadValue.min
