@@ -812,10 +812,10 @@ class ResidentNetworkRuntime:
         self._memory_for(rank).fill(destination, nbytes, value)
 
     def workspace(self, shape, dtype, rank, *, fill=0):
-        """Reuse device scratch and initialize zero or integer -1 bytes on device."""
+        """Reuse device scratch, optionally skipping fill for a full overwrite."""
         integral = dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
-        if fill != 0 and not (fill == -1 and integral):
-            raise ValueError("Device workspaces support zero or integer -1 initialization")
+        if fill is not None and fill != 0 and not (fill == -1 and integral):
+            raise ValueError("Device workspaces support no fill, zero or integer -1 initialization")
         shape = tuple(shape)
         if not shape or any(size <= 0 for size in shape):
             raise ValueError("Device workspaces require positive dimensions")
@@ -836,10 +836,11 @@ class ResidentNetworkRuntime:
                 owner = self._value_owner_locked(value, rank, initialize=False)
                 owner["workspace"] = True
             allocation = owner["allocation"]
-            self._device_fill(allocation.data_ptr, allocation.nbytes, 0 if fill == 0 else 255, rank)
-            owner["device_written"] = True
+            if fill is not None:
+                self._device_fill(allocation.data_ptr, allocation.nbytes, 0 if fill == 0 else 255, rank)
+                owner["device_written"] = True
+                self._record_transfer(rank, "workspace_fill_bytes", allocation.nbytes)
             self._record_transfer(rank, "workspace_requests", 1)
-            self._record_transfer(rank, "workspace_fill_bytes", allocation.nbytes)
             return value
 
     def tensor(self, value, rank):

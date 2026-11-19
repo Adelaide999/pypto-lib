@@ -609,20 +609,23 @@ def run_index_query_selection(state, q_input, latent, cosine, sine, operands,
         if left >= right:
             continue
         offset, count = left - start, right - left
+        covers_query_shard = offset == 0 and count == query_rows
         packed_key = zeros(KEY_CAPACITY, 128, dtype=torch.int8)
         packed_scale = zeros(KEY_CAPACITY, dtype=torch.float16)
         execute("index_key_gather", rank, case + f"-request-{request}",
                 [codes, scales, long_table, packed_key, packed_scale, request, cache_lengths[request]],
                 dict(key=packed_key, scales=packed_scale), "index_select")
-        scores = zeros(capacity, KEY_CAPACITY, dtype=torch.float32)
-        picked = torch.full((capacity, 512), -1, dtype=torch.int32)
+        # A complete shard can write into the final buffers at row zero.
+        scores = candidate_scores if covers_query_shard else zeros(capacity, KEY_CAPACITY, dtype=torch.float32)
+        picked = raw_selected if covers_query_shard else torch.full((capacity, 512), -1, dtype=torch.int32)
         selection_args = [pad(query_codes[offset:offset + count]), pad(query_scales[offset:offset + count]),
                           packed_key, packed_scale, pad(weights[offset:offset + count]),
                           pad(q_positions[offset:offset + count]).to(torch.int32), scores, picked, count]
         execute("index_select", rank, case + f"-request-{request}", selection_args,
                 dict(scores=scores, selected=picked), "index_select")
-        copy_runtime_tensor(state.get("runtime", {}), raw_selected[offset:offset + count], picked[:count], rank)
-        copy_runtime_tensor(state.get("runtime", {}), candidate_scores[offset:offset + count], scores[:count], rank)
+        if not covers_query_shard:
+            copy_runtime_tensor(state.get("runtime", {}), raw_selected[offset:offset + count], picked[:count], rank)
+            copy_runtime_tensor(state.get("runtime", {}), candidate_scores[offset:offset + count], scores[:count], rank)
     if not query_rows:
         # Empty CP ranks retain a recorded index-selection boundary.
         execute("index_weights_scale", rank, case + "-empty-selection", [weights_proj, weights, 0],

@@ -20,6 +20,7 @@ from .runtime_config import SPMD_WORKER_LIMIT
 
 # tiling
 D_TILE = 512
+PACK_T_TILE = 8
 
 
 def make_vocab_embedding(capacity, hidden, vocabulary, tp):
@@ -303,6 +304,7 @@ def make_sp_masked_zero(capacity, width):
 def make_head_pack(capacity, heads, head_dim, tp):
     """Pack all local CP heads into fixed equal peer buckets."""
     local_width = heads // tp * head_dim
+    row_tile = PACK_T_TILE if capacity % PACK_T_TILE == 0 and local_width <= 8192 else 1
 
     @pl.jit
     def head_pack(
@@ -310,16 +312,27 @@ def make_head_pack(capacity, heads, head_dim, tp):
         packed: pl.InOut[pl.Tensor[[tp * capacity, local_width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        row_count = tp * capacity
-        for row_worker in pl.spmd(pl.min(row_count, SPMD_WORKER_LIMIT), name_hint='prefill_cp_head_pack'):
-            for row in pl.range(row_worker, row_count, SPMD_WORKER_LIMIT):
+        block_count = tp * capacity // row_tile
+        for worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint="prefill_cp_head_pack"):
+            for block in pl.range(worker, block_count, SPMD_WORKER_LIMIT):
+                row = block * row_tile
                 peer = row // capacity
                 token = row % capacity
-                if token < active:
-                    source = peer * local_width
-                    packed[row : row + 1, 0 : local_width] = value[token : token + 1, source : source + local_width]
+                source = peer * local_width
+                if token + row_tile <= active:
+                    data = value[token:token + row_tile, source:source + local_width]
+                    packed[row:row + row_tile, :] = data
+                elif token >= active:
+                    packed[row:row + row_tile, :] = pl.full([row_tile, local_width], dtype=pl.BF16, value=0.0)
                 else:
-                    packed[row : row + 1, 0 : local_width] = pl.full([1, local_width], dtype=pl.BF16, value=0.0)
+                    for lane in pl.range(row_tile):
+                        out_row = row + lane
+                        src_row = token + lane
+                        if src_row < active:
+                            tail = value[src_row:src_row + 1, source:source + local_width]
+                            packed[out_row:out_row + 1, :] = tail
+                        else:
+                            packed[out_row:out_row + 1, :] = pl.full([1, local_width], dtype=pl.BF16, value=0.0)
         return packed
 
     return head_pack
@@ -331,6 +344,7 @@ def make_sp_gather_unpack(capacity, width, tp, dtype=pl.BF16, tile=D_TILE, *, la
     scalar_rows = width < 8
     while tile < 4096 and width % (2 * tile) == 0:
         tile *= 2
+    row_tile = PACK_T_TILE if dtype == pl.BF16 and tile <= 8192 and width % tile == 0 and not last_row else 1
 
     @pl.jit
     def gather_unpack(
@@ -352,6 +366,15 @@ def make_sp_gather_unpack(capacity, width, tp, dtype=pl.BF16, tile=D_TILE, *, la
                     for column in pl.range(width):
                         state_value = pl.read(packet, [source, column])
                         pl.write(output, [token, column], state_value)
+        elif row_tile > 1 and physical % row_tile == 0 and rows % row_tile == 0:
+            block_count = rows // row_tile * (width // tile)
+            for worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint="prefill_sp_gather_unpack_tiled"):
+                for block in pl.range(worker, block_count, SPMD_WORKER_LIMIT):
+                    token = block // (width // tile) * row_tile
+                    column = block % (width // tile) * tile
+                    source = token // physical * capacity + token % physical
+                    data = packet[source:source + row_tile, column:column + tile]
+                    output[token:token + row_tile, column:column + tile] = data
         else:
             block_count = rows * (width // tile)
             for block_worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint='prefill_sp_gather_unpack'):
@@ -369,6 +392,7 @@ def make_sp_gather_unpack(capacity, width, tp, dtype=pl.BF16, tile=D_TILE, *, la
 
 def make_sp_reduce_pack(capacity, hidden, tp):
     """Pad full Wo-B partial sums into equal reduce-scatter peer buckets."""
+    row_tile = PACK_T_TILE if capacity % PACK_T_TILE == 0 and hidden <= 8192 else 1
 
     @pl.jit
     def reduce_pack(
@@ -377,17 +401,26 @@ def make_sp_reduce_pack(capacity, hidden, tp):
         physical: pl.Scalar[pl.INT32],
         active: pl.Scalar[pl.INT32],
     ):
-        row_count = tp * capacity
-        for row_worker in pl.spmd(pl.min(row_count, SPMD_WORKER_LIMIT), name_hint='prefill_sp_reduce_pack'):
-            for row in pl.range(row_worker, row_count, SPMD_WORKER_LIMIT):
+        block_count = tp * capacity // row_tile
+        for worker in pl.spmd(pl.min(block_count, SPMD_WORKER_LIMIT), name_hint="prefill_sp_reduce_pack"):
+            for block in pl.range(worker, block_count, SPMD_WORKER_LIMIT):
+                row = block * row_tile
                 peer = row // capacity
                 local = row % capacity
                 source = peer * physical + local
                 valid = pl.min(physical, pl.max(active - peer * physical, 0))
-                if local < valid:
-                    packed[row : row + 1, 0 : hidden] = value[source : source + 1, 0 : hidden]
+                if local + row_tile <= valid:
+                    packed[row:row + row_tile, :] = value[source:source + row_tile, :]
+                elif local >= valid:
+                    packed[row:row + row_tile, :] = pl.full([row_tile, hidden], dtype=pl.BF16, value=0.0)
                 else:
-                    packed[row : row + 1, 0 : hidden] = pl.full([1, hidden], dtype=pl.BF16, value=0.0)
+                    for lane in pl.range(row_tile):
+                        out_row = row + lane
+                        src_row = source + lane
+                        if local + lane < valid:
+                            packed[out_row:out_row + 1, :] = value[src_row:src_row + 1, :]
+                        else:
+                            packed[out_row:out_row + 1, :] = pl.full([1, hidden], dtype=pl.BF16, value=0.0)
         return packed
 
     return reduce_pack
