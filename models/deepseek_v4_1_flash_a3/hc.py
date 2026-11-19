@@ -16,6 +16,8 @@ if __package__ in (None, ""):
     __package__ = "models.deepseek_v4_1_flash_a3"
 import pypto.language as pl
 
+from .operator_config import SMALL_TOKEN_CAPACITY
+
 
 # tiling
 D_TILE = 256
@@ -102,6 +104,12 @@ def make_hc_pre_inline(capacity, config):
     rms_rows = max(TOKEN_TILE, flat_width // D_TILE)
     collapse_rows = hidden // D_TILE
     prep_elements = min(SHARED_PREP_K_TILE * SHARED_PREP_N_TILE, channels * flat_width)
+    small_capacity = capacity <= SMALL_TOKEN_CAPACITY
+    proj_rows = 16 if small_capacity else PROJ_T_TILE
+    proj_cols = 16 if small_capacity else PROJ_N_TILE
+    proj_k = 512 if small_capacity else SHARED_PROJ_K_TILE
+    sinkhorn_rows = 8 if small_capacity else SINKHORN_T_TILE
+
     @pl.jit.inline
     def pre(
         x: pl.Tensor[[capacity, hc, hidden], pl.BF16],
@@ -166,23 +174,23 @@ def make_hc_pre_inline(capacity, config):
             rounded_flat[0:1, prep_start : prep_start + prep_elements] = prep_result
 
         accumulated = pl.create_tensor([capacity, channels], dtype=pl.FP32)
-        channel_blocks = (channels + PROJ_N_TILE - 1) // PROJ_N_TILE
+        channel_blocks = (channels + proj_cols - 1) // proj_cols
         for block in pl.spmd(
-            (active + PROJ_T_TILE - 1) // PROJ_T_TILE * channel_blocks, name_hint="a2_hc_projection_cube"
+            (active + proj_rows - 1) // proj_rows * channel_blocks, name_hint="a2_hc_projection_cube"
         ):
-            token = block // channel_blocks * PROJ_T_TILE
-            channel = block % channel_blocks * PROJ_N_TILE
-            rows = pl.min(PROJ_T_TILE, active - token)
-            columns = pl.min(PROJ_N_TILE, channels - channel)
-            acc = pl.create_tile([PROJ_T_TILE, PROJ_N_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc, compact=True)
-            for inner in pl.pipeline(0, flat_width, SHARED_PROJ_K_TILE, stage=2):
+            token = block // channel_blocks * proj_rows
+            channel = block % channel_blocks * proj_cols
+            rows = pl.min(proj_rows, active - token)
+            columns = pl.min(proj_cols, channels - channel)
+            acc = pl.create_tile([proj_rows, proj_cols], dtype=pl.FP32, target_memory=pl.Mem.Acc, compact=True)
+            for inner in pl.pipeline(0, flat_width, proj_k, stage=2):
                 source = pl.load(
-                    prepared, [token, inner], [PROJ_T_TILE, SHARED_PROJ_K_TILE],
-                    valid_shape=[rows, SHARED_PROJ_K_TILE], target_memory=pl.Mem.Mat,
+                    prepared, [token, inner], [proj_rows, proj_k],
+                    valid_shape=[rows, proj_k], target_memory=pl.Mem.Mat,
                 )
                 weight = pl.load(
-                    rounded_function, [channel, inner], [PROJ_N_TILE, SHARED_PROJ_K_TILE],
-                    valid_shape=[columns, SHARED_PROJ_K_TILE], target_memory=pl.Mem.Mat,
+                    rounded_function, [channel, inner], [proj_cols, proj_k],
+                    valid_shape=[columns, proj_k], target_memory=pl.Mem.Mat,
                 )
                 acc = pl.matmul_acc(acc, source, pl.tile.transpose_view(weight), init_cond=(inner == 0))
             projection_tile = pl.set_validshape(acc, rows, columns)
@@ -190,17 +198,17 @@ def make_hc_pre_inline(capacity, config):
 
         comb_flat = pl.reshape(comb, [capacity, hc * hc])
         bias = pl.reshape(base, [1, channels])
-        for block in pl.spmd((active + SINKHORN_T_TILE - 1) // SINKHORN_T_TILE, name_hint="a2_hc_sinkhorn"):
-            token = block * SINKHORN_T_TILE
-            rows = pl.min(SINKHORN_T_TILE, active - token)
-            inv_repeated = pl.load(inverse, [token, 0], [SINKHORN_T_TILE, TOKEN_TILE], valid_shape=[rows, TOKEN_TILE])
-            inv_scratch = pl.create_tile([SINKHORN_T_TILE, TOKEN_TILE], dtype=pl.FP32)
+        for block in pl.spmd((active + sinkhorn_rows - 1) // sinkhorn_rows, name_hint="a2_hc_sinkhorn"):
+            token = block * sinkhorn_rows
+            rows = pl.min(sinkhorn_rows, active - token)
+            inv_repeated = pl.load(inverse, [token, 0], [sinkhorn_rows, TOKEN_TILE], valid_shape=[rows, TOKEN_TILE])
+            inv_scratch = pl.create_tile([sinkhorn_rows, TOKEN_TILE], dtype=pl.FP32)
             inv = pl.row_min(inv_repeated, tmp_tile=inv_scratch)
             scale0 = pl.read(scale, [0])
             scale1 = pl.read(scale, [1])
             scale2 = pl.read(scale, [2])
-            raw_p0 = pl.load(accumulated, [token, 0], [SINKHORN_T_TILE, MIX_TILE], valid_shape=[rows, hc])
-            raw_p1 = pl.load(accumulated, [token, hc], [SINKHORN_T_TILE, MIX_TILE], valid_shape=[rows, hc])
+            raw_p0 = pl.load(accumulated, [token, 0], [sinkhorn_rows, MIX_TILE], valid_shape=[rows, hc])
+            raw_p1 = pl.load(accumulated, [token, hc], [sinkhorn_rows, MIX_TILE], valid_shape=[rows, hc])
             p0 = pl.row_expand_mul(raw_p0, inv)
             p1 = pl.row_expand_mul(raw_p1, inv)
             b0 = pl.load(bias, [0, 0], [1, MIX_TILE], valid_shape=[1, hc])
@@ -213,10 +221,10 @@ def make_hc_pre_inline(capacity, config):
             post_valid = pl.set_validshape(post_result, rows, hc)
             pl.store(pre_valid, [token, 0], next_pre)
             pl.store(post_valid, [token, 0], post)
-            raw_v0 = pl.load(accumulated, [token, 2 * hc], [SINKHORN_T_TILE, MIX_TILE], valid_shape=[rows, hc])
-            raw_v1 = pl.load(accumulated, [token, 3 * hc], [SINKHORN_T_TILE, MIX_TILE], valid_shape=[rows, hc])
-            raw_v2 = pl.load(accumulated, [token, 4 * hc], [SINKHORN_T_TILE, MIX_TILE], valid_shape=[rows, hc])
-            raw_v3 = pl.load(accumulated, [token, 5 * hc], [SINKHORN_T_TILE, MIX_TILE], valid_shape=[rows, hc])
+            raw_v0 = pl.load(accumulated, [token, 2 * hc], [sinkhorn_rows, MIX_TILE], valid_shape=[rows, hc])
+            raw_v1 = pl.load(accumulated, [token, 3 * hc], [sinkhorn_rows, MIX_TILE], valid_shape=[rows, hc])
+            raw_v2 = pl.load(accumulated, [token, 4 * hc], [sinkhorn_rows, MIX_TILE], valid_shape=[rows, hc])
+            raw_v3 = pl.load(accumulated, [token, 5 * hc], [sinkhorn_rows, MIX_TILE], valid_shape=[rows, hc])
             v0 = pl.row_expand_mul(raw_v0, inv)
             v1 = pl.row_expand_mul(raw_v1, inv)
             v2 = pl.row_expand_mul(raw_v2, inv)
@@ -229,7 +237,7 @@ def make_hc_pre_inline(capacity, config):
             logits1 = pl.fillpad(pl.col_expand_add(pl.mul(v1, scale2), c1), pad_value=pl.PadValue.min)
             logits2 = pl.fillpad(pl.col_expand_add(pl.mul(v2, scale2), c2), pad_value=pl.PadValue.min)
             logits3 = pl.fillpad(pl.col_expand_add(pl.mul(v3, scale2), c3), pad_value=pl.PadValue.min)
-            row_tmp = pl.create_tile([SINKHORN_T_TILE, MIX_TILE], dtype=pl.FP32)
+            row_tmp = pl.create_tile([sinkhorn_rows, MIX_TILE], dtype=pl.FP32)
             exp0 = pl.exp(pl.row_expand_sub(logits0, pl.row_max(logits0, row_tmp)))
             exp1 = pl.exp(pl.row_expand_sub(logits1, pl.row_max(logits1, row_tmp)))
             exp2 = pl.exp(pl.row_expand_sub(logits2, pl.row_max(logits2, row_tmp)))
@@ -273,7 +281,7 @@ def make_hc_post_inline(capacity, config):
     """Build BF16 residual expansion with FP32 combination arithmetic."""
     hidden = config["hidden_size"]
     hc = config["hc_mult"]
-    pipelined = hidden == 5120 and hc == 4
+    pipelined = capacity > SMALL_TOKEN_CAPACITY and hidden == 5120 and hc == 4
     merge_tile = PREFILL_POST_D_TILE if pipelined else min(SHARED_MERGE_D_TILE, hidden)
     stages = 2 if pipelined else 1
 

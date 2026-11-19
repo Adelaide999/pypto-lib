@@ -22,7 +22,7 @@ from .runtime_config import SPMD_WORKER_LIMIT
 import torch
 from .config import FLASH as M
 from .gemm import make_dot, make_fp32_dequantize, make_int8_gemm
-from .operator_config import T_DYN
+from .operator_config import SMALL_TOKEN_CAPACITY, T_DYN
 from .quant import int8_matmul, make_decode_dequantize as decode_make_dequantize, make_decode_dynamic_int8_quantize as decode_make_dynamic_int8_quantize, make_decode_quantize as decode_make_quantize, make_dequantize, make_dynamic_int8_quantize, make_quantize, quantize_per_token_int8
 from .rmsnorm import decode_rms_norm_reference, make_blocked_rmsnorm as make_norm, make_decode_blocked_rmsnorm as decode_make_norm, make_decode_rmsnorm as decode_make_rmsnorm, make_rmsnorm, rms_norm_reference
 from .rope import decode_rope_reference, make_adjacent_rope as qkv_w8a8_make_rope, make_decode_adjacent_rope as decode_make_rope, make_decode_rope as decode_qkv_make_rope, make_rope as qkv_make_rope, rope_reference
@@ -209,7 +209,9 @@ def make_prefill_output_projection(capacity, tp, *, grouped):
         flat_shape = weight_shape
         hint = "prefill_bf16_projection_cube"
 
-    row_tile, n_tile, k_tile = 128, 256, 256
+    small_grouped = grouped and tp == 4 and capacity <= SMALL_TOKEN_CAPACITY
+    row_tile, n_tile = (16, 128) if small_grouped else (128, 256)
+    k_tile = 256
     workers = 24
     n_blocks = columns // n_tile
     row_blocks = groups * n_blocks

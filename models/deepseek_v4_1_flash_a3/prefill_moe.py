@@ -27,6 +27,7 @@ from .gemm import (
     prepare_ecotech_dynamic_weight as _ecotech_shared_prepare_ecotech_dynamic_weight,
     prepare_ecotech_tail_weight as _ecotech_shared_prepare_ecotech_tail_weight,
 )
+from .operator_config import SMALL_TOKEN_CAPACITY
 from .quant import (
     make_cast_tile as _router_make_cast_tile,
     make_dequantize as _ecotech_shared_make_dequantize,
@@ -206,9 +207,12 @@ def make_routed_expert_w8a8(capacity: int, hidden: int, intermediate: int, clamp
 
 
 def _make_router_gate(capacity, hidden, experts, input_dtype):
-    """Reuse each FP32 weight tile across a block of source tokens."""
-    token_tile = math.gcd(capacity, ROUTER_TOKEN_TILE)
-    expert_blocks = experts // ROUTER_EXPERT_TILE
+    """Use one token per gate tile for the shared network's small Decode shape."""
+    small_capacity = capacity <= SMALL_TOKEN_CAPACITY
+    token_tile = 1 if small_capacity else math.gcd(capacity, ROUTER_TOKEN_TILE)
+    expert_tile = 8 if small_capacity else ROUTER_EXPERT_TILE
+    expert_blocks = experts // expert_tile
+    worker_limit = 256 if small_capacity else ROUTER_GATE_WORKERS
     needs_widen = input_dtype != pl.FP32
     widen = _router_make_cast_tile(1, ROUTER_D_TILE, input_dtype, pl.FP32)
 
@@ -220,13 +224,13 @@ def _make_router_gate(capacity, hidden, experts, input_dtype):
         active: pl.Scalar[pl.INT32],
     ):
         block_count = ((active + token_tile - 1) // token_tile) * expert_blocks
-        for worker in pl.spmd(pl.min(block_count, ROUTER_GATE_WORKERS), name_hint="a2_moe_gate_fp32"):
-            for block in pl.range(worker, block_count, ROUTER_GATE_WORKERS):
+        for worker in pl.spmd(pl.min(block_count, worker_limit), name_hint="a2_moe_gate_fp32"):
+            for block in pl.range(worker, block_count, worker_limit):
                 token = (block // expert_blocks) * token_tile
-                expert = (block % expert_blocks) * ROUTER_EXPERT_TILE
-                dot_sum = pl.full([token_tile, ROUTER_EXPERT_TILE], dtype=pl.FP32, value=0.0)
+                expert = (block % expert_blocks) * expert_tile
+                dot_sum = pl.full([token_tile, expert_tile], dtype=pl.FP32, value=0.0)
                 for inner in pl.range(0, hidden, ROUTER_D_TILE):
-                    weight = gate_weight[expert : expert + ROUTER_EXPERT_TILE, inner : inner + ROUTER_D_TILE]
+                    weight = gate_weight[expert : expert + expert_tile, inner : inner + ROUTER_D_TILE]
                     for row in pl.unroll(token_tile):
                         source = x[token + row : token + row + 1, inner : inner + ROUTER_D_TILE]
                         if needs_widen:
@@ -236,11 +240,11 @@ def _make_router_gate(capacity, hidden, experts, input_dtype):
                         else:
                             source_fp32 = source
                         product = pl.col_expand_mul(weight, source_fp32)
-                        partial = pl.reshape(pl.row_sum(product), [1, ROUTER_EXPERT_TILE])
+                        partial = pl.reshape(pl.row_sum(product), [1, expert_tile])
                         dot_sum[row : row + 1, :] = pl.add(dot_sum[row : row + 1, :], partial)
                 rows = pl.min(token_tile, active - token)
-                logits[token : token + token_tile, expert : expert + ROUTER_EXPERT_TILE] = pl.set_validshape(
-                    dot_sum, rows, ROUTER_EXPERT_TILE
+                logits[token : token + token_tile, expert : expert + expert_tile] = pl.set_validshape(
+                    dot_sum, rows, expert_tile
                 )
         return logits
 
@@ -881,7 +885,7 @@ def _make_shared_moe_partition(
         capacity, intermediate, activation_dtype, fused_requantize=fused_requantize, whole_row=True,
     )
     dot_gate_up = _shared_make_dot(capacity, hidden, gate_up_width, full_k_reuse=True, column_group=3, row_tile=32)
-    down_row_tile = 256 if intermediate <= 768 else 16
+    down_row_tile = 256 if capacity > SMALL_TOKEN_CAPACITY and intermediate <= 768 else 16
     down_stages = 1 if down_row_tile > 16 else 2
     dot_down = _shared_make_dot(
         capacity, intermediate, hidden, full_k_reuse=True, column_group=4,

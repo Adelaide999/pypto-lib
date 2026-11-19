@@ -12,6 +12,10 @@ from dataclasses import dataclass
 import pypto.language as pl
 
 
+# The shared network compiles one-token Decode with this row capacity.
+SMALL_TOKEN_CAPACITY = 16
+
+
 # Dynamic shape variables.
 T_DYN = pl.dynamic("V41_T_DYN")
 B_DYN = pl.dynamic("V41_B_DYN")
