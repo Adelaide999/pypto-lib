@@ -32,7 +32,14 @@ def make_o_proj_inline(capacity, config):
     rotate = make_rope(capacity, heads, head_dim, rope_dim)
     quantize = make_quantize(capacity, group_width)
     pack = make_pack_weight(group_width, hidden)
-    dot = make_dot(capacity, group_width, hidden)
+    wide_prefill = capacity >= 2048 and capacity % 256 == 0
+    dot = make_dot(
+        capacity,
+        group_width,
+        hidden,
+        row_tile=256 if wide_prefill else M_TILE,
+        paired_columns=wide_prefill,
+    )
     dequantize = make_dequantize(capacity, hidden, combine_scales=True)
 
     @pl.jit.inline

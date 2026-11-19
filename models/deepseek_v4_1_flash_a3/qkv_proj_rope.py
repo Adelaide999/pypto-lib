@@ -295,9 +295,31 @@ def make_qkv_w8a8_inline(capacity, config):
 
     quant_x = make_quantize(capacity, hidden)
     quant_q = make_quantize(capacity, latent)
-    dot_qa = make_dot(capacity, hidden, latent)
-    dot_qb = make_dot(capacity, latent, query_width)
-    dot_kv = make_dot(capacity, hidden, head_dim)
+    dot_qa = make_dot(
+        capacity,
+        hidden,
+        latent,
+        full_k_reuse=True,
+        column_group=8,
+        row_tile=32,
+    )
+    dot_qb = make_dot(
+        capacity,
+        latent,
+        query_width,
+        full_k_reuse=True,
+        column_group=26,
+        column_stages=2,
+        row_tile=64,
+    )
+    dot_kv = make_dot(
+        capacity,
+        hidden,
+        head_dim,
+        full_k_reuse=True,
+        column_group=8,
+        row_tile=32,
+    )
     dequant_qa = make_dequantize(capacity, latent)
     dequant_qb = make_dequantize(capacity, query_width, combine_scales=True)
     dequant_kv = make_dequantize(capacity, head_dim)

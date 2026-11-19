@@ -57,7 +57,7 @@ MOE_ACT_TILE = 256
 ROUTER_D_TILE = 256
 ROUTER_EXPERT_TILE = 32
 ROUTER_TOKEN_TILE = 16
-ROUTER_GATE_WORKERS = 64
+ROUTER_GATE_WORKERS = 512
 ROUTER_TOPK_TILE = 8
 ROUTER_SELECT_TOKEN_TILE = 16
 ROUTER_SELECT_WORKERS = 48
@@ -208,13 +208,58 @@ def make_routed_expert_w8a8(capacity: int, hidden: int, intermediate: int, clamp
     return make_shared_expert_w8a8(capacity, hidden, intermediate, clamp_limit)
 
 
-def _make_router_gate(capacity, hidden, experts, input_dtype):
-    """Use one token per gate tile for the shared network's small Decode shape."""
-    small_capacity = capacity <= SMALL_TOKEN_CAPACITY
-    token_tile = 1 if small_capacity else math.gcd(capacity, ROUTER_TOKEN_TILE)
-    expert_tile = 8 if small_capacity else ROUTER_EXPERT_TILE
+def _make_router_gate_vector(capacity, hidden, experts, input_dtype):
+    token_tile = math.gcd(capacity, ROUTER_TOKEN_TILE)
+    expert_tile = ROUTER_EXPERT_TILE
     expert_blocks = experts // expert_tile
-    worker_limit = 256 if small_capacity else ROUTER_GATE_WORKERS
+    worker_limit = ROUTER_GATE_WORKERS
+    needs_widen = input_dtype != pl.FP32
+    widen = _router_make_cast_tile(1, ROUTER_D_TILE, input_dtype, pl.FP32)
+
+    @pl.jit.inline
+    def project(
+        x: pl.Tensor[[capacity, hidden], input_dtype],
+        gate_weight: pl.Tensor[[experts, hidden], pl.FP32],
+        logits: pl.Tensor[[capacity, experts], pl.FP32],
+        active: pl.Scalar[pl.INT32],
+    ):
+        block_count = ((active + token_tile - 1) // token_tile) * expert_blocks
+        for worker in pl.spmd(pl.min(block_count, worker_limit), name_hint="a2_moe_gate_fp32"):
+            for block in pl.range(worker, block_count, worker_limit):
+                token = (block // expert_blocks) * token_tile
+                expert = (block % expert_blocks) * expert_tile
+                dot_sum = pl.full([token_tile, expert_tile], dtype=pl.FP32, value=0.0)
+                for inner in pl.range(0, hidden, ROUTER_D_TILE):
+                    weight = gate_weight[expert : expert + expert_tile, inner : inner + ROUTER_D_TILE]
+                    for row in pl.unroll(token_tile):
+                        source = x[token + row : token + row + 1, inner : inner + ROUTER_D_TILE]
+                        if needs_widen:
+                            source_storage = pl.create_tensor([1, ROUTER_D_TILE], dtype=input_dtype)
+                            source_storage[:, :] = source
+                            source_fp32 = widen(source_storage)
+                        else:
+                            source_fp32 = source
+                        product = pl.col_expand_mul(weight, source_fp32)
+                        partial = pl.reshape(pl.row_sum(product), [1, expert_tile])
+                        dot_sum[row : row + 1, :] = pl.add(dot_sum[row : row + 1, :], partial)
+                rows = pl.min(token_tile, active - token)
+                logits[token : token + token_tile, expert : expert + expert_tile] = pl.set_validshape(
+                    dot_sum, rows, expert_tile
+                )
+        return logits
+
+    return project
+
+
+def _make_router_gate(capacity, hidden, experts, input_dtype):
+    """Use cube tiles for Prefill and one-token vector tiles for Decode."""
+    small_capacity = capacity <= SMALL_TOKEN_CAPACITY
+    if not small_capacity:
+        return _make_router_gate_vector(capacity, hidden, experts, input_dtype)
+    token_tile = 1
+    expert_tile = 8
+    expert_blocks = experts // expert_tile
+    worker_limit = 256
     needs_widen = input_dtype != pl.FP32
     widen = _router_make_cast_tile(1, ROUTER_D_TILE, input_dtype, pl.FP32)
 
@@ -919,13 +964,15 @@ def _make_shared_moe_partition(
     )
     wide_prefill = capacity >= 2048 and capacity % 256 == 0 and hidden == 5120 and intermediate == 768
     dot_gate_up = _shared_make_dot(
-        capacity, hidden, gate_up_width, full_k_reuse=not wide_prefill, column_group=3,
+        capacity, hidden, gate_up_width, full_k_reuse=not wide_prefill, column_group=8,
         row_tile=256 if wide_prefill else 32, paired_columns=wide_prefill,
     )
     down_row_tile = 256 if capacity > SMALL_TOKEN_CAPACITY and intermediate <= 768 else 16
-    down_stages = 1 if down_row_tile > 16 else 2
+    down_wide = down_row_tile >= 256
+    down_stages = 2
     dot_down = _shared_make_dot(
-        capacity, intermediate, hidden, full_k_reuse=True, column_group=16 if wide_prefill else 4,
+        capacity, intermediate, hidden, full_k_reuse=True,
+        column_group=32 if down_wide else 4,
         row_tile=down_row_tile, column_stages=down_stages,
     )
     channel_dtype = fused_channel_dtype if fused_activation else pl.FP32
