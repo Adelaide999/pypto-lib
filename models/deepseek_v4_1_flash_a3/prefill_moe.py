@@ -55,6 +55,8 @@ ROUTER_EXPERT_TILE = 32
 ROUTER_TOKEN_TILE = 16
 ROUTER_GATE_WORKERS = 64
 ROUTER_TOPK_TILE = 8
+ROUTER_SELECT_TOKEN_TILE = 16
+ROUTER_SELECT_WORKERS = 48
 DISPATCH_RECV_MAX = 64
 DISPATCH_D_TILE = 512
 DISPATCH_MAP_PAD = 8
@@ -273,58 +275,75 @@ def make_moe_router_inline(capacity, config, input_dtype=pl.BF16):
     ):
         logits = project(x, gate_weight, logits, active)
 
-        raw_scores = pl.create_tensor([capacity, experts], dtype=pl.FP32)
-        selected_ids = pl.create_tensor([capacity, ROUTER_TOPK_TILE], dtype=pl.INT32)
-        for token in pl.spmd(active, name_hint="a2_moe_route_sort"):
-            gate_logits = logits[token : token + 1, :]
-            positive = pl.maximum(gate_logits, 0.0)
-            negative_abs = pl.neg(pl.abs(gate_logits))
-            exponential = pl.exp(negative_abs)
-            log_tail = pl.log(pl.add(exponential, 1.0))
-            softplus_log = pl.add(positive, log_tail)
-            negative_shift = pl.sub(pl.neg(gate_logits), 10.0)
-            negative_mask = pl.minimum(pl.maximum(negative_shift, 0.0), 1.0)
-            negative_exp = pl.exp(pl.minimum(gate_logits, 0.0))
-            negative_floor = pl.mul(negative_mask, negative_exp)
-            softplus = pl.maximum(softplus_log, negative_floor)
-            scores = pl.sqrt(softplus)
-            raw_scores[token : token + 1, :] = scores
-
-            bias = pl.reshape(text_bias[:], [1, experts])
-            token_id = pl.read(input_ids, [token])
-            if token_id >= sentinel_base:
-                if token_id < sentinel_end:
-                    bias = pl.reshape(vision_bias[:], [1, experts])
-            biased_scores = pl.add(scores, bias)
-            index_range = pl.arange(0, [1, experts], dtype=pl.UINT32)
-            sorted_32 = pl.sort32(biased_scores, index_range)
-            sorted_64 = pl.mrgsort(sorted_32, block_len=64)
-            first = sorted_64[:, 0:256]
-            second = sorted_64[:, 256:512]
-            third = sorted_64[:, 512:768]
-            sorted_pairs = pl.mrgsort(first, second, third)
-            top_pairs = sorted_pairs[:, 0:16]
-            top_ids = pl.gather(top_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-            selected_ids[token : token + 1, :] = top_ids
-
-        # Serialize adjacent 24-byte routing rows sharing a 64-byte cache line.
-        for _block in pl.spmd(1, name_hint="a2_moe_route_normalize"):
-            for token in pl.range(active):
-                score_sum = pl.cast(0.0, pl.FP32)
-                for rank in pl.range(topk):
-                    selected_expert_idx = pl.cast(pl.read(selected_ids, [token, rank]), pl.INDEX)
-                    if controlled:
-                        selected_expert_idx = pl.cast(pl.read(route_ids, [token, rank]), pl.INDEX)
-                    score = pl.read(raw_scores, [token, selected_expert_idx])
-                    score_sum = score_sum + score
-                for rank in pl.range(topk):
-                    selected_expert_idx = pl.cast(pl.read(selected_ids, [token, rank]), pl.INDEX)
-                    if controlled:
-                        selected_expert_idx = pl.cast(pl.read(route_ids, [token, rank]), pl.INDEX)
-                    score = pl.read(raw_scores, [token, selected_expert_idx])
-                    normalized = (score / score_sum) * route_scale
-                    pl.write(route_ids, [token, rank], pl.cast(selected_expert_idx, pl.INT32))
-                    pl.write(route_weights, [token, rank], normalized)
+        # The six-slot output is contiguous across each token block.
+        flat_ids = pl.reshape(route_ids, [1, capacity * topk])
+        flat_weights = pl.reshape(route_weights, [1, capacity * topk])
+        num_blocks = (active + ROUTER_SELECT_TOKEN_TILE - 1) // ROUTER_SELECT_TOKEN_TILE
+        workers = pl.min(num_blocks, ROUTER_SELECT_WORKERS)
+        for worker in pl.spmd(workers, name_hint="a2_moe_route_select"):
+            for block in pl.range(worker, num_blocks, workers):
+                begin = block * ROUTER_SELECT_TOKEN_TILE
+                rows = pl.min(ROUTER_SELECT_TOKEN_TILE, active - begin)
+                gate_logits = pl.slice(logits, [ROUTER_SELECT_TOKEN_TILE, experts], [begin, 0], valid_shape=[rows, experts])
+                gate_logits = pl.fillpad(gate_logits, pad_value=pl.PadValue.zero)
+                positive = pl.maximum(gate_logits, 0.0)
+                negative_abs = pl.neg(pl.abs(gate_logits))
+                exponential = pl.exp(negative_abs)
+                log_tail = pl.log(pl.add(exponential, 1.0))
+                softplus_log = pl.add(positive, log_tail)
+                negative_shift = pl.sub(pl.neg(gate_logits), 10.0)
+                negative_mask = pl.minimum(pl.maximum(negative_shift, 0.0), 1.0)
+                # The negative floor reuses exp(-abs(logit)) for logit < -10.
+                negative_floor = pl.mul(negative_mask, exponential)
+                softplus = pl.maximum(softplus_log, negative_floor)
+                scores = pl.sqrt(softplus)
+                index_range = pl.arange(0, [1, experts], dtype=pl.UINT32)
+                if not controlled:
+                    text_bias_row = pl.reshape(text_bias[:], [1, experts])
+                    text_scores = pl.col_expand_add(scores, text_bias_row)
+                ids_out = pl.create_tensor([1, ROUTER_SELECT_TOKEN_TILE * topk], dtype=pl.INT32)
+                weights_out = pl.create_tensor([1, ROUTER_SELECT_TOKEN_TILE * topk], dtype=pl.FP32)
+                for row in pl.range(rows):
+                    token = begin + row
+                    if not controlled:
+                        biased_scores = text_scores[row : row + 1, :]
+                        token_id = pl.read(input_ids, [token])
+                        if token_id >= sentinel_base:
+                            if token_id < sentinel_end:
+                                score_row = scores[row : row + 1, :]
+                                bias = pl.reshape(vision_bias[:], [1, experts])
+                                biased_scores = pl.add(score_row, bias)
+                        sorted_32 = pl.sort32(biased_scores, index_range)
+                        sorted_64 = pl.mrgsort(sorted_32, block_len=64)
+                        prefix = 2 * ROUTER_TOPK_TILE
+                        first = sorted_64[:, :prefix]
+                        second = sorted_64[:, 256 : 256 + prefix]
+                        third = sorted_64[:, 512 : 512 + prefix]
+                        sorted_pairs = pl.mrgsort(first, second, third)
+                        top_pairs = sorted_pairs[:, : 2 * ROUTER_TOPK_TILE]
+                        top_ids = pl.gather(top_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                    selected_ids = pl.array.create(topk, pl.INT32)
+                    selected_scores = pl.create_tensor([1, ROUTER_TOPK_TILE], dtype=pl.FP32)
+                    score_sum = pl.cast(0.0, pl.FP32)
+                    for rank in pl.unroll(topk):
+                        if controlled:
+                            expert = pl.read(route_ids, [token, rank])
+                        else:
+                            expert = pl.read(top_ids, [0, rank])
+                        score = pl.read(scores, [row, pl.cast(expert, pl.INDEX)])
+                        selected_ids[rank] = expert
+                        pl.write(selected_scores, [0, rank], score)
+                        score_sum = score_sum + score
+                    for rank in pl.unroll(topk):
+                        score = pl.read(selected_scores, [0, rank])
+                        normalized = (score / score_sum) * route_scale
+                        pl.write(ids_out, [0, row * topk + rank], selected_ids[rank])
+                        pl.write(weights_out, [0, row * topk + rank], normalized)
+                offset = begin * topk
+                flat_ids[:, offset : offset + ROUTER_SELECT_TOKEN_TILE * topk] = pl.set_validshape(ids_out, 1, rows * topk)
+                flat_weights[:, offset : offset + ROUTER_SELECT_TOKEN_TILE * topk] = pl.set_validshape(
+                    weights_out, 1, rows * topk
+                )
         return logits, route_ids, route_weights
 
     return moe_router_inline
