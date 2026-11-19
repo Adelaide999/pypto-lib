@@ -121,20 +121,23 @@ def make_blocked_rmsnorm(capacity, width, eps):
         output: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        for block in pl.spmd((active + VEC_M_TILE - 1) // VEC_M_TILE, name_hint="a2_rms_norm"):
-            t0 = block * VEC_M_TILE
-            rows = pl.min(VEC_M_TILE, active - t0)
-            source = pl.slice(x, [VEC_M_TILE, width], [t0, 0], valid_shape=[rows, width])
-            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), VEC_M_TILE, width)
-            value = pl.cast(source, pl.FP32)
-            square = pl.mul(value, value)
-            mean = pl.mul(pl.row_sum(square), 1.0 / width)
-            inverse = pl.rsqrt(pl.add(mean, eps), high_precision=True)
-            normalized = pl.row_expand_mul(value, inverse)
+        tiles = (active + VEC_M_TILE - 1) // VEC_M_TILE
+        workers = pl.min(tiles, PREFILL_NORM_WORKERS)
+        for worker in pl.spmd(workers, name_hint="a2_rms_norm"):
             gamma = pl.reshape(pl.cast(weight[:], pl.FP32), [1, width])
-            weighted = pl.col_expand_mul(normalized, gamma)
-            narrowed = pl.cast(weighted, pl.BF16, mode="rint")
-            output[t0 : t0 + VEC_M_TILE, :] = pl.set_validshape(narrowed, rows, width)
+            for block in pl.range(worker, tiles, workers):
+                t0 = block * VEC_M_TILE
+                rows = pl.min(VEC_M_TILE, active - t0)
+                source = pl.slice(x, [VEC_M_TILE, width], [t0, 0], valid_shape=[rows, width])
+                source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), VEC_M_TILE, width)
+                value = pl.cast(source, pl.FP32)
+                square = pl.mul(value, value)
+                mean = pl.mul(pl.row_sum(square), 1.0 / width)
+                inverse = pl.rsqrt(pl.add(mean, eps), high_precision=True)
+                normalized = pl.row_expand_mul(value, inverse)
+                weighted = pl.col_expand_mul(normalized, gamma)
+                narrowed = pl.cast(weighted, pl.BF16, mode="rint")
+                output[t0 : t0 + VEC_M_TILE, :] = pl.set_validshape(narrowed, rows, width)
         return output
 
     return norm
