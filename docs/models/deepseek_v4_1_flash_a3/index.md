@@ -532,10 +532,9 @@ commands and the read/upload/cache-alias audit fields.
 ## Standalone Prefill vector launch
 
 `PrefillVectorLaunch` is an opt-in synchronous path for standalone A3
-RMSNormCast and BF16-to-INT8 projection quantization at capacity 8192. It
-launches the generated PyPTO vector body through a CANN stream adapter and
-rejects artifacts whose generated task or tensor ABI does not match. It
-does not change QKV, FFN, or any network entry.
+RMSNormCast, BF16-to-INT8 projection quantization, and RoPE table generation
+at capacity 8192. A CANN stream adapter launches the generated PyPTO vector
+body after validating the generated task and tensor ABI.
 
 Compile `make_prefill_norm_cast(8192, 5120)` or
 `make_prefill_projection_quantize_entry(8192, width)` for onboard A3 with
@@ -552,7 +551,10 @@ with entry.open(worker) as launch:
 ```
 
 For `"rms_norm_cast"`, pass `collapsed, weight, normed, router_input` to
-`run` and receive the last two buffers back. All buffers must be live,
+`run` and receive the last two buffers back. For `"rope_tables"`, compile
+`make_rope_tables(8192, 64, theta, scaling)` and pass 32 as the width to
+`build`. Pass INT64 `positions` and two FP32 buffers `cosine` and `sine`
+to `run`, which returns both FP32 buffers. All buffers must be live,
 32-byte-aligned ND `DeviceTensor` operands owned by the same `ChipWorker`.
 Use the stream on one thread within the worker's lifetime. Each call
 checks ownership, shape, dtype, and output overlap, waits for completion,

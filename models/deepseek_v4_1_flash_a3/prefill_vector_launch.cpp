@@ -35,6 +35,11 @@ extern "C" __global__ AICORE void prefill_vector_leaf(
 #if PYPTO_VECTOR_QUANT
     prefill_token_quantize_whole_row((__gm__ int8_t *)b, (__gm__ float *)c, (__gm__ bfloat16_t *)a,
                                     active, static_cast<int64_t>(workers), block, workers);
+#elif PYPTO_VECTOR_ROPE_TABLE_ROWS
+    constexpr auto rows = PYPTO_VECTOR_ROPE_TABLE_ROWS;
+    const int64_t tiles = (static_cast<int64_t>(active) + rows - 1) / rows;
+    prefill_rope_tables((__gm__ int64_t *)a, (__gm__ float *)b, (__gm__ float *)c,
+                        tiles, static_cast<int64_t>(workers), active, block, workers);
 #else
     const int64_t tiles = (static_cast<int64_t>(active) + 7) / 8;
     prefill_norm_dual_output((__gm__ bfloat16_t *)c, (__gm__ float *)d, (__gm__ bfloat16_t *)a,

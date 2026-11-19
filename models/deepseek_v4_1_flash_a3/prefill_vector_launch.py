@@ -26,7 +26,10 @@ _CAPACITY = 8192
 _D = 5120
 _I32 = ctypes.c_int32
 _PTR = ctypes.c_void_p
-_DTYPES = {"bfloat16": (torch.bfloat16, 2), "fp32": (torch.float32, 4), "int8": (torch.int8, 1)}
+_DTYPES = {
+    "bfloat16": (torch.bfloat16, 2), "fp32": (torch.float32, 4),
+    "int8": (torch.int8, 1), "int64": (torch.int64, 8),
+}
 
 
 def _abi(leaf, width):
@@ -47,6 +50,15 @@ def _abi(leaf, width):
             ("scales", "InOut", [_CAPACITY, 8], "fp32", "ND"),
             active,
         ), (1, 2), 1
+    if leaf == "rope_tables" and width == 32:
+        from .rope import ROPE_TABLE_ROWS_TILE
+
+        return "prefill_rope_tables", (
+            ("positions", "In", [_CAPACITY], "int64", "ND"),
+            ("cosine", "InOut", matrix, "fp32", "ND"),
+            ("sine", "InOut", matrix, "fp32", "ND"),
+            active,
+        ), (1, 2), ROPE_TABLE_ROWS_TILE
     raise ValueError(f"Unsupported Prefill vector leaf: {leaf}, width={width}")
 
 
@@ -58,22 +70,33 @@ def _matches_orchestration(source, symbol, params, aliases, tile):
     decl = "".join(f"constTensor&ext_{param[0]}=orch_args.tensor({i}).ref();" for i, param in enumerate(params[:-1]))
     first = f"ext_{params[0][0]}"
     ret, aux = (f"ext_{params[i][0]}" for i in aliases)
-    grid = "int64_ttiles=((static_cast<int64_t>(active)+7)/8);" if tile == 8 else ""
-    bound = "tiles" if tile == 8 else "static_cast<int64_t>(active)"
+    is_table = symbol == "prefill_rope_tables"
+    bound = "blocks" if is_table else "tiles"
+    grid = f"int64_t{bound}=((static_cast<int64_t>(active)+{tile - 1})/{tile});" if tile > 1 else ""
+    if tile == 1:
+        bound = "static_cast<int64_t>(active)"
     grid += f"int64_tworkers=std::min<int64_t>({bound},48);"
-    args = "".join(f"params_t0.add_inout(ext_{params[i][0]});" for i in aliases)
-    args += "".join(f"params_t0.add_input(ext_{param[0]});" for param in params[:-1] if param[1] == "In")
-    scalars = ("tiles", "workers", "active") if tile == 8 else ("active", "workers")
+    reshape = f"uint32_tposition_rows_shapes[2]={{1,{_CAPACITY}}};"
+    reshape += "Tensorposition_rows=ext_positions.reshape(position_rows_shapes,2);"
+    inputs = "".join(f"params_t0.add_input(ext_{param[0]});" for param in params[:-1] if param[1] == "In")
+    if is_table and reshape in code:
+        grid += reshape
+        inputs = "params_t0.add_input(position_rows);"
+    outputs = "".join(f"params_t0.add_inout(ext_{params[i][0]});" for i in aliases)
+    args = inputs + outputs if is_table else outputs + inputs
+    scalars = (bound, "workers", "active") if tile > 1 else ("active", "workers")
     args += "".join(f"params_t0.add_scalar({scalar});" for scalar in scalars)
-    expected = (
-        f'(constChipTaskArgs&orch_args){{{decl}int32_tactive=orch_args.scalar<int32_t>(0);'
-        f'Tensorret={first};Tensorret__tmp_v0_guarded_1={first};SIMPLER_SCOPE(){{{grid}'
-        f'if((0<workers)){{SIMPLER_SCOPE(){{CoreTaskArgsparams_t0;{args}'
-        f'params_t0.launch_spec.set_block_num(workers);rt_submit_aiv_task(0,params_t0);'
-        f'ret={ret};ret__tmp_v0_guarded_1={aux};}}}}else{{SIMPLER_SCOPE(){{'
-        f'ret={ret};ret__tmp_v0_guarded_1={aux};}}}}}}}}}}'
-    )
-    return code.partition("voidaicpu_orchestration_entry")[2] == expected
+    prefix = f"(constChipTaskArgs&orch_args){{{decl}int32_tactive=orch_args.scalar<int32_t>(0);"
+    grid = f"SIMPLER_SCOPE(){{{grid}if((0<workers)){{SIMPLER_SCOPE(){{"
+    task = f"CoreTaskArgsparams_t0;{args}params_t0.launch_spec.set_block_num(workers);rt_submit_aiv_task(0,params_t0);"
+    suffix = "}}else{SIMPLER_SCOPE(){"
+    actual = code.partition("voidaicpu_orchestration_entry")[2]
+    close = "}}}}}"
+    if is_table and actual == prefix + grid + task + suffix + close:
+        return True
+    initial = f"Tensorret={first};Tensorret__tmp_v0_guarded_1={first};"
+    returned = f"ret={ret};ret__tmp_v0_guarded_1={aux};"
+    return actual == prefix + initial + grid + task + returned + suffix + returned + close
 
 
 def _generated_body(root, symbol, params, aliases, tile):
@@ -97,11 +120,12 @@ def _generated_body(root, symbol, params, aliases, tile):
     return body
 
 
-def _compile(root, body, quantize, cann):
+def _compile(root, body, leaf, tile, cann):
     pto = Path(ensure_pto_isa_root()).resolve()
     shim = Path(__file__).with_suffix(".cpp")
     compiler = cann / "bin/bisheng"
     digest = hashlib.sha256(shim.read_bytes() + body.read_bytes())
+    digest.update(f"{leaf}:{tile}".encode())
     for path in (cann, pto):
         digest.update(str(path.resolve()).encode())
     digest.update(str(compiler.stat().st_mtime_ns).encode())
@@ -112,7 +136,9 @@ def _compile(root, body, quantize, cann):
             command = [
                 str(compiler), "-xcce", "-O2", "-std=c++17", "-shared", "-fPIC", "--cce-fatobj-link",
                 "--cce-aicore-arch=dav-c220-vec", "-fenable-matrix", "--cce-auto-infer-kernel-type=true",
-                "-DREGISTER_BASE", f'-DPYPTO_VECTOR_BODY="{body.name}"', f"-DPYPTO_VECTOR_QUANT={int(quantize)}",
+                "-DREGISTER_BASE", f'-DPYPTO_VECTOR_BODY="{body.name}"',
+                f"-DPYPTO_VECTOR_QUANT={int(leaf == 'projection_quantize')}",
+                f"-DPYPTO_VECTOR_ROPE_TABLE_ROWS={tile if leaf == 'rope_tables' else 0}",
                 "-Wno-ignored-attributes", "-Wno-macro-redefined",
                 "-mllvm", "-cce-aicore-stack-size=0x8000", "-mllvm", "-cce-aicore-function-stack-size=0x8000",
                 "-mllvm", "-cce-aicore-dcci-insert-for-scalar=false",
@@ -148,7 +174,7 @@ class PrefillVectorLaunch:
         symbol, params, aliases, tile = _abi(leaf, width)
         body = _generated_body(root, symbol, params, aliases, tile)
         cann = Path(os.environ["ASCEND_HOME_PATH"]).resolve()
-        library = ctypes.CDLL(str(_compile(root, body, tile == 1, cann)))
+        library = ctypes.CDLL(str(_compile(root, body, leaf, tile, cann)))
         return cls(library, params[:-1], aliases, tile)
 
     def __init__(self, library, params, aliases, tile):
