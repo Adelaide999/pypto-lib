@@ -109,10 +109,15 @@ def main(function, *, mode, capacity):
     parser.add_argument("--validate-teacher-forced", action="store_true")
     parser.add_argument("--warmup-requests", type=int, default=0)
     parser.add_argument("--measured-requests", type=int, default=1)
-    parser.add_argument("--profile-last-decode", action="store_true")
+    profiling = parser.add_mutually_exclusive_group()
+    profiling.add_argument("--profile-last-decode", action="store_true")
+    profiling.add_argument("--profile-all-steps", type=Path, metavar="DIR",
+                           help="capture Level 1 swimlanes for prefill and all seven decode steps in a new directory")
     parser.add_argument("--execution-log", type=Path)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
+    if args.profile_all_steps is not None and (args.checkpoint is None or args.validation_only or args.compile_only):
+        parser.error("--profile-all-steps requires full checkpoint generation")
     if args.warmup_requests < 0 or args.measured_requests < 1:
         parser.error("warmup requests must be nonnegative; measured requests must be positive")
     if args.validation_only and not args.validate_layers:

@@ -18,6 +18,7 @@ import config as C
 from config import FLASH as M
 from host import prepare_resident_inputs
 from reference import compare_logits
+from swimlane import step_name
 from telemetry import route_distribution
 from utils import DECODE_CACHE_NAMES, prepare_decode_inputs
 
@@ -38,7 +39,7 @@ def run_request(
     runtime, programs, arguments, names, ranks,
     weights, engram, tokenizer, request, host_cache, rope_tables,
     config, memory, report, *, reference=None, teacher_forced=False,
-    audit=None, save_logits=None, label="greedy", profile=False,
+    audit=None, save_logits=None, label="greedy", profile=False, profile_dir=None,
 ):
     """Submit one full prefill and seven decode calls, then check frozen logits."""
     if teacher_forced and reference is None:
@@ -84,10 +85,17 @@ def run_request(
         memory.phase = "decode" if index else "prefill"
         marker = dict(label=label, step=step + 1, mode=memory.phase)
         print("A3_ENGINE_BEGIN", json.dumps(marker), flush=True)
-        dispatch_config = dataclasses.replace(config, enable_chip_swimlane=4) if profile and step == 7 else config
+        dispatch_config = config
+        if profile_dir is not None:
+            dispatch_config = dataclasses.replace(config, enable_chip_swimlane=1)
+        elif profile and step == 7:
+            dispatch_config = dataclasses.replace(config, enable_chip_swimlane=4)
         runtime.run(programs[index], *[arguments[index][name] for name in names[index]], config=dispatch_config)
         engine_times.append(time.monotonic() - engine_start)
         print("A3_ENGINE_END", json.dumps(marker), flush=True)
+        if profile_dir is not None:
+            # Each profiled dispatch clears its program's previous DFX output.
+            (programs[index].output_dir / "dfx_outputs").rename(profile_dir / step_name(step))
         for name, value in (("logits", logits), ("sampled_ids", sampled)):
             runtime.copy_from(value.data_ptr(), ranks[index][owner][name].data_ptr,
                               value.numel() * value.element_size(), worker_id=owner)

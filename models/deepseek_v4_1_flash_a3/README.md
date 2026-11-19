@@ -148,6 +148,47 @@ STRACE captures additionally provide per-rank device execution windows.
 Fast-rank comparisons use the active TP group; all 16 ranks remain visible
 for EP imbalance. Missing rank records are explicitly reported.
 
+### Level 1 operator timings for prefill and seven decode steps
+
+Use a new directory per capture. With the checkpoint, input and compiled
+artifacts from the build instructions above, run:
+
+```bash
+python "$model/prefill_fwd.py" -p a2a3 --devices "$devices" \
+  --checkpoint "$CHECKPOINT" --runtime-dir "$PREFILL_ARTIFACT" \
+  --decode-runtime-dir "$DECODE_ARTIFACT" \
+  --input-ids-json "$model/validation_data/input_ids.json" \
+  --chunk-size 8192 --max-new-tokens 8 --profile-all-steps "$PROFILE_DIR" \
+  --report "$REPORT_JSON"
+```
+
+After the measured request, the driver resets the caches and replays the full
+sequence with Level 1 collection. Each forward saves the raw records, task
+graph, kernel names and Perfetto trace under
+`$PROFILE_DIR/{prefill,decode-01,...,decode-07}/rank<R>/d<N>/`.
+Open `merged_swimlane_*.json` for the rank and step of interest. PyPTO runs
+each profiled forward twice. The profiling worker restores read-write tensors,
+including the shared caches and decode residual, after the dependency pass so
+the timing pass receives the same inputs. The measured request supplies the
+uninstrumented wall times in the main report.
+
+* `operator_summary.csv` has ten rows for the request owner's first TP rank
+  (rank 0 for the bundled input). `prefill_task_ms` sums logical task spans
+  by category. Each span runs from the first block start to the last block
+  end within one task. `decode_mean_task_ms` is the arithmetic mean of the
+  seven decode sums, including zero for steps where a category has no tasks.
+* `per_rank.csv` includes every rank, its physical device and all seven
+  individual decode values. The separate `*_core_ms` columns sum individual
+  AIC/AIV block durations. Parallel task spans and core durations can exceed
+  elapsed time. Host copies and time outside AICore tasks are excluded.
+* `kernel_categories.json` records the classification for the compiled kernels.
+  Each logical task contributes to one row. For example, `mhc_linear` belongs
+  to mHC Pre, expert gate/down kernels to MoE, dispatch/combine to MoE routing,
+  and standalone Q/KV/O projections to Matmul / GEMM. Fused kernels stay whole.
+  Unclassified kernels and logical tasks spanning multiple categories go into
+  Other. The summary checks each rank and step against the number of AIC/AIV
+  blocks requested by the dependency graph and reports incomplete captures.
+
 `validation_reports/performance_previous.json` retains the earlier run's
 instrumented warmup timings. That run completed eight tokens but stopped
 before measured requests. Its cache audits are included in host token

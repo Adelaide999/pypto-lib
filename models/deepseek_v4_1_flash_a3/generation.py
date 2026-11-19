@@ -22,7 +22,9 @@ from tokenizers import Tokenizer
 from pypto.backend import BackendType
 from pypto.ir import DistributedConfig
 from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
+from pypto.pypto_core.ir import ParamDirection
 from pypto.runtime import DeviceTensor, ExecutionMode, RunConfig, StackedDeviceTensor
+from pypto.runtime.distributed_runner import DistributedWorker
 
 import config as C
 from config import FLASH as M
@@ -31,6 +33,26 @@ from host import prepare_resident_inputs
 from utils import DECODE_CACHE_NAMES, decode_cache_views, prepare_decode_inputs
 from weights import Checkpoint, ResidentWeights
 from replay import LogitValidationError, reset_caches, run_request
+from swimlane import profile_program_dirs, summarize_swimlanes
+
+
+class SwimlaneWorker(DistributedWorker):
+    """Restore resident InOut tensors between PyPTO's graph and timing passes."""
+
+    def _dispatch_prepared(self, state, tensors, call_config, keepalive=None):
+        snapshots = []
+        if call_config.enable_dep_gen and not call_config.enable_chip_swimlane:
+            for param in state["param_infos"]:
+                if param.direction != ParamDirection.InOut:
+                    continue
+                stacked = tensors[param.name]
+                for rank, shard in zip(stacked.worker_ids, stacked.shards, strict=True):
+                    before = torch.empty(shard.shape, dtype=shard.dtype)
+                    self.copy_from(before.data_ptr(), shard.data_ptr, shard.nbytes, worker_id=rank)
+                    snapshots.append((rank, shard, before))
+        super()._dispatch_prepared(state, tensors, call_config, keepalive)
+        for rank, shard, before in snapshots:
+            self.copy_to(shard.data_ptr, before.data_ptr(), shard.nbytes, worker_id=rank)
 
 
 class HbmSampler:
@@ -153,9 +175,12 @@ def generate(args, devices, *, manifests):
     config = RunConfig(backend_type=BackendType.Ascend910B, execution_mode=ExecutionMode.ONBOARD,
                        distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
                        ring_heap=(4 * 1024**3, 4 * 1024**3, 2 * 1024**3, 1024**3), ring_dep_pool=131072)
+    program_dirs = (args.runtime_dir, args.decode_runtime_dir)
+    if args.profile_all_steps is not None:
+        program_dirs = profile_program_dirs(args.profile_all_steps, program_dirs)
     programs = [DistributedCompiledProgram.from_dir(path, backend_type=config.backend_type,
                 execution_mode=config.execution_mode, distributed_config=config.distributed_config)
-                for path in (args.runtime_dir, args.decode_runtime_dir)]
+                for path in program_dirs]
     names = [[parameter.name.removesuffix("__ssa_v0") for parameter in program._get_metadata()[0]]
              for program in programs]
     cache_names = set(DECODE_CACHE_NAMES.values())
@@ -182,8 +207,9 @@ def generate(args, devices, *, manifests):
     load_start = time.monotonic()
     try:
         print("A3_PREPARE_RESIDENT_GRAPHS", flush=True)
-        with programs[0].prepare(config, extra_compiled=[programs[1]], persistent=True,
-                                 reset_persistent_windows=False, inherited_host_tensors=list(counts.values())) as runtime:
+        worker = SwimlaneWorker if args.profile_all_steps is not None else DistributedWorker
+        with worker(programs, config, persistent=True, reset_persistent_windows=False,
+                    inherited_host_tensors=list(counts.values())) as runtime:
             memory.phase = "graphs_prepared"
             memory.sample()
             print("A3_RESIDENT_GRAPHS_READY", flush=True)
@@ -310,7 +336,7 @@ def generate(args, devices, *, manifests):
                 values = torch.tensor([replay[metric] for replay in timed], dtype=torch.float64)
                 report["benchmark"][metric] = dict(median=float(values.quantile(0.5)),
                                                   p95=float(values.quantile(0.95)), samples=values.tolist())
-            if args.profile_last_decode:
+            if args.profile_last_decode or args.profile_all_steps is not None:
                 reset_caches(runtime, ranks, host_cache)
                 profiled = {}
                 report["profile_request"] = profiled
@@ -318,12 +344,18 @@ def generate(args, devices, *, manifests):
                     runtime, programs, arguments, names, ranks,
                     weights, engram, tokenizer, request, host_cache, rope_tables,
                     config, memory, profiled, reference=reference, label="profile", profile=True,
+                    profile_dir=args.profile_all_steps,
+                    teacher_forced=args.teacher_forced and args.profile_all_steps is not None,
                 )
+                if args.profile_all_steps is not None and profiled["output_sequences"] != timed[-1]["output_sequences"]:
+                    raise ValueError("Level 1 replay generated different tokens from the measured request")
             memory.sample()
             if "layer_validation_error" in report:
                 raise ValueError(report["layer_validation_error"])
             if "teacher_forced_error" in report:
                 raise ValueError(report["teacher_forced_error"])
+        if args.profile_all_steps is not None:
+            report["operator_timings"] = summarize_swimlanes(args.profile_all_steps, devices, owner)
     except Exception as error:
         report.update(status="failed", error=f"{type(error).__name__}: {error}")
         if args.report:
