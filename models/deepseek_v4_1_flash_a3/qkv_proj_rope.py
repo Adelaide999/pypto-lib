@@ -209,6 +209,9 @@ def make_prefill_output_projection(capacity, tp, *, grouped):
         flat_shape = weight_shape
         hint = "prefill_bf16_projection_cube"
 
+    if capacity > SMALL_TOKEN_CAPACITY:
+        return _make_prefill_cube_output(capacity, groups * width, weight_shape, groups * columns, hint, grouped)
+
     small_grouped = grouped and tp == 4 and capacity <= SMALL_TOKEN_CAPACITY
     row_tile, n_tile = (16, 128) if small_grouped else (128, 256)
     k_tile = 256
@@ -244,6 +247,36 @@ def make_prefill_output_projection(capacity, tp, *, grouped):
                     acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(kb == 0))
                 valid = pl.set_validshape(acc, rows, n_tile)
                 pl.store(valid, [row, col], output)
+        return output
+
+    return project
+
+
+def _make_prefill_cube_output(capacity, input_width, weight_shape, output_width, hint, grouped):
+    """Stream the local Wo-A or Wo-B weight panels through the Cube pipeline."""
+    from pypto.runtime import pto_isa_include_dir
+
+    kernel_path = Path(__file__).parent / "kernels" / "prefill_output_projection.cpp"
+
+    @pl.jit.extern(core_type="aic", source=kernel_path, include_dirs=(pto_isa_include_dir(),))
+    def projection(
+        x: pl.Tensor[[capacity, input_width], pl.BF16],
+        weight: pl.Tensor[weight_shape, pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
+        num_tokens: pl.Scalar[pl.INT32],
+    ) -> pl.Tensor:
+        ...
+
+    @pl.jit
+    def project(
+        x: pl.Tensor[[capacity, input_width], pl.BF16],
+        weight: pl.Tensor[weight_shape, pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, output_width], pl.BF16]],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        blocks = (num_tokens + 127) // 128 * (output_width // 256)
+        with pl.spmd(pl.min(24, blocks), name_hint=hint, allow_early_resolve=grouped):
+            output = projection(x, weight, output, num_tokens)
         return output
 
     return project
