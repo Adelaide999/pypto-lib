@@ -21,7 +21,13 @@ from .decode_network import DecodeNetwork, TOPOLOGY
 from .prefill_fwd import prefill_fwd
 from .prefill_prepare import checkpoint_cache, tokenize_prompt
 from .runtime_config import (
-    MAX_CONTEXT_TOKENS, MAX_PREFILL_CHUNK_SIZE, PREFILL_MOE_SLAB_ROWS, configure_devices, prefill_execution_capacity,
+    MAX_CONTEXT_TOKENS,
+    MAX_MODEL_CONTEXT_TOKENS,
+    MAX_PREFILL_CHUNK_SIZE,
+    PREFILL_MOE_SLAB_ROWS,
+    ParallelPlan,
+    configure_devices,
+    prefill_execution_capacity,
 )
 from .utils import write_json
 
@@ -38,9 +44,13 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--result", type=Path)
     parser.add_argument("--max-new-tokens", type=int, default=3)
-    parser.add_argument("--chunk-size", type=int, default=128)
+    parser.add_argument("--chunk-size", type=int, help="Defaults to 128, bounded by any experimental token budget")
     parser.add_argument("--prefill-moe-slab-rows", choices=PREFILL_MOE_SLAB_ROWS, type=int,
                         help="Maximum source rows per rank in one Prefill expert dispatch/return round")
+    parser.add_argument("--max-num-batched-tokens", type=int, choices=(16, 64, 256, 512),
+                        help="Opt into experimental packed requests with this new-token budget")
+    parser.add_argument("--tp", type=int, choices=(1, 2, 4), default=4)
+    parser.add_argument("--hbm-budget", type=Path, help="JSON per-rank HBM budget for expanded token/history runs")
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--logits-mode", choices=("last", "all"), default="last",
                         help="Project the last active position or every position in each chunk")
@@ -51,9 +61,19 @@ def main(argv=None):
                         help="Capture all forward phases or only Prefill/Decode")
     parser.add_argument("--profile-output", type=Path, help="Device trace root; defaults to OUTPUT/profiling")
     args = parser.parse_args(argv)
-    if not 1 <= args.chunk_size <= MAX_PREFILL_CHUNK_SIZE or not 1 <= args.max_new_tokens <= 256:
-        parser.error(f"Require chunk size 1..{MAX_PREFILL_CHUNK_SIZE} and a new-token limit in 1..256")
     started = perf_counter()
+    experimental = args.max_num_batched_tokens is not None
+    if not experimental and args.tp != TOPOLOGY["tp"]:
+        parser.error("Alternate TP requires --max-num-batched-tokens to opt into experimental packed requests")
+    if experimental and args.logits_mode == "all":
+        parser.error("Experimental packed requests project only final request positions")
+    chunk_limit = args.max_num_batched_tokens if experimental else MAX_PREFILL_CHUNK_SIZE
+    if args.chunk_size is None:
+        args.chunk_size = min(128, chunk_limit)
+    if not 1 <= args.chunk_size <= chunk_limit or not 1 <= args.max_new_tokens <= 256:
+        parser.error(f"Require chunk size 1..{chunk_limit} and a new-token limit in 1..256")
+    topology = dict(TOPOLOGY, tp=args.tp, dp=16 // args.tp)
+    ParallelPlan.from_topology(topology, args.devices)
     args.checkpoint, args.output = args.checkpoint.resolve(), args.output.resolve()
     result_dir = (args.result or args.output / "generation").resolve()
     model = json.loads((args.checkpoint / "config.json").read_text())
@@ -64,14 +84,17 @@ def main(argv=None):
             parser.error("--tokens-file must contain a JSON array of token IDs")
     else:
         raw = args.prompt if args.prompt is not None else [int(item) for item in args.tokens.split(",")]
-    tokens = tokenize_prompt(raw, args.checkpoint, model["text_config"]["vocab_size"])
-    if len(tokens) + args.max_new_tokens > MAX_CONTEXT_TOKENS:
-        parser.error(f"Prompt plus generation exceeds the {MAX_CONTEXT_TOKENS}-position session reservation")
+    context_limit = MAX_MODEL_CONTEXT_TOKENS if experimental else MAX_CONTEXT_TOKENS
+    tokens = tokenize_prompt(raw, args.checkpoint, model["text_config"]["vocab_size"], max_tokens=context_limit)
+    if len(tokens) + args.max_new_tokens > context_limit:
+        parser.error(f"Prompt plus generation exceeds the {context_limit}-position session reservation")
     devices = configure_devices(args.devices, world=16)
     args.output.mkdir(parents=True, exist_ok=False)
     result_dir.mkdir(parents=True, exist_ok=True)
     preparation_started = perf_counter()
-    cache, config = checkpoint_cache(args.checkpoint, TOPOLOGY, capacity=prefill_execution_capacity(args.chunk_size))
+    capacity = args.max_num_batched_tokens if experimental else prefill_execution_capacity(args.chunk_size)
+    decode_capacity = capacity if experimental else 16
+    cache, config = checkpoint_cache(args.checkpoint, topology, capacity=capacity)
     checkpoint_contract_seconds = perf_counter() - preparation_started
     config.update(chunk_size=args.chunk_size, context_capacity=len(tokens) + args.max_new_tokens,
                   logits_mode=args.logits_mode, dump_logits=args.dump_logits,
@@ -79,12 +102,21 @@ def main(argv=None):
     profiling = dict(level=args.enable_chip_swimlane, phase=args.profile_phase,
                      output_dir=str((args.profile_output or args.output / "profiling").resolve()))
     config["profiling"] = profiling
+    if experimental:
+        config["runtime_limits"] = dict(max_num_seqs=1, max_seqs_per_dp=1,
+                                        max_num_batched_tokens=args.max_num_batched_tokens,
+                                        max_model_len=MAX_MODEL_CONTEXT_TOKENS)
+    if args.hbm_budget is not None:
+        config["hbm_budget"] = json.loads(args.hbm_budget.read_text())
     eos = model.get("eos_token_id", model["text_config"].get("eos_token_id"))
-    report = dict(status="executing", checkpoint=str(args.checkpoint), topology=TOPOLOGY,
+    report = dict(status="executing", checkpoint=str(args.checkpoint), topology=topology,
                   devices=devices, chunk_size=args.chunk_size, prefill_capacity=config["capacity"],
-                  decode_capacity=16, requested_prefill_moe_slab_rows=args.prefill_moe_slab_rows,
+                  decode_capacity=decode_capacity, requested_prefill_moe_slab_rows=args.prefill_moe_slab_rows,
                   prompt_token_ids=tokens, generated_token_ids=[], phases=[],
-                  profiling=profiling, logits_mode=args.logits_mode, dump_logits=args.dump_logits, accuracy="not_run")
+                  profiling=profiling, logits_mode="request-final" if experimental else args.logits_mode,
+                  dump_logits=args.dump_logits, accuracy="not_run")
+    if experimental:
+        report["runtime_limits"] = config["runtime_limits"]
     write_json(result_dir / "prompt.json", report)
     session, network = None, None
     generated, decode_timings, token_timings = [], [], []
@@ -126,7 +158,7 @@ def main(argv=None):
         chunks = prefill.get("completed_prefill_chunks", [prefill])
         prefill_forward_seconds = sum(chunk["timings"]["chunk_seconds"] for chunk in chunks)
         prefill_moe = session.program.moe_geometry[0]
-        decode_moe = session.phase_programs[16].moe_geometry[0]
+        decode_moe = session.phase_programs[decode_capacity].moe_geometry[0]
         report.update(moe_slab_rows=prefill_moe["slab_rows"], prefill_expert_capacity=prefill_moe["expert_capacity"],
                       decode_moe_slab_rows=decode_moe["slab_rows"], decode_expert_capacity=decode_moe["expert_capacity"])
         report["timings"].update(
@@ -135,7 +167,8 @@ def main(argv=None):
             weights=dict(session.weights.initialization_timings),
             prefill_forward_seconds=prefill_forward_seconds,
         )
-        emit(int(prefill["logits"][0]["fresh"][-1].argmax()), "prefill")
+        logits = prefill["request_outputs"][0]["logits"] if experimental else prefill["logits"][0]["fresh"][-1]
+        emit(int(logits.argmax()), "prefill")
         network = DecodeNetwork(runtime=session.runtime, resident_weights=session.weights,
             cache_views=session.cache_views, session=session, output=args.output / "decode",
             progress=lambda event: print(json.dumps(dict(event, phase="decode")), flush=True))
@@ -201,7 +234,7 @@ def main(argv=None):
             raise cleanup_error
     print("[generation] RUN PASS; " + json.dumps(dict(
         tokens=generated, prefill_layers=report["prefill_layers"], decode_layers=report["decode_layers"],
-        decode_steps=len(decode_timings), same_runtime=True, topology=TOPOLOGY)), flush=True)
+        decode_steps=len(decode_timings), same_runtime=True, topology=topology)), flush=True)
 
 
 if __name__ == "__main__":

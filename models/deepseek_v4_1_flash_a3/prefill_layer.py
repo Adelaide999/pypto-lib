@@ -405,12 +405,14 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 inverse = zeros(rank, capacity, 32768)
             else:
                 controls = original["metadata"]
+                request_count = len(original["request_slots"]) if "request_slots" in original else len(controls["seq_lens"])
                 schedule = from_controls(
-                    controls["query_start_loc"].tolist(),
-                    controls["seq_lens"].tolist(),
-                    controls["block_table"].tolist(),
+                    controls["query_start_loc"][:request_count + 1].tolist(),
+                    controls["seq_lens"][:request_count].tolist(),
+                    controls["block_table"][:request_count].tolist(),
                     cache_blocks=cache_pages,
                     capacity=capacity,
+                    rolling_pages=state["live"].get("packed_requests", False),
                 )
                 slots = torch.full((capacity, 2), -1, dtype=torch.int64)
                 slot_rows = torch.tensor(schedule["slot_mapping"], dtype=torch.int64).reshape(-1, 2)
@@ -701,6 +703,11 @@ REGIONS = {
         ("norm", ("collapsed", "norm_weight", "normalized", "active")),
         ("projection", ("normalized", "weight", "local_logits", "active")),
     ),
+    "sample_head_l2": (
+        ("sp_unpack", ("gathered", "collapsed", "sample_rows", "physical", "active")),
+        ("norm", ("collapsed", "norm_weight", "normalized", "active")),
+        ("projection", ("normalized", "weight", "local_logits", "active")),
+    ),
     "qkv_l2": (
         ("wq_a", ("q_input", "wq_a", "wq_a_scale", "wqa", "query_rows")),
         ("q_norm", ("wqa", "q_norm", "latent", "query_rows")),
@@ -769,6 +776,7 @@ REGIONS = {
 STAGE_REGIONS = {
     "embedding": ("input_l2",),
     "output": ("head_l2",),
+    "sample_output": ("sample_head_l2",),
     "layer": ("qkv_l2", "attention_pack_l2", "output_projection_l2", "ffn_dispatch_l2",
               "moe_experts_l2", "moe_finish_l2"),
 }
