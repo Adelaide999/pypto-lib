@@ -55,10 +55,13 @@ COMBINE_D = 5120
 MOE_VEC_M_TILE = 8
 MOE_ACT_TILE = 256
 ROUTER_D_TILE = 256
+# 5120-wide V4.1 hidden states divide into five 1024-wide Cube panels.
+ROUTER_CUBE_D_TILE = 1024
 ROUTER_EXPERT_TILE = 32
 ROUTER_TOKEN_TILE = 16
-ROUTER_GATE_WORKERS = 512
-ROUTER_GATE_CUBE_WORKERS = 1024
+# Scale the Cube launch with the Prefill token extent.  The lower bound keeps
+# the smaller 2K specialization from paying for excess worker descriptors.
+ROUTER_GATE_WORKERS = 2048
 ROUTER_TOPK_TILE = 8
 ROUTER_SELECT_TOKEN_TILE = 16
 ROUTER_SELECT_WORKERS = 48
@@ -213,7 +216,7 @@ def _make_router_gate_vector(capacity, hidden, experts, input_dtype):
     token_tile = math.gcd(capacity, ROUTER_TOKEN_TILE)
     expert_tile = ROUTER_EXPERT_TILE
     expert_blocks = experts // expert_tile
-    worker_limit = ROUTER_GATE_WORKERS
+    worker_limit = min(ROUTER_GATE_WORKERS, max(512, capacity // 4))
     needs_widen = input_dtype != pl.FP32
     widen = _router_make_cast_tile(1, ROUTER_D_TILE, input_dtype, pl.FP32)
 
@@ -252,43 +255,52 @@ def _make_router_gate_vector(capacity, hidden, experts, input_dtype):
     return project
 
 
-def _make_router_gate_cube(capacity, hidden, experts, input_dtype):
-    """Use AIC cube matmul for the large Prefill gate projection."""
+def _make_router_gate_cube(capacity, hidden, experts):
+    """Project Prefill router logits with FP32 Cube tiles.
 
+    Prefill passes the router FP32 activation.  A 16x16 output tile and a
+    1024-wide reduction keeps the weight panel in Mat while using the same
+    accumulation order as the existing FP32 matmul path.
+    """
     token_tile = math.gcd(capacity, ROUTER_TOKEN_TILE)
-    expert_tile = ROUTER_EXPERT_TILE
+    expert_tile = 16
     expert_blocks = experts // expert_tile
-    k_tile = 1024 if hidden % 1024 == 0 else ROUTER_D_TILE
-    worker_limit = ROUTER_GATE_CUBE_WORKERS
-    widen = _router_make_cast_tile(token_tile, k_tile, input_dtype, pl.FP32)
+    worker_limit = min(ROUTER_GATE_WORKERS, max(512, capacity // 4))
 
     @pl.jit.inline
     def project(
-        x: pl.Tensor[[capacity, hidden], input_dtype],
+        x: pl.Tensor[[capacity, hidden], pl.FP32],
         gate_weight: pl.Tensor[[experts, hidden], pl.FP32],
         logits: pl.Tensor[[capacity, experts], pl.FP32],
         active: pl.Scalar[pl.INT32],
     ):
         block_count = ((active + token_tile - 1) // token_tile) * expert_blocks
-        for worker in pl.spmd(pl.min(block_count, worker_limit), name_hint="a2_moe_gate_cube"):
+        for worker in pl.spmd(pl.min(block_count, worker_limit), name_hint="a2_moe_gate_fp32"):
             for block in pl.range(worker, block_count, worker_limit):
                 token = (block // expert_blocks) * token_tile
                 expert = (block % expert_blocks) * expert_tile
-                source = x[token : token + token_tile, 0:k_tile]
-                source_storage = pl.create_tensor([token_tile, k_tile], dtype=input_dtype)
-                source_storage[:, :] = source
-                source_fp32 = widen(source_storage)
-                weight = gate_weight[expert : expert + expert_tile, 0:k_tile]
-                acc = pl.matmul(source_fp32, weight, out_dtype=pl.FP32, b_trans=True)
-                for k0 in pl.range(k_tile, hidden, k_tile):
-                    source = x[token : token + token_tile, k0 : k0 + k_tile]
-                    source_storage[:, :] = source
-                    source_fp32 = widen(source_storage)
-                    weight = gate_weight[expert : expert + expert_tile, k0 : k0 + k_tile]
-                    acc = pl.matmul_acc(acc, source_fp32, weight, b_trans=True)
                 rows = pl.min(token_tile, active - token)
+                dot_sum = pl.create_tensor([token_tile, expert_tile], dtype=pl.FP32)
+                for inner in pl.pipeline(0, hidden, ROUTER_CUBE_D_TILE, stage=2):
+                    source = pl.slice(
+                        x, [token_tile, ROUTER_CUBE_D_TILE], [token, inner],
+                        valid_shape=[rows, ROUTER_CUBE_D_TILE],
+                    )
+                    source = pl.set_validshape(
+                        pl.fillpad(source, pad_value=pl.PadValue.zero), token_tile, ROUTER_CUBE_D_TILE
+                    )
+                    weight = pl.slice(
+                        gate_weight, [expert_tile, ROUTER_CUBE_D_TILE], [expert, inner]
+                    )
+                    dot_sum = pl.matmul_acc(
+                        dot_sum,
+                        source,
+                        weight,
+                        b_trans=True,
+                        init_cond=(inner == 0),
+                    )
                 logits[token : token + token_tile, expert : expert + expert_tile] = pl.set_validshape(
-                    acc, rows, expert_tile
+                    dot_sum, rows, expert_tile
                 )
         return logits
 
@@ -296,10 +308,12 @@ def _make_router_gate_cube(capacity, hidden, experts, input_dtype):
 
 
 def _make_router_gate(capacity, hidden, experts, input_dtype):
-    """Use cube tiles for large Prefill and vector tiles for Decode."""
+    """Use cube tiles for Prefill and one-token vector tiles for Decode."""
     small_capacity = capacity <= SMALL_TOKEN_CAPACITY
+    if not small_capacity and input_dtype == pl.FP32 and hidden % ROUTER_CUBE_D_TILE == 0:
+        return _make_router_gate_cube(capacity, hidden, experts)
     if not small_capacity:
-        return _make_router_gate_cube(capacity, hidden, experts, input_dtype)
+        return _make_router_gate_vector(capacity, hidden, experts, input_dtype)
     token_tile = 1
     expert_tile = 8
     expert_blocks = experts // expert_tile
@@ -1016,6 +1030,8 @@ def _make_shared_moe_partition(
     down_stages = 2
     dot_down = _shared_make_dot(
         capacity, intermediate, hidden, full_k_reuse=True,
+        # At the 256-row tile, 16 output panels keeps enough independent
+        # blocks for Cube occupancy while retaining the full-K input reuse.
         column_group=16 if down_wide else 4,
         row_tile=down_row_tile, column_stages=down_stages,
     )

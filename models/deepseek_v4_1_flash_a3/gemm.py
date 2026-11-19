@@ -427,7 +427,14 @@ def _make_full_k_dynamic_linear(capacity, input_width, output_width, combine_sca
     """Project full-K INT8 tiles and apply channel/token scales before BF16 stores."""
     qb_columns = input_width == 1280 and output_width == 32768
     qb_large_rows = qb_columns and capacity >= PREFILL_QB_M_TILE
-    column_group = 26 if qb_columns else 1
+    # Keep the activation panel resident while walking several output panels.
+    # This is only enabled for the large Prefill specialization. Decode is
+    # compiled with capacity=16 and retains one panel per task.
+    wide_prefill = capacity >= 2048
+    column_group = 26 if qb_columns else (8 if wide_prefill else 1)
+    # A second weight stage is useful for the very wide QB panel.  QA/KV
+    # already reuse the activation across eight columns, while two stages
+    # would duplicate the full-K activation in Mat and exceed 512 KiB.
     column_stages = 2 if qb_columns else 1
     column_blocks = (output_width // N_TILE + column_group - 1) // column_group
     packed_rows = input_width * (output_width // N_TILE)
@@ -481,7 +488,11 @@ def _make_full_k_dynamic_linear(capacity, input_width, output_width, combine_sca
 
         return project
 
-    project_rows = make_project(min(capacity, M_TILE), True)
+    # The QKV QA/KV projections reuse the full-K activation tile across the
+    # output columns.  A 32-row tile doubles that reuse at Prefill capacities
+    # while remaining within the Mat buffer.  QB keeps its dedicated 16/64-row
+    # split because its much wider output already uses a larger weight panel.
+    project_rows = make_project(min(capacity, M_TILE if qb_columns else 32), True)
     project_aligned = make_project(PREFILL_QB_M_TILE, False)
 
     @pl.jit

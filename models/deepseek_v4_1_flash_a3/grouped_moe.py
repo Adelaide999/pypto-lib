@@ -23,10 +23,7 @@ def make_grouped_routed_experts(capacity, config, local_experts):
     gate_rows = hidden * (width // 64)
     down_rows = intermediate * (hidden // 64)
     row_tile = min(capacity, 64)
-    # The V4.1 hidden width is 5120.  A 512-column K tile keeps the cube fed
-    # while leaving enough resident space for the three paired accumulators.
-    # Fall back to the historical split for unsupported hidden widths.
-    gate_k_tile = 512 if hidden >= 512 and hidden % 512 == 0 else hidden // 5
+    gate_k_tile = hidden // 10
     # Each A3 vector worker handles successive waves of compact rows.
     vector_workers = 48
     max_tiles = local_experts * ((capacity + row_tile - 1) // row_tile)
@@ -145,14 +142,14 @@ def make_grouped_routed_experts(capacity, config, local_experts):
                 scales[block : block + 1, :] = activation_scale
 
         down_acc = pl.create_tensor([scratch_rows, hidden], dtype=pl.INT32)
-        for block in pl.spmd(active_tiles * (hidden // 256), name_hint="grouped_down"):
-            tile = block // (hidden // 256)
+        for block in pl.spmd(active_tiles * (hidden // 1024), name_hint="grouped_down"):
+            tile = block // (hidden // 1024)
             expert = pl.cast(pl.read(tile_map, [tile, 0]), pl.INDEX)
-            first_nb = block % (hidden // 256) * 4
+            first_nb = block % (hidden // 1024) * 16
             rows = pl.cast(pl.read(tile_map, [tile, 2]), pl.INDEX)
             compact_row = pl.cast(pl.read(tile_map, [tile, 1]), pl.INDEX)
             down_source = pl.slice(activated, [row_tile, intermediate], [compact_row, 0], valid_shape=[rows, intermediate])
-            for nb in pl.pipeline(first_nb, first_nb + 4, stage=2):
+            for nb in pl.pipeline(first_nb, first_nb + 16, stage=2):
                 packed_begin = expert * down_rows + nb * intermediate
                 down_matrix = down_weight[packed_begin : packed_begin + intermediate, :]
                 product = pl.matmul(down_source, down_matrix, out_dtype=pl.INT32)
