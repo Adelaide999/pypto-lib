@@ -254,12 +254,12 @@ def make_blocked_weight_pack(width, output_width):
     return pack_weight
 
 
-def make_dot(capacity, width, output_width, *, full_k_reuse=False, column_group=1, column_stages=1):
+def make_dot(capacity, width, output_width, *, full_k_reuse=False, column_group=1, column_stages=1, row_tile=M_TILE):
     """Accumulate complete blocked INT8 products in INT32."""
     packed_rows = width * (output_width // N_TILE)
 
     if full_k_reuse and width <= FULL_K_TILE:
-        row_tile = min(capacity, M_TILE)
+        row_tile = math.gcd(capacity, row_tile)
 
         @pl.jit.inline
         def dot_full_k(
@@ -275,13 +275,13 @@ def make_dot(capacity, width, output_width, *, full_k_reuse=False, column_group=
                 first_nb = block % column_blocks * column_group
                 last_nb = pl.min(first_nb + column_group, output_width // N_TILE)
                 rows = pl.min(row_tile, active - t0)
-                source = pl.slice(payload, [row_tile, width], [t0, 0], valid_shape=[rows, width])
+                source = pl.load(payload, [t0, 0], [row_tile, width], valid_shape=[rows, width], target_memory=pl.Mem.Mat)
                 for nb in pl.pipeline(first_nb, last_nb, stage=column_stages):
                     n0 = nb * N_TILE
                     packed_k0 = nb * width
-                    weight = packed[packed_k0 : packed_k0 + width, :]
+                    weight = pl.load(packed, [packed_k0, 0], [width, N_TILE], target_memory=pl.Mem.Mat)
                     product = pl.matmul(source, weight, out_dtype=pl.INT32)
-                    accumulator[t0 : t0 + row_tile, n0 : n0 + N_TILE] = product
+                    pl.store(product, [t0, n0], accumulator)
             return accumulator
 
         return dot_full_k
