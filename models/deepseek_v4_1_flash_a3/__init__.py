@@ -12,6 +12,12 @@ from importlib import import_module
 
 
 _EXPORTS = {
+    "prefill_batch": ("prefill_fwd", "prefill_batch"),
+    "RuntimeLimits": ("runtime_config", "RuntimeLimits"),
+    "ParallelPlan": ("runtime_config", "ParallelPlan"),
+    "RequestQuery": ("metadata", "RequestQuery"),
+    "RequestHandle": ("metadata", "RequestHandle"),
+    "RequestLedger": ("metadata", "RequestLedger"),
     "run_prefill": ("prefill_fwd", "run_prefill"),
     "A2A3OperatorConfig": ("operator_config", "A2A3OperatorConfig"),
     "A2A3_DTYPE_CONTRACT": ("operator_config", "A2A3_DTYPE_CONTRACT"),
