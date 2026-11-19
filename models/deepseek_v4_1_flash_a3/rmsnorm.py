@@ -23,6 +23,9 @@ EPS = M.rms_norm_eps
 # tiling
 NORM_T_TILE = 8
 NORM_D_TILE = 512
+# The dual-output Prefill path processes the fixed 5120-wide hidden row in
+# four larger chunks.  Decode and the other norm entry points keep NORM_D_TILE.
+PREFILL_NORM_D_TILE = 1280
 PREFILL_NORM_WORKERS = 48
 
 
@@ -348,25 +351,27 @@ def make_prefill_norm_cast(capacity, hidden):
                 source = pl.slice(collapsed, [NORM_T_TILE, hidden], [t0, 0], valid_shape=[rows, hidden])
                 cached = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), NORM_T_TILE, hidden)
                 sq_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
-                for k0 in pl.range(0, hidden, NORM_D_TILE):
-                    value = pl.cast(cached[:, k0 : k0 + NORM_D_TILE], pl.FP32, mode="rint")
+                for k0 in pl.range(0, hidden, PREFILL_NORM_D_TILE):
+                    value = pl.cast(cached[:, k0 : k0 + PREFILL_NORM_D_TILE], pl.FP32, mode="rint")
                     square = pl.mul(value, value)
                     partial = pl.reshape(pl.row_sum(square), [1, NORM_T_TILE])
                     sq_sum = pl.add(sq_sum, partial)
                 mean = pl.mul(sq_sum, 1.0 / hidden)
                 inv_rms = pl.rsqrt(pl.add(mean, EPS), high_precision=True)
                 inverse = pl.reshape(inv_rms, [NORM_T_TILE, 1])
-                for k0 in pl.range(0, hidden, NORM_D_TILE):
-                    value = pl.cast(cached[:, k0 : k0 + NORM_D_TILE], pl.FP32, mode="rint")
-                    gamma = pl.reshape(pl.cast(weight[k0 : k0 + NORM_D_TILE], pl.FP32), [1, NORM_D_TILE])
+                for k0 in pl.range(0, hidden, PREFILL_NORM_D_TILE):
+                    value = pl.cast(cached[:, k0 : k0 + PREFILL_NORM_D_TILE], pl.FP32, mode="rint")
+                    gamma = pl.reshape(
+                        pl.cast(weight[k0 : k0 + PREFILL_NORM_D_TILE], pl.FP32), [1, PREFILL_NORM_D_TILE]
+                    )
                     normalized = pl.col_expand_mul(pl.row_expand_mul(value, inverse), gamma)
                     narrowed = pl.cast(normalized, pl.BF16, mode="rint")
-                    normed[t0 : t0 + NORM_T_TILE, k0 : k0 + NORM_D_TILE] = pl.set_validshape(
-                        narrowed, rows, NORM_D_TILE
+                    normed[t0 : t0 + NORM_T_TILE, k0 : k0 + PREFILL_NORM_D_TILE] = pl.set_validshape(
+                        narrowed, rows, PREFILL_NORM_D_TILE
                     )
                     widened = pl.cast(narrowed, pl.FP32)
-                    router_input[t0 : t0 + NORM_T_TILE, k0 : k0 + NORM_D_TILE] = pl.set_validshape(
-                        widened, rows, NORM_D_TILE
+                    router_input[t0 : t0 + NORM_T_TILE, k0 : k0 + PREFILL_NORM_D_TILE] = pl.set_validshape(
+                        widened, rows, PREFILL_NORM_D_TILE
                     )
         return normed, router_input
 
