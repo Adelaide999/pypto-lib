@@ -32,6 +32,7 @@ from .quant import (
     make_dequantize as _ecotech_shared_make_dequantize,
     make_dequantize as _shared_make_dequantize,
     make_dynamic_int8_quantize as _moe_make_dynamic_int8_quantize,
+    make_prefill_projection_quantize,
     make_quantize as _ecotech_shared_make_quantize,
     make_quantize as _shared_make_quantize,
     make_quantize_row as _shared_make_quantize_row,
@@ -794,68 +795,72 @@ def _make_shared_activation(
         channels: pl.Tensor[[width], pl.FP32],
         scales: pl.Tensor[[capacity, 8], pl.FP32],
         output: pl.Tensor[[capacity, intermediate], output_dtype],
+        output_scale: pl.Tensor[[capacity, 8], pl.FP32],
         active: pl.Scalar[pl.INT32],
     ):
         row_blocks = (active + row_tile - 1) // row_tile
-        for block in pl.spmd(row_blocks * (intermediate // tile), name_hint="a2_moe_swiglu_fused"):
-            token = block // (intermediate // tile) * row_tile
-            column = block % (intermediate // tile) * tile
-            rows = pl.min(row_tile, active - token)
-            up_column = intermediate + column
-            gate_i32 = pl.slice(
-                accumulator, [row_tile, tile], [token, column], valid_shape=[rows, tile]
-            )
-            up_i32 = pl.slice(
-                accumulator, [row_tile, tile], [token, up_column], valid_shape=[rows, tile]
-            )
-            gate_channels = pl.reshape(channels[column : column + tile], [1, tile])
-            up_channels = pl.reshape(channels[up_column : up_column + tile], [1, tile])
-            if token_first:
-                if quantize_output:
-                    scalar_scale = pl.read(scales, [token, 0])
-                    gate_token = pl.mul(pl.cast(gate_i32, pl.FP32), scalar_scale)
-                    up_token = pl.mul(pl.cast(up_i32, pl.FP32), scalar_scale)
+        blocks = row_blocks * (intermediate // tile)
+        workers = pl.min(blocks, 48)
+        for worker in pl.spmd(workers, name_hint="a2_moe_swiglu_fused"):
+            for block in pl.range(worker, blocks, workers):
+                token = block // (intermediate // tile) * row_tile
+                column = block % (intermediate // tile) * tile
+                rows = pl.min(row_tile, active - token)
+                up_column = intermediate + column
+                gate_i32 = pl.slice(
+                    accumulator, [row_tile, tile], [token, column], valid_shape=[rows, tile]
+                )
+                up_i32 = pl.slice(
+                    accumulator, [row_tile, tile], [token, up_column], valid_shape=[rows, tile]
+                )
+                gate_channels = pl.reshape(channels[column : column + tile], [1, tile])
+                up_channels = pl.reshape(channels[up_column : up_column + tile], [1, tile])
+                if token_first:
+                    if quantize_output:
+                        scalar_scale = pl.read(scales, [token, 0])
+                        gate_token = pl.mul(pl.cast(gate_i32, pl.FP32), scalar_scale)
+                        up_token = pl.mul(pl.cast(up_i32, pl.FP32), scalar_scale)
+                    else:
+                        row_scale = pl.row_min(scales[token : token + row_tile, :])
+                        gate_token = pl.row_expand_mul(pl.cast(gate_i32, pl.FP32), row_scale)
+                        up_token = pl.row_expand_mul(pl.cast(up_i32, pl.FP32), row_scale)
+                    gate = pl.col_expand_mul(gate_token, gate_channels)
+                    up = pl.col_expand_mul(up_token, up_channels)
                 else:
-                    row_scale = pl.row_min(scales[token : token + row_tile, :])
-                    gate_token = pl.row_expand_mul(pl.cast(gate_i32, pl.FP32), row_scale)
-                    up_token = pl.row_expand_mul(pl.cast(up_i32, pl.FP32), row_scale)
-                gate = pl.col_expand_mul(gate_token, gate_channels)
-                up = pl.col_expand_mul(up_token, up_channels)
-            else:
-                gate_channel = pl.col_expand_mul(pl.cast(gate_i32, pl.FP32), gate_channels)
-                up_channel = pl.col_expand_mul(pl.cast(up_i32, pl.FP32), up_channels)
-                if fp16_channel:
-                    gate_half = pl.cast(gate_channel, pl.FP16, mode="rint")
-                    up_half = pl.cast(up_channel, pl.FP16, mode="rint")
-                    gate_channel = pl.cast(gate_half, pl.FP32)
-                    up_channel = pl.cast(up_half, pl.FP32)
+                    gate_channel = pl.col_expand_mul(pl.cast(gate_i32, pl.FP32), gate_channels)
+                    up_channel = pl.col_expand_mul(pl.cast(up_i32, pl.FP32), up_channels)
+                    if fp16_channel:
+                        gate_half = pl.cast(gate_channel, pl.FP16, mode="rint")
+                        up_half = pl.cast(up_channel, pl.FP16, mode="rint")
+                        gate_channel = pl.cast(gate_half, pl.FP32)
+                        up_channel = pl.cast(up_half, pl.FP32)
+                    if quantize_output:
+                        scalar_scale = pl.read(scales, [token, 0])
+                        gate = pl.mul(gate_channel, scalar_scale)
+                        up = pl.mul(up_channel, scalar_scale)
+                    else:
+                        row_scale = pl.row_min(scales[token : token + row_tile, :])
+                        gate = pl.row_expand_mul(gate_channel, row_scale)
+                        up = pl.row_expand_mul(up_channel, row_scale)
+                gate = pl.minimum(gate, limit)
+                up = pl.maximum(pl.minimum(up, limit), -limit)
+                denominator = pl.add(pl.exp(pl.neg(gate)), 1.0)
+                silu = pl.div(gate, denominator)
+                activated = pl.mul(silu, up)
                 if quantize_output:
-                    scalar_scale = pl.read(scales, [token, 0])
-                    gate = pl.mul(gate_channel, scalar_scale)
-                    up = pl.mul(up_channel, scalar_scale)
+                    quant_value = pl.create_tensor([1, intermediate], dtype=pl.FP32)
+                    quant_value[:, :] = activated
+                    codes, activation_scale = quantize_row(quant_value)
+                    output[token : token + 1, :] = codes
+                    output_scale[token : token + 1, :] = activation_scale
                 else:
-                    row_scale = pl.row_min(scales[token : token + row_tile, :])
-                    gate = pl.row_expand_mul(gate_channel, row_scale)
-                    up = pl.row_expand_mul(up_channel, row_scale)
-            gate = pl.minimum(gate, limit)
-            up = pl.maximum(pl.minimum(up, limit), -limit)
-            denominator = pl.add(pl.exp(pl.neg(gate)), 1.0)
-            silu = pl.div(gate, denominator)
-            activated = pl.mul(silu, up)
-            if quantize_output:
-                quant_value = pl.create_tensor([1, intermediate], dtype=pl.FP32)
-                quant_value[:, :] = activated
-                codes, activation_scale = quantize_row(quant_value)
-                output[token : token + 1, :] = codes
-                scales[token : token + 1, :] = activation_scale
-            else:
-                output[token : token + row_tile, column : column + tile] = pl.set_validshape(activated, rows, tile)
+                    output[token : token + row_tile, column : column + tile] = pl.set_validshape(activated, rows, tile)
         return output
 
     return fp32_activation
 
 
-def make_shared_moe_w8a8_inline(
+def _make_shared_moe_partition(
     capacity, config, *, fused_activation=False, fused_channel_dtype=pl.FP16,
     token_first=False, fused_requantize=False,
 ):
@@ -872,7 +877,6 @@ def make_shared_moe_w8a8_inline(
         quantize_output=fused_activation, fused_requantize=fused_requantize,
     )
 
-    quant_x = _shared_make_quantize(capacity, hidden, whole_row=True)
     quant_hidden = _shared_make_quantize(
         capacity, intermediate, activation_dtype, fused_requantize=fused_requantize, whole_row=True,
     )
@@ -887,8 +891,9 @@ def make_shared_moe_w8a8_inline(
     dequant_down = _shared_make_dequantize(capacity, hidden, channel_dtype=channel_dtype)
 
     @pl.jit.inline
-    def shared_moe_w8a8_inline(
-        x: pl.Tensor[[capacity, hidden], pl.BF16],
+    def shared_moe_partition(
+        x_payload: pl.Tensor[[capacity, hidden], pl.INT8],
+        x_scale: pl.Tensor[[capacity, 8], pl.FP32],
         gate_up_weight: pl.Tensor[[hidden * (gate_up_width // 64), 64], pl.INT8],
         gate_up_scale: pl.Tensor[[gate_up_width], pl.FP32],
         down_weight: pl.Tensor[[intermediate * (hidden // 64), 64], pl.INT8],
@@ -896,24 +901,48 @@ def make_shared_moe_w8a8_inline(
         output: pl.Tensor[[capacity, hidden], pl.BF16],
         active: pl.Scalar[pl.INT32],
     ):
-        x_payload = pl.create_tensor([capacity, hidden], dtype=pl.INT8)
-        x_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
-        quant_x(x, x_payload, x_scale, active)
-
         gate_up_acc = pl.create_tensor([capacity, gate_up_width], dtype=pl.INT32)
         dot_gate_up(x_payload, gate_up_weight, gate_up_acc, active)
         hidden_payload = pl.create_tensor([capacity, intermediate], dtype=pl.INT8)
+        hidden_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
         if fused_activation:
-            activate(gate_up_acc, gate_up_scale, x_scale, hidden_payload, active)
-            hidden_scale = x_scale
+            activate(gate_up_acc, gate_up_scale, x_scale, hidden_payload, hidden_scale, active)
         else:
             activation = pl.create_tensor([capacity, intermediate], dtype=activation_dtype)
             activate(gate_up_acc, gate_up_scale, x_scale, activation, active)
-            hidden_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
             quant_hidden(activation, hidden_payload, hidden_scale, active)
         down_acc = pl.create_tensor([capacity, hidden], dtype=pl.INT32)
         dot_down(hidden_payload, down_weight, down_acc, active)
         dequant_down(down_acc, down_scale, hidden_scale, output, active)
+        return output
+
+    return shared_moe_partition
+
+
+def make_shared_moe_w8a8_inline(capacity, config, *, fused_activation=False, fused_channel_dtype=pl.FP16,
+                                token_first=False, fused_requantize=False):
+    """Build a single shared expert with unpartitioned weights."""
+    hidden = config["hidden_size"]
+    intermediate = config["moe_intermediate_size"]
+    quantize = make_prefill_projection_quantize(capacity, hidden)
+    partition = _make_shared_moe_partition(capacity, config, fused_activation=fused_activation,
+                                           fused_channel_dtype=fused_channel_dtype, token_first=token_first,
+                                           fused_requantize=fused_requantize)
+
+    @pl.jit.inline
+    def shared_moe_w8a8_inline(
+        x: pl.Tensor[[capacity, hidden], pl.BF16],
+        gate_up_weight: pl.Tensor[[hidden * (2 * intermediate // 64), 64], pl.INT8],
+        gate_up_scale: pl.Tensor[[2 * intermediate], pl.FP32],
+        down_weight: pl.Tensor[[intermediate * (hidden // 64), 64], pl.INT8],
+        down_scale: pl.Tensor[[hidden], pl.FP32],
+        output: pl.Tensor[[capacity, hidden], pl.BF16],
+        active: pl.Scalar[pl.INT32],
+    ):
+        payload = pl.create_tensor([capacity, hidden], dtype=pl.INT8)
+        scales = pl.create_tensor([capacity, 8], dtype=pl.FP32)
+        quantize(x, payload, scales, active)
+        partition(payload, scales, gate_up_weight, gate_up_scale, down_weight, down_scale, output, active)
         return output
 
     return shared_moe_w8a8_inline
@@ -931,7 +960,8 @@ def make_shared_moe_w8a8(
     intermediate = (local_width + 255) // 256 * 256
     local_config = dict(config, moe_intermediate_size=intermediate)
     gate_up_width = intermediate * 2
-    compute = make_shared_moe_w8a8_inline(
+    quantize = make_prefill_projection_quantize(capacity, hidden)
+    compute = _make_shared_moe_partition(
         capacity,
         local_config,
         fused_activation=fused_activation,
@@ -950,8 +980,11 @@ def make_shared_moe_w8a8(
         output: pl.InOut[pl.Tensor[[capacity, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
+        payload = pl.create_tensor([capacity, hidden], dtype=pl.INT8)
+        input_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
+        quantize(x, payload, input_scale, active)
         if partitions == 1:
-            compute(x, gate_up_weight, gate_up_scale, down_weight, down_scale, output, active)
+            compute(payload, input_scale, gate_up_weight, gate_up_scale, down_weight, down_scale, output, active)
         else:
             partials = pl.create_tensor([partitions * capacity, hidden], dtype=pl.BF16)
             for peer in pl.unroll(partitions):
@@ -963,7 +996,7 @@ def make_shared_moe_w8a8(
                 local_scale = gate_up_scale[peer * gate_up_width : (peer + 1) * gate_up_width]
                 local_down = down_weight[down_begin : down_end, :]
                 local_output = partials[peer * capacity : (peer + 1) * capacity, :]
-                compute(x, local_gate, local_scale, local_down, down_scale, local_output, active)
+                compute(payload, input_scale, local_gate, local_scale, local_down, down_scale, local_output, active)
             for block in pl.spmd(((active + 7) // 8) * (hidden // 256), name_hint="shared_tp_reduce"):
                 token = block // (hidden // 256) * 8
                 column = block % (hidden // 256) * 256
