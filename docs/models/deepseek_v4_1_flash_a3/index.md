@@ -529,6 +529,36 @@ and the vocabulary head run on A3; dynamic Engram lookup rows are prepared
 from the persistent host tables. See [Decode](decode.md) for standalone
 commands and the read/upload/cache-alias audit fields.
 
+## Standalone Prefill vector launch
+
+`PrefillVectorLaunch` is an opt-in synchronous path for standalone A3
+RMSNormCast and BF16-to-INT8 projection quantization at capacity 8192. It
+launches the generated PyPTO vector body through a CANN stream adapter and
+rejects artifacts whose generated task or tensor ABI does not match. It
+does not change QKV, FFN, or any network entry.
+
+Compile `make_prefill_norm_cast(8192, 5120)` or
+`make_prefill_projection_quantize_entry(8192, width)` for onboard A3 with
+`save_kernels=True`. The quantization widths are 1280 and 5120. Use the
+CANN compiler and PTO ISA that match the compiled artifact. Build the
+adapter once, then reuse it and the stream for repeated calls:
+
+```python
+from models.deepseek_v4_1_flash_a3.prefill_vector_launch import PrefillVectorLaunch
+
+entry = PrefillVectorLaunch.build("projection_quantize", width, compiled)
+with entry.open(worker) as launch:
+    payload, scales = launch.run(x, payload, scales, active=active)
+```
+
+For `"rms_norm_cast"`, pass `collapsed, weight, normed, router_input` to
+`run` and receive the last two buffers back. All buffers must be live,
+32-byte-aligned ND `DeviceTensor` operands owned by the same `ChipWorker`.
+Use the stream on one thread within the worker's lifetime. Each call
+checks ownership, shape, dtype, and output overlap, waits for completion,
+and leaves rows beyond the active prefix untouched. Use the standard
+PyPTO path for profiling or unsupported artifacts.
+
 ## Network profiling
 
 The persistent generation runtime supports optional chip swimlane capture

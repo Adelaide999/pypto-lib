@@ -37,7 +37,8 @@ ENGRAM_ECOTECH_K, ENGRAM_ECOTECH_N = ENGRAM_ECOTECH_COLS * WIDTH, (ENGRAM_ECOTEC
 
 # tiling
 T_TILE, D_TILE, ROTATION_TILE = 16, 512, 32
-RESTORE_M_TILE = 16
+DECODE_RESTORE_M_TILE = 16
+PREFILL_RESTORE_M_TILE = 320
 
 
 # tiling
@@ -266,7 +267,7 @@ def make_resident_int8_lookup(capacity, table_rows, columns=ENGRAM_ECOTECH_COLS,
     return lookup_rows
 
 
-def make_original_basis_hidden(capacity):
+def make_original_basis_hidden(capacity, m_tile):
     """Restore FP32 hidden with independent block32 FP32 matrix products."""
 
     @pl.jit.inline
@@ -282,16 +283,17 @@ def make_original_basis_hidden(capacity):
         flat_original = pl.reshape(
             original, [capacity * ENGRAM_ECOTECH_HC * (ENGRAM_ECOTECH_D // ROTATION_TILE), ROTATION_TILE]
         )
-        blocks = active * ENGRAM_ECOTECH_HC * (ENGRAM_ECOTECH_D // ROTATION_TILE // RESTORE_M_TILE)
+        # Independent block32 rows can share a tile across HC branches of a token.
+        blocks = active * (ENGRAM_ECOTECH_HC * (ENGRAM_ECOTECH_D // ROTATION_TILE) // m_tile)
         task_count = blocks
         for task_worker in pl.spmd(pl.min(task_count, SPMD_WORKER_LIMIT), name_hint='engram_ecotech_original_basis_cube'):
             for task in pl.range(task_worker, task_count, SPMD_WORKER_LIMIT):
-                row = task * RESTORE_M_TILE
-                source_bf16 = flat_hidden[row : row + RESTORE_M_TILE, :]
+                row = task * m_tile
+                source_bf16 = flat_hidden[row : row + m_tile, :]
                 source_fp32 = pl.cast(source_bf16, pl.FP32)
                 rotation_fp32 = rotation_block[:, :]
                 restored = pl.matmul(source_fp32, rotation_fp32, out_dtype=pl.FP32, b_trans=True)
-                flat_original[row : row + RESTORE_M_TILE, :] = pl.mul(restored, 1.0)
+                flat_original[row : row + m_tile, :] = pl.mul(restored, 1.0)
         return original
 
     return restore
@@ -383,7 +385,7 @@ def make_engram_ecotech(capacity, table_rows, rms_norm_eps=1e-20):
         raise ValueError("Use a positive padded capacity, resident row count and source norm epsilon")
     gather = pl.jit.inline(make_resident_int8_lookup(capacity, table_rows)._func)
     project = pl.jit.inline(make_bf16_projection_staged(ENGRAM_ECOTECH_K, ENGRAM_ECOTECH_N)._func)
-    restore = make_original_basis_hidden(capacity)
+    restore = make_original_basis_hidden(capacity, PREFILL_RESTORE_M_TILE)
     gate = make_original_basis_gate(capacity, rms_norm_eps)
 
     @pl.jit
@@ -417,7 +419,7 @@ def make_engram_ecotech_observed(capacity, table_rows, rms_norm_eps=1e-20):
         raise ValueError("Use a positive padded capacity, resident row count and source norm epsilon")
     gather = pl.jit.inline(make_resident_int8_lookup(capacity, table_rows)._func)
     project = pl.jit.inline(make_bf16_projection_staged(ENGRAM_ECOTECH_K, ENGRAM_ECOTECH_N)._func)
-    restore = make_original_basis_hidden(capacity)
+    restore = make_original_basis_hidden(capacity, PREFILL_RESTORE_M_TILE)
     gate = make_original_basis_gate(capacity, rms_norm_eps)
 
     @pl.jit
@@ -612,7 +614,7 @@ def make_prefill_engram_layout(capacity, tp):
 
 def make_prefill_engram_gate(capacity, eps):
     """Restore hidden and apply FP32 channel products and the original-basis gate."""
-    restore = make_original_basis_hidden(capacity)
+    restore = make_original_basis_hidden(capacity, PREFILL_RESTORE_M_TILE)
     gate = make_original_basis_gate(capacity, eps)
 
     @pl.jit
@@ -1219,7 +1221,7 @@ def make_decode_engram_ecotech(capacity, table_rows, rms_norm_eps=1e-20):
         raise ValueError("Use a positive padded capacity, resident row count and source norm epsilon")
     gather = pl.jit.inline(make_decode_resident_int8_lookup(capacity, table_rows)._func)
     project = pl.jit.inline(make_bf16_projection_staged(K, N)._func)
-    restore = make_original_basis_hidden(capacity)
+    restore = make_original_basis_hidden(capacity, DECODE_RESTORE_M_TILE)
     gate = make_original_basis_gate(capacity, rms_norm_eps)
 
     @pl.jit
@@ -1356,7 +1358,7 @@ def _decode_engram_linear(
 def make_decode_engram():
     """Apply checkpoint Engram projection and the original-basis residual gate."""
 
-    restore = make_original_basis_hidden(DECODE_CAPACITY)
+    restore = make_original_basis_hidden(DECODE_CAPACITY, DECODE_RESTORE_M_TILE)
     gate = make_original_basis_gate(DECODE_CAPACITY, 1e-20)
 
     @pl.jit

@@ -16,6 +16,7 @@ K_TILE = 256
 N_TILE = 64
 VEC_M_TILE = 8
 WHOLE_ROW_TILE = 5120
+PREFILL_QUANT_WORKERS = 48
 
 INT8_AMAX_EPS = CONTRACT.int8_amax_epsilon
 
@@ -283,6 +284,53 @@ def make_quantize(
         return payload, scales
 
     return quantize
+
+
+def make_prefill_projection_quantize(capacity, width):
+    """Quantize contiguous groups of BF16 projection inputs to INT8."""
+    if capacity < 1024 or width not in (1280, 5120):
+        return make_quantize(capacity, width, whole_row=True)
+    widen = make_cast_tile(1, width, pl.BF16, pl.FP32)
+    quantize_row = make_quantize_row(width)
+
+    @pl.jit.inline
+    def quantize(
+        x: pl.Tensor[[capacity, width], pl.BF16],
+        payload: pl.Tensor[[capacity, width], pl.INT8],
+        scales: pl.Tensor[[capacity, 8], pl.FP32],
+        active: pl.Scalar[pl.INT32],
+    ):
+        workers = pl.min(active, PREFILL_QUANT_WORKERS)
+        for worker in pl.spmd(workers, name_hint="prefill_token_quantize_whole_row"):
+            start = worker * active // workers
+            end = (worker + 1) * active // workers
+            for token in pl.range(start, end):
+                source = pl.slice(x, [1, width], [token, 0])
+                value = pl.create_tensor([1, width], dtype=pl.FP32)
+                value[:, :] = widen(source)
+                codes, scale = quantize_row(value)
+                scales[token : token + 1, :] = scale
+                payload[token : token + 1, :] = codes
+        return payload, scales
+
+    return quantize
+
+
+def make_prefill_projection_quantize_entry(capacity, width):
+    """Compile the shared Prefill projection quantizer as a standalone leaf."""
+    quantize_projection = make_prefill_projection_quantize(capacity, width)
+
+    @pl.jit
+    def quant(
+        x: pl.Tensor[[capacity, width], pl.BF16],
+        payload: pl.InOut[pl.Tensor[[capacity, width], pl.INT8]],
+        scales: pl.InOut[pl.Tensor[[capacity, 8], pl.FP32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        quantize_projection(x, payload, scales, active)
+        return payload, scales
+
+    return quant
 
 
 def make_decode_quantize(capacity, width, input_dtype=pl.BF16):

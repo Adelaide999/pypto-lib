@@ -12,10 +12,11 @@ import math
 import pypto.language as pl
 from .runtime_config import SPMD_WORKER_LIMIT
 import torch
-from .quant import make_dequantize, make_quantize
+from .quant import make_dequantize, make_prefill_projection_quantize, make_quantize
 from .utils import pack_blocked_weight
 
 M_TILE = 16
+PREFILL_QB_M_TILE = 64
 N_TILE = 64
 K_TILE = 256
 VEC_M_TILE = 8
@@ -390,12 +391,64 @@ def prepare_ecotech_dynamic_weight(weight_nk, source_scale, source_offset):
 
 def _make_full_k_dynamic_linear(capacity, input_width, output_width, combine_scales, quantize):
     """Project full-K INT8 tiles and apply channel/token scales before BF16 stores."""
-    row_tile = min(capacity, M_TILE)
     qb_columns = input_width == 1280 and output_width == 32768
+    qb_large_rows = qb_columns and capacity >= PREFILL_QB_M_TILE
     column_group = 26 if qb_columns else 1
     column_stages = 2 if qb_columns else 1
     column_blocks = (output_width // N_TILE + column_group - 1) // column_group
     packed_rows = input_width * (output_width // N_TILE)
+
+    def make_project(row_tile, partial):
+        @pl.jit.inline
+        def project(
+            payload: pl.Tensor[[capacity, input_width], pl.INT8],
+            token_scale: pl.Tensor[[capacity, 8], pl.FP32],
+            weight: pl.Tensor[[packed_rows, N_TILE], pl.INT8],
+            channel_scale: pl.Tensor[[output_width], pl.FP32],
+            output: pl.Tensor[[capacity, output_width], pl.BF16],
+            base: pl.Scalar[pl.INT32],
+            active: pl.Scalar[pl.INT32],
+        ):
+            row_blocks = (active + row_tile - 1) // row_tile
+            for block in pl.spmd(row_blocks * column_blocks, name_hint="prefill_int8_linear_full_k"):
+                row = block // column_blocks * row_tile
+                t0 = base + row
+                first_nb = block % column_blocks * column_group
+                last_nb = pl.min(first_nb + column_group, output_width // N_TILE)
+                if partial:
+                    rows = pl.min(row_tile, active - row)
+                else:
+                    rows = row_tile
+                activation = pl.load(
+                    payload, [t0, 0], [row_tile, input_width], valid_shape=[rows, input_width], target_memory=pl.Mem.Mat,
+                )
+                scale_values = pl.load(token_scale, [t0, 0], [row_tile, 8], valid_shape=[rows, 8])
+                scale_scratch = pl.tile.create([row_tile, 8], dtype=pl.FP32)
+                scale = pl.row_min(scale_values, tmp_tile=scale_scratch)
+                for nb in pl.pipeline(first_nb, last_nb, stage=column_stages):
+                    n0 = nb * N_TILE
+                    packed_k0 = nb * input_width
+                    packed = pl.load(weight, [packed_k0, 0], [input_width, N_TILE], target_memory=pl.Mem.Mat)
+                    product = pl.matmul(activation, packed, out_dtype=pl.INT32)
+                    value = pl.cast(product, pl.FP32, mode="rint")
+                    channel_values = pl.load(channel_scale, [n0], [N_TILE])
+                    channels = pl.reshape(channel_values, [1, N_TILE])
+                    if combine_scales:
+                        channel_rows = pl.col_expand(value, channels)
+                        combined = pl.row_expand_mul(channel_rows, scale)
+                        scaled = pl.mul(value, combined)
+                    else:
+                        scaled_channels = pl.col_expand_mul(value, channels)
+                        scaled = pl.row_expand_mul(scaled_channels, scale)
+                    narrowed = pl.cast(scaled, pl.BF16, mode="rint")
+                    result = pl.set_validshape(narrowed, rows, N_TILE)
+                    pl.store(result, [t0, n0], output)
+            return output
+
+        return project
+
+    project_rows = make_project(min(capacity, M_TILE), True)
+    project_aligned = make_project(PREFILL_QB_M_TILE, False)
 
     @pl.jit
     def linear(
@@ -408,35 +461,12 @@ def _make_full_k_dynamic_linear(capacity, input_width, output_width, combine_sca
         payload = pl.create_tensor([capacity, input_width], dtype=pl.INT8)
         token_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
         quantize(x, payload, token_scale, active)
-        row_blocks = (active + row_tile - 1) // row_tile
-        for block in pl.spmd(row_blocks * column_blocks, name_hint="prefill_int8_linear_full_k"):
-            t0 = block // column_blocks * row_tile
-            first_nb = block % column_blocks * column_group
-            last_nb = pl.min(first_nb + column_group, output_width // N_TILE)
-            rows = pl.min(row_tile, active - t0)
-            activation = pl.load(payload, [t0, 0], [row_tile, input_width], valid_shape=[rows, input_width], target_memory=pl.Mem.Mat)
-            scale_values = pl.load(token_scale, [t0, 0], [row_tile, 8], valid_shape=[rows, 8])
-            scale_scratch = pl.tile.create([row_tile, 8], dtype=pl.FP32)
-            scale = pl.row_min(scale_values, tmp_tile=scale_scratch)
-            for nb in pl.pipeline(first_nb, last_nb, stage=column_stages):
-                n0 = nb * N_TILE
-                packed_k0 = nb * input_width
-                packed = pl.load(weight, [packed_k0, 0], [input_width, N_TILE], target_memory=pl.Mem.Mat)
-                product = pl.matmul(activation, packed, out_dtype=pl.INT32)
-                value = pl.cast(product, pl.FP32, mode="rint")
-                channel_values = pl.load(channel_scale, [n0], [N_TILE])
-                channels = pl.reshape(channel_values, [1, N_TILE])
-                if combine_scales:
-                    ones = pl.tile.full([row_tile, N_TILE], dtype=pl.FP32, value=1.0)
-                    channel_rows = pl.col_expand_mul(ones, channels)
-                    combined = pl.row_expand_mul(channel_rows, scale)
-                    scaled = pl.mul(value, combined)
-                else:
-                    scaled_channels = pl.col_expand_mul(value, channels)
-                    scaled = pl.row_expand_mul(scaled_channels, scale)
-                narrowed = pl.cast(scaled, pl.BF16, mode="rint")
-                result = pl.set_validshape(narrowed, rows, N_TILE)
-                pl.store(result, [t0, n0], output)
+        if qb_large_rows:
+            aligned = active // PREFILL_QB_M_TILE * PREFILL_QB_M_TILE
+            project_aligned(payload, token_scale, weight, channel_scale, output, 0, aligned)
+            project_rows(payload, token_scale, weight, channel_scale, output, aligned, active - aligned)
+        else:
+            project_rows(payload, token_scale, weight, channel_scale, output, 0, active)
         return output
 
     return linear
@@ -446,7 +476,7 @@ def make_ecotech_dynamic_linear(capacity, input_width, output_width, combine_sca
     """Consume prepacked INT8 weights with unchanged quantization and scaling."""
     if capacity <= 0 or capacity % 16 or input_width % 256 or output_width % 64:
         raise ValueError("Use a positive capacity/16, K/256 and N/64")
-    quantize = make_quantize(capacity, input_width, whole_row=True)
+    quantize = make_prefill_projection_quantize(capacity, input_width)
     if input_width <= FULL_K_TILE:
         return _make_full_k_dynamic_linear(capacity, input_width, output_width, combine_scales, quantize)
     qb_columns = input_width == 1280 and output_width == 32768
