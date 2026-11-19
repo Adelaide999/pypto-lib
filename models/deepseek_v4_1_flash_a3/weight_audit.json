@@ -1,0 +1,705 @@
+{
+  "layout_version": "v41-a3-w8a8-dynamic-nd-v3",
+  "checkpoint_identity": {
+    "config.json": "1b2ed579c6a221f68f49222d470dab2068b23a3efc17d969b7a909e684e06316",
+    "quant_model_weights.safetensors.index.json": "0dc009ac93014cb0848acec2140223455b14733a82cfdbefc97c1b8c19559dfb",
+    "aurora_export_manifest.json": "5a9183ab5cf1b4e3c45b01332b1b4f67a3b5709bd2179d572df54ee32a9c80c1",
+    "quant_model_description.json": "2006d73f44523ca9d5a1f5494b6351e04729ab9e5825d0fd43a75f6f4fcede8e",
+    "optional/quarot.safetensors": "b8d7cf606b976364618821f2c30938635b4d322d39596efa5e58bc47013904c7"
+  },
+  "resident_bytes_per_rank": 39242607552,
+  "resident_byte_breakdown": {
+    "routed_experts": 34011217920,
+    "shared_expert": 1417134080,
+    "attention_tp": 1930693120,
+    "lm_head": 330956800,
+    "replicated": 1552605632
+  },
+  "resident_gib_per_rank": 36.54752629995346,
+  "topology": {
+    "dp": 4,
+    "tp": 4,
+    "ep": 16,
+    "local_experts": 24
+  },
+  "weight_layout": "v41-a3-w8a8-dynamic-nd-v3",
+  "projection_and_sharding_checks": [
+    {
+      "name": "layers.0.attn.wq_a",
+      "shape": [
+        5120,
+        1280
+      ],
+      "scale_shape": [
+        1,
+        1280
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.0.attn.wq_b",
+      "shape": [
+        1280,
+        32768
+      ],
+      "scale_shape": [
+        1,
+        32768
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.0.attn.wkv",
+      "shape": [
+        5120,
+        512
+      ],
+      "scale_shape": [
+        1,
+        512
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.0.ffn.shared_experts.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.0.ffn.experts.0.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.0.ffn.experts.383.w2",
+      "shape": [
+        2304,
+        5120
+      ],
+      "scale_shape": [
+        1,
+        5120
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.0.attn.wo_a.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.0.attn.wo_b.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.1.attn.wq_a",
+      "shape": [
+        5120,
+        1280
+      ],
+      "scale_shape": [
+        1,
+        1280
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.1.attn.wq_b",
+      "shape": [
+        1280,
+        32768
+      ],
+      "scale_shape": [
+        1,
+        32768
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.1.attn.wkv",
+      "shape": [
+        5120,
+        512
+      ],
+      "scale_shape": [
+        1,
+        512
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.1.ffn.shared_experts.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.1.ffn.experts.0.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.1.ffn.experts.383.w2",
+      "shape": [
+        2304,
+        5120
+      ],
+      "scale_shape": [
+        1,
+        5120
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.1.attn.wo_a.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.1.attn.wo_b.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.2.attn.wq_a",
+      "shape": [
+        5120,
+        1280
+      ],
+      "scale_shape": [
+        1,
+        1280
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.2.attn.wq_b",
+      "shape": [
+        1280,
+        32768
+      ],
+      "scale_shape": [
+        1,
+        32768
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.2.attn.wkv",
+      "shape": [
+        5120,
+        512
+      ],
+      "scale_shape": [
+        1,
+        512
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.2.ffn.shared_experts.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.2.ffn.experts.0.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.2.ffn.experts.383.w2",
+      "shape": [
+        2304,
+        5120
+      ],
+      "scale_shape": [
+        1,
+        5120
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.2.attn.wo_a.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.2.attn.wo_b.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.3.attn.wq_a",
+      "shape": [
+        5120,
+        1280
+      ],
+      "scale_shape": [
+        1,
+        1280
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.3.attn.wq_b",
+      "shape": [
+        1280,
+        32768
+      ],
+      "scale_shape": [
+        1,
+        32768
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.3.attn.wkv",
+      "shape": [
+        5120,
+        512
+      ],
+      "scale_shape": [
+        1,
+        512
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.3.ffn.shared_experts.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.3.ffn.experts.0.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.3.ffn.experts.383.w2",
+      "shape": [
+        2304,
+        5120
+      ],
+      "scale_shape": [
+        1,
+        5120
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.3.attn.wo_a.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.3.attn.wo_b.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.14.attn.wq_a",
+      "shape": [
+        5120,
+        1280
+      ],
+      "scale_shape": [
+        1,
+        1280
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.14.attn.wq_b",
+      "shape": [
+        1280,
+        32768
+      ],
+      "scale_shape": [
+        1,
+        32768
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.14.attn.wkv",
+      "shape": [
+        5120,
+        512
+      ],
+      "scale_shape": [
+        1,
+        512
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.14.ffn.shared_experts.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.14.ffn.experts.0.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.14.ffn.experts.383.w2",
+      "shape": [
+        2304,
+        5120
+      ],
+      "scale_shape": [
+        1,
+        5120
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.14.attn.wo_a.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.14.attn.wo_b.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.20.attn.wq_a",
+      "shape": [
+        5120,
+        1280
+      ],
+      "scale_shape": [
+        1,
+        1280
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.20.attn.wq_b",
+      "shape": [
+        1280,
+        32768
+      ],
+      "scale_shape": [
+        1,
+        32768
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.20.attn.wkv",
+      "shape": [
+        5120,
+        512
+      ],
+      "scale_shape": [
+        1,
+        512
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.20.ffn.shared_experts.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.20.ffn.experts.0.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.20.ffn.experts.383.w2",
+      "shape": [
+        2304,
+        5120
+      ],
+      "scale_shape": [
+        1,
+        5120
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.20.attn.wo_a.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.20.attn.wo_b.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.21.attn.wq_a",
+      "shape": [
+        5120,
+        1280
+      ],
+      "scale_shape": [
+        1,
+        1280
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.21.attn.wq_b",
+      "shape": [
+        1280,
+        32768
+      ],
+      "scale_shape": [
+        1,
+        32768
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.21.attn.wkv",
+      "shape": [
+        5120,
+        512
+      ],
+      "scale_shape": [
+        1,
+        512
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.21.ffn.shared_experts.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.21.ffn.experts.0.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.21.ffn.experts.383.w2",
+      "shape": [
+        2304,
+        5120
+      ],
+      "scale_shape": [
+        1,
+        5120
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.21.attn.wo_a.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.21.attn.wo_b.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.24.attn.wq_a",
+      "shape": [
+        5120,
+        1280
+      ],
+      "scale_shape": [
+        1,
+        1280
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.24.attn.wq_b",
+      "shape": [
+        1280,
+        32768
+      ],
+      "scale_shape": [
+        1,
+        32768
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.24.attn.wkv",
+      "shape": [
+        5120,
+        512
+      ],
+      "scale_shape": [
+        1,
+        512
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.24.ffn.shared_experts.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.24.ffn.experts.0.w1",
+      "shape": [
+        5120,
+        2304
+      ],
+      "scale_shape": [
+        1,
+        2304
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.24.ffn.experts.383.w2",
+      "shape": [
+        2304,
+        5120
+      ],
+      "scale_shape": [
+        1,
+        5120
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.24.attn.wo_a.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.24.attn.wo_b.weight",
+      "status": "pass"
+    },
+    {
+      "name": "layers.1.engram.embed",
+      "boundary_rows": [
+        0,
+        384006167
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "layers.14.engram.embed",
+      "boundary_rows": [
+        0,
+        384016681
+      ],
+      "status": "pass"
+    },
+    {
+      "name": "global_rotation",
+      "shape": [
+        160,
+        32,
+        32
+      ],
+      "status": "pass"
+    }
+  ],
+  "lm_head_boundary_rows": [
+    0,
+    32319,
+    32320,
+    64639,
+    64640,
+    96959,
+    96960,
+    129279
+  ],
+  "status": "host_weight_format_and_sharding_pass",
+  "limits": "Device model output, peak HBM and performance acceptance remain separate checks."
+}

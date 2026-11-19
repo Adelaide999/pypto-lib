@@ -1,0 +1,3 @@
+# Local validation reports and generated reference tensors.
+validation_reports/
+validation_data/frozen_reference/
