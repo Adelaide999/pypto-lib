@@ -162,15 +162,18 @@ python "$model/prefill_fwd.py" -p a2a3 --devices "$devices" \
   --report "$REPORT_JSON"
 ```
 
-After the measured request, the driver resets the caches and replays the full
-sequence with Level 1 collection. Each forward saves the raw records, task
-graph, kernel names and Perfetto trace under
+Profiling is off by default. With `--profile-all-steps DIR`, the first measured
+request captures the task graph and Level 1 timestamps together, during one
+prefill and seven decode calls. The report identifies this request in
+`profile_request`. Its latency includes collection overhead. If additional
+measured requests are configured, their unprofiled samples supply the
+benchmark percentiles. The benchmark lists its sample labels and whether
+those samples include instrumentation.
+
+After generation, the driver summarizes the raw records and converts the
+captures to Perfetto traces. Each step has a separate directory under
 `$PROFILE_DIR/{prefill,decode-01,...,decode-07}/rank<R>/d<N>/`.
-Open `merged_swimlane_*.json` for the rank and step of interest. PyPTO runs
-each profiled forward twice. The profiling worker restores read-write tensors,
-including the shared caches and decode residual, after the dependency pass so
-the timing pass receives the same inputs. The measured request supplies the
-uninstrumented wall times in the main report.
+Open `merged_swimlane_*.json` for the rank and step of interest.
 
 * `operator_summary.csv` has ten rows for the request owner's first TP rank
   (rank 0 for the bundled input). `prefill_task_ms` sums logical task spans

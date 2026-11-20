@@ -84,18 +84,17 @@ def run_request(
         engine_start = time.monotonic()
         memory.phase = "decode" if index else "prefill"
         marker = dict(label=label, step=step + 1, mode=memory.phase)
-        print("A3_ENGINE_BEGIN", json.dumps(marker), flush=True)
-        dispatch_config = config
         if profile_dir is not None:
-            dispatch_config = dataclasses.replace(config, enable_chip_swimlane=1)
-        elif profile and step == 7:
-            dispatch_config = dataclasses.replace(config, enable_chip_swimlane=4)
-        runtime.run(programs[index], *[arguments[index][name] for name in names[index]], config=dispatch_config)
+            marker["profiled"] = True
+        print("A3_ENGINE_BEGIN", json.dumps(marker), flush=True)
+        program_args = [arguments[index][name] for name in names[index]]
+        if profile_dir is not None:
+            runtime.run_profiled_step(programs[index], *program_args, config=config, directory=profile_dir / step_name(step))
+        else:
+            dispatch_config = dataclasses.replace(config, enable_chip_swimlane=4) if profile and step == 7 else config
+            runtime.run(programs[index], *program_args, config=dispatch_config)
         engine_times.append(time.monotonic() - engine_start)
         print("A3_ENGINE_END", json.dumps(marker), flush=True)
-        if profile_dir is not None:
-            # Each profiled dispatch clears its program's previous DFX output.
-            (programs[index].output_dir / "dfx_outputs").rename(profile_dir / step_name(step))
         for name, value in (("logits", logits), ("sampled_ids", sampled)):
             runtime.copy_from(value.data_ptr(), ranks[index][owner][name].data_ptr,
                               value.numel() * value.element_size(), worker_id=owner)

@@ -66,7 +66,7 @@ def test_operator_summary(tmp_path, swimlane):
     assert float(gemm["decode-07_task_ms"]) == 817
 
 
-@pytest.mark.parametrize("missing", ["chip_swimlane_records.json", "deps.json", "merged_swimlane_0.json"])
+@pytest.mark.parametrize("missing", ["chip_swimlane_records.json", "deps.json"])
 def test_incomplete_capture_has_no_summary(tmp_path, missing, swimlane):
     directory = tmp_path / "prefill" / "rank0" / "d9"
     write_capture(directory, 0, 0)
@@ -87,36 +87,82 @@ def test_missing_block_on_mixed_task(tmp_path, swimlane):
         swimlane.dispatch_totals(records, tmp_path, {})
 
 
+def test_raw_step_reports_use_same_dispatch_graph(tmp_path, swimlane, monkeypatch):
+    runner = pytest.importorskip("pypto.runtime.runner")
+    converted = []
+
+    def convert(program, dispatch, records, *, func_names, deps_json):
+        assert records.parent == deps_json.parent == func_names.parent == dispatch
+        converted.append(dispatch)
+
+    monkeypatch.setattr(runner, "_generate_swimlane", convert)
+    for mode in ("prefill", "decode"):
+        program = tmp_path / ".programs" / mode / "next_levels" / f"l2_{mode}_fwd"
+        program.mkdir(parents=True)
+        (program / "kernel_config.py").write_text(
+            'KERNELS = [{"func_id": 0, "name": "proj_q_a_aic"}, {"func_id": 1, "name": "proj_q_a_aiv"},'
+            ' {"func_id": 2, "name": "route_sort"}]\n'
+        )
+    for step in range(8):
+        dispatch = tmp_path / swimlane.step_name(step) / "rank0" / f"d{step}"
+        write_capture(dispatch, step, 0)
+        (dispatch / "name_map.json").unlink()
+        (dispatch / "merged_swimlane_0.json").unlink()
+    result = swimlane.summarize_swimlanes(tmp_path, [0], convert=True)
+    assert len(converted) == 8
+    assert result["categories"][swimlane.CATEGORIES.index("MoE routing")]["decode_mean_task_ms"] == 4
+
+
 def test_classifier_precedence(tmp_path, swimlane):
     kernels = ("mhc_linear", "hc_post", "c1a_sparse_attn_aic", "proj_idx_q_aic", "routed_swiglu",
                "dispatch_scale_pack", "proj_q_a_aic", "dynamic_int8_quant", "moe_output_zero", "prefill_tp_wait")
     assert tuple(swimlane.kernel_category(name, tmp_path) for name in kernels) == swimlane.CATEGORIES
 
 
-def test_only_timing_pass_commits_resident_state(swimlane, monkeypatch):
+@pytest.mark.parametrize("profile", [False, True])
+def test_generate_eight_tokens_with_one_dispatch_each(tmp_path, swimlane, monkeypatch, profile):
     torch = pytest.importorskip("torch")
     pytest.importorskip("pypto.runtime.distributed_runner")
-    from generation import DistributedWorker, ParamDirection, SwimlaneWorker
-    from pypto.runtime import DeviceTensor, StackedDeviceTensor
+    from generation import DistributedWorker, SwimlaneWorker, RunConfig, DistributedConfig
+    import replay
 
-    worker = object.__new__(SwimlaneWorker)
-    values = [torch.tensor([10]), torch.tensor([20])]
-    shards = [DeviceTensor(v.data_ptr(), v.shape, v.dtype) for v in values]
-    tensors = {"state": StackedDeviceTensor(shards, (2, 1), (0, 1))}
-    state = {"param_infos": [SimpleNamespace(name="state", direction=ParamDirection.InOut),
-                             SimpleNamespace(name="weights", direction=ParamDirection.In)]}
+    (tmp_path / "tokenizer_config.json").write_text('{"eos_token":"eos"}')
+    devices = list(range(16))
+    config = RunConfig(distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0))
+    worker = object.__new__(SwimlaneWorker if profile else DistributedWorker)
+    monkeypatch.setattr(worker, "_drain_dispatch_handles", lambda: None)
+    submissions = []
 
-    def dispatch(*args):
-        for value in values:
-            value.add_(1)
+    def submit(program, *args, config):
+        native, _, two_pass = worker._prepare_dispatch_config(program, config)
+        assert not two_pass
+        assert native.enable_dep_gen == profile
+        assert native.enable_chip_swimlane == int(profile)
+        if profile:
+            assert Path(native.output_prefix) == tmp_path / swimlane.step_name(len(submissions))
+        submissions.append(program.mode)
 
-    def copy(dst, src, nbytes, *, worker_id):
-        ctypes.memmove(dst, src, nbytes)
-
-    monkeypatch.setattr(DistributedWorker, "_dispatch_prepared", dispatch)
-    monkeypatch.setattr(worker, "copy_from", copy)
-    monkeypatch.setattr(worker, "copy_to", copy)
-    worker._dispatch_prepared(state, tensors, SimpleNamespace(enable_dep_gen=True, enable_chip_swimlane=0))
-    assert [v.item() for v in values] == [10, 20]
-    worker._dispatch_prepared(state, tensors, SimpleNamespace(enable_dep_gen=False, enable_chip_swimlane=1))
-    assert [v.item() for v in values] == [11, 21]
+    monkeypatch.setattr(worker, "run", submit)
+    monkeypatch.setattr(worker, "copy_from", lambda dst, src, size, **kw: ctypes.memset(dst, 0, size))
+    monkeypatch.setattr(replay, "prepare_resident_inputs", lambda *a, **kw: {"logit_rows": torch.zeros(1)})
+    monkeypatch.setattr(replay, "prepare_decode_inputs", lambda inputs: inputs)
+    monkeypatch.setattr(replay, "route_distribution", lambda *a: {})
+    monkeypatch.setattr(replay, "M", SimpleNamespace(vocab_size=10))
+    programs = [SimpleNamespace(mode=mode, platform="a2a3", output_dir=tmp_path / mode / "artifact",
+                                _distributed_config=config.distributed_config) for mode in ("prompt", "decode")]
+    ranks = [[{"logits": SimpleNamespace(data_ptr=0), "sampled_ids": SimpleNamespace(data_ptr=0)}
+              for _ in devices] for _ in programs]
+    counts = {name: torch.zeros(16) for name in ("attention_num_tokens", "moe_num_tokens")}
+    report = {}
+    replay.run_request(
+        worker, programs, [{}, counts], [[], []], ranks,
+        SimpleNamespace(tensor_layouts={}, checkpoint=SimpleNamespace(root=tmp_path)), None,
+        SimpleNamespace(token_to_id=lambda token: 9, decode=lambda *a, **kw: "result"),
+        {"dp_rank": 0, "input_ids": [1] * 8192, "request_id": "test"}, [None] * 16, None,
+        config, SimpleNamespace(), report, profile=profile, profile_dir=tmp_path if profile else None,
+    )
+    assert submissions == ["prompt"] + ["decode"] * 7
+    assert report["profiled"] == profile
+    assert len(report["engine_seconds"]) == 8
+    assert (tmp_path / "prefill").exists() == profile
+    assert config.enable_chip_swimlane == 0 and not config.enable_dep_gen

@@ -84,17 +84,17 @@ def rank_timings(path, devices=tuple(range(16)), *, dp_rank=0):
     for dispatch in dispatches:
         if not dispatch.get("label", "").startswith("measured_"):
             continue
-        key = dispatch["mode"], dispatch["step"]
+        key = dispatch["mode"], dispatch["step"], dispatch.get("profiled", False)
         stage = stages.setdefault(key, {})
         stage.setdefault(dispatch["rank"], []).append(dispatch["effective_us"])
     summaries = []
     active_ranks = list(range(dp_rank * 4, dp_rank * 4 + 4))
-    for (mode, step), samples in sorted(stages.items(), key=lambda item: item[0][1]):
+    for (mode, step, profiled), samples in sorted(stages.items(), key=lambda item: item[0][1]):
         medians = {rank: statistics.median(values) for rank, values in samples.items()}
         comparable = {rank: medians[rank] for rank in active_ranks if rank in medians}
         fastest = min(comparable, key=comparable.get) if len(comparable) == 4 else None
         slowest = max(medians, key=medians.get)
-        summaries.append(dict(mode=mode, step=step, median_us_per_rank=medians,
+        summaries.append(dict(mode=mode, step=step, profiled=profiled, median_us_per_rank=medians,
                               samples_us_per_rank=samples, fastest_rank=fastest,
                               fastest_rank_median_us=medians.get(fastest), slowest_rank=slowest,
                               slowest_rank_median_us=medians[slowest]))

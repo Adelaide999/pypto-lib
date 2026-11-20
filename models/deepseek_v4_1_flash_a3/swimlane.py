@@ -68,8 +68,6 @@ def kernel_category(kernel, program):
 def dispatch_totals(records, program, kernel_categories):
     """Count logical task spans and physical core execution cycles separately."""
     directory = records.parent
-    if len(list(directory.glob("merged_swimlane_*.json"))) != 1:
-        raise ValueError(f"expected one converted swimlane in {directory}")
     data = json.loads(records.read_bytes())
     metadata = data["metadata"]
     frequency = metadata["clock_freq_hz"]
@@ -124,10 +122,14 @@ def dispatch_totals(records, program, kernel_categories):
     return {cat: (elapsed[cat] * ms_per_tick, busy[cat] * ms_per_tick) for cat in CATEGORIES}
 
 
-def summarize_swimlanes(directory, devices, owner=0):
+def summarize_swimlanes(directory, devices, owner=0, *, convert=False):
     """Publish timing tables only after validating all eight steps on every rank."""
     by_rank = [[] for _ in devices]
     kernel_categories = {}
+    name_maps = {}
+    if convert:
+        from pypto.runtime.distributed_runner import _write_dispatch_name_map
+        from pypto.runtime.runner import _generate_swimlane
     for step in range(8):
         capture = directory / step_name(step)
         mode = "decode" if step else "prefill"
@@ -137,7 +139,18 @@ def summarize_swimlanes(directory, devices, owner=0):
             files = list((capture / f"rank{rank}").glob("d[0-9]*/chip_swimlane_records.json"))
             if len(files) != 1:
                 raise ValueError(f"expected one Level 1 capture in {capture}/rank{rank}, found {len(files)}")
-            samples.append(dispatch_totals(files[0], program, kernel_categories))
+            records = files[0]
+            if convert:
+                dispatch = records.parent
+                deps = dispatch / "deps.json"
+                if not deps.is_file():
+                    raise ValueError(f"missing same-dispatch task graph: {deps}")
+                names = _write_dispatch_name_map(dispatch, program, name_maps)
+                if names is None:
+                    raise ValueError(f"cannot resolve kernel names for {program}")
+            samples.append(dispatch_totals(records, program, kernel_categories))
+            if convert:
+                _generate_swimlane(program, dispatch, records, func_names=names, deps_json=deps)
     summary = []
     with (directory / "per_rank.csv").open("w", newline="") as stream:
         output = csv.writer(stream)
