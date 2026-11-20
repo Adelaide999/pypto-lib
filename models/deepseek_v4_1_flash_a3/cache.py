@@ -477,7 +477,13 @@ def make_network_sparse_read(capacity, config, geometry):
     heads, dim = config["num_attention_heads"], config["head_dim"]
     own_stride, long_stride = own["stride"], long["stride"]
     own_offset, long_offset = own["offset"], long["offset"]
-    if (heads, dim) != (64, 512) or any(v % dim for v in (own_stride, long_stride, own_offset, long_offset)):
+    # Decode compiles a 16-row network shape and normally has one active row.
+    # The pipelined reader below is tuned for large Prefill batches.  Keeping
+    # its fixed 24-worker staging ring for Decode creates buffers for 4,608
+    # head rows even though at most 16 rows can be live.  Use the dynamic
+    # reader for this small shape so its scratch follows the active rows.
+    if (capacity <= 16 or (heads, dim) != (64, 512)
+            or any(v % dim for v in (own_stride, long_stride, own_offset, long_offset))):
         return _make_general_network_sparse_read(capacity, config, geometry)
 
     blocks = own["blocks"]
