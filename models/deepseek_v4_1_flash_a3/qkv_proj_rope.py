@@ -138,7 +138,7 @@ def make_rope(
     return rotate
 
 
-def make_bf16_projection_staged(width, output_width, *, capacity=None):
+def make_bf16_projection_staged(width, output_width, *, capacity=None, row_tile=None):
     """Accumulate BF16 Cube slabs and narrow through a fused Vector epilogue.
 
     The BF16 operand passes through Vector before Cube starts its result transfer
@@ -146,12 +146,23 @@ def make_bf16_projection_staged(width, output_width, *, capacity=None):
     """
     n_tile = gcd(BF16_N_TILE, output_width)
     k_tile = gcd(BF16_K_TILE, width)
+    # The 8K Prefill specialization has enough independent rows to amortize
+    # the full-K weight walk with a wider Cube tile. Smaller and dynamic
+    # specializations retain the 16-row latency-oriented path.
+    if row_tile is None:
+        row_tile = M_TILE
+    if row_tile not in (M_TILE, 64):
+        raise ValueError("BF16 projection row tile must be 16 or 64")
+    if row_tile == 64 and output_width % 128 == 0:
+        n_tile = 128
     n_owner_tile = gcd(32, output_width)
     n_owners = output_width // n_owner_tile
     n_pairs = max(1, n_owners // 2)
     shift_enabled = int(4 <= n_owners <= 2 * (width // k_tile) + 1)
     shift_step = (width // k_tile) // n_pairs * shift_enabled
     extent = T_DYN if capacity is None else capacity
+    worker_limit = 24 if row_tile == 64 else SPMD_WORKER_LIMIT
+    initial_memory = pl.Mem.Mat if row_tile == 64 else pl.Mem.Vec
 
     @pl.jit
     def project(
@@ -160,25 +171,41 @@ def make_bf16_projection_staged(width, output_width, *, capacity=None):
         output: pl.InOut[pl.Tensor[[extent, output_width], pl.BF16]],
         num_tokens: pl.Scalar[pl.INT32],
     ):
-        blocks = (num_tokens + M_TILE - 1) // M_TILE * (output_width // n_tile)
-        with pl.spmd(pl.min(blocks, SPMD_WORKER_LIMIT), name_hint="prefill_bf16_projection_cube"):
-            for block in pl.range(pl.tile.get_block_idx(), blocks, SPMD_WORKER_LIMIT):
-                row = block // (output_width // n_tile) * M_TILE
+        blocks = (num_tokens + row_tile - 1) // row_tile * (output_width // n_tile)
+        with pl.spmd(pl.min(blocks, worker_limit), name_hint="prefill_bf16_projection_cube"):
+            for block in pl.range(pl.tile.get_block_idx(), blocks, worker_limit):
+                row = block // (output_width // n_tile) * row_tile
                 col = block % (output_width // n_tile) * n_tile
-                rows = pl.min(M_TILE, num_tokens - row)
+                rows = pl.min(row_tile, num_tokens - row)
+                if row_tile == 64:
+                    load_rows = row_tile
+                else:
+                    load_rows = rows
                 owner = col // n_owner_tile
                 parity = owner % 2 * shift_enabled
                 phase = shift_step * ((owner // 2) % n_pairs)
-                acc = pl.create_tile([M_TILE, n_tile], dtype=pl.FP32)
+                acc = pl.create_tile([row_tile, n_tile], dtype=pl.FP32)
                 first = (parity * (width // k_tile - 1) + phase) % (width // k_tile) * k_tile
-                initial_a = pl.load(source, [row, first], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Vec)
+                initial_a = pl.load(
+                    source,
+                    [row, first],
+                    [row_tile, k_tile],
+                    valid_shape=[load_rows, k_tile],
+                    target_memory=initial_memory,
+                )
                 initial_b = pl.load(weight, [first, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
                 acc = pl.matmul_acc(acc, initial_a, initial_b, init_cond=True)
                 for step in pl.pipeline(1, width // k_tile, stage=2):
                     directed = step + parity * (width // k_tile - 1 - 2 * step)
                     physical = (directed + phase) % (width // k_tile)
                     k = physical * k_tile
-                    a = pl.load(source, [row, k], [M_TILE, k_tile], valid_shape=[rows, k_tile], target_memory=pl.Mem.Mat)
+                    a = pl.load(
+                        source,
+                        [row, k],
+                        [row_tile, k_tile],
+                        valid_shape=[load_rows, k_tile],
+                        target_memory=pl.Mem.Mat,
+                    )
                     b = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
                     acc = pl.matmul_acc(acc, a, b)
                 transferred = pl.mul(acc, 1.0)

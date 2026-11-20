@@ -663,7 +663,10 @@ def make_prefill_engram_entries(capacity, constants, config, shards, cache_rows,
     entries["engram_hash"] = make_prefill_engram_hash(*hash_args, image_id, image_pad_id, constants["pad_id"])
     entries["engram_layout"] = make_prefill_engram_layout(capacity, tp)
     entries["engram_projection"] = make_bf16_projection_staged(
-        ENGRAM_ECOTECH_K, ENGRAM_ECOTECH_N, capacity=capacity
+        ENGRAM_ECOTECH_K,
+        ENGRAM_ECOTECH_N,
+        capacity=capacity,
+        row_tile=64 if capacity >= 8192 else TILE,
     )
     entries["engram_gate"] = make_prefill_engram_gate(capacity, config["rms_norm_eps"])
     return entries
