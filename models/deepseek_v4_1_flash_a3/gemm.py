@@ -440,12 +440,12 @@ def _make_full_k_dynamic_linear(capacity, input_width, output_width, combine_sca
     # This is only enabled for the large Prefill specialization. Decode is
     # compiled with capacity=16 and retains one panel per task.
     wide_prefill = capacity >= 2048
-    # QB has 512 output panels at the 32K projection width.  At Prefill
-    # capacity, grouping 64 panels leaves enough independent row blocks for
-    # Cube occupancy while removing the scheduler overhead of the 26-panel
-    # split.  The capacity=16 Decode specialization keeps its existing
-    # 26-panel schedule.
-    column_group = (64 if wide_prefill else 26) if qb_columns else (8 if wide_prefill else 1)
+    # QB has 512 output panels at the 32K projection width.  The full 8K
+    # Prefill specialization can use six 96-panel waves without starving the
+    # Cube. Smaller Prefill capacities keep 64-panel waves, and Decode keeps
+    # its existing 26-panel schedule.
+    qb_column_group = 96 if capacity >= 8192 else 64
+    column_group = (qb_column_group if wide_prefill else 26) if qb_columns else (8 if wide_prefill else 1)
     # A second weight stage is useful for the very wide QB panel.  QA/KV
     # already reuse the activation across eight columns, while two stages
     # would duplicate the full-K activation in Mat and exceed 512 KiB.
