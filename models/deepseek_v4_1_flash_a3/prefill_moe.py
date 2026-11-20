@@ -55,8 +55,12 @@ COMBINE_D = 5120
 MOE_VEC_M_TILE = 8
 MOE_ACT_TILE = 256
 ROUTER_D_TILE = 256
-# 5120-wide V4.1 hidden states divide into five 1024-wide Cube panels.
-ROUTER_CUBE_D_TILE = 1024
+# The Prefill router uses wider Cube tiles than the vector fallback.  A
+# 32x64 output tile with a 512-wide reduction keeps the source and weight
+# panels resident while exposing enough independent blocks for AIC occupancy.
+ROUTER_CUBE_D_TILE = 512
+ROUTER_CUBE_EXPERT_TILE = 64
+ROUTER_CUBE_TOKEN_TILE = 32
 ROUTER_EXPERT_TILE = 32
 ROUTER_TOKEN_TILE = 16
 # Scale the Cube launch with the Prefill token extent.  The lower bound keeps
@@ -258,12 +262,12 @@ def _make_router_gate_vector(capacity, hidden, experts, input_dtype):
 def _make_router_gate_cube(capacity, hidden, experts):
     """Project Prefill router logits with FP32 Cube tiles.
 
-    Prefill passes the router FP32 activation.  A 16x16 output tile and a
-    1024-wide reduction keeps the weight panel in Mat while using the same
+    Prefill passes the router FP32 activation.  A 32x64 output tile and a
+    512-wide reduction keeps the weight panel in Mat while using the same
     accumulation order as the existing FP32 matmul path.
     """
-    token_tile = math.gcd(capacity, ROUTER_TOKEN_TILE)
-    expert_tile = 16
+    token_tile = math.gcd(capacity, ROUTER_CUBE_TOKEN_TILE)
+    expert_tile = ROUTER_CUBE_EXPERT_TILE
     expert_blocks = experts // expert_tile
     worker_limit = min(ROUTER_GATE_WORKERS, max(512, capacity // 4))
 

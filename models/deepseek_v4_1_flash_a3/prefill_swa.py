@@ -75,7 +75,10 @@ def make_builders(capacity=16, config=None, cache_blocks=2, *, tp=1):
         q_norm=standalone(make_norm(capacity, 1280, 1e-20)),
         wq_b=make_ecotech_dynamic_linear(capacity, 1280, 32768, combine_scales=True),
         q_rope=standalone(make_rope(capacity, 64, 512, 64)),
-        wkv=make_ecotech_dynamic_linear(capacity, 5120, 512),
+        # The KV projection keeps FP32 channel and token scales.  Combining
+        # them before the final multiply removes the intermediate scale tile
+        # on the Prefill path and leaves Decode's separate builder unchanged.
+        wkv=make_ecotech_dynamic_linear(capacity, 5120, 512, combine_scales=True),
         kv_norm=standalone(make_norm(capacity, 512, 1e-20)),
         kv_rope=standalone(make_rope(capacity, 1, 512, 64)),
         cache_publish=standalone(publish),
