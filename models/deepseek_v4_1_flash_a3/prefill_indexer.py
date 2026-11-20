@@ -345,6 +345,7 @@ def make_index_key_gather(cache_blocks, requests, table_pages, page_rows=64, *, 
 
 def make_sparse_index_pack(capacity):
     """Pack the window and compressed physical row IDs into the attention arena."""
+    ROW_TILE = 32
 
     @pl.jit
     def sparse_index_pack(
@@ -353,10 +354,25 @@ def make_sparse_index_pack(capacity):
         indices: pl.InOut[pl.Tensor[[capacity, WINDOW_SIZE + INDEX_TOPK], pl.INT32]],
         active: pl.Scalar[pl.INT32],
     ):
-        with pl.spmd(active, name_hint="sparse_physical_index_pack"):
-            row = pl.tile.get_block_idx()
-            indices[row:row + 1, :WINDOW_SIZE] = window[row:row + 1, :]
-            indices[row:row + 1, WINDOW_SIZE:] = compressed[row:row + 1, :]
+        block_count = (active + ROW_TILE - 1) // ROW_TILE
+        with pl.spmd(block_count, name_hint="sparse_physical_index_pack"):
+            block = pl.tile.get_block_idx()
+            row = block * ROW_TILE
+            rows = pl.min(ROW_TILE, active - row)
+            window_rows = pl.slice(
+                window, [ROW_TILE, WINDOW_SIZE], [row, 0],
+                valid_shape=[rows, WINDOW_SIZE],
+            )
+            indices[row:row + ROW_TILE, :WINDOW_SIZE] = pl.set_validshape(
+                window_rows, rows, WINDOW_SIZE,
+            )
+            compressed_rows = pl.slice(
+                compressed, [ROW_TILE, INDEX_TOPK], [row, 0],
+                valid_shape=[rows, INDEX_TOPK],
+            )
+            indices[row:row + ROW_TILE, WINDOW_SIZE:] = pl.set_validshape(
+                compressed_rows, rows, INDEX_TOPK,
+            )
         return indices
 
     return sparse_index_pack
@@ -364,6 +380,7 @@ def make_sparse_index_pack(capacity):
 
 def make_shared_index_publish(capacity, shared_rows=8192):
     """Publish actual CP selection rows while preserving shared history and tails."""
+    ROW_TILE = 8
 
     @pl.jit
     def shared_index_publish(
@@ -373,13 +390,24 @@ def make_shared_index_publish(capacity, shared_rows=8192):
         shared_lengths: pl.InOut[pl.Tensor[[shared_rows, 1], pl.INT32]],
         active: pl.Scalar[pl.INT32],
     ):
-        with pl.spmd(active, name_hint="shared_index_rows"):
-            row = pl.tile.get_block_idx()
-            shared_indices[row:row + 1, :] = indices[row:row + 1, :]
-        with pl.spmd(1, name_hint="shared_index_lengths"):
-            _writer = pl.tile.get_block_idx()
-            for row in pl.range(active):
-                pl.write(shared_lengths, [row, 0], pl.read(lengths, [row, 0]))
+        block_count = (active + ROW_TILE - 1) // ROW_TILE
+        with pl.spmd(block_count, name_hint="shared_index_rows"):
+            block = pl.tile.get_block_idx()
+            row = block * ROW_TILE
+            rows = pl.min(ROW_TILE, active - row)
+            index_rows = pl.slice(
+                indices, [ROW_TILE, INDEX_TOPK], [row, 0],
+                valid_shape=[rows, INDEX_TOPK],
+            )
+            shared_indices[row:row + ROW_TILE, :] = pl.set_validshape(
+                index_rows, rows, INDEX_TOPK,
+            )
+            length_rows = pl.slice(
+                lengths, [ROW_TILE, 1], [row, 0], valid_shape=[rows, 1],
+            )
+            shared_lengths[row:row + ROW_TILE, :] = pl.set_validshape(
+                length_rows, rows, 1,
+            )
         return shared_indices, shared_lengths
 
     return shared_index_publish

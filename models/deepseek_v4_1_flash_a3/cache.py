@@ -443,7 +443,7 @@ def make_network_cache_publish(capacity, plane):
     """Publish current BF16 rows into their real page stride and payload offset."""
     blocks, stride, offset = plane["blocks"], plane["stride"], plane["offset"]
     width = plane["width"]
-    T_TILE = 4
+    T_TILE = 64
 
     @pl.jit
     def publish(
