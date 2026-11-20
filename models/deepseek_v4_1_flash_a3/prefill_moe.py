@@ -1034,9 +1034,9 @@ def _make_shared_moe_partition(
     down_stages = 2
     dot_down = _shared_make_dot(
         capacity, intermediate, hidden, full_k_reuse=True,
-        # At the 256-row tile, 16 output panels keeps enough independent
-        # blocks for Cube occupancy while retaining the full-K input reuse.
-        column_group=16 if down_wide else 4,
+        # At the 256-row tile, 32 output panels reduce task and source-load
+        # overhead while retaining enough independent blocks for Cube occupancy.
+        column_group=32 if down_wide else 4,
         column_major=down_wide,
         row_tile=down_row_tile, column_stages=down_stages,
     )
