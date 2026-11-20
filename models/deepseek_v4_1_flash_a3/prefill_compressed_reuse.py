@@ -219,7 +219,9 @@ def make_physical_consumer_entries(
         from .prefill_indexer import make_physical_index_query_entries
 
         entries.update(
-            make_physical_index_query_entries(capacity, config, cache_blocks, requests, table_pages, 1)
+            make_physical_index_query_entries(
+                capacity, config, cache_blocks, requests, table_pages, 1, packed_keys=True,
+            )
         )
         if not network_cache:
             geometry = physical_index_geometry(cache_layout, source_prefix, cache_blocks)

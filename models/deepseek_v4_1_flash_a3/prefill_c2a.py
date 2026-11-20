@@ -933,7 +933,12 @@ def make_physical_compressed_entries(
         compressed_attention=make_swa_read(capacity, cache_blocks, sparse_config),
     )
     entries.update(make_physical_index_query_entries(
-        capacity, config, cache_blocks, requests, table_pages, compress_ratio, packed_keys=network_cache,
+        # ``index_key_gather`` materializes each request into a contiguous
+        # ``[0:length)`` key prefix and zero-fills the remaining 16K arena.
+        # Keep the Prefill selector on its causal-prefix path for both the
+        # resident and network-backed cache layouts.  ``network_cache`` only
+        # selects the cache transport and must not disable this optimization.
+        capacity, config, cache_blocks, requests, table_pages, compress_ratio, packed_keys=True,
     ))
     if compress_ratio not in (1, 2):
         raise ValueError("Physical compressed attention supports ratio1 or ratio2")
@@ -954,7 +959,7 @@ def make_physical_compressed_entries(
             index_publish=make_index_cache_publish_observed(capacity, cache_blocks, page_rows=128),
             index_key_gather=make_index_key_gather(cache_blocks, requests, table_pages, page_rows=128),
             index_select=make_indexer_select(
-                capacity, KEY_CAPACITY, compress_ratio=1, packed_keys=network_cache,
+                capacity, KEY_CAPACITY, compress_ratio=1, packed_keys=True,
             ),
             sparse_controls=make_sparse_controls(
                 capacity, requests, table_pages, table_pages, long_page_rows=128, compress_ratio=1
