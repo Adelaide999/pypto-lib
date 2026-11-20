@@ -318,6 +318,7 @@ def make_readback_entries(entries, active_rows):
         selected_lengths: pl.InOut[pl.Tensor[[16, 1], pl.INT32]],
         compressed_indices: pl.InOut[pl.Tensor[[16, 512], pl.INT32]],
         window_indices: pl.InOut[pl.Tensor[[16, 128], pl.INT32]],
+        packed_indices: pl.InOut[pl.Tensor[[16, 640], pl.INT32]],
         active: pl.Scalar[pl.INT32],
     ):
         compute_sparse_controls(
@@ -330,6 +331,7 @@ def make_readback_entries(entries, active_rows):
             selected_lengths,
             compressed_indices,
             window_indices,
+            packed_indices,
             active,
         )
         return (
@@ -342,6 +344,7 @@ def make_readback_entries(entries, active_rows):
             selected_lengths,
             compressed_indices,
             window_indices,
+            packed_indices,
         )
 
     compute_sparse_core = pl.jit.inline(entries["sparse_core"]._func)

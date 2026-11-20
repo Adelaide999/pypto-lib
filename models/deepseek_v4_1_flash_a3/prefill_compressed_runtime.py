@@ -329,16 +329,7 @@ def run_compressed_attention(
         scales,
     )
     selected, lengths = selection["selected"], selection["lengths"]
-    compressed_indices, window_indices = selection["compressed"], selection["window"]
-    indices = torch.full((capacity, 640), -1, dtype=torch.int32)
-    execute(
-        "sparse_index_pack",
-        rank,
-        case,
-        [window_indices, compressed_indices, indices, query_rows],
-        dict(indices=indices),
-        "compressed_attention",
-    )
+    indices = selection["indices"]
     context = zeros(capacity, 32768)
     if network is not None:
         controls = read_runtime_control(state.get("runtime", {}), indices[:query_rows], rank)

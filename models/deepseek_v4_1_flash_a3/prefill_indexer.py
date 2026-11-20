@@ -195,7 +195,7 @@ def make_empty_selection(capacity):
 
 def make_sparse_controls(capacity, requests, long_pages, window_pages, long_page_rows=64, *,
                          compress_ratio=2, long_page_stride=None, selection_ready=False):
-    """Prepare producer QLI or readonly consumer IDs and map both caches to physical rows."""
+    """Prepare sparse IDs, map cache rows, and publish the packed attention indices."""
     if long_page_rows not in (64, 128):
         raise ValueError("A2 compressed page rows must match the actual 64/128-row cache ABI")
     if compress_ratio not in (1, 2):
@@ -214,6 +214,7 @@ def make_sparse_controls(capacity, requests, long_pages, window_pages, long_page
         selected_lengths: pl.InOut[pl.Tensor[[capacity, 1], pl.INT32]],
         compressed_indices: pl.InOut[pl.Tensor[[capacity, INDEX_TOPK], pl.INT32]],
         window_indices: pl.InOut[pl.Tensor[[capacity, WINDOW_SIZE], pl.INT32]],
+        packed_indices: pl.InOut[pl.Tensor[[capacity, WINDOW_SIZE + INDEX_TOPK], pl.INT32]],
         active: pl.Scalar[pl.INT32],
     ):
         with pl.spmd(active, name_hint="a2_prepare_sparse_indices") as controls_tid:
@@ -260,6 +261,8 @@ def make_sparse_controls(capacity, requests, long_pages, window_pages, long_page
                     window_physical = pl.cast(window_block * WINDOW_SIZE + window_offset, pl.INT32)
                     pl.tile.write(window_ids, [0, lane], window_physical)
             pl.store(window_ids, [token, 0], window_indices)
+            pl.store(window_ids, [token, 0], packed_indices)
+            pl.store(physical_ids, [token, WINDOW_SIZE], packed_indices)
         lengths_flat = pl.reshape(selected_lengths, [1, capacity])
         for block in pl.spmd((active + 7) // 8, name_hint="a2_sparse_lengths_publish", deps=[controls_tid]):
             first = block * 8
@@ -270,7 +273,7 @@ def make_sparse_controls(capacity, requests, long_pages, window_pages, long_page
             counts = pl.cast(pl.row_sum(valid), pl.INT32, mode="rint")
             flat_counts = pl.reshape(counts, [1, 8])
             lengths_flat[0:1, first:first + 8] = pl.set_validshape(flat_counts, 1, rows)
-        return selected, selected_lengths, compressed_indices, window_indices
+        return selected, selected_lengths, compressed_indices, window_indices, packed_indices
 
     return sparse_controls
 
@@ -502,6 +505,7 @@ def build_sparse_controls_specs(capacity=16, active=16, *, compress_ratio=2, sel
         TensorSpec("selected_lengths", [capacity, 1], torch.int32, init_value=-73),
         TensorSpec("compressed_indices", [capacity, INDEX_TOPK], torch.int32, init_value=-79),
         TensorSpec("window_indices", [capacity, WINDOW_SIZE], torch.int32, init_value=-83),
+        TensorSpec("packed_indices", [capacity, WINDOW_SIZE + INDEX_TOPK], torch.int32, init_value=-89),
         ScalarSpec("active", torch.int32, active, compile_runtime=True),
     ]
 
@@ -647,16 +651,18 @@ def run_index_query_selection(state, q_input, latent, cosine, sine, operands,
     selected = torch.full((capacity, 512), -1, dtype=torch.int32)
     lengths = zeros(capacity, 1, dtype=torch.int32)
     compressed_indices, window_indices = selected.clone(), torch.full((capacity, 128), -1, dtype=torch.int32)
+    indices = torch.full((capacity, WINDOW_SIZE + INDEX_TOPK), -1, dtype=torch.int32)
     controls_args = [raw_selected, q_positions, q_requests, long_table, window_table,
-                     selected, lengths, compressed_indices, window_indices, query_rows]
+                     selected, lengths, compressed_indices, window_indices, indices, query_rows]
     execute("sparse_controls", rank, case, controls_args,
-            dict(selected=selected, lengths=lengths, compressed=compressed_indices, window=window_indices), "index_select")
+            dict(selected=selected, lengths=lengths, compressed=compressed_indices, window=window_indices,
+                 indices=indices), "index_select")
     visible_lengths = zeros(capacity, dtype=torch.int32)
     ratio = state["role"]["ratio"]
     visible = [(position + 1) // ratio for position in q_positions[:query_rows].tolist()]
     visible_lengths[:query_rows].copy_(torch.tensor(visible, dtype=torch.int32))
     return dict(selected=selected, lengths=lengths, compressed=compressed_indices, candidate_blocks=paged_candidates,
-                window=window_indices, scores=candidate_scores, visible_lengths=visible_lengths)
+                window=window_indices, indices=indices, scores=candidate_scores, visible_lengths=visible_lengths)
 
 
 if __name__ == "__main__":

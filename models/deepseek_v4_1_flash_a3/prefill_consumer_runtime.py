@@ -121,7 +121,7 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
         selection = run_index_query_selection(state, q_input, latent, cosine, sine, operands,
             execute, rank, case, capacity, requests, table_pages, source_prefix, own_prefix, codes, scales)
         selected, lengths = selection["selected"], selection["lengths"]
-        compressed, window = selection["compressed"], selection["window"]
+        indices = selection["indices"]
         execute("shared_index_publish", rank, case,
             [selected, lengths, shared["topk_indices"], shared["topk_lengths"], query_rows],
             dict(indices=shared["topk_indices"], lengths=shared["topk_lengths"]), "index_select")
@@ -131,13 +131,12 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
         lengths = torch.zeros((capacity, 1), dtype=torch.int32)
         compressed = torch.full((capacity, 512), -1, dtype=torch.int32)
         window = torch.full((capacity, 128), -1, dtype=torch.int32)
+        indices = torch.full((capacity, 640), -1, dtype=torch.int32)
         control_args = [source_selected, positions, query_requests, table(long_name), table(own_name),
-                        selected, lengths, compressed, window, query_rows]
+                        selected, lengths, compressed, window, indices, query_rows]
         execute("sparse_controls", rank, case, control_args,
-                dict(selected=selected, lengths=lengths, compressed=compressed, window=window), "compressed_attention")
-    indices = torch.full((capacity, 640), -1, dtype=torch.int32)
-    execute("sparse_index_pack", rank, case, [window, compressed, indices, query_rows],
-            dict(indices=indices), "compressed_attention")
+                dict(selected=selected, lengths=lengths, compressed=compressed, window=window, indices=indices),
+                "compressed_attention")
     context = allocate_runtime_tensor(state.get("runtime", {}), (capacity, 32768), torch.bfloat16, rank)
     if network is not None:
         controls = read_runtime_control(state.get("runtime", {}), indices[:query_rows], rank)

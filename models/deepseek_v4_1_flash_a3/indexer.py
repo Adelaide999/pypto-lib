@@ -1525,6 +1525,9 @@ def golden_sparse_controls(args, *, compress_ratio=2, long_page_rows=64, long_pa
         pages = args["window_block_table"][request, window // WINDOW_SIZE]
         args["window_indices"][token].fill_(-1)
         args["window_indices"][token, :window.numel()] = pages * WINDOW_SIZE + window % WINDOW_SIZE
+        if "packed_indices" in args:
+            args["packed_indices"][token, :WINDOW_SIZE] = args["window_indices"][token]
+            args["packed_indices"][token, WINDOW_SIZE:] = args["compressed_indices"][token]
 
 
 def prepare_indexer_indices_reference(
