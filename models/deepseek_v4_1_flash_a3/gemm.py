@@ -445,10 +445,17 @@ def _make_full_k_dynamic_linear(capacity, input_width, output_width, combine_sca
     # Cube. Smaller Prefill capacities keep 64-panel waves, and Decode keeps
     # its existing 26-panel schedule.
     qb_column_group = 96 if capacity >= 8192 else 64
-    column_group = (qb_column_group if wide_prefill else 26) if qb_columns else (8 if wide_prefill else 1)
-    # A second weight stage is useful for the very wide QB panel.  QA/KV
-    # already reuse the activation across eight columns, while two stages
-    # would duplicate the full-K activation in Mat and exceed 512 KiB.
+    qa_columns = input_width == 5120 and output_width == 1280
+    column_group = (
+        (qb_column_group if wide_prefill else 26)
+        if qb_columns
+        else 20 if capacity >= 8192 and qa_columns
+        else 8 if wide_prefill
+        else 1
+    )
+    # A second weight stage is useful for the very wide QB panel.  QA and KV
+    # reuse the activation across their selected column groups, while two
+    # stages would duplicate the full-K activation in Mat and exceed 512 KiB.
     column_stages = 2 if qb_columns else 1
     column_blocks = (output_width // N_TILE + column_group - 1) // column_group
     packed_rows = input_width * (output_width // N_TILE)
