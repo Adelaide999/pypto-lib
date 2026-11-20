@@ -23,7 +23,9 @@ def make_grouped_routed_experts(capacity, config, local_experts):
     gate_rows = hidden * (width // 64)
     down_rows = intermediate * (hidden // 64)
     row_tile = min(capacity, 64)
-    gate_k_tile = hidden // 10
+    # A 512-column K tile keeps the V4.1 Cube fed while leaving room for
+    # the paired accumulators. Retain the historical split for other widths.
+    gate_k_tile = 512 if hidden >= 512 and hidden % 512 == 0 else hidden // 5
     # Each A3 vector worker handles successive waves of compact rows.
     vector_workers = 48
     max_tiles = local_experts * ((capacity + row_tile - 1) // row_tile)
