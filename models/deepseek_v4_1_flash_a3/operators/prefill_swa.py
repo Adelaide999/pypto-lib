@@ -98,7 +98,7 @@ def prefill_swa_attention(
         wkv, wkv_scale, kv_norm_weight,
         rope_cos, rope_sin,
         kv_projection, kv,
-        num_tokens,
+        num_tokens, True,
     )
     chunk_done = prefill_publish_window_batched(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
     cache_blocks = pl.tensor.dim(window_cache, 0)
@@ -138,7 +138,7 @@ def prefill_swa_attention(
             wq_b, wq_b_scale,
             chunk_cos, chunk_sin,
             qr, q,
-            active,
+            active, True,
         )
         index_ready = analyze_index_runs(chunk_indices, descriptors, active, cache_rows)
         attend_shared_cache(

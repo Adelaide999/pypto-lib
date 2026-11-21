@@ -95,14 +95,14 @@ def decode_c2a_reuse(
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, query,
-        num_tokens,
+        num_tokens, False,
     )
     kv_proj_rope(
         proj_payload, proj_scales,
         wkv, wkv_scale, kv_norm_weight,
         rope_cos, rope_sin,
         kv_projection, window_kv,
-        num_tokens,
+        num_tokens, False,
     )
     publish_window_row(window_kv, window_slots, window_cache, window_cache_scale, num_tokens)
 

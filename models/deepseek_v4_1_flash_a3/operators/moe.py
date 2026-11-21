@@ -445,6 +445,7 @@ def prefill_moe_sublayer(
     ep_rank: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
+    prefill: pl.constexpr = False,
 ):
     """Collapse mHC streams, normalize compact TP owner rows, and run the EP MoE."""
     hc_pre(
@@ -472,6 +473,7 @@ def prefill_moe_sublayer(
         npu_gate(
             local_ffn_normed, gate_weight, correction_bias, local_num_tokens,
             x_norm_mx, x_norm_scale, indices, weights,
+            prefill,
         )
         dispatch_indices = indices
 
@@ -481,7 +483,7 @@ def prefill_moe_sublayer(
             shared_w1, shared_w1_scale,
             shared_w3, shared_w3_scale,
             shared_w2, shared_w2_scale,
-            shared_output, local_num_tokens,
+            shared_output, local_num_tokens, prefill,
         )
 
         recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.INT8)

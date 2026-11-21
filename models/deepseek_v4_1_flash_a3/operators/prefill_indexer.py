@@ -613,6 +613,7 @@ def project_index_weights(
         x, weight, projected_weights, num_tokens, ready,
         width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
         workers=2147483647, name_hint="prefill_index_weights", source_col=0, output_col=0, ordered=False,
+        row_tile=16,
     )
     with pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="c1a_index_weights_scale") as weights_tid:
         block = pl.tile.get_block_idx()
@@ -643,7 +644,10 @@ def prepare_prefill_index_query(
     """Project, rotate, and quantize query rows with group-32 scales."""
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    gemm_dynamic_int8(latent, query_weight, query_weight_scale, projected, num_tokens, Q_LORA, INDEX_H * INDEX_DIM, "c1a_mx_projection")
+    gemm_dynamic_int8(
+        latent, query_weight, query_weight_scale, projected, num_tokens, Q_LORA, INDEX_H * INDEX_DIM,
+        "prefill_index_query", row_tile=32, n_tile=256, k_tile=256, full_k=True, column_group=8,
+    )
     rotated = _rope_inplace(projected, cos, sin, 0, num_tokens, INDEX_H, INDEX_DIM, "prefill_index_rope", False)
     query_tid = quantize_index_query(rotated, query, query_scale, num_tokens, ready, dequantize=False)
     weights_tid = project_index_weights(x, weight_projection, weights, num_tokens)
@@ -1083,6 +1087,7 @@ def prefill_index_key_project(
         latent, weight, projected, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=2147483647, name_hint="prefill_index_key", source_col=0, output_col=0, ordered=False,
+        row_tile=16,
     )
     norm_blocks = (num_tokens + M_TILE - 1) // M_TILE
     with pl.spmd(norm_blocks, name_hint="prefill_c2a_index_norm", deps=[pool_ready]) as norm_tid:
@@ -1116,6 +1121,7 @@ def publish_c1a_index_key(
         compressed_latent, index_wk, index_projection, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=2147483647, name_hint="prefill_index_key", source_col=0, output_col=0, ordered=False,
+        row_tile=16,
     )
     index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     norm_blocks = (num_tokens + 7) // 8

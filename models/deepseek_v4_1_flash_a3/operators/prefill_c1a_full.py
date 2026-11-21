@@ -154,7 +154,7 @@ def prefill_c1a_full_attention(
             wq_b, wq_b_scale,
             rope_cos, rope_sin,
             query_latent, query,
-            num_tokens,
+            num_tokens, True,
         )
         publication[0] = published
     publication_ready = publication[0]
@@ -172,7 +172,7 @@ def prefill_c1a_full_attention(
             wkv, wkv_scale, kv_norm_weight,
             rope_cos, rope_sin,
             kv_projection, window_kv,
-            num_tokens,
+            num_tokens, True,
         )
         window_ready = prefill_publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, source_ready)
 

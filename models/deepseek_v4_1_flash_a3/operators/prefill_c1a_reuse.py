@@ -99,7 +99,7 @@ def prefill_c1a_reuse_attention(
             wq_b, wq_b_scale,
             rope_cos, rope_sin,
             query_latent, query,
-            num_tokens,
+            num_tokens, True,
         )
         source_ready = pl.system.task_dummy(deps=[])
         window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
@@ -109,7 +109,7 @@ def prefill_c1a_reuse_attention(
             wkv, wkv_scale, kv_norm_weight,
             rope_cos, rope_sin,
             kv_projection, window_kv,
-            num_tokens,
+            num_tokens, True,
         )
         window_ready = prefill_publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, source_ready)
 

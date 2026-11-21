@@ -99,15 +99,34 @@ def q_proj_rope(
     query_latent: pl.Tensor,
     query: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
+    prefill: pl.constexpr = False,
 ):
     """Project INT8 Q-A/Q-B weights, normalize latent rows, and rotate query heads."""
     tokens = pl.tensor.dim(query_latent, 0)
     projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    gemm_int8(payload, scales, wq_a, wq_a_scale, projected, num_tokens, D, Q_LORA, "proj_q_a", 64, 256)
+    if prefill:
+        gemm_int8(
+            payload, scales, wq_a, wq_a_scale, projected, num_tokens, D, Q_LORA,
+            "prefill_q_a", 64, 256, row_tile=32, full_k=True, column_group=20,
+        )
+    else:
+        gemm_int8(
+            payload, scales, wq_a, wq_a_scale, projected, num_tokens, D, Q_LORA,
+            "proj_q_a", 64, 256, row_tile=16, full_k=False, column_group=1,
+        )
     for worker in pl.spmd((num_tokens + 7) // 8, name_hint="norm_q_latent"):
         rms_norm(projected, q_norm_weight, query_latent, worker, num_tokens, width=Q_LORA)
     qb_payload, qb_scales = quantize_activation(query_latent, num_tokens, Q_LORA)
-    gemm_int8(qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens, Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", 64, 256)
+    if prefill:
+        gemm_int8(
+            qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens, Q_LORA, LOCAL_H * HEAD_DIM,
+            "prefill_q_b", 256, 256, row_tile=32, full_k=True, column_group=8,
+        )
+    else:
+        gemm_int8(
+            qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens, Q_LORA, LOCAL_H * HEAD_DIM,
+            "proj_q_b", 64, 256, row_tile=16, full_k=False, column_group=1,
+        )
     query = _rope_inplace(query, rope_cos, rope_sin, 0, num_tokens, LOCAL_H, HEAD_DIM, "attention_q_rope", False)
     return query_latent, query, qb_payload, qb_scales
 
@@ -124,9 +143,19 @@ def kv_proj_rope(
     kv_projection: pl.Tensor,
     window_kv: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
+    prefill: pl.constexpr = False,
 ):
     """Project INT8 KV weights, normalize latent rows, and rotate their tails."""
-    gemm_int8(payload, scales, wkv, wkv_scale, kv_projection, num_tokens, D, HEAD_DIM, "proj_kv", 64, 256)
+    if prefill:
+        gemm_int8(
+            payload, scales, wkv, wkv_scale, kv_projection, num_tokens, D, HEAD_DIM,
+            "prefill_kv", 64, 256, row_tile=32, full_k=True, column_group=8,
+        )
+    else:
+        gemm_int8(
+            payload, scales, wkv, wkv_scale, kv_projection, num_tokens, D, HEAD_DIM,
+            "proj_kv", 64, 256, row_tile=16, full_k=False, column_group=1,
+        )
     for worker in pl.spmd((num_tokens + 7) // 8, name_hint="norm_kv"):
         rms_norm(kv_projection, kv_norm_weight, window_kv, worker, num_tokens, width=HEAD_DIM)
     window_kv = _rope_inplace(window_kv, rope_cos, rope_sin, 0, num_tokens, 1, HEAD_DIM, "rope_kv", False)

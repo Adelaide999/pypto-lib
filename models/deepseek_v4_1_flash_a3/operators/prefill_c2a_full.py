@@ -137,14 +137,14 @@ def prefill_c2a_full_attention(
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, query,
-        num_tokens,
+        num_tokens, True,
     )
     kv_proj_rope(
         proj_payload, proj_scales,
         wkv, wkv_scale, kv_norm_weight,
         rope_cos, rope_sin,
         kv_projection, window_kv,
-        num_tokens,
+        num_tokens, True,
     )
     window_publish_tid = prefill_publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
 

@@ -343,6 +343,7 @@ def _prefill_moe(
                 routed_output, combine_arrived, ffn_input, owned, round_next, post, residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
                 active, ep_rank, ep_rank % TP_SIZE, epoch,
+                True,
             )
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_counts"):
                 for counter in pl.range(3):
@@ -619,6 +620,7 @@ def l2_prefill_fwd(
                 engram_slot = layer // 14
                 engram_from_rows(
                     engram_lookup[engram_slot], engram_wkv[engram_slot], engram_weight[engram_slot], engram_rotation, hidden, hidden,
+                    True,
                 )
         with pl.scope():
             attn_post = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)

@@ -83,8 +83,12 @@ def project_output(
         gemm_bf16_to_bf16(
             rotated, wo_a[group], projected, num_tokens, ready,
             O_GROUP_IN, O_LORA, O_A_N_TILE, K_TILE, 24, "proj_o_a", source_col, output_col, sequential,
+            row_tile=16,
         )
-    gemm_bf16_to_bf16(projected, wo_b, output, num_tokens, ready, LOCAL_O_WIDTH, D, O_B_N_TILE, K_TILE, 24, "proj_o_b", 0, 0, sequential)
+    gemm_bf16_to_bf16(
+        projected, wo_b, output, num_tokens, ready, LOCAL_O_WIDTH, D, O_B_N_TILE, K_TILE, 24,
+        "proj_o_b", 0, 0, sequential, row_tile=16,
+    )
     return output
 
 

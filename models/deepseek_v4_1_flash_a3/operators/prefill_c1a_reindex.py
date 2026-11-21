@@ -128,7 +128,7 @@ def prefill_c1a_reindex_attention(
             wq_b, wq_b_scale,
             rope_cos, rope_sin,
             query_latent, query,
-            num_tokens,
+            num_tokens, True,
         )
         cache_ready = pl.system.task_dummy(deps=[])
         indexer_completion = prefill_indexer(
@@ -143,7 +143,7 @@ def prefill_c1a_reindex_attention(
             wkv, wkv_scale, kv_norm_weight,
             rope_cos, rope_sin,
             kv_projection, window_kv,
-            num_tokens,
+            num_tokens, True,
         )
         window_ready = prefill_publish_window(
             window_kv, window_slots, window_cache, window_cache_scale, num_tokens, indexer_completion,

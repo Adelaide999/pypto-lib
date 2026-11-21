@@ -163,12 +163,22 @@ def engram_from_rows(
     rotation: pl.Tensor[[D // 32, 32, 32], pl.FP32],
     x: pl.Tensor,
     out: pl.Tensor,
+    prefill: pl.constexpr = False,
 ):
     """Project host-gathered BF16 rows and gate the FP32 residual stream."""
     tokens = pl.tensor.dim(x, 0)
     kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
     ready = pl.system.task_dummy(deps=[])
-    gemm_bf16_to_bf16(lookup, wkv_weight, kv, tokens, ready, ENGRAM_K, KV_OUT, 128, 128, 24, "engram_projection", 0, 0, False)
+    if prefill:
+        gemm_bf16_to_bf16(
+            lookup, wkv_weight, kv, tokens, ready, ENGRAM_K, KV_OUT, 128, 128, 24,
+            "prefill_engram_projection", 0, 0, False, row_tile=64,
+        )
+    else:
+        gemm_bf16_to_bf16(
+            lookup, wkv_weight, kv, tokens, ready, ENGRAM_K, KV_OUT, 128, 128, 24,
+            "engram_projection", 0, 0, False, row_tile=16,
+        )
     pl.dump_tag(kv)
     kv_fp32 = pl.create_tensor([tokens, KV_OUT], dtype=pl.FP32)
     engram_cast_to_fp32(kv, kv_fp32)

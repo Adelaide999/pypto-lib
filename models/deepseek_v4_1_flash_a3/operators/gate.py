@@ -53,6 +53,9 @@ TOPK_PAD = 8
 SORT_PAD = TOPK_PAD * 2
 QUANT_GROUPS = QUANT_TILE // 32
 QUANT_SCALE_TMP = ((64 + (GATE_M_TILE // 16) * QUANT_GROUPS + 31) // 32) * 32
+PREFILL_GATE_M_TILE = 32
+PREFILL_GATE_N_TILE = 64
+PREFILL_GATE_K_TILE = 512
 
 
 if M.name == "flash":
@@ -122,6 +125,7 @@ def gate_normalized(
     x_norm_scale: pl.Tensor[[1, T_PAD * MX_SCALE_GROUPS], pl.FP32],
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
+    prefill: pl.constexpr = False,
 ):
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
@@ -148,7 +152,7 @@ def gate_normalized(
         xg_buf[t0 : t0 + GATE_INPUT_TILE, :] = pl.cast(normalized, pl.FP32)
 
     return gate_from_fp32(
-        xg_buf, gate_w, gate_bias, num_tokens, indices, weights,
+        xg_buf, gate_w, gate_bias, num_tokens, indices, weights, prefill,
     )
 
 
@@ -160,6 +164,7 @@ def gate_from_fp32(
     num_tokens: pl.Scalar[pl.INT32],
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
+    prefill: pl.constexpr = False,
 ):
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
@@ -167,7 +172,13 @@ def gate_from_fp32(
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
     task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
-    task_gate_tiles = (task_tokens + GATE_M_TILE - 1) // GATE_M_TILE
+    if prefill:
+        gate_m_tile = PREFILL_GATE_M_TILE
+        gate_n_tile = PREFILL_GATE_N_TILE
+    else:
+        gate_m_tile = GATE_M_TILE
+        gate_n_tile = GATE_N_TILE
+    task_gate_tiles = (task_tokens + gate_m_tile - 1) // gate_m_tile
 
     biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
@@ -186,31 +197,59 @@ def gate_from_fp32(
     # Reserve both engines before any local Cube-to-Vector transfer.
     # Bound synchronous cohorts to the target A5 core count.
     gate_bias_matrix = pl.reshape(gate_bias, [1, N_EXPERTS])
-    gate_tasks = task_gate_tiles * ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
+    gate_tasks = task_gate_tiles * ((N_EXPERTS + gate_n_tile - 1) // gate_n_tile)
     gate_workers = pl.min(gate_tasks, pl.min(16, pl.system.available_cluster_count()))
     for gate_worker in pl.spmd(gate_workers, name_hint="gate", sync_start=True):
         for gb_idx in pl.range(gate_worker, gate_tasks, gate_workers):
-            tg = gb_idx // ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
-            nb = gb_idx % ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
-            t1 = tg * GATE_M_TILE
-            n0 = nb * GATE_N_TILE
-            gate_logits_tile = pl.full([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, value=0.0)
-            gate_compensation = pl.full([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
-                gd_kd = kb * GATE_D_TILE
-                gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
-                valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
-                gd_w_raw = pl.slice(
-                    gate_w, [GATE_N_TILE, GATE_D_TILE], [n0, gd_kd], valid_shape=[valid_n, GATE_D_TILE],
+            tg = gb_idx // ((N_EXPERTS + gate_n_tile - 1) // gate_n_tile)
+            nb = gb_idx % ((N_EXPERTS + gate_n_tile - 1) // gate_n_tile)
+            t1 = tg * gate_m_tile
+            n0 = nb * gate_n_tile
+            if prefill:
+                gate_logits_tile = pl.create_tile(
+                    [PREFILL_GATE_M_TILE, PREFILL_GATE_N_TILE],
+                    dtype=pl.FP32,
+                    target_memory=pl.MemorySpace.Acc,
                 )
-                gd_w_pad = pl.fillpad(gd_w_raw, pad_value=pl.PadValue.zero)
-                gd_w = pl.set_validshape(gd_w_pad, GATE_N_TILE, GATE_D_TILE)
-                gate_partial = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
-                gate_delta = pl.sub(gate_partial, gate_compensation)
-                gate_next = pl.add(gate_logits_tile, gate_delta)
-                gate_rounding = pl.sub(gate_next, gate_logits_tile)
-                gate_compensation = pl.sub(gate_rounding, gate_delta)
-                gate_logits_tile = gate_next
+                for kb in pl.pipeline(0, D // PREFILL_GATE_K_TILE, stage=2):
+                    gd_kd = kb * PREFILL_GATE_K_TILE
+                    gd_x = pl.load(
+                        xg_buf,
+                        [t1, gd_kd],
+                        [PREFILL_GATE_M_TILE, PREFILL_GATE_K_TILE],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    gd_w = pl.load(
+                        gate_w,
+                        [n0, gd_kd],
+                        [PREFILL_GATE_N_TILE, PREFILL_GATE_K_TILE],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    gd_w = pl.tile.transpose_view(gd_w)
+                    gate_logits_tile = pl.matmul_acc(
+                        gate_logits_tile,
+                        gd_x,
+                        gd_w,
+                        init_cond=(kb == 0),
+                    )
+            else:
+                gate_logits_tile = pl.full([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, value=0.0)
+                gate_compensation = pl.full([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, value=0.0)
+                for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
+                    gd_kd = kb * GATE_D_TILE
+                    gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                    valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
+                    gd_w_raw = pl.slice(
+                        gate_w, [GATE_N_TILE, GATE_D_TILE], [n0, gd_kd], valid_shape=[valid_n, GATE_D_TILE],
+                    )
+                    gd_w_pad = pl.fillpad(gd_w_raw, pad_value=pl.PadValue.zero)
+                    gd_w = pl.set_validshape(gd_w_pad, GATE_N_TILE, GATE_D_TILE)
+                    gate_partial = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
+                    gate_delta = pl.sub(gate_partial, gate_compensation)
+                    gate_next = pl.add(gate_logits_tile, gate_delta)
+                    gate_rounding = pl.sub(gate_next, gate_logits_tile)
+                    gate_compensation = pl.sub(gate_rounding, gate_delta)
+                    gate_logits_tile = gate_next
             gp_relu = pl.maximum(gate_logits_tile, 0.0)
             gp_abs = pl.abs(gate_logits_tile)
             gp_neg_abs = pl.neg(gp_abs)
@@ -235,15 +274,26 @@ def gate_from_fp32(
             gp_softplus_tail = pl.add(gp_softplus_tail, gp_tail_correction)
             gp_softplus_log = pl.add(gp_relu, gp_softplus_tail)
             gp_score = pl.sqrt(gp_softplus_log)
-            route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
-            bias_valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
-            gp_bias_raw = pl.slice(
-                gate_bias_matrix, [1, GATE_N_TILE], [0, n0], valid_shape=[1, bias_valid_n],
-            )
-            gp_bias_pad = pl.fillpad(gp_bias_raw, pad_value=pl.PadValue.min)
-            gp_bias_row = pl.set_validshape(gp_bias_pad, 1, GATE_N_TILE)
-            gp_biased = pl.col_expand_add(gp_score, gp_bias_row)
-            biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
+            if prefill:
+                route_scores_buf = pl.store(gp_score, [t1, n0], route_scores_buf)
+                gp_bias_tile = pl.load(
+                    gate_bias_matrix,
+                    [0, n0],
+                    [1, PREFILL_GATE_N_TILE],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                gp_biased = pl.tile.col_expand_add(gp_score, gp_bias_tile)
+                biased_scores_buf = pl.store(gp_biased, [t1, n0], biased_scores_buf)
+            else:
+                route_scores_buf[t1 : t1 + gate_m_tile, n0 : n0 + gate_n_tile] = gp_score
+                bias_valid_n = pl.min(gate_n_tile, N_EXPERTS - n0)
+                gp_bias_raw = pl.slice(
+                    gate_bias_matrix, [1, gate_n_tile], [0, n0], valid_shape=[1, bias_valid_n],
+                )
+                gp_bias_pad = pl.fillpad(gp_bias_raw, pad_value=pl.PadValue.min)
+                gp_bias_row = pl.set_validshape(gp_bias_pad, 1, gate_n_tile)
+                gp_biased = pl.col_expand_add(gp_score, gp_bias_row)
+                biased_scores_buf[t1 : t1 + gate_m_tile, n0 : n0 + gate_n_tile] = gp_biased
 
     # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
     # does not emit an invalid function for a route_hash path that does no work.
@@ -296,7 +346,7 @@ def l2_gate(
     indices: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
     weights: pl.Out[pl.Tensor[[T, TOPK], pl.FP32]],
 ):
-    gate_normalized(source, gate_weight, gate_bias, num_tokens, codes, scales, indices, weights)
+    gate_normalized(source, gate_weight, gate_bias, num_tokens, codes, scales, indices, weights, False)
     return codes, scales, indices, weights
 
 

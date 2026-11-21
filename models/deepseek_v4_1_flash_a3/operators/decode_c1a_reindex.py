@@ -106,14 +106,14 @@ def decode_c1a_reindex(
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, query,
-        num_tokens,
+        num_tokens, False,
     )
     kv_proj_rope(
         proj_payload, proj_scales,
         wkv, wkv_scale, kv_norm_weight,
         rope_cos, rope_sin,
         kv_projection, kv,
-        num_tokens,
+        num_tokens, False,
     )
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     score_width = pl.tensor.dim(pool_block_ids, 1) * 8

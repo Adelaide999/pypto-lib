@@ -267,6 +267,7 @@ def decode_encoder(
                 engram_slot = layer // 14
                 engram_from_rows(
                     engram_lookup[engram_slot], engram_wkv[engram_slot], engram_weight[engram_slot], engram_rotation, x_hc, x_hc,
+                    False,
                 )
         with pl.scope():
             layer_window_cache = pl.slice(window_cache_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [layer * window_blocks_per_layer, 0, 0, 0])
@@ -345,7 +346,7 @@ def decode_encoder(
                 recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
                 routed_output, combine_arrived, ffn_input, ffn_owned, pre_mix, ffn_post, ffn_residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
-                local_moe_tokens, rank, rank % TP_SIZE, layer + 1,
+                local_moe_tokens, rank, rank % TP_SIZE, layer + 1, False,
             )
             prefill_ffn_restore(
                 attention_hidden, ffn_owned, ffn_post, ffn_residual,
@@ -563,7 +564,7 @@ def decode_decoder(
                 recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
                 routed_output, combine_arrived, ffn_input, ffn_owned, pre_mix, ffn_post, ffn_residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
-                local_moe_tokens, rank, rank % TP_SIZE, layer + 1,
+                local_moe_tokens, rank, rank % TP_SIZE, layer + 1, False,
             )
             prefill_ffn_restore(
                 attention_hidden, ffn_owned, ffn_post, ffn_residual,
