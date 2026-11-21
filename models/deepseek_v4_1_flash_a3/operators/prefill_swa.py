@@ -50,7 +50,7 @@ prefill_sp_input_allgather = make_prefill_sp_input_allgather(PREFILL_MAX_TOKENS)
 
 
 # tiling
-QUERY_TILE = 128
+QUERY_TILE = 512
 WORKER_TILE = 64
 
 
@@ -109,7 +109,8 @@ def prefill_swa_attention(
     # dependency protects the hoisted reader independently of query staging.
     decoded_ready = decode_shared_cache_after_publish(window_cache, window_cache_scale, decoded_cache, zero_row, chunk_done)
 
-    chunk_x = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
+    chunk_codes = pl.create_tensor([QUERY_TILE, D], dtype=pl.INT8)
+    chunk_scales = pl.create_tensor([QUERY_TILE, 1], dtype=pl.FP32)
     chunk_cos = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
     chunk_sin = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
     chunk_indices = pl.create_tensor([QUERY_TILE, 128], dtype=pl.INT32)
@@ -127,13 +128,17 @@ def prefill_swa_attention(
             for row in pl.range(worker, active, WORKER_TILE):
                 source_row = start + row
                 for col in pl.range(0, D, 512):
-                    chunk_x[row:row + 1, col:col + 512] = x[source_row:source_row + 1, col:col + 512]
+                    chunk_codes[row:row + 1, col:col + 512] = kv_input_payload[source_row:source_row + 1, col:col + 512]
                 chunk_cos[row:row + 1, :] = rope_cos[source_row:source_row + 1, :]
                 chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
                 chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
-        q_input_payload, q_input_scales = quantize_activation(chunk_x, active, D)
+            for tile in pl.range(worker, (active + 15) // 16, WORKER_TILE):
+                row = tile * 16
+                rows = pl.min(16, active - row)
+                factors = pl.load(kv_input_scales, [start + row, 0], [16, 1], valid_shape=[rows, 1])
+                pl.store(factors, [row, 0], chunk_scales)
         q_proj_rope(
-            q_input_payload, q_input_scales,
+            chunk_codes, chunk_scales,
             wq_a, wq_a_scale, q_norm_weight,
             wq_b, wq_b_scale,
             chunk_cos, chunk_sin,
@@ -152,8 +157,8 @@ def prefill_swa_attention(
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
             worker = pl.tile.get_block_idx()
             for row in pl.range(worker, active, WORKER_TILE):
-                for col in pl.range(0, D, 512):
-                    partial[start + row:start + row + 1, col:col + 512] = chunk_partial[row:row + 1, col:col + 512]
+                for col in pl.range(0, D, 1280):
+                    partial[start + row:start + row + 1, col:col + 1280] = chunk_partial[row:row + 1, col:col + 1280]
         chunk_done = collect_tid
     return partial
 

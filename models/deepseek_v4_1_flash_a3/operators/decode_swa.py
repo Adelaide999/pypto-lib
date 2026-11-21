@@ -15,8 +15,8 @@ import pypto.language.distributed as pld
 from .config import TP_SIZE
 from .config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
 from .sparse_attention import publish_window_row, swa_attention_partial
-from .qkv_proj_rope import q_proj_rope, kv_proj_rope
-from .o_proj import project_output, prefill_tp_output_all_reduce
+from .qkv_proj_rope import decode_q_proj_rope as q_proj_rope, decode_kv_proj_rope as kv_proj_rope
+from .o_proj import decode_project_output as project_output, prefill_tp_output_all_reduce
 from .hc import hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding, hc_post
 
 
@@ -112,7 +112,7 @@ def decode_swa(
     reduced_output = pl.create_tensor([tokens, D], dtype=pl.BF16)
     prefill_tp_output_all_reduce(
         attention_output, output_window, output_arrived, reduced_output,
-        group_base, tp_rank, num_tokens, attention_epoch,
+        group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
     hc_post(reduced_output, x_hc, post_mix, residual_mix, attention_hidden, deps=hc_post_deps)

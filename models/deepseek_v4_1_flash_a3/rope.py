@@ -174,7 +174,7 @@ def make_rope_tables(capacity, rope_dim, theta, scaling=None):
     return rope_tables
 
 
-def _make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow_early_resolve):
+def make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow_early_resolve):
     """Rotate groups of heads sharing one token's coefficients."""
     width = heads * head_dim
     nope = head_dim - 64
@@ -190,8 +190,9 @@ def _make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow
         output: pl.InOut[pl.Tensor[[capacity, width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        source = pl.reshape(x, [capacity * heads, head_dim])
-        target = pl.reshape(output, [capacity * heads, head_dim])
+        tokens = pl.tensor.dim(x, 0)
+        source = pl.reshape(x, [tokens * heads, head_dim])
+        target = pl.reshape(output, [tokens * heads, head_dim])
         blocks = active * (heads // rows)
         workers = pl.min(blocks, ROPE_WORKER_LIMIT)
         for worker in pl.spmd(workers, name_hint=name_hint, allow_early_resolve=allow_early_resolve):
@@ -232,7 +233,7 @@ def make_adjacent_rope(
 ):
     """Rotate the final channels of each head in adjacent pairs."""
     if capacity >= 1024 and rope_dim == 64 and (heads, head_dim) in {(16, 512), (64, 512), (32, 128)}:
-        return _make_pipelined_rope(
+        return make_pipelined_rope(
             capacity, heads, head_dim, inverse=inverse, name_hint=name_hint, allow_early_resolve=allow_early_resolve,
         )
     output_width = heads * head_dim

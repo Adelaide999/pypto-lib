@@ -195,7 +195,7 @@ def prefill_c1a_full_attention(
     else:
         prefill_tp_output_all_reduce(
             partial, output_window, output_arrived, output,
-            group_base, tp_rank, num_tokens, attention_epoch,
+            group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
         )
     return output
 

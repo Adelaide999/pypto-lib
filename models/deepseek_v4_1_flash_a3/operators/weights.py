@@ -222,7 +222,8 @@ def forward_weight_layouts(local_experts=N_LOCAL_EXPERTS):
         "routed_w3": (layers * local_experts, d, inter),
     }
     for name, shape in projections.items():
-        result[name] = (shape, torch.int8)
+        bank_shape = (shape[0], shape[2], shape[1]) if name.startswith(("routed_", "shared_")) else shape
+        result[name] = (bank_shape, torch.int8)
         result[name + "_scale"] = ((shape[0], shape[-1]), torch.float32)
     return result
 
@@ -275,8 +276,8 @@ class ResidentWeights:
             result[category] += math.prod(shape) * torch.empty((), dtype=dtype).element_size()
         return result
 
-    def projection(self, stem, *, output_slice=None, input_slice=None):
-        """Transpose one INT8 projection and preserve its FP32 channel scales."""
+    def projection(self, stem, *, output_slice=None, input_slice=None, output_major=False):
+        """Read a symmetric INT8 matrix and preserve the FP32 scale of each output channel."""
         weight = self.checkpoint.tensor(stem + ".weight")
         scale = self.checkpoint.tensor(stem + ".weight_scale")
         offset = self.checkpoint.tensor(stem + ".weight_offset")
@@ -292,7 +293,8 @@ class ResidentWeights:
             weight, scale = weight[output_slice], scale[output_slice]
         if input_slice is not None:
             weight = weight[:, input_slice]
-        return weight.t().contiguous(), scale.reshape(1, -1).contiguous()
+        weight = weight.contiguous() if output_major else weight.t().contiguous()
+        return weight, scale.reshape(1, -1).contiguous()
 
     def upload(self, runtime, rank, handles, *, layers=None):
         """Upload each sharded payload and scale once to the selected worker."""
@@ -321,7 +323,8 @@ class ResidentWeights:
         for layer in selected_layers:
             for target, suffix in self.int8_projections:
                 output_slice = slice(lane * heads * M.head_dim, (lane + 1) * heads * M.head_dim) if target == "wq_b" else None
-                weight, scale = self.projection(f"layers.{layer}.{suffix}", output_slice=output_slice)
+                weight, scale = self.projection(f"layers.{layer}.{suffix}", output_slice=output_slice,
+                                                output_major=target.startswith("shared_"))
                 copy(target, weight, layer, total_layers)
                 copy(target + "_scale", scale, layer, total_layers)
             for target, suffix in self.layer_projections:
@@ -340,7 +343,8 @@ class ResidentWeights:
             for local in range(self.local_experts):
                 expert = rank * self.local_experts + local
                 for projection in ("w1", "w2", "w3"):
-                    weight, scale = self.projection(f"layers.{layer}.ffn.experts.{expert}.{projection}")
+                    weight, scale = self.projection(f"layers.{layer}.ffn.experts.{expert}.{projection}",
+                                                    output_major=True)
                     slot = layer * self.local_experts + local
                     copy("routed_" + projection, weight, slot, total_layers * self.local_experts)
                     copy("routed_" + projection + "_scale", scale, slot, total_layers * self.local_experts)

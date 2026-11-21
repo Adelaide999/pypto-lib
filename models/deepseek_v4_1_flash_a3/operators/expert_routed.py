@@ -24,7 +24,7 @@ import pypto.language.distributed as pld
 import torch
 import torch.nn.functional as F
 
-from .config import FLASH as M, EP_SIZE as EP_WORLD_SIZE, MOE_RECV_MAX as RECV_MAX
+from .config import EXPERT_N_TILE, EXPERT_K_TILE, FLASH as M, MOE_TOKENS
 from .config import N_LOCAL_EXPERTS, ROUTE_T_DYN
 from .gemm import expert_swiglu, gemm_dynamic_int8
 
@@ -33,6 +33,7 @@ from .gemm import expert_swiglu, gemm_dynamic_int8
 D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
+ROUTES_PER_SOURCE = MOE_TOKENS * M.num_experts_per_tok
 EXPERT_ROWS_DYN = pl.dynamic("A3_EXPERT_ROWS_DYN")
 
 # tiling
@@ -44,23 +45,24 @@ def expert_routed_compute(
     source: pl.Tensor[[EXPERT_ROWS_DYN, D], pl.INT8],
     source_scale: pl.Tensor[[EXPERT_ROWS_DYN, 1], pl.FP32],
     route_weights: pl.Tensor[[1, EXPERT_ROWS_DYN], pl.FP32],
-    w1: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    w1: pl.Tensor,
     scale1: pl.Tensor[[1, MOE_INTER], pl.FP32],
-    w3: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    w3: pl.Tensor,
     scale3: pl.Tensor[[1, MOE_INTER], pl.FP32],
-    w2: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    w2: pl.Tensor,
     scale2: pl.Tensor[[1, D], pl.FP32],
     output: pl.Tensor[[EXPERT_ROWS_DYN, D], pl.BF16],
     count: pl.Scalar[pl.INT32],
+    output_major: pl.constexpr,
 ):
     """Apply a routed W8A8 expert with route weighting before hidden quantization."""
     capacity = pl.max(16, (count + 15) // 16 * 16)
     hidden = pl.create_tensor([capacity, MOE_INTER], dtype=pl.BF16)
     expert_swiglu(
         source, source_scale, w1, scale1, w3, scale3, route_weights, hidden, count,
-        D, MOE_INTER, 128, 512, SWIGLU_LIMIT, True, "routed_swiglu",
+        D, MOE_INTER, EXPERT_N_TILE, EXPERT_K_TILE, SWIGLU_LIMIT, True, "routed_swiglu", output_major,
     )
-    return gemm_dynamic_int8(hidden, w2, scale2, output, count, MOE_INTER, D, "routed_down")
+    return gemm_dynamic_int8(hidden, w2, scale2, output, count, MOE_INTER, D, "routed_down", output_major)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -76,39 +78,42 @@ def expert_routed_scatter(
     routed_w2: pl.Tensor,
     routed_w2_scale: pl.Tensor,
     recv_route: pl.Tensor,
-    recv_meta: pl.Tensor,
     routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
     input_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Compute compact INT8 expert rows and return weighted outputs to their owners."""
-    x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    scales = pl.reshape(recv_mx_scale, [N_LOCAL_EXPERTS * RECV_MAX, 1])
+    total_rows = pl.tensor.dim(recv_x, 0)
+    scales = pl.reshape(recv_mx_scale, [total_rows, 1])
     completion = pl.array.create(N_LOCAL_EXPERTS, pl.TASK_ID)
     for expert in pl.parallel(N_LOCAL_EXPERTS):
         completion[expert] = pl.system.task_dummy(deps=[input_ready])
         count = pl.read(recv_expert_count, [expert, 0])
         if count > 0:
             padded_count = (count + 15) // 16 * 16
-            source = pl.slice(x_flat, [padded_count, D], [expert * RECV_MAX, 0])
-            source_scale = pl.slice(scales, [padded_count, 1], [expert * RECV_MAX, 0])
+            offset = pl.cast(pl.read(recv_expert_count, [expert, 1]), pl.INDEX)
+            source = pl.slice(recv_x, [padded_count, D], [offset, 0])
+            source_scale = pl.slice(scales, [padded_count, 1], [offset, 0])
             scale1 = pl.slice(routed_w1_scale, [1, MOE_INTER], [expert, 0])
             scale3 = pl.slice(routed_w3_scale, [1, MOE_INTER], [expert, 0])
             output = pl.create_tensor([padded_count, D], dtype=pl.BF16)
             scale2 = pl.slice(routed_w2_scale, [1, D], [expert, 0])
-            route_weights = pl.slice(recv_weights, [1, padded_count], [expert, 0])
+            route_weights = pl.slice(recv_weights, [1, padded_count], [0, offset])
             expert_routed_compute(
                 source, source_scale, route_weights,
                 routed_w1[expert], scale1, routed_w3[expert], scale3, routed_w2[expert], scale2,
-                output, count,
+                output, count, True,
             )
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="routed_return") as returned:
-                begin = pl.cast(0, pl.INDEX)
-                for source_rank in pl.range(EP_WORLD_SIZE):
-                    rows = pl.cast(pl.read(recv_meta, [source_rank, expert]), pl.INDEX)
-                    for row in pl.range(begin, begin + rows):
-                        route = pl.cast(pl.read(recv_route, [expert, row]), pl.INDEX)
-                        pld.tensor.put(dst=routed_output, peer=source_rank, src=output, dst_offsets=[route, 0], src_offsets=[row, 0], shape=[1, D])
-                    begin = begin + rows
+            workers = pl.min(32, (count + 3) // 4)
+            with pl.spmd(workers, name_hint="routed_return") as returned:
+                worker = pl.tile.get_block_idx()
+                for row in pl.range(worker, count, workers):
+                    address = pl.cast(pl.read(recv_route, [0, offset + row]), pl.INDEX)
+                    route = address % ROUTES_PER_SOURCE
+                    source_rank = address // ROUTES_PER_SOURCE
+                    pld.tensor.put(
+                        dst=routed_output, peer=source_rank, src=output,
+                        dst_offsets=[route, 0], src_offsets=[row, 0], shape=[1, D],
+                    )
             completion[expert] = returned
     return pl.system.task_dummy(deps=[completion])
 
@@ -141,7 +146,7 @@ def l2_expert_routed(
     output: pl.InOut[pl.Tensor[[VALIDATION_T_TILE, D], pl.BF16]],
 ):
     count = pl.read(counts, [0])
-    expert_routed_compute(source, source_scale, route_weights, w1, scale1, w3, scale3, w2, scale2, output, count)
+    expert_routed_compute(source, source_scale, route_weights, w1, scale1, w3, scale3, w2, scale2, output, count, False)
     return output
 
 

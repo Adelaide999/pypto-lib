@@ -22,12 +22,12 @@ from .compressor import (
     c2a_compressor_publish, STATE_WIDTH, c2a_compressor_project, c2a_compressor_pool_state,
 )
 from .hc import hc_head_norm, hc_project, hc_sinkhorn, hc_post
-from .qkv_proj_rope import q_proj_rope, kv_proj_rope
+from .qkv_proj_rope import decode_q_proj_rope as q_proj_rope, decode_kv_proj_rope as kv_proj_rope
 from .sparse_attention import (
-    gather_packed, attend_selected, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE, attend_packed_cohorts,
+    gather_packed, attend_selected, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
 )
 from .decode_indexer import decode_c2a_indexer
-from .o_proj import o_proj, prefill_tp_output_all_reduce
+from .o_proj import decode_o_proj as o_proj, prefill_tp_output_all_reduce
 
 # model config
 LOCAL_H = M.num_attention_heads // TP_SIZE
@@ -108,6 +108,8 @@ def decode_c2a_full(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
+    selected: pl.Tensor[[LOCAL_T_DYN, 640, HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[LOCAL_T_DYN, 640], pl.INT32],
 ):
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
@@ -159,21 +161,12 @@ def decode_c2a_full(
     chunk_done = pl.system.task_dummy(deps=[select_tid, state_tid, compressed_publish_tid])
 
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    if num_tokens <= 12:
-        attend_packed_cohorts(
-            query, window_indices, window_cache, window_cache_scale, topk_indices,
-            compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, chunk_done,
-            gather_name="c2a_gather", attn_name="c2a_sparse_attn",
-        )
-    else:
-        selected = pl.create_tensor([tokens, 640, HEAD_DIM], dtype=pl.BF16)
-        indices = pl.create_tensor([tokens, 640], dtype=pl.INT32)
-        selected_ret, indices_ret, gather_tid = gather_packed(
-            window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
-            window_indices, topk_indices, selected, indices, num_tokens, chunk_done, max_workers=GATHER_WORKER_TILE,
-            name_hint="c2a_gather",
-        )
-        attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64)
+    selected_ret, indices_ret, gather_tid = gather_packed(
+        window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+        window_indices, topk_indices, selected, indices, num_tokens, chunk_done, max_workers=GATHER_WORKER_TILE,
+        name_hint="c2a_gather", gather_keys=640,
+    )
+    attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64)
 
     inv_rms, partials = hc_project(x_hc, hc_attn_fn)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
@@ -184,7 +177,7 @@ def decode_c2a_full(
     reduced_output = pl.create_tensor([tokens, D], dtype=pl.BF16)
     prefill_tp_output_all_reduce(
         attn_out, output_window, output_arrived, reduced_output,
-        group_base, tp_rank, num_tokens, attention_epoch,
+        group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
     hc_post(reduced_output, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)

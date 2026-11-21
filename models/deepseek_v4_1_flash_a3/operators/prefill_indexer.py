@@ -29,7 +29,7 @@ from .config import INDEX_CACHE_GROUP, FLASH as M, INDEX_BLOCKS_DYN, INDEX_POOL_
 from .rmsnorm import EPS, rms_norm, golden_rms_norm
 from .quant import dequantize_mxfp4_cache, quantize_mxfp4_cache
 from .gemm import golden_dynamic_int8
-from .qkv_proj_rope import _rope_inplace, golden_rope_tail, golden_rope_interleave
+from .qkv_proj_rope import _rotate_rope, golden_rope_tail, golden_rope_interleave
 
 
 # model config
@@ -612,7 +612,7 @@ def project_index_weights(
     projected_result, projected_tid = gemm_bf16_to_bf16(
         x, weight, projected_weights, num_tokens, ready,
         width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
-        workers=2147483647, name_hint="prefill_index_weights", source_col=0, output_col=0, ordered=False,
+        workers=2147483647, name_hint="prefill_index_weights", source_col=0, output_col=0, ordered=False, row_tile=16,
     )
     with pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="c1a_index_weights_scale") as weights_tid:
         block = pl.tile.get_block_idx()
@@ -643,8 +643,8 @@ def prepare_prefill_index_query(
     """Project, rotate, and quantize query rows with group-32 scales."""
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    gemm_dynamic_int8(latent, query_weight, query_weight_scale, projected, num_tokens, Q_LORA, INDEX_H * INDEX_DIM, "c1a_mx_projection")
-    rotated = _rope_inplace(projected, cos, sin, 0, num_tokens, INDEX_H, INDEX_DIM, "prefill_index_rope", False)
+    gemm_dynamic_int8(latent, query_weight, query_weight_scale, projected, num_tokens, Q_LORA, INDEX_H * INDEX_DIM, "c1a_mx_projection", False)
+    rotated = _rotate_rope(projected, projected, cos, sin, 0, num_tokens, INDEX_H, INDEX_DIM, "prefill_index_rope", False, False)
     query_tid = quantize_index_query(rotated, query, query_scale, num_tokens, ready, dequantize=False)
     weights_tid = project_index_weights(x, weight_projection, weights, num_tokens)
     return query_tid, weights_tid
@@ -1082,7 +1082,7 @@ def prefill_index_key_project(
     projected_result, projected_tid = gemm_bf16_to_bf16(
         latent, weight, projected, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=2147483647, name_hint="prefill_index_key", source_col=0, output_col=0, ordered=False,
+        workers=2147483647, name_hint="prefill_index_key", source_col=0, output_col=0, ordered=False, row_tile=16,
     )
     norm_blocks = (num_tokens + M_TILE - 1) // M_TILE
     with pl.spmd(norm_blocks, name_hint="prefill_c2a_index_norm", deps=[pool_ready]) as norm_tid:
@@ -1115,7 +1115,7 @@ def publish_c1a_index_key(
     projected_result, projected_tid = gemm_bf16_to_bf16(
         compressed_latent, index_wk, index_projection, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=2147483647, name_hint="prefill_index_key", source_col=0, output_col=0, ordered=False,
+        workers=2147483647, name_hint="prefill_index_key", source_col=0, output_col=0, ordered=False, row_tile=16,
     )
     index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     norm_blocks = (num_tokens + 7) // 8

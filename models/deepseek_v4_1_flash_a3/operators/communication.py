@@ -83,7 +83,7 @@ def probe_rank(
             if epoch > 2:
                 active = pl.cast(1, pl.INT32)
         prefill_tp_output_all_reduce(partial, tp_payload, tp_ready, result,
-                                    rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, epoch)
+                                    rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, epoch, owner_rows=False)
         with pl.spmd(ROWS, name_hint="probe_tp_save") as saved:
             saved_row = pl.tile.get_block_idx()
             value = pl.load(result, [saved_row, 0], [1, D])

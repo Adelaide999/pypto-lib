@@ -70,7 +70,10 @@ def build_specs(function, *, mode, capacity, history_capacity=HISTORY_CAPACITY, 
 def manifest(mode, capacity, history_capacity=HISTORY_CAPACITY, *, slab_rows=64):
     """Version the shared weight, cache and quantization ABI."""
     root = Path(__file__).parent
-    paths = [root / name for name in ("prefill_fwd.py", "decode_fwd.py", "driver.py")]
+    paths = [root / name for name in (
+        "prefill_fwd.py", "decode_fwd.py", "driver.py", "rmsnorm.py", "rope.py",
+        "quant.py", "config.py", "operator_config.py",
+    )]
     paths.extend(sorted((root / "operators").glob("*.py")))
     sources = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
     return {"format": "deepseek-v41-a3-artifact-v1", "platform": "a2a3", "mode": mode,
@@ -88,7 +91,7 @@ def load_manifest(directory, *, mode, capacity=None):
     slab_rows = actual.get("moe_slab_rows")
     if mode == "decode" and actual["capacity"] not in (16, C.DECODE_INPUT_MAX_TOKENS):
         raise ValueError(f"artifact {path} has incompatible Decode capacity")
-    supported_slabs = (64, 128) if mode == "prefill" else (min(64, actual["capacity"]),)
+    supported_slabs = C.NATIVE_PREFILL_MOE_SLAB_ROWS if mode == "prefill" else (min(64, actual["capacity"]),)
     if slab_rows not in supported_slabs:
         raise ValueError(f"artifact {path} has incompatible MoE slab geometry")
     expected = manifest(mode, actual["capacity"] if capacity is None else capacity, actual["history_capacity"],
@@ -110,7 +113,7 @@ def main(function, *, mode, capacity, argv=None):
     parser.add_argument("--experts-per-rank", type=int, choices=[24], default=24)
     parser.add_argument("--decode-capacity", type=int, choices=[16, C.DECODE_INPUT_MAX_TOKENS],
                         help="Physical rows per DP group in the Decode graph")
-    parser.add_argument("--prefill-moe-slab-rows", type=int, choices=[64, 128])
+    parser.add_argument("--prefill-moe-slab-rows", type=int, choices=C.NATIVE_PREFILL_MOE_SLAB_ROWS)
     parser.add_argument("--capacity", type=int, default=capacity)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--prepare-windows", action="store_true",
@@ -218,7 +221,7 @@ def main(function, *, mode, capacity, argv=None):
                    "--output", str(directory), "--context-capacity", str(context), "--devices", args.devices]
             if phase == "prefill":
                 cmd.extend(("--capacity", str(prefill_capacity), "--prefill-moe-slab-rows",
-                            str(args.prefill_moe_slab_rows or 64)))
+                            str(args.prefill_moe_slab_rows or C.default_prefill_slab_rows(prefill_capacity))))
             else:
                 cmd.extend(("--decode-capacity", str(args.decode_capacity or 16)))
             # Each phase has its own compile-time shapes.

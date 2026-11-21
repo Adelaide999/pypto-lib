@@ -168,31 +168,24 @@ def encode_fp4(
 
 
 @pl.jit.inline(auto_scope=False)
+def fp4_bf16_bits(code: pl.Tile[[CODE_ROWS_DYN, CODE_COLS_DYN], pl.INT16]):
+    """Map an E2M1 nibble to the corresponding BF16 sign, exponent and mantissa."""
+    magnitude = pl.ands(code, 7)
+    normal = pl.add(pl.shls(magnitude, 6), 0x3F00)
+    small = pl.mul(pl.ands(magnitude, 1), 0x3F00)
+    is_small = pl.tile.cmps(pl.cast(magnitude, pl.FP16), 2.0, cmp_type=2)
+    bits = pl.tile.select(is_small, small, normal)
+    return pl.or_(bits, pl.shls(pl.ands(code, 8), 12))
+
+
+@pl.jit.inline(auto_scope=False)
 def decode_fp4(payload: pl.Tile[[CODE_ROWS_DYN, CODE_COLS_DYN], pl.UINT8], rows: pl.constexpr, width: pl.constexpr):
     """Unpack E2M1 nibble pairs into BF16 rows."""
     fixed = pl.reshape(payload, [rows, width // 2])
     signed_bytes = pl.reinterpret_view(fixed, pl.INT8)
-    raw = pl.ands(pl.cast(pl.cast(signed_bytes, pl.FP16), pl.INT16, mode="rint"), 255)
-    low = pl.ands(raw, 15)
-    high = pl.ands(pl.shrs(raw, 4), 15)
-    low_mag = pl.ands(low, 7)
-    high_mag = pl.ands(high, 7)
-    low_bits = pl.shls(pl.add(pl.cast(pl.cast(pl.shrs(low_mag, 1), pl.FP32), pl.INT32, mode="rint"), 125), 23)
-    high_bits = pl.shls(pl.add(pl.cast(pl.cast(pl.shrs(high_mag, 1), pl.FP32), pl.INT32, mode="rint"), 125), 23)
-    low_sig = pl.cast(pl.add(pl.ands(low_mag, 1), 2), pl.FP32)
-    high_sig = pl.cast(pl.add(pl.ands(high_mag, 1), 2), pl.FP32)
-    low_normal = pl.mul(low_sig, pl.reinterpret_view(low_bits, pl.FP32))
-    high_normal = pl.mul(high_sig, pl.reinterpret_view(high_bits, pl.FP32))
-    low_mask = pl.cast(pl.minimum(pl.shrs(low_mag, 1), 1), pl.FP32)
-    high_mask = pl.cast(pl.minimum(pl.shrs(high_mag, 1), 1), pl.FP32)
-    low_value = pl.add(pl.mul(low_normal, low_mask), pl.mul(pl.cast(low_mag, pl.FP32), pl.mul(pl.sub(low_mask, 1.0), -0.5)))
-    high_value = pl.add(pl.mul(high_normal, high_mask), pl.mul(pl.cast(high_mag, pl.FP32), pl.mul(pl.sub(high_mask, 1.0), -0.5)))
-    low_sign = pl.add(pl.mul(pl.cast(pl.shrs(low, 3), pl.FP32), -2.0), 1.0)
-    high_sign = pl.add(pl.mul(pl.cast(pl.shrs(high, 3), pl.FP32), -2.0), 1.0)
-    low_bf16 = pl.cast(pl.mul(low_value, low_sign), pl.BF16, mode="rint")
-    high_bf16 = pl.cast(pl.mul(high_value, high_sign), pl.BF16, mode="rint")
-    low_word = pl.reinterpret_view(low_bf16, pl.INT16)
-    high_word = pl.reinterpret_view(high_bf16, pl.INT16)
+    raw = pl.cast(pl.cast(signed_bytes, pl.FP16), pl.INT16, mode="rint")
+    low_word = fp4_bf16_bits(raw)
+    high_word = fp4_bf16_bits(pl.shrs(raw, 4))
     low_lanes = pl.tile.full([rows, width], dtype=pl.INT16, value=0)
     low_lanes = pl.tile.scatter_mask(low_lanes, low_word, mask_pattern=pl.tile.MaskPattern.P0101)
     high_lanes = pl.tile.full([rows, width], dtype=pl.INT16, value=0)

@@ -17,11 +17,169 @@ N_TILE = 64
 VEC_M_TILE = 8
 WHOLE_ROW_TILE = 5120
 PREFILL_QUANT_WORKERS = 48
+QUANT_REDUCE_TILE = 1024
 
 INT8_AMAX_EPS = CONTRACT.int8_amax_epsilon
 
 
 DECODE_INT8_AMAX_EPS = CONTRACT.int8_amax_epsilon
+
+
+CHECKPOINT_ROWS = pl.dynamic("CHECKPOINT_QUANT_ROWS")
+
+
+@pl.jit.inline(auto_scope=False)
+def _checkpoint_codes(
+    value: pl.Tile[[CHECKPOINT_ROWS, K_TILE], pl.FP32],
+    denominator: pl.Tile[[CHECKPOINT_ROWS, 1], pl.FP32],
+    inverse: pl.Tile[[CHECKPOINT_ROWS, 1], pl.FP32],
+):
+    """Resolve signed half-way cases against the original BF16 row peak."""
+    magnitude = pl.abs(value)
+    # Scale both sides of the midpoint comparison by a power of two to keep finite BF16 inputs in range.
+    scaled_magnitude = pl.mul(magnitude, 127.0 / 128.0)
+    estimate = pl.row_expand_mul(scaled_magnitude, inverse)
+    floor_int = pl.cast(pl.minimum(estimate, 127.0), pl.INT32, mode="floor")
+    lower = pl.cast(floor_int, pl.FP32)
+    midpoint = pl.row_expand_mul(pl.add(lower, 0.5), denominator)
+    upper = pl.add(lower, 1.0)
+    nearest = pl.tile.select(pl.tile.cmp(scaled_magnitude, midpoint, cmp_type=4), upper, lower)
+    odd = pl.cast(pl.ands(pl.cast(lower, pl.INT16), 1), pl.FP32)
+    nearest = pl.tile.select(pl.tile.cmp(scaled_magnitude, midpoint, cmp_type=0), pl.add(lower, odd), nearest)
+    signed = pl.tile.select(pl.tile.cmps(value, 0.0, cmp_type=2), pl.neg(nearest), nearest)
+    encoded = pl.cast(signed, pl.INT8, mode="rint")
+    return encoded
+
+
+@pl.jit.inline(auto_scope=False)
+def _encode_checkpoint_panel(
+    source: pl.Tensor, payload: pl.Tensor, row: pl.Scalar[pl.INDEX],
+    k0: pl.Scalar[pl.INDEX], rows: pl.Scalar[pl.INDEX],
+    denominator: pl.Tile[[8, 1], pl.FP32], inverse: pl.Tile[[8, 1], pl.FP32],
+):
+    raw = pl.load(source, [row, k0], [8, 256], valid_shape=[rows, 256])
+    padded = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), 8, 256)
+    value = pl.cast(padded, pl.FP32)
+    encoded = _checkpoint_codes(value, denominator, inverse)
+    pl.store(encoded, [row, k0], payload)
+
+
+@pl.jit.inline(auto_scope=False)
+def _quantize_cached_rows(
+    source: pl.Tensor, payload: pl.Tensor, scales: pl.Tensor, active: pl.Scalar[pl.INT32],
+    capacity: pl.Scalar[pl.INDEX], width: pl.constexpr, checkpoint: pl.constexpr,
+):
+    """Keep complete input rows in UB for the peak and midpoint passes."""
+    blocks = capacity // VEC_M_TILE
+    if not checkpoint:
+        blocks = (active + VEC_M_TILE - 1) // VEC_M_TILE
+    workers = pl.min(blocks, PREFILL_QUANT_WORKERS)
+    for worker in pl.spmd(workers, name_hint="prefill_token_quantize_whole_row"):
+        start = worker * blocks // workers
+        end = (worker + 1) * blocks // workers
+        for block in pl.pipeline(start, end, stage=2):
+            row = block * VEC_M_TILE
+            rows = pl.max(0, pl.min(VEC_M_TILE, active - row))
+            raw = pl.load(source, [row, 0], [VEC_M_TILE, width], valid_shape=[rows, width])
+            cached = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), VEC_M_TILE, width)
+            fp = pl.cast(cached, pl.FP32)
+            scratch = pl.create_tile([VEC_M_TILE, width], dtype=pl.FP32)
+            maximum = pl.row_max(pl.abs(fp), tmp_tile=scratch)
+            if checkpoint:
+                factor = pl.maximum(pl.mul(maximum, 1.0 / 127.0), 1e-30)
+                pl.store(factor, [row, 0], scales)
+                denominator = pl.mul(pl.maximum(maximum, 127e-30), 1.0 / 128.0)
+                inverse = pl.recip(denominator)
+                for k0 in pl.range(0, width, 256):
+                    part = pl.tile.slice(fp, [VEC_M_TILE, 256], [0, k0])
+                    encoded = _checkpoint_codes(part, denominator, inverse)
+                    pl.store(encoded, [row, k0], payload)
+            else:
+                row_peak = pl.reshape(maximum, [1, VEC_M_TILE])
+                numerator = pl.tile.full([1, VEC_M_TILE], dtype=pl.FP32, value=127.0)
+                inverse = pl.reshape(pl.div(numerator, pl.maximum(row_peak, 1e-30)), [VEC_M_TILE, 1])
+                scale = pl.mul(maximum, 1.0 / 127.0)
+                ones = pl.tile.full([VEC_M_TILE, 8], dtype=pl.FP32, value=1.0)
+                scale_rows = pl.row_expand_mul(ones, scale)
+                pl.store(pl.set_validshape(scale_rows, rows, 8), [row, 0], scales)
+                rounded = pl.cast(pl.row_expand_mul(fp, inverse), pl.INT32, mode="rint")
+                codes = pl.cast(rounded, pl.INT8, mode="trunc")
+                pl.store(pl.set_validshape(codes, rows, width), [row, 0], payload)
+    return payload, scales
+
+
+@pl.jit.inline(auto_scope=False)
+def quantize_projection_activation(
+    source: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], width: pl.constexpr, dense_query: pl.constexpr,
+):
+    """Quantize the resident A3 checkpoint's padded rows with ties-to-even rounding."""
+    capacity = pl.tensor.dim(source, 0)
+    padded_rows = (capacity + 15) // 16 * 16
+    payload = pl.create_tensor([padded_rows, width], dtype=pl.INT8)
+    scale = pl.create_tensor([padded_rows, 1], dtype=pl.FP32)
+    if padded_rows <= 32:
+        panels = (width + QUANT_REDUCE_TILE - 1) // QUANT_REDUCE_TILE
+        partials = pl.create_tensor([padded_rows // 8 * panels, 8], dtype=pl.FP32)
+        with pl.spmd(padded_rows // 8 * panels, name_hint="quant_absmax") as partials_ready:
+            shard = pl.tile.get_block_idx()
+            shard_row = shard // panels * 8
+            shard_col = shard % panels * QUANT_REDUCE_TILE
+            shard_rows = pl.max(0, pl.min(8, num_tokens - shard_row))
+            shard_cols = pl.min(QUANT_REDUCE_TILE, width - shard_col)
+            raw = pl.tile.load(source, [shard_row, shard_col], [8, QUANT_REDUCE_TILE], valid_shape=[shard_rows, shard_cols])
+            padded = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), 8, QUANT_REDUCE_TILE)
+            absolute = pl.abs(pl.cast(padded, pl.FP32))
+            scratch = pl.create_tile([8, QUANT_REDUCE_TILE], dtype=pl.FP32)
+            shard_max = pl.reshape(pl.row_max(absolute, tmp_tile=scratch), [1, 8])
+            pl.tile.store(shard_max, [shard, 0], partials)
+        tiles = padded_rows // 8 * (width // 256)
+        workers = pl.min(tiles, 2 * pl.system.available_cluster_count())
+        with pl.spmd(workers, name_hint="quant_encode", deps=[partials_ready]):
+            worker = pl.tile.get_block_idx()
+            for block in pl.range(worker, tiles, workers):
+                group = block // (width // 256)
+                row = group * 8
+                k0 = block % (width // 256) * 256
+                rows = pl.max(0, pl.min(8, num_tokens - row))
+                maximum = pl.tile.full([1, 8], dtype=pl.FP32, value=0.0)
+                for panel in pl.range(panels):
+                    local = pl.load(partials, [group * panels + panel, 0], [1, 8])
+                    maximum = pl.maximum(maximum, local)
+                if k0 == 0:
+                    factor = pl.reshape(pl.maximum(pl.mul(maximum, 1.0 / 127.0), 1e-30), [8, 1])
+                    pl.store(factor, [row, 0], scale)
+                denominator = pl.reshape(pl.mul(pl.maximum(maximum, 127e-30), 1.0 / 128.0), [8, 1])
+                inverse = pl.recip(denominator)
+                _encode_checkpoint_panel(source, payload, row, k0, rows, denominator, inverse)
+    elif dense_query and width == 1280:
+        _quantize_cached_rows(source, payload, scale, num_tokens, padded_rows, width, True)
+    else:
+        workers = pl.max(1, pl.min(2 * pl.system.available_cluster_count(), padded_rows // 8))
+        for worker in pl.spmd(workers, name_hint="dynamic_int8_quant"):
+            for row in pl.range(worker * 8, padded_rows, workers * 8):
+                rows = pl.max(0, pl.min(8, num_tokens - row))
+                maximum = pl.tile.full([1, 8], dtype=pl.FP32, value=0.0)
+                for k0 in pl.range(0, width, QUANT_REDUCE_TILE):
+                    cols = pl.min(QUANT_REDUCE_TILE, width - k0)
+                    reduce_raw = pl.load(source, [row, k0], [8, QUANT_REDUCE_TILE], valid_shape=[rows, cols])
+                    reduce_padded = pl.set_validshape(pl.fillpad(reduce_raw, pad_value=pl.PadValue.zero), 8, QUANT_REDUCE_TILE)
+                    reduce_value = pl.cast(reduce_padded, pl.FP32)
+                    tmp = pl.create_tile([8, QUANT_REDUCE_TILE], dtype=pl.FP32)
+                    local_maximum = pl.reshape(pl.row_max(pl.abs(reduce_value), tmp_tile=tmp), [1, 8])
+                    maximum = pl.maximum(maximum, local_maximum)
+                factor = pl.reshape(pl.maximum(pl.mul(maximum, 1.0 / 127.0), 1e-30), [8, 1])
+                scale = pl.store(factor, [row, 0], scale)
+                denominator = pl.reshape(pl.mul(pl.maximum(maximum, 127e-30), 1.0 / 128.0), [8, 1])
+                inverse = pl.recip(denominator)
+                for k0 in pl.range(0, width, 256):
+                    _encode_checkpoint_panel(source, payload, row, k0, rows, denominator, inverse)
+    return payload, scale
+
+
+@pl.jit.inline(auto_scope=False)
+def quantize_activation(source: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], width: pl.constexpr):
+    """Quantize A3 checkpoint activations using the matching width and row schedule."""
+    return quantize_projection_activation(source, num_tokens, width, True)
 
 
 def make_dynamic_int8_quantize(capacity: int, width: int):
@@ -290,8 +448,20 @@ def make_prefill_projection_quantize(capacity, width):
     """Quantize contiguous groups of BF16 projection inputs to INT8."""
     if capacity < 1024 or capacity % VEC_M_TILE or width not in (1280, 5120):
         return make_quantize(capacity, width, whole_row=True)
+    if width == 1280:
+
+        @pl.jit.inline
+        def quantize_query(
+            x: pl.Tensor[[capacity, width], pl.BF16],
+            payload: pl.Tensor[[capacity, width], pl.INT8],
+            scales: pl.Tensor[[capacity, 8], pl.FP32],
+            active: pl.Scalar[pl.INT32],
+        ):
+            return _quantize_cached_rows(x, payload, scales, active, capacity, width, False)
+
+        return quantize_query
+
     column_tile = 1280
-    stages = 2 if width == column_tile else 1
 
     @pl.jit.inline
     def quantize(
@@ -305,33 +475,24 @@ def make_prefill_projection_quantize(capacity, width):
         for worker in pl.spmd(workers, name_hint="prefill_token_quantize_whole_row"):
             start = worker * tiles // workers
             end = (worker + 1) * tiles // workers
-            for block in pl.pipeline(start, end, stage=stages):
+            for block in pl.pipeline(start, end, stage=1):
                 token = block * VEC_M_TILE
                 rows = pl.min(VEC_M_TILE, active - token)
                 source = x[token : token + VEC_M_TILE, :]
-                if width == column_tile:
-                    values = pl.cast(source, pl.FP32)
-                    peak = pl.reshape(pl.row_max(pl.abs(values)), [1, VEC_M_TILE])
-                else:
-                    peak = pl.full([1, VEC_M_TILE], dtype=pl.FP32, value=0.0)
-                    for col in pl.range(0, width, column_tile):
-                        part = pl.cast(source[:, col : col + column_tile], pl.FP32)
-                        peak = pl.maximum(peak, pl.reshape(pl.row_max(pl.abs(part)), [1, VEC_M_TILE]))
+                peak = pl.full([1, VEC_M_TILE], dtype=pl.FP32, value=0.0)
+                for col in pl.range(0, width, column_tile):
+                    part = pl.cast(source[:, col : col + column_tile], pl.FP32)
+                    peak = pl.maximum(peak, pl.reshape(pl.row_max(pl.abs(part)), [1, VEC_M_TILE]))
                 numerator = pl.full([1, VEC_M_TILE], dtype=pl.FP32, value=127.0)
                 inverse = pl.reshape(pl.div(numerator, pl.maximum(peak, 1e-30)), [VEC_M_TILE, 1])
                 scale = pl.reshape(pl.mul(peak, 1.0 / 127.0), [VEC_M_TILE, 1])
                 ones = pl.full([VEC_M_TILE, 8], dtype=pl.FP32, value=1.0)
                 scales[token : token + VEC_M_TILE, :] = pl.set_validshape(pl.row_expand_mul(ones, scale), rows, 8)
-                if width == column_tile:
-                    rounded = pl.cast(pl.row_expand_mul(values, inverse), pl.INT32, mode="rint")
+                for col in pl.range(0, width, column_tile):
+                    part = pl.cast(source[:, col : col + column_tile], pl.FP32)
+                    rounded = pl.cast(pl.row_expand_mul(part, inverse), pl.INT32, mode="rint")
                     codes = pl.cast(rounded, pl.INT8, mode="trunc")
-                    payload[token : token + VEC_M_TILE, :] = pl.set_validshape(codes, rows, width)
-                else:
-                    for col in pl.range(0, width, column_tile):
-                        part = pl.cast(source[:, col : col + column_tile], pl.FP32)
-                        rounded = pl.cast(pl.row_expand_mul(part, inverse), pl.INT32, mode="rint")
-                        codes = pl.cast(rounded, pl.INT8, mode="trunc")
-                        payload[token : token + VEC_M_TILE, col : col + column_tile] = pl.set_validshape(codes, rows, column_tile)
+                    payload[token : token + VEC_M_TILE, col : col + column_tile] = pl.set_validshape(codes, rows, column_tile)
         return payload, scales
 
     return quantize

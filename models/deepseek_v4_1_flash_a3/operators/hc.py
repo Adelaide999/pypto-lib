@@ -41,7 +41,7 @@ T_TILE = 8
 LINEAR_T_TILE = 16
 SINKHORN_LOAD_T_TILE = 8
 SINKHORN_T_TILE = 2
-SINKHORN_WORKER_TILE = 12
+SINKHORN_WORKER_TILE = 24
 RMS_K_TILE = 1024
 LINEAR_K_TILE = 256
 LINEAR_OK = 4
@@ -380,9 +380,14 @@ def zero_bf16_padding(x: pl.Tensor, valid_rows: pl.Scalar[pl.INT32]):
     """
     tokens = pl.tensor.dim(x, 0)
     if tokens > 0 and valid_rows < tokens:
-        for row in pl.spmd(tokens, name_hint="decode_sp_zero_padding"):
-            if row >= valid_rows:
-                x[row : row + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+        blocks = (tokens - valid_rows + 3) // 4
+        workers = pl.min(blocks, 48)
+        for worker in pl.spmd(workers, name_hint="decode_sp_zero_padding"):
+            for block in pl.range(worker, blocks, workers):
+                first = valid_rows + block * 4
+                rows = pl.min(4, tokens - first)
+                empty = pl.tile.full([4, D], dtype=pl.BF16, value=0.0)
+                pl.store(pl.set_validshape(empty, rows, D), [first, 0], x)
 
 
 @pl.jit.inline(auto_scope=False)

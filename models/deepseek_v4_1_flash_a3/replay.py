@@ -14,6 +14,7 @@ import time
 
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import torch
 
 from .prefill_resident import _device_view
@@ -111,7 +112,7 @@ def run_request(
     owner = request["dp_rank"] * 4
     constants = set(weights.tensor_layouts) | set(DECODE_CACHE_NAMES.values()) | {"freqs_cos", "freqs_sin"}
     counts = {name: arguments[1][name] for name in ("moe_num_tokens", "attention_num_tokens")}
-    logits = host_io["logits"]
+    logit_buffer = host_io["logits"]
     sampled = host_io["sampled_ids"]
     report.update(prefill_calls=0, decode_calls=0, output_sequences=[], logit_checks=[], cache_checks=[],
                   teacher_forced=teacher_forced, label=label, instrumented_cache_audits=audit is not None,
@@ -140,6 +141,8 @@ def run_request(
                 start_row = call * options.chunk_size
                 current_ids = prompt[start_row:start_row + options.chunk_size]
             if index:
+                idle_uploads = [uploads.submit(decode_inputs.upload, runtime, rank, owner)
+                                for rank in range(16) if rank // C.TP_SIZE != request["dp_rank"]]
                 decode_inputs.stage_token(weights, engram, current_ids[0], committed, owner)
             else:
                 inputs = {}
@@ -157,12 +160,16 @@ def run_request(
                 # image until it becomes active. An interrupted upload invalidates the record.
                 dirty_groups = host_io.pop("prefill_dirty_groups", range(C.DP_SIZE))
                 for active, values in inputs.items():
-                    if not active and not any(group != request["dp_rank"] for group in dirty_groups):
-                        continue
-                    for name in ("embedding", "engram_lookup"):
-                        buffer = host_io["prefill_" + name][int(active)]
-                        buffer.copy_(values[name])
+                    for name, value in values.items():
+                        buffers = host_io.get("prefill_" + name)
+                        if buffers is None:
+                            continue
+                        buffer = buffers[int(active)]
+                        if active or idle_inputs is None or not host_io.get("idle_metadata_staged"):
+                            buffer.copy_(value)
                         values[name] = buffer
+                if idle_inputs is not None:
+                    host_io["idle_metadata_staged"] = True
 
             def upload_rank(rank):
                 if index:
@@ -182,7 +189,11 @@ def run_request(
                 for tensor in counts.values():
                     tensor.zero_()
                     tensor[owner:owner + C.TP_SIZE] = len(current_ids)
-            list(uploads.map(upload_rank, range(16)))
+                list(uploads.map(upload_rank, range(owner, owner + C.TP_SIZE)))
+                for completed in idle_uploads:
+                    completed.result()
+            else:
+                list(uploads.map(upload_rank, range(16)))
             if not index:
                 host_io["prefill_dirty_groups"] = (request["dp_rank"],)
                 del inputs, values
@@ -204,16 +215,18 @@ def run_request(
             report["decode_calls" if index else "prefill_calls"] += 1
             if step < 0:
                 continue
+            logits = logit_buffer[step]
             for name, value in (("logits", logits), ("sampled_ids", sampled)):
                 runtime.copy_from(value.data_ptr(), ranks[index][owner][name].data_ptr,
                                   value.numel() * value.element_size(), worker_id=owner)
-            if not bool(torch.isfinite(logits).all()):
+            row = logits.numpy()
+            if not np.isfinite(row).all():
                 raise FloatingPointError("nonfinite owner logits")
-            token = int(logits.argmax())
+            token = int(row.argmax())
             if token != int(sampled[0]):
                 raise RuntimeError("device greedy token differs from the complete vocabulary argmax")
             generated.append(token)
-            observed_logits.append(logits.clone())
+            observed_logits.append(logits)
             token_times.append(time.monotonic())
             report["output_sequences"] = [{"request_id": request["request_id"], "token_ids": generated.copy()}]
             print("A3_TOKEN", json.dumps(dict(label=label, step=step + 1, token_id=token, committed=committed)), flush=True)

@@ -91,23 +91,27 @@ def paged_slots(
         raise ValueError("storage_block_size and logical_divisor must be positive")
     if any(value.dtype not in (torch.int32, torch.int64) for value in (positions, request_ids, block_table)):
         raise ValueError("positions, request_ids and block_table must contain integer indices")
-    publish = torch.ones_like(positions, dtype=torch.bool)
-    if publish_only_complete and logical_divisor > 1:
+    partial = publish_only_complete and logical_divisor > 1
+    active_positions, active_requests = positions, request_ids
+    if partial:
         publish = (positions + 1).remainder(logical_divisor) == 0
-    slots = torch.full_like(positions, -1, dtype=torch.int64)
-    logical = torch.div(positions[publish], logical_divisor, rounding_mode="floor")
+        active_positions, active_requests = positions[publish], request_ids[publish]
+    logical = torch.div(active_positions, logical_divisor, rounding_mode="floor")
     logical_block = torch.div(logical, storage_block_size, rounding_mode="floor")
     offset = logical.remainder(storage_block_size)
-    active_requests = request_ids[publish]
     if bool(((active_requests < 0) | (active_requests >= block_table.shape[0])).any()):
         raise ValueError("published request id is outside the block table")
     if bool(((logical_block < 0) | (logical_block >= block_table.shape[1])).any()):
         raise ValueError("block table does not cover a required logical page")
-    physical = block_table[request_ids[publish].to(torch.long), logical_block.to(torch.long)]
+    physical = block_table[active_requests.long(), logical_block.long()]
     if bool((physical < 0).any()):
         raise ValueError("required logical page has no physical allocation")
-    slots[publish] = physical.to(torch.int64) * storage_block_size + offset.to(torch.int64)
-    return slots
+    mapped = physical.long() * storage_block_size + offset.long()
+    if partial:
+        slots = torch.full_like(positions, -1, dtype=torch.int64)
+        slots[publish] = mapped
+        return slots
+    return mapped
 
 
 def window_metadata(
@@ -123,10 +127,13 @@ def window_metadata(
     starts = positions - lens.to(positions.dtype) + 1
     visible = starts.unsqueeze(-1) + offsets
     valid = offsets.unsqueeze(0) < lens.unsqueeze(-1)
-    indices = torch.full_like(visible, -1, dtype=torch.int64)
-    visible_requests = request_ids.unsqueeze(-1).expand_as(visible)
-    indices[valid] = paged_slots(visible[valid], visible_requests[valid], block_table)
-    return slots, indices.to(torch.int32), lens
+    safe_positions = torch.minimum(visible, positions.unsqueeze(-1))
+    pages = torch.div(safe_positions, BLOCK_SIZE, rounding_mode="floor")
+    physical = block_table[request_ids.long().unsqueeze(-1), pages]
+    if bool((physical < 0).any()):
+        raise ValueError("required logical page has no physical allocation")
+    indices = physical.long() * BLOCK_SIZE + safe_positions.remainder(BLOCK_SIZE)
+    return slots, indices.masked_fill_(~valid, -1).int(), lens
 
 
 def upload_forward_inputs(runtime, specs, parameters, ranks, host_inputs, upload_buffer):

@@ -714,36 +714,9 @@ def make_index_scores(skip_short=False, request_workers=32):
     ):
         width = pl.tensor.dim(output, 1)
         capacity = pl.tensor.dim(query, 0)
-        runs = pl.create_tensor([4, capacity + 1], dtype=pl.INT32)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="idx_plan_req") as plan_tid:
-            run_count = pl.cast(0, pl.INT32)
-            run_start = pl.cast(0, pl.INT32)
-            previous_request = pl.cast(-1, pl.INT32)
-            maximum_visible = pl.cast(0, pl.INT32)
-            for token in pl.range(num_tokens):
-                request = pl.read(request_ids, [token])
-                if token > 0:
-                    if request != previous_request:
-                        pl.write(runs, [0, run_count], run_start)
-                        pl.write(runs, [1, run_count], pl.cast(token, pl.INT32))
-                        pl.write(runs, [2, run_count], maximum_visible)
-                        run_count = run_count + pl.cast(1, pl.INT32)
-                        run_start = pl.cast(token, pl.INT32)
-                        maximum_visible = pl.cast(0, pl.INT32)
-                visible = pl.cast(pl.max(0, pl.min(pl.read(lengths, [token]), width)), pl.INT32)
-                if skip_short:
-                    if visible <= INDEX_TOPK:
-                        visible = pl.cast(0, pl.INT32)
-                maximum_visible = pl.max(maximum_visible, visible)
-                previous_request = request
-            if num_tokens > 0:
-                pl.write(runs, [0, run_count], run_start)
-                pl.write(runs, [1, run_count], num_tokens)
-                pl.write(runs, [2, run_count], maximum_visible)
-                run_count = run_count + pl.cast(1, pl.INT32)
-            pl.write(runs, [3, 0], run_count)
+        # Paged scores derive validity from lengths. Only the pooled call consumes this argument.
+        unused_valid = pl.create_tensor([4, capacity + 1], dtype=pl.INT32)
         launch_workers = pl.max(1, pl.min(request_workers, pl.system.available_cluster_count()))
-        run_stride = pl.tensor.dim(runs, 1)
         table_width = pl.tensor.dim(block_table, 1)
         cache_rows = pl.tensor.dim(index_cache, 0) * 128
         payload_flat = pl.reshape(index_cache, [cache_rows, INDEX_DIM // 2])
@@ -752,12 +725,12 @@ def make_index_scores(skip_short=False, request_workers=32):
         query_scales_flat = pl.reshape(query_scale, [1, capacity * INDEX_H * 4])
         with pl.spmd(
             launch_workers, name_hint="idx_score_req", sync_start=True,
-            deps=[cache_ready, query_ready, weights_ready, plan_tid],
+            deps=[cache_ready, query_ready, weights_ready],
         ) as score_tid:
             _worker = pl.tile.get_block_idx()
             _index_scores(
                 query_flat, query_scales_flat, weights, payload_flat, scales_flat,
-                block_table, request_ids, lengths, output, runs,
+                block_table, request_ids, lengths, output, unused_valid,
                 width, table_width, pl.cast(skip_threshold, pl.INT32), 0, num_tokens,
             )
         return score_tid
@@ -1463,7 +1436,7 @@ def project_index_weights(
     result, completed = gemm_bf16_to_bf16(
         source, weight, output, num_tokens, ready,
         width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
-        workers=8, name_hint="proj_idx_w", source_col=0, output_col=0, ordered=False,
+        workers=8, name_hint="proj_idx_w", source_col=0, output_col=0, ordered=False, row_tile=16,
     )
     return completed
 
@@ -1488,7 +1461,7 @@ def c1a_index(
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
     gemm_int8(
         projection_payload, projection_scale_backing, index_wq_b, index_wq_b_scale,
-        projected, num_tokens, Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q", 64, 256,
+        projected, num_tokens, Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q", 64, 256, False,
     )
     query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM // 2], dtype=pl.UINT8)
     query_scale = pl.create_tensor(
@@ -1517,7 +1490,7 @@ def c2a_project_index_key(
     result, completed = gemm_bf16_to_bf16(
         source, weight, output, num_tokens, ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=32, name_hint='proj_idx_k', source_col=0, output_col=0, ordered=False,
+        workers=32, name_hint='proj_idx_k', source_col=0, output_col=0, ordered=False, row_tile=16,
     )
     return completed
 
@@ -2080,7 +2053,7 @@ def c1a_project_index_key(
     result, completed = gemm_bf16_to_bf16(
         source, weight, output, num_tokens, ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=8, name_hint='proj_idx_k', source_col=0, output_col=0, ordered=False,
+        workers=8, name_hint='proj_idx_k', source_col=0, output_col=0, ordered=False, row_tile=16,
     )
     return completed
 
@@ -2141,7 +2114,7 @@ def l2_decode_indexer_validation(
     projected = pl.create_tensor([pl.tensor.dim(x, 0), INDEX_QUERY_WIDTH], dtype=pl.BF16)
     gemm_dynamic_int8(
         latent, query_weight, query_weight_scale, projected, num_tokens,
-        Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q",
+        Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q", False,
     )
     query_tid = quantize_index_query(projected, cos, sin, query, query_scale, num_tokens, entry)
     weights_tid = project_index_weights(x, weight_projection, weights, num_tokens, entry)

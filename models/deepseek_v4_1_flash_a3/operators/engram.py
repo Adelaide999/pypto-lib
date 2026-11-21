@@ -168,7 +168,7 @@ def engram_from_rows(
     tokens = pl.tensor.dim(x, 0)
     kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
     ready = pl.system.task_dummy(deps=[])
-    gemm_bf16_to_bf16(lookup, wkv_weight, kv, tokens, ready, ENGRAM_K, KV_OUT, 128, 128, 24, "engram_projection", 0, 0, False)
+    gemm_bf16_to_bf16(lookup, wkv_weight, kv, tokens, ready, ENGRAM_K, KV_OUT, 256, 128, 24, "engram_projection", 0, 0, False, 64)
     pl.dump_tag(kv)
     kv_fp32 = pl.create_tensor([tokens, KV_OUT], dtype=pl.FP32)
     engram_cast_to_fp32(kv, kv_fp32)
@@ -307,14 +307,23 @@ class HostEngram:
         result = torch.zeros((layers, capacity, width), dtype=torch.bfloat16)
         for slot, layer in enumerate(M.engram_layer_ids):
             prefix = f"layers.{layer}.engram.embed."
-            rows = self.checkpoint.tensor_rows(prefix + "weight", hashes[slot])
-            scales = self.checkpoint.tensor_rows(prefix + "scale", hashes[slot])
+            row_ids = hashes[slot].flatten()
+            repeated = len(token_ids) > 1 and hashes[slot, :, 0].unique().numel() * 2 <= len(token_ids)
+            if repeated:
+                row_ids, restore = torch.unique(row_ids, return_inverse=True)
+            rows = self.checkpoint.tensor_rows(prefix + "weight", row_ids)
+            scales = self.checkpoint.tensor_rows(prefix + "scale", row_ids)
             if rows.dtype != torch.int8 or rows.shape[-1] != M.engram_head_dim:
                 raise ValueError(f"unsupported native Engram table layout: {prefix}weight")
             if scales.dtype != torch.float32 or scales.shape[-1] != M.engram_head_dim // 32:
                 raise ValueError(f"unsupported native Engram table scales: {prefix}scale")
-            values = rows.float() * scales.repeat_interleave(32, dim=-1)
-            result[slot, :len(token_ids)] = values.flatten(1).to(torch.bfloat16)
+            groups = rows.unflatten(-1, (-1, 32))
+            decoded = (groups * scales.unsqueeze(-1)).bfloat16().flatten(1)
+            dest = result[slot, :len(token_ids)].view(-1, M.engram_head_dim)
+            if repeated:
+                torch.index_select(decoded, 0, restore, out=dest)
+            else:
+                dest.copy_(decoded)
         return result
 
 

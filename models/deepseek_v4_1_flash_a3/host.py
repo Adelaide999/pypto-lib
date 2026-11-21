@@ -77,7 +77,7 @@ def prepare_prefill_inputs(
     positions = torch.arange(start_pos, start_pos + count, dtype=torch.int32)
     window_slots, window_indices, _ = window_metadata(positions, request_ids, table)
     c2a_slots = paged_slots(positions, request_ids, c2a_table, C.BLOCK_SIZE, 2, True)
-    c1a_slots = paged_slots(positions, request_ids, table)
+    c1a_slots = window_slots
     freqs_cos, freqs_sin = prepare_forward_rope_tables(max_seq_len, rope_tables)
 
     def pad(value, fill=0):

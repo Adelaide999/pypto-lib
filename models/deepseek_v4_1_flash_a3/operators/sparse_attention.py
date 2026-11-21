@@ -82,7 +82,7 @@ GATHER_KEY_TILE = 16
 TOKEN_TILE = 512
 WORKERS = 32
 GATHER_WORKERS = 64
-SELECTED_GATHER_TILE = 64
+SELECTED_GATHER_TILE = 32
 CACHE_WORKERS = 32
 WINDOW_PUBLISH_WORKER_TILE = 12
 SHARED_GATHER_WORKERS = 64
@@ -478,14 +478,16 @@ def attention_tile(
         denominator = pl.tile.full([1, heads], dtype=pl.FP32, value=1.0)
     numerator = pl.tile.full([heads, HEAD_DIM], dtype=pl.FP32, value=0.0)
     reduction = pl.create_tile([heads, key_tile], dtype=pl.FP32)
+    q_low = pl.load(query, [query_offset, 0], [heads, 256], target_memory=pl.MemorySpace.Mat)
+    q_high = pl.load(query, [query_offset, 256], [heads, 256], target_memory=pl.MemorySpace.Mat)
     for part in pl.range(key_rows // key_tile):
         column = part * key_tile
         first_key = key_offset + column
-        qk = pl.create_tile([heads, key_tile], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
-        for feature in pl.range(0, HEAD_DIM, 128):
-            q_tile = pl.load(query, [query_offset, feature], [heads, 128], target_memory=pl.MemorySpace.Mat)
-            k_tile = pl.load(keys, [first_key, feature], [key_tile, 128], target_memory=pl.MemorySpace.Mat)
-            qk = pl.matmul_acc(qk, q_tile, pl.tile.transpose_view(k_tile), init_cond=(feature == 0))
+        k_low = pl.load(keys, [first_key, 0], [key_tile, 256], target_memory=pl.MemorySpace.Mat)
+        k_high = pl.load(keys, [first_key, 256], [key_tile, 256], target_memory=pl.MemorySpace.Mat)
+        qk = pl.create_tile([heads, key_tile], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc, compact=True)
+        qk = pl.matmul_acc(qk, q_low, pl.tile.transpose_view(k_low), init_cond=True)
+        qk = pl.matmul_acc(qk, q_high, pl.tile.transpose_view(k_high))
         product = pl.tile.move(qk, pl.MemorySpace.Vec, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box)
         scores = pl.mul(product, SCALE)
         ids = pl.load(indices, [index_row, column], [1, key_tile])
@@ -509,9 +511,11 @@ def attention_tile(
         correction_column = pl.reshape(correction, [heads, 1])
         for half in pl.unroll(2):
             feature = half * 256
-            value = pl.load(keys, [first_key, feature], [key_tile, 256], target_memory=pl.MemorySpace.Mat)
-            weighted = pl.tile.matmul(weights, value)
-            weighted = pl.tile.move(weighted, pl.MemorySpace.Vec, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box)
+            if half == 0:
+                weighted_acc = pl.tile.matmul(weights, k_low)
+            else:
+                weighted_acc = pl.tile.matmul(weights, k_high)
+            weighted = pl.tile.move(weighted_acc, pl.MemorySpace.Vec, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box)
             previous = pl.tile.slice(numerator, [heads, 256], [0, feature])
             previous = pl.row_expand_mul(previous, correction_column)
             accumulated = pl.add(previous, weighted)
@@ -1257,6 +1261,7 @@ def gather_packed(
     ready: pl.Scalar[pl.TASK_ID],
     max_workers: pl.constexpr,
     name_hint: pl.constexpr,
+    gather_keys: pl.constexpr,
 ):
     """Gather packed cache rows and dequantize them once for all query heads."""
     window_rows = pl.tensor.dim(window, 0) * 128
@@ -1267,12 +1272,12 @@ def gather_packed(
     cs = pl.reshape(compressed_scale, [compressed_rows, HEAD_DIM // 16])
     selected_rows = pl.tensor.dim(selected, 0) * SELECTED_KEYS
     dst = pl.reshape(selected, [selected_rows, HEAD_DIM])
-    workers = pl.max(1, pl.min(num_tokens * (SELECTED_KEYS // GATHER_KEY_TILE), max_workers))
+    workers = pl.max(1, pl.min(num_tokens * (gather_keys // GATHER_KEY_TILE), max_workers))
     with pl.spmd(workers, name_hint=name_hint, deps=[ready]) as gathered:
         worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, num_tokens * (SELECTED_KEYS // GATHER_KEY_TILE), workers):
-            token = block // (SELECTED_KEYS // GATHER_KEY_TILE)
-            column = block % (SELECTED_KEYS // GATHER_KEY_TILE) * GATHER_KEY_TILE
+        for block in pl.range(worker, num_tokens * (gather_keys // GATHER_KEY_TILE), workers):
+            token = block // (gather_keys // GATHER_KEY_TILE)
+            column = block % (gather_keys // GATHER_KEY_TILE) * GATHER_KEY_TILE
             if column < 128:
                 ids = pl.tile.load(wi, [token, column], [1, GATHER_KEY_TILE])
                 safe_ids = pl.maximum(ids, 0)
@@ -1344,7 +1349,7 @@ def gather_packed_chunk(
     selected, combined, gathered = gather_packed(
         window_cache, window_scales, compressed_cache, compressed_scales,
         window_chunk, compressed_chunk, selected, combined, active, chunk_done, max_workers=GATHER_WORKERS,
-        name_hint="c2a_gather",
+        name_hint="c2a_gather", gather_keys=640,
     )
     return gathered
 
@@ -1549,6 +1554,32 @@ def decode_packed_caches(
 
 
 @pl.jit.inline(auto_scope=False)
+def gather_decoded_rows(
+    cache: pl.Tensor,
+    ids: pl.Tile[[1, SELECTED_GATHER_TILE], pl.INT32],
+):
+    """Copy contiguous physical rows together and leave masked lanes zero."""
+    first = pl.tile.read(ids, [0, 0])
+    expected = pl.tile.ci(first, [1, SELECTED_GATHER_TILE], dtype=pl.INT32)
+    delta = pl.abs(pl.cast(pl.sub(ids, expected), pl.FP32))
+    checks = pl.tile.full([8, SELECTED_GATHER_TILE], dtype=pl.FP32, value=0.0)
+    checks = pl.tile.assemble(checks, delta, [0, 0])
+    scratch = pl.tile.create([8, SELECTED_GATHER_TILE], dtype=pl.FP32)
+    error = pl.tile.read(pl.row_max(checks, tmp_tile=scratch), [0, 0])
+    start = pl.cast(first, pl.INDEX)
+    values = pl.tile.full([SELECTED_GATHER_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+    if first >= 0 and error == 0.0:
+        values = pl.tile.load(cache, [start, 0], [SELECTED_GATHER_TILE, HEAD_DIM])
+    else:
+        for lane in pl.range(SELECTED_GATHER_TILE):
+            physical = pl.tile.read(ids, [0, lane])
+            if physical >= 0:
+                row = pl.cast(physical, pl.INDEX)
+                values = pl.tile.gather_row(values, cache, [lane, 0], [row, 0], [1, HEAD_DIM])
+    return values
+
+
+@pl.jit.inline(auto_scope=False)
 def gather_decoded_caches(
     decoded_window: pl.Tensor[[CACHE_WINDOW_ROWS, HEAD_DIM], pl.BF16],
     decoded_compressed: pl.Tensor[[CACHE_COMPRESSED_ROWS, HEAD_DIM], pl.BF16],
@@ -1572,28 +1603,13 @@ def gather_decoded_caches(
         for block in pl.range(worker, num_tokens * (SELECTED_KEYS // SELECTED_GATHER_TILE), workers):
             token = block // (SELECTED_KEYS // SELECTED_GATHER_TILE)
             column = block % (SELECTED_KEYS // SELECTED_GATHER_TILE) * SELECTED_GATHER_TILE
-            values = pl.tile.create([SELECTED_GATHER_TILE, HEAD_DIM], dtype=pl.BF16)
             if column < 128:
                 ids = pl.tile.load(wi, [token, column], [1, SELECTED_GATHER_TILE])
-                safe_ids = pl.maximum(ids, 0)
-                for lane in pl.range(SELECTED_GATHER_TILE):
-                    physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
-                    values = pl.tile.gather_row(
-                        values, decoded_window, [lane, 0], [physical, 0], [1, HEAD_DIM]
-                    )
+                values = gather_decoded_rows(decoded_window, ids)
             else:
                 ids = pl.tile.load(ci, [token, column - 128], [1, SELECTED_GATHER_TILE])
-                safe_ids = pl.maximum(ids, 0)
-                for lane in pl.range(SELECTED_GATHER_TILE):
-                    physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
-                    values = pl.tile.gather_row(
-                        values, decoded_compressed, [lane, 0], [physical, 0], [1, HEAD_DIM]
-                    )
+                values = gather_decoded_rows(decoded_compressed, ids)
             pl.tile.store(values, [token * SELECTED_KEYS + column, 0], dst)
-            zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            for lane in pl.range(SELECTED_GATHER_TILE):
-                if pl.tile.read(ids, [0, lane]) < 0:
-                    pl.tile.store(zero, [token * SELECTED_KEYS + column + lane, 0], dst)
             pl.tile.store(ids, [token, column], indices)
     return gathered
 
@@ -1622,21 +1638,24 @@ def _attend_cache_shared(
         window, window_scale, compressed, compressed_scale,
         decoded_window, decoded_compressed, query_ready,
     )
-    capacity = pl.max(1, pl.min(token_tile, num_tokens))
-    selected = pl.create_tensor([capacity, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
-    indices = pl.create_tensor([capacity, SELECTED_KEYS], dtype=pl.INT32)
-    previous = query_ready
-    for offset in pl.range(0, num_tokens, token_tile):
-        count = pl.min(token_tile, num_tokens - offset)
-        q = pl.slice(query, [count, LOCAL_H * HEAD_DIM], [offset, 0])
-        wi = pl.slice(window_indices, [count, 128], [offset, 0])
-        ci = pl.slice(compressed_indices, [count, INDEX_TOPK], [offset, 0])
-        out = pl.slice(output, [count, LOCAL_H * HEAD_DIM], [offset, 0])
-        gathered = gather_decoded_caches(
-            decoded_window, decoded_compressed, wi, ci, selected, indices,
-            count, window_ready, compressed_ready, previous,
-        )
-        previous = attend_selected(q, selected, indices, sink, out, count, gathered, key_tile)
+    half_tile = token_tile // 2
+    streams = pl.min(2, (num_tokens + half_tile - 1) // half_tile)
+    for stream in pl.parallel(streams):
+        capacity = pl.min(half_tile, num_tokens - stream * half_tile)
+        selected = pl.create_tensor([capacity, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
+        indices = pl.create_tensor([capacity, SELECTED_KEYS], dtype=pl.INT32)
+        previous = query_ready
+        for offset in pl.range(stream * half_tile, num_tokens, token_tile):
+            count = pl.min(half_tile, num_tokens - offset)
+            q = pl.slice(query, [count, LOCAL_H * HEAD_DIM], [offset, 0])
+            wi = pl.slice(window_indices, [count, 128], [offset, 0])
+            ci = pl.slice(compressed_indices, [count, INDEX_TOPK], [offset, 0])
+            out = pl.slice(output, [count, LOCAL_H * HEAD_DIM], [offset, 0])
+            gathered = gather_decoded_caches(
+                decoded_window, decoded_compressed, wi, ci, selected, indices,
+                count, window_ready, compressed_ready, previous,
+            )
+            previous = attend_selected(q, selected, indices, sink, out, count, gathered, key_tile)
     return output
 
 
@@ -1660,7 +1679,7 @@ def _attend_packed_block(
     selected, indices, gathered = gather_packed(
         window, window_scale, compressed, compressed_scale,
         window_indices, compressed_indices, selected, indices, num_tokens, query_ready, max_workers=GATHER_WORKERS,
-        name_hint="c2a_gather",
+        name_hint="c2a_gather", gather_keys=640,
     )
     attended = attend_selected(query, selected, indices, sink, output, num_tokens, gathered, key_tile)
     return attended
@@ -1809,7 +1828,7 @@ def attend_packed_cohorts(
         output_a = pl.slice(output, [active_a, LOCAL_H * HEAD_DIM], [start, 0])
         selected_a, combined_a, gathered_a = gather_packed(
             window, window_scale, compressed, compressed_scale,
-            wi_a, ci_a, selected_a, combined_a, active_a, done_a, max_workers=32, name_hint=gather_name,
+            wi_a, ci_a, selected_a, combined_a, active_a, done_a, max_workers=32, name_hint=gather_name, gather_keys=640,
         )
         done_a = _attend_cohort(
             query_a, selected_a, combined_a, sink, output_a, 0, active_a, gathered_a, name_hint=attn_name,
@@ -1822,7 +1841,7 @@ def attend_packed_cohorts(
             output_b = pl.slice(output, [active_b, LOCAL_H * HEAD_DIM], [start + width, 0])
             selected_b, combined_b, gathered_b = gather_packed(
                 window, window_scale, compressed, compressed_scale,
-                wi_b, ci_b, selected_b, combined_b, active_b, done_b, max_workers=32, name_hint=gather_name,
+                wi_b, ci_b, selected_b, combined_b, active_b, done_b, max_workers=32, name_hint=gather_name, gather_keys=640,
             )
             done_b = _attend_cohort(
                 query_b, selected_b, combined_b, sink, output_b, 0, active_b, gathered_b, name_hint=attn_name,

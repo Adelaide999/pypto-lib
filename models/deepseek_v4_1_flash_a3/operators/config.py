@@ -302,7 +302,9 @@ SCALE_DTYPE = pl.UINT8
 MX_A_LAYOUT = pl.ND
 MX_B_LAYOUT = pl.ND
 PROJECTION_LAYOUT = pl.ND
-WEIGHT_LAYOUT_VERSION = "v41-a3-w8a8-dynamic-nd-v3"
+EXPERT_N_TILE = 128
+EXPERT_K_TILE = 512
+WEIGHT_LAYOUT_VERSION = "v41-a3-w8a8-dynamic-expert-nk-v4"
 CACHE_LAYOUT_VERSION = "v41-a3-u8-paged128-v1"
 
 TP_SIZE = _parse_parallel_size("tp", 4)
@@ -320,6 +322,14 @@ def get_ep_size() -> int:
     if FLASH.n_routed_experts % size:
         raise ValueError(f"{FLASH.n_routed_experts} routed experts cannot be evenly sharded across EP{size}")
     return size
+
+
+NATIVE_PREFILL_MOE_SLAB_ROWS = (64, 128, 256, 512, 1024, 2048)
+
+
+def default_prefill_slab_rows(capacity: int) -> int:
+    """Select the native EP slab for the full prompt or a smaller token allocation."""
+    return 2048 if capacity == PREFILL_MAX_TOKENS else 64
 
 
 def set_moe_tokens(tokens: int) -> None:

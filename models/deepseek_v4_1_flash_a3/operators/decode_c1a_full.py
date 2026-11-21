@@ -13,8 +13,8 @@ import pypto.language as pl
 from .gemm import quantize_activation
 import pypto.language.distributed as pld
 from .config import TP_SIZE
-from .qkv_proj_rope import q_proj_rope, kv_proj_rope
-from .o_proj import o_proj, prefill_tp_output_all_reduce
+from .qkv_proj_rope import decode_q_proj_rope as q_proj_rope, decode_kv_proj_rope as kv_proj_rope
+from .o_proj import decode_o_proj as o_proj, prefill_tp_output_all_reduce
 from .decode_indexer import (
     select_candidate_block_pool, c1a_index, score_select_c1a_groups,
     publish_index_rows, c1a_project_index_key, c1a_rotate_index_key,
@@ -101,6 +101,8 @@ def decode_c1a_full(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
+    selected: pl.Tensor[[LOCAL_T_DYN, 640, HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[LOCAL_T_DYN, 640], pl.INT32],
 ):
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
@@ -175,12 +177,10 @@ def decode_c1a_full(
     )
     selection_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid, compressed_ready])
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    selected = pl.create_tensor([tokens, 640, HEAD_DIM], dtype=pl.BF16)
-    indices = pl.create_tensor([tokens, 640], dtype=pl.INT32)
     selected_ret, indices_ret, gather_tid = gather_packed(
         window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
         window_indices, topk_indices, selected, indices, num_tokens, selection_ready,
-        max_workers=GATHER_WORKER_TILE, name_hint="c1a_gather",
+        max_workers=GATHER_WORKER_TILE, name_hint="c1a_gather", gather_keys=640,
     )
     attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
@@ -190,7 +190,7 @@ def decode_c1a_full(
     reduced_output = pl.create_tensor([tokens, D], dtype=pl.BF16)
     prefill_tp_output_all_reduce(
         attn_out, output_window, output_arrived, reduced_output,
-        group_base, tp_rank, num_tokens, attention_epoch,
+        group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
     hc_post(reduced_output, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)

@@ -196,7 +196,7 @@ def generate(args, devices, *, manifests):
         raise ValueError("teacher forcing requires a frozen eight-step reference")
     config = RunConfig(arch=BackendType.Ascend910, execution_mode=ExecutionMode.ONBOARD,
                        distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
-                       ring_heap=(4 * 1024**3, 4 * 1024**3, (4 if C.MOE_TOKENS == 128 else 2) * 1024**3, 1024**3), ring_dep_pool=131072)
+                       ring_heap=(4 * 1024**3, 4 * 1024**3, (4 if C.MOE_TOKENS >= 128 else 2) * 1024**3, 1024**3), ring_dep_pool=131072)
     program_dirs = (args.runtime_dir, args.decode_runtime_dir)
     if args.profile_all_steps is not None:
         program_dirs = profile_program_dirs(args.profile_all_steps, program_dirs)
@@ -245,11 +245,12 @@ def generate(args, devices, *, manifests):
         # TP peers read the same active or idle inputs until the synchronous forward completes.
         decode_inputs = DecodeInputs({name: value for name, value in decode_template.items()
                                       if name in names[1] and name not in constants})
-        host_io = {"logits": torch.empty(M.vocab_size, dtype=torch.float32).share_memory_(),
+        host_io = {"logits": torch.empty((args.max_new_tokens, M.vocab_size), dtype=torch.float32).share_memory_(),
                    "sampled_ids": torch.empty(8, dtype=torch.int32).share_memory_()}
-        for name in ("embedding", "engram_lookup"):
-            template = prefill_template[name]
-            host_io["prefill_" + name] = torch.empty((2, *template.shape), dtype=template.dtype).share_memory_()
+        for name in names[0]:
+            if name in prefill_template and name not in constants:
+                template = prefill_template[name]
+                host_io["prefill_" + name] = torch.empty((2, *template.shape), dtype=template.dtype).share_memory_()
         worker = SwimlaneWorker if args.profile_all_steps is not None else DistributedWorker
         with worker(programs, config, persistent=True, reset_persistent_windows=False,
                     inherited_host_tensors=[*counts.values(), *host_io.values(), decode_inputs.images]) as runtime:

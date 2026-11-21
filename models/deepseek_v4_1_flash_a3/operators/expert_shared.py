@@ -22,7 +22,7 @@ import pypto.language as pl
 import torch
 import torch.nn.functional as F
 
-from .config import FLASH as M, MOE_TOKENS
+from .config import EXPERT_N_TILE, EXPERT_K_TILE, FLASH as M, MOE_TOKENS
 from .gemm import expert_swiglu, gemm_dynamic_int8
 
 
@@ -49,6 +49,7 @@ def expert_shared(
     shared_w2_scale: pl.Tensor,
     sh: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
+    output_major: pl.constexpr,
 ):
     """Compute the shared INT8 SwiGLU expert with BF16 activation rounding."""
     scale = pl.reshape(x_local_scale, [T_PAD, 1])
@@ -56,9 +57,9 @@ def expert_shared(
     hidden = pl.create_tensor([padded_rows, MOE_INTER], dtype=pl.BF16)
     expert_swiglu(
         x_local, scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        scale, hidden, num_tokens, D, MOE_INTER, 128, 512, SWIGLU_LIMIT, False, "shared_swiglu",
+        scale, hidden, num_tokens, D, MOE_INTER, EXPERT_N_TILE, EXPERT_K_TILE, SWIGLU_LIMIT, False, "shared_swiglu", output_major,
     )
-    return gemm_dynamic_int8(hidden, shared_w2, shared_w2_scale, sh, num_tokens, MOE_INTER, D, "shared_down")
+    return gemm_dynamic_int8(hidden, shared_w2, shared_w2_scale, sh, num_tokens, MOE_INTER, D, "shared_down", output_major)
 
 
 def golden_expert_shared(payload, activation_scale, w1, scale1, w3, scale3, w2, scale2):
@@ -85,7 +86,7 @@ def l2_expert_shared(
     scale2: pl.Tensor[[1, D], pl.FP32],
     output: pl.Out[pl.Tensor[[T_PAD, D], pl.BF16]],
 ):
-    expert_shared(source, scale, w1, scale1, w3, scale3, w2, scale2, output, T)
+    expert_shared(source, scale, w1, scale1, w3, scale3, w2, scale2, output, T, False)
     return output
 
 
