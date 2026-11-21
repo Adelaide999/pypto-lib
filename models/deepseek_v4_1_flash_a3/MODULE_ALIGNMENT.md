@@ -1,22 +1,33 @@
 # A3 module ownership
 
-The organization follows the shared
-[DeepSeek V4.1 Flash model](https://github.com/hw-native-sys/pypto-lib/tree/e1c3522fa2670e13efaab80def5c04e7cfab024a/models/deepseek_v4_1_flash):
-forward entries compose attention and MoE, while independent child files own
-the computation and corresponding Torch goldens. A3 retains Eco-Tech W8A8
-arithmetic and layouts; it does not substitute the reference model's
-MXFP8/MXFP4 kernels or topology.
+## Default distributed forward
 
-## Maintained owners
+| Responsibility | Owner |
+| --- | --- |
+| Prefill rank loop, layer schedule, six attention modes and round-based MoE | `prefill_fwd.py` |
+| Decode rank loop, encoder and decoder layer schedules | `decode_fwd.py` |
+| Phase-specific attention and indexing | `operators/prefill_*.py`, `operators/decode_*.py` |
+| Routing, expert dispatch and combine, point-to-point signaling | `operators/moe.py`, `operators/expert_routed.py`, `operators/expert_shared.py` |
+| Topology, phase geometry, checkpoint loading and resident weight layouts | `operators/config.py`, `operators/weights.py` |
+| Prepared tensor inputs, cache geometry and Decode aliases | `host.py`, `operators/utils.py` |
+| Compile, verify manifests and select execution | `driver.py`, `generate.py` |
+| Weight and cache lifetime, request submission and sampling | `generation.py`, `replay.py` |
+| Layer and logit comparison, routing reports and profiling | `validation.py`, `reference.py`, `telemetry.py`, `swimlane.py` |
+
+The default forward imports the operators under `operators/`. The following
+tables describe the separate host-scheduled implementation selected by
+`--staged-network` and its standalone cases.
+
+## Staged session and bounded operators
 
 | Responsibility | Modules |
 | --- | --- |
-| Shared TP4 programs, network execution and generation session | `network.py` |
-| Whole-network Prefill preparation | `prefill_fwd.py` |
+| Staged TP4 programs, layer execution and session | `network.py` |
+| Whole-network Prefill preparation | `staged_prefill.py` |
 | One-token Decode and token feedback | `decode_network.py`, `generate.py` |
 | Session weight bank and Decode ABI binding | `resident_weights.py` |
 | Generic layer and L2 composition | `prefill_layer.py`, `prefill_layer_plan.json` |
-| Bounded Decode forward | `decode_fwd.py` |
+| Bounded SWA validation | `bounded_decode.py` |
 | Phase attention compositions | `prefill_swa.py`, `prefill_c2a.py`, `prefill_compressed_reuse.py`, `decode_swa.py`, `decode_c1a.py`, `decode_c2a.py` |
 | Vocabulary embedding and final head | `input_pack.py`, `lm_head.py` |
 | Compression projection, pooling and publication | `compressor.py` |
@@ -37,9 +48,8 @@ MXFP8/MXFP4 kernels or topology.
 
 The full Decode network follows the same flat package layout as Prefill.
 Attention variants compose shared operator owners; `decode_layer.py` selects
-the layer entry and combines attention, MoE and residual streams. The public
-`decode_fwd.py`, `decode_network.py` and `generate.py` entries retain their
-existing responsibilities. Standalone audits, independent-layer runners,
+the layer entry and combines attention, MoE and residual streams.
+Standalone audits, independent-layer runners,
 native reference-capture workers, state replay and identity manifests are
 removed. Historical code and provenance remain in Git history. Production
 request/cache checks and operator-local golden entries remain.
@@ -65,7 +75,7 @@ their casts and cache-publication boundaries are unchanged.
 | Functional modules | `indexer.py`, `compressor.py`, `prefill_moe.py`, `decode_moe.py`, `decode_moe_ep.py`, `grouped_moe.py`, `expert_routed.py` |
 | Attention variants | `prefill_swa.py`, `prefill_c2a.py`, `prefill_compressed_reuse.py`, `decode_swa.py`, `decode_c1a.py`, `decode_c2a.py` |
 | Layer composition | `prefill_layer.py`, `decode_layer.py` |
-| Network and generation | `prefill_fwd.py`, `decode_fwd.py`, `decode_network.py`, `network.py`, `generate.py` |
+| Network and generation | `staged_prefill.py`, `decode_network.py`, `network.py`, `staged_generate.py` |
 
 Runtime topology controls stay in `operator_config.py`, `runtime_config.py`,
 `decode_config.py` and `decode_layer_config.py`, with their original defaults

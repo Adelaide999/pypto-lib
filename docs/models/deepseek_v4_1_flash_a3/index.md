@@ -1,8 +1,12 @@
 # DeepSeek V4.1 Flash A3 Prefill and Decode
 
-A3 Eco-Tech W8A8 operators, the original 40-layer Prefill composition and
-persistent generation session, bounded Decode operators, and a shared TP4
-40-layer network for Prefill and one-token Decode. See [Decode](decode.md) for its implementation scope and
+Default single-request generation uses separate 40-layer Prefill and Decode graphs
+on DP4/TP4/EP16. Both bind the resident W8A8 weights and paged history.
+Each L3 program calls a handwritten rank-local L2 schedule. Prefill selects six attention modes and executes EP16 communication in the graph. Decode runs separate encoder and decoder schedules with seven shared cache views. See the [default forward and commands](../../../models/deepseek_v4_1_flash_a3/README.md).
+
+The staged session described below is available with `--staged-network`. Packed batches,
+all-position logits, MoE slab sizing, HBM budgets and chip profiling select it
+automatically. See [Decode](decode.md) for its implementation scope and
 remaining work.
 
 See [Native vLLM-Ascend accuracy comparison](accuracy.md) for fixed
@@ -11,6 +15,17 @@ See [Experimental packed requests and paged history](dynamic-runtime.md) for
 request admission, independent limits, TP plans, HBM estimates and device validation status.
 
 ## Development priorities
+
+- Performance target: run one distributed dispatch per prompt chunk and one
+  per subsequent token, reusing rank-local weights, communication windows
+  and cache allocations.
+- Compatibility requirements: preserve the W8A8 checkpoint layout, six
+  Prefill attention modes, Decode layer roles, DP4/TP4/EP16 ownership and
+  the seven shared cache buffers.
+- Deferred performance work: measure end-to-end timing and tune kernels on
+  an allocated 16-device group.
+
+### Staged session
 
 - Performance target: complete-network correctness and continuous generation
   with generation-scoped workers, compute weights, caches and communication,
@@ -22,16 +37,16 @@ request admission, independent limits, TP plans, HBM estimates and device valida
   cache/source lifetime, quantization, dtypes, and explicit DP/TP/EP mappings.
   TP1/TP2 full-network device compatibility remains unvalidated.
 
-## Structure
+## Staged session structure
 
 | Responsibility | Owner |
 | --- | --- |
-| Shared network compilation, execution and session | `network.py` |
-| Whole-network Prefill and request preparation | `prefill_fwd.py` |
-| 40-layer Decode schedule, resident weights and state | `decode_fwd.py --network`, `decode_network.py` |
+| Staged network compilation, execution and session | `network.py` |
+| Whole-network Prefill and request preparation | `staged_prefill.py` |
+| 40-layer Decode schedule, resident weights and state | `decode_network.py` |
 | Generic layer composition and L2 bindings | `prefill_layer.py`, `prefill_layer_plan.json` |
-| Bounded SWA Decode | `decode_fwd.py` |
-| Vocabulary embedding, initial HC and output head | `input_pack.py`, `prefill_fwd.py`, `lm_head.py` |
+| Bounded SWA Decode | `bounded_decode.py` |
+| Vocabulary embedding, initial HC and output head | `input_pack.py`, `staged_prefill.py`, `lm_head.py` |
 | Attention, compression and Indexer | `swa.py`, `sparse_attention.py`, `compressor.py`, `indexer.py`, phase compositions |
 | Phase MoE routing, dispatch and shared experts | `prefill_moe.py`, `decode_moe.py` |
 | Full-width Decode layer dispatch and attention | `decode_layer.py`, `decode_swa.py`, `decode_c1a.py`, `decode_c2a.py` |
@@ -148,7 +163,7 @@ NPU accuracy, distributed communication, whole-network accuracy or performance.
 
 ## Whole-network Prefill
 
-`prefill_fwd.prefill_fwd` executes embedding, initial HC, layers 0 through 39,
+`staged_prefill.prefill_fwd` executes embedding, initial HC, layers 0 through 39,
 final HC collapse, RMSNorm and the vocabulary head. Each layer consumes the
 previous layer's actual activations. The default DP4/TP4/EP16, PP1/PCP1/DCP1
 path retains Prefill capacities up to 8192 and Decode capacity 16. The separate
@@ -159,7 +174,7 @@ by logical rank. Duplicate IDs, rank-count mismatches and a
 conflicting `ASCEND_RT_VISIBLE_DEVICES` mapping are rejected before initialization.
 
 ```python
-from models.deepseek_v4_1_flash_a3.prefill_fwd import compile_prefill, prefill_fwd
+from models.deepseek_v4_1_flash_a3.staged_prefill import compile_prefill, prefill_fwd
 
 program = compile_prefill(
     inputs, cache=cache_state, config=network_contract,
@@ -430,7 +445,7 @@ Empty ranks skip the routed invocation and its weight lookup.
 Activation quantization and routed-token dispatch packing still run per call.
 The generation network reuses the blocked routed-expert representation in
 both phases. Bounded legacy Decode operators retain their FRACTAL_NZ contract,
-including down projection padding. The bounded `decode_fwd` direct-tile GEMMs retain logical
+including down projection padding. The bounded `bounded_decode` direct-tile GEMMs retain logical
 `[K, N]` weights and do not perform a whole-weight pack. A5 FP8/FP4 layouts are
 not used by these A3 W8A8 kernels.
 
@@ -487,9 +502,9 @@ For automatic inputs, replace `inputs` with `prompt` or `token_ids` and
 optionally add `chunk_size` and `dp_rank`.
 
 ```bash
-python -m models.deepseek_v4_1_flash_a3.prefill_fwd --config prefill.json --check-config
-python -m models.deepseek_v4_1_flash_a3.prefill_fwd --config prefill.json --compile-only
-python -m models.deepseek_v4_1_flash_a3.prefill_fwd --config prefill.json -p a2a3
+python -m models.deepseek_v4_1_flash_a3.staged_prefill --config prefill.json --check-config
+python -m models.deepseek_v4_1_flash_a3.staged_prefill --config prefill.json --compile-only
+python -m models.deepseek_v4_1_flash_a3.staged_prefill --config prefill.json -p a2a3
 ```
 
 `--checkpoint`, `--devices` and `--output` override the JSON settings.
@@ -501,7 +516,7 @@ execution progress and failures, without per-layer reference-comparison captures
 session with one static weight bank and the original cache allocations:
 
 ```bash
-python -m models.deepseek_v4_1_flash_a3.generate \
+python -m models.deepseek_v4_1_flash_a3.generate --staged-network \
   --checkpoint weights/deepseek-v4.1-flash-w8a8 --prompt "Hello" \
   --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
   --max-new-tokens 3 --ignore-eos --output build_output/ds41-generation
@@ -511,7 +526,7 @@ For batch size 1, 8192 input tokens, one 8192-token Prefill chunk and eight
 output tokens, supply a JSON array containing exactly 8192 token IDs:
 
 ```bash
-python -m models.deepseek_v4_1_flash_a3.generate \
+python -m models.deepseek_v4_1_flash_a3.generate --staged-network \
   --checkpoint weights/deepseek-v4.1-flash-w8a8 \
   --tokens-file prompt-8192.json --devices "$TASK_DEVICE" \
   --chunk-size 8192 --max-new-tokens 8 --ignore-eos \
@@ -520,13 +535,11 @@ python -m models.deepseek_v4_1_flash_a3.generate \
 
 Run this command in a job allocated 16 devices. Only DP rank 0 receives the
 request; every EP rank participates in expert execution. The first output
-token comes from Prefill and the remaining seven from Decode. The 8K chunk
-is a single network admission, not a sequence of 128-token forwards. MoE
-continues to use bounded internal communication slabs. This configuration
+token comes from Prefill and the remaining seven from Decode. The Prefill graph processes the 8K chunk in one submission and dispatches routed experts one row at a time. This configuration
 increases activation and full-vocabulary output storage; it does not change
 Engram's CPU lookup placement or reduce the model's expert count.
 
-The resident runtime sizes ring 1 for active-query BF16 sparse gathers and
+The staged resident runtime sizes ring 1 for active-query BF16 sparse gathers and
 full-capacity HC/shared-expert intermediates, and ring 2 for mixed-kernel
 pipeline buffers including index selection. Required sizes include 1 MiB
 of additional space and are rounded to runtime-supported powers of two.
@@ -589,7 +602,7 @@ across embedding, all 40 layers and the vocabulary head. The same controls
 apply to Prefill and Decode, including cached resident dispatches:
 
 ```bash
-python -m models.deepseek_v4_1_flash_a3.generate \
+python -m models.deepseek_v4_1_flash_a3.generate --staged-network \
   --checkpoint weights/deepseek-v4.1-flash-w8a8 \
   --tokens-file prompt-8192.json --devices "$TASK_DEVICE" \
   --chunk-size 8192 --max-new-tokens 8 --ignore-eos \
@@ -621,7 +634,7 @@ config["profiling"] = {
 }
 ```
 
-For the `prefill_fwd --config` entry, place this object in the referenced
+For the `staged_prefill --config` entry, place this object in the referenced
 network contract JSON. The retained Decode session inherits these settings.
 If `output_dir` is omitted, the Python entry uses its output directory's
 `profiling` subdirectory. Settings are fixed for that session.

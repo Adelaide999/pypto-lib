@@ -1131,6 +1131,27 @@ def _pack_routed_slot(operands, grouped, local):
         scale.copy_(operands[stem + ".weight_scale"].reshape_as(scale))
 
 
+def pack_routed_layer(reader, layer, ownership, packers):
+    """Pack the contiguous local expert rows and scales for one layer and EP rank."""
+    grouped = None
+    pending = deque()
+    for expert, local in ownership:
+        if len(pending) == ROUTED_PACK_WORKERS:
+            pending.popleft().result()
+        operands = reader.read_expert(f"layers.{layer}.ffn.experts.{expert}")
+        if grouped is None:
+            intermediate, hidden = operands["w1.weight"].shape
+            rows = hidden * intermediate // BLOCKED_INT8_COLUMNS
+            shapes = ((2 * rows, BLOCKED_INT8_COLUMNS), (2 * intermediate,), (rows, BLOCKED_INT8_COLUMNS), (hidden,))
+            dtypes = (torch.int8, torch.float32, torch.int8, torch.float32)
+            grouped = [torch.empty((len(ownership), *shape), dtype=dtype) for shape, dtype in zip(shapes, dtypes)]
+        pending.append(packers.submit(_pack_routed_slot, operands, grouped, local))
+        del operands
+    for future in pending:
+        future.result()
+    return grouped
+
+
 class ResidentNetworkWeights:
     """Retain prepacked compute weights, with routed experts sharded by their actual EP owner."""
 
@@ -1241,23 +1262,9 @@ class ResidentNetworkWeights:
 
     def _preload_routed(self, layer, rank, packers):
         """Pack one rank's experts and fill the four layer slices of its resident banks."""
-        grouped = None
-        pending = deque()
         ownership = self.layout.ownership(rank)
-        for expert, local in ownership:
-            if len(pending) == ROUTED_PACK_WORKERS:
-                pending.popleft().result()
-            operands = self.reader.read_expert(f"layers.{layer}.ffn.experts.{expert}")
-            if grouped is None:
-                intermediate, hidden = operands["w1.weight"].shape
-                rows = hidden * intermediate // BLOCKED_INT8_COLUMNS
-                shapes = ((2 * rows, BLOCKED_INT8_COLUMNS), (2 * intermediate,), (rows, BLOCKED_INT8_COLUMNS), (hidden,))
-                dtypes = (torch.int8, torch.float32, torch.int8, torch.float32)
-                grouped = [torch.empty((len(ownership), *shape), dtype=dtype) for shape, dtype in zip(shapes, dtypes)]
-            pending.append(packers.submit(_pack_routed_slot, operands, grouped, local))
-            del operands
-        for future in pending:
-            future.result()
+        grouped = pack_routed_layer(self.reader, layer, ownership, packers)
+        shapes = [value.shape[1:] for value in grouped]
         layers = [value.flatten(0, 1) for value in grouped]
         if rank not in self.routed_banks:
             self.routed_banks[rank] = tuple(

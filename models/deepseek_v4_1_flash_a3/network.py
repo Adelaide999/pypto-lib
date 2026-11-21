@@ -593,10 +593,13 @@ class NetworkExecutor:
         self.phase = phase
         self.activation_banks = {}
 
-    def execute_entry(self, entry, rank, arguments, *, empty_capture=False):
+    def execute_entry(self, entry, rank, arguments, *, empty_capture=False, replay_name=None):
         """Bind one existing compiled entry to the generation's persistent worker."""
         if self.resident is None:
             raise ValueError("Ordinary execution requires an initialized resident runtime")
+        if self.resident.recording is not None:
+            name = replay_name or Path(entry.compiled.output_dir).name.split("-", 2)[-1]
+            self.resident.recording.roles[rank] = self.current_layer, name, arguments
         key = id(entry.compiled)
         if key not in self.resident_abis:
             self.resident_abis[key] = network_parameter_abi(entry.compiled)
@@ -608,7 +611,14 @@ class NetworkExecutor:
         transport = (
             values if packets else [{case: {"value": value} for case, value in row.items()} for row in values]
         )
-        result, receipts = self.resident.exchange(stage, transport, collective, group, host_control=host_control)
+        if self.resident.recording is not None:
+            if host_control:
+                raise RuntimeError("Unexpected intermediate host read during Decode recording")
+            result = self.resident.recording.collective(transport, collective, group)
+            receipts = [dict(stage=stage, rank=rank, backend="PyPTO device collective", collective=collective)
+                        for rank in range(len(result))]
+        else:
+            result, receipts = self.resident.exchange(stage, transport, collective, group, host_control=host_control)
         for rank, receipt in enumerate(receipts):
             self.reports[rank]["communication"].append(receipt)
         if packets:
@@ -654,6 +664,8 @@ class NetworkExecutor:
         keep = [(rank, value) for rows in (hidden, premix)
                 for rank, cases in enumerate(rows) for value in cases.values()]
         keep.extend((rank, value) for (rank, _, _), pair in self.activation_banks.items() for value in pair)
+        if self.resident.recording is not None:
+            keep.extend((rank, bank) for rank, (bank, _) in self.resident.recording.routes.items())
         self.resident.release_values(keep)
 
     def for_layer(self, layer_id):
@@ -668,9 +680,12 @@ class NetworkExecutor:
 
         def execute(name, rank, case, arguments, outputs, responsibility=None):
             empty_capture = name == "mask_output" and arguments[-2] == arguments[-1]
-            self.execute_entry(self.current_entries[name], rank, arguments, empty_capture=empty_capture)
+            self.execute_entry(self.current_entries[name], rank, arguments, empty_capture=empty_capture, replay_name=name)
 
+        graph = self.resident.recording
         return dict(
+            resident_experts=graph.mesh.run if graph is not None else None,
+            decode_graph=graph,
             topology=self.topology,
             ownership=self.ownership,
             enable_expert_parallel=True,
@@ -753,108 +768,131 @@ def run_output_boundary(result, *, batch, topology, config, weights, executor, o
         write_json(directory / "execution.json", dict(outcome="no_request_requires_sampling"))
         return dict(files={}, logits=[{case: torch.empty((0, config["vocab_size"]), dtype=torch.bfloat16)
                                       for case in cases} for cases in result["hidden"]])
-    norm = weights.reader.load("norm.weight")
-    head = weights.reader.load("head.weight")
-    if (
-        norm.dtype != torch.bfloat16
-        or head.dtype != torch.bfloat16
-        or tuple(head.shape) != (config["vocab_size"], 5120)
-    ):
-        raise ValueError("Actual complete output norm/head checkpoint ABI differs")
-
-    def execute(name, rank, case, arguments, outputs, responsibility=None):
-        executor.execute_entry(entries[name], rank, arguments)
-
-    packets = [{} for _ in range(world)]
-    for case, records in batch["cases"].items():
-        def run_output_boundary_rank_0(rank):
-            record = records[rank]
-            physical = record["SP_physical_rows"]
-            collapsed = torch.full((capacity, 5120), -17, dtype=torch.bfloat16)
-            execute(
-                "collapse",
-                rank,
-                case,
-                [result["hidden"][rank][case], result["pre_mix"][rank][case], collapsed, physical],
-                dict(local_collapsed=collapsed),
-            )
-            packets[rank][case] = collapsed
-        executor.resident.map_ranks(run_output_boundary_rank_0)
-    gathered = executor.exchange(executor.namespace + "-output-SP-gather", packets, "all_gather", "tp")
-    logits_packets = [{} for _ in range(world)]
-    for case, records in batch["cases"].items():
-        def run_output_boundary_rank_1(rank):
-            record = records[rank]
-            physical = record["SP_physical_rows"]
-            active = len(record["output_rows"]) if sampled else len(record["positions"])
-            if sampled:
-                sample_rows = torch.zeros(capacity, dtype=torch.int32)
-                sample_rows[:active] = torch.tensor(record["output_rows"], dtype=torch.int32)
-            output_active = min(active, 1) if last_row else active
-            collapsed = torch.full((output_capacity, 5120), -17, dtype=torch.bfloat16)
-            normalized = torch.full((output_capacity, 5120), -19, dtype=torch.bfloat16)
-            local_logits = torch.full((output_capacity, config["vocab_size"] // tp), -23, dtype=torch.bfloat16)
-            count = config["vocab_size"] // tp
-            weight = weights.head_for_rank(rank)
-            if tuple(weight.shape) != (5120, count):
-                raise ValueError("Output head must use canonical KN vocabulary shard layout")
-            execute_region(
-                {"execute_l2": execute},
-                "sample_head_l2" if sampled else "head_l2",
-                rank,
-                case,
-                (
-                    (
-                        "sp_unpack",
-                        ([gathered[rank][case], collapsed, sample_rows, max(physical, 1), active] if sampled
-                         else [gathered[rank][case], collapsed, max(physical, 1), active]),
-                        dict(collapsed=collapsed),
-                        "output",
-                    ),
-                    ("norm", [collapsed, norm, normalized, output_active], dict(normalized=normalized), "output"),
-                    (
-                        "projection",
-                        [normalized, weight, local_logits, output_active],
-                        dict(local_logits=local_logits),
-                        "output",
-                    ),
-                ),
-            )
-            logits_packets[rank][case] = local_logits
-        executor.resident.map_ranks(run_output_boundary_rank_1)
-    gathered_logits = executor.exchange(
-        executor.namespace + "-output-vocabulary-gather", logits_packets, "all_gather", "tp"
-    )
     files, actual_logits = {}, [{} for _ in range(world)]
-    for case, records in batch["cases"].items():
-        def run_output_boundary_rank_2(rank):
-            record = records[rank]
-            active = len(record["output_rows"]) if sampled else len(record["positions"])
-            if last_row:
-                active = min(active, 1)
-            if (last_row and rank % tp) or (not active and (last_row or not dump_logits)):
-                actual_logits[rank][case] = torch.empty((0, config["vocab_size"]), dtype=torch.bfloat16)
-                return
-            logits = torch.full((output_capacity, config["vocab_size"]), -29, dtype=torch.bfloat16)
-            execute(
-                "vocab_unpack",
-                rank,
-                case,
-                [gathered_logits[rank][case], logits, active],
-                dict(logits=logits),
-            )
-            readback = logits if dump_logits and not last_row and not sampled else logits[:active]
-            logits = executor.resident.read_output(readback, rank) if readback.numel() else readback.clone()
-            if dump_logits:
-                path = directory / f"rank-{rank}-{case}-network-logits.pt"
-                positions = record["positions"][-1:] if last_row else record["positions"]
+    pending = [{} for _ in range(world)]
+    def materialize(rank, case, record, readback, active):
+        logits = executor.resident.read_output(readback, rank) if readback.numel() else readback.clone()
+        if dump_logits:
+            path = directory / f"rank-{rank}-{case}-network-logits.pt"
+            positions = record["positions"][-1:] if last_row else record["positions"]
+            if sampled:
+                positions = positions[record["output_rows"]]
+            torch.save(dict(logits=logits, active=active, positions=positions, DP_rank=rank // tp), path)
+            files[str(path)] = file_sha(path)
+        actual_logits[rank][case] = logits[:active].clone()
+    graph = executor.resident.recording
+    if graph is not None and graph.replaying:
+        pending = graph.pending
+        for rank, row in enumerate(pending):
+            for case in batch["cases"]:
+                if case not in row:
+                    actual_logits[rank][case] = torch.empty((0, config["vocab_size"]), dtype=torch.bfloat16)
+    else:
+        norm = weights.reader.load("norm.weight")
+        head = weights.reader.load("head.weight")
+        if (
+            norm.dtype != torch.bfloat16
+            or head.dtype != torch.bfloat16
+            or tuple(head.shape) != (config["vocab_size"], 5120)
+        ):
+            raise ValueError("Actual complete output norm/head checkpoint ABI differs")
+
+        def execute(name, rank, case, arguments, outputs, responsibility=None):
+            executor.execute_entry(entries[name], rank, arguments)
+
+        packets = [{} for _ in range(world)]
+        for case, records in batch["cases"].items():
+            def run_output_boundary_rank_0(rank):
+                record = records[rank]
+                physical = record["SP_physical_rows"]
+                collapsed = torch.full((capacity, 5120), -17, dtype=torch.bfloat16)
+                execute(
+                    "collapse",
+                    rank,
+                    case,
+                    [result["hidden"][rank][case], result["pre_mix"][rank][case], collapsed, physical],
+                    dict(local_collapsed=collapsed),
+                )
+                packets[rank][case] = collapsed
+            executor.resident.map_ranks(run_output_boundary_rank_0)
+        gathered = executor.exchange(executor.namespace + "-output-SP-gather", packets, "all_gather", "tp")
+        logits_packets = [{} for _ in range(world)]
+        for case, records in batch["cases"].items():
+            def run_output_boundary_rank_1(rank):
+                record = records[rank]
+                physical = record["SP_physical_rows"]
+                active = len(record["output_rows"]) if sampled else len(record["positions"])
                 if sampled:
-                    positions = positions[record["output_rows"]]
-                torch.save(dict(logits=logits, active=active, positions=positions, DP_rank=rank // tp), path)
-                files[str(path)] = file_sha(path)
-            actual_logits[rank][case] = logits[:active].clone()
-        executor.resident.map_ranks(run_output_boundary_rank_2)
-        if last_row:
+                    sample_rows = torch.zeros(capacity, dtype=torch.int32)
+                    sample_rows[:active] = torch.tensor(record["output_rows"], dtype=torch.int32)
+                output_active = min(active, 1) if last_row else active
+                collapsed = torch.full((output_capacity, 5120), -17, dtype=torch.bfloat16)
+                normalized = torch.full((output_capacity, 5120), -19, dtype=torch.bfloat16)
+                local_logits = torch.full((output_capacity, config["vocab_size"] // tp), -23, dtype=torch.bfloat16)
+                count = config["vocab_size"] // tp
+                weight = weights.head_for_rank(rank)
+                if tuple(weight.shape) != (5120, count):
+                    raise ValueError("Output head must use canonical KN vocabulary shard layout")
+                execute_region(
+                    {"execute_l2": execute},
+                    "sample_head_l2" if sampled else "head_l2",
+                    rank,
+                    case,
+                    (
+                        (
+                            "sp_unpack",
+                            ([gathered[rank][case], collapsed, sample_rows, max(physical, 1), active] if sampled
+                             else [gathered[rank][case], collapsed, max(physical, 1), active]),
+                            dict(collapsed=collapsed),
+                            "output",
+                        ),
+                        ("norm", [collapsed, norm, normalized, output_active], dict(normalized=normalized), "output"),
+                        (
+                            "projection",
+                            [normalized, weight, local_logits, output_active],
+                            dict(local_logits=local_logits),
+                            "output",
+                        ),
+                    ),
+                )
+                logits_packets[rank][case] = local_logits
+            executor.resident.map_ranks(run_output_boundary_rank_1)
+        gathered_logits = executor.exchange(
+            executor.namespace + "-output-vocabulary-gather", logits_packets, "all_gather", "tp"
+        )
+        for case, records in batch["cases"].items():
+            def run_output_boundary_rank_2(rank):
+                record = records[rank]
+                active = len(record["output_rows"]) if sampled else len(record["positions"])
+                if last_row:
+                    active = min(active, 1)
+                if (last_row and rank % tp) or (not active and (last_row or not dump_logits)):
+                    actual_logits[rank][case] = torch.empty((0, config["vocab_size"]), dtype=torch.bfloat16)
+                    return
+                logits = torch.full((output_capacity, config["vocab_size"]), -29, dtype=torch.bfloat16)
+                execute(
+                    "vocab_unpack",
+                    rank,
+                    case,
+                    [gathered_logits[rank][case], logits, active],
+                    dict(logits=logits),
+                )
+                readback = logits if dump_logits and not last_row and not sampled else logits[:active]
+                if executor.resident.recording is None:
+                    materialize(rank, case, record, readback, active)
+                else:
+                    pending[rank][case] = readback, active
+            executor.resident.map_ranks(run_output_boundary_rank_2)
+        if graph is not None:
+            graph.pending = pending
+    if executor.resident.recording is not None:
+        executor.resident.recording.launch()
+        def read_rank_output(rank):
+            for case, (readback, active) in pending[rank].items():
+                materialize(rank, case, batch["cases"][case][rank], readback, active)
+        executor.resident.map_ranks(read_rank_output)
+    if last_row:
+        for case in batch["cases"]:
             for rank in range(world):
                 if rank % tp:
                     actual_logits[rank][case] = actual_logits[rank - rank % tp][case].clone()
@@ -1111,10 +1149,25 @@ class GenerationSession:
                                  prefill_moe_slab_rows=contract.get("prefill_moe_slab_rows"))
             output = Path(output)
             output.mkdir(parents=True, exist_ok=False)
-            result = run_network_chunk(following, contract=contract, output=output, provider=self.provider,
-                weights=self.weights, memory=self.memory, ownership=self.ownership, assigned=self.assigned,
-                engram_contracts=self.engram_contracts, program=self.program, epoch=epoch, progress=progress,
-                resident=self.runtime, phase=phase)
+            graph = None
+            if (phase == "decode" and not packed and self.runtime._native_dispatch
+                    and contract["topology"]["tp"] == 4 and contract["topology"]["ep"] == 16
+                    and sum(engine["active"] for engine in actual["DP_engines"]) == 1):
+                from .resident_decode import ResidentDecodeGraph
+                if self.runtime.decode_graph is None:
+                    self.runtime.decode_graph = ResidentDecodeGraph(self.runtime, self.program)
+                graph = self.runtime.decode_graph
+                graph.begin(self.provider, actual, following["engram_lookup"], metadata)
+                self.runtime.recording = graph
+            try:
+                result = run_network_chunk(following, contract=contract, output=output, provider=self.provider,
+                    weights=self.weights, memory=self.memory, ownership=self.ownership, assigned=self.assigned,
+                    engram_contracts=self.engram_contracts, program=self.program, epoch=epoch, progress=progress,
+                    resident=self.runtime, phase=phase)
+            finally:
+                if graph is not None:
+                    self.runtime.recording = None
+                    graph.end()
             self.weights.assert_static_unchanged()
             if cache_uploads != self.runtime.stats["cache_h2d_bytes"]:
                 raise RuntimeError("A token step uploaded persistent cache bytes")
@@ -1327,10 +1380,14 @@ def run_network_chunk(
         resident=resident,
         phase=phase,
     )
-    executor.precheck()
-    hidden, premix = embed_network_input(
-        inputs["input_contract"], weights, executor, text, output / "embedding"
-    )
+    if resident.recording is None:
+        executor.precheck()
+    graph = resident.recording
+    replaying = graph is not None and graph.replaying
+    if not replaying:
+        hidden, premix = embed_network_input(inputs["input_contract"], weights, executor, text, output / "embedding")
+    else:
+        executor.compiled.update(graph.compiled)
     hash_batch = provider.hash_batch()
     common_engram = engram_contracts[1]
     if progress is not None:
@@ -1385,6 +1442,17 @@ def run_network_chunk(
         return actual
 
     completed_layers = []
+    if graph is not None and not replaying:
+        # Compile against a private version ledger. Publish the actual cache owners
+        # only after all sixteen ranks and their validation tasks have finished.
+        version_plan = [{case: dict(tags) for case, tags in row.items()} for row in provider.versions]
+
+    def cache_for_layer(layer):
+        states = provider.cache_for_layer(layer)
+        if graph is None:
+            return states
+        return [{case: dict(live, versions=version_plan[rank][case]) for case, live in row.items()}
+                for rank, row in enumerate(states)]
 
     def observe_layer(layer, result):
         for case, records in provider.batch_for_layer(layer)["cases"].items():
@@ -1393,9 +1461,15 @@ def run_network_chunk(
                 status = torch.empty(provider.capacity, dtype=torch.int32)
                 arguments = [result["hidden"][rank][case], result["pre_mix"][rank][case], status, valid]
                 executor.execute_entry(program.entries_for_stage("validation")["finite"], rank, arguments)
-                if not bool(resident.read_control(status, rank).all()):
+                if resident.recording is not None:
+                    resident.recording.check(-3, rank, (status,))
+                elif not bool(resident.read_control(status, rank).all()):
                     raise RuntimeError(f"Non-finite {phase} state after layer {layer} on rank {rank}")
         executor.retain_boundaries(result["hidden"], result["pre_mix"])
+        if graph is not None:
+            layer_timings.append(dict(layer=layer, graph_prepare_seconds=perf_counter() - layer_started[layer]))
+            weights.release_current()
+            return
         provider.observe_layer(layer, result)
         completed_layers.append(layer)
         layer_timings.append(dict(layer=layer, weight_load_seconds=0.0,
@@ -1406,15 +1480,17 @@ def run_network_chunk(
         weights.release_current()
 
     try:
-        result = run_network_inmemory(
-            hidden,
-            premix,
-            batch_for_layer=provider.batch_for_layer,
-            cache_for_layer=provider.cache_for_layer,
-            weights_for_layer=weights.decode.layer if phase == "decode" else weights.for_layer,
-            runtime_for_layer=runtime_for_layer,
-            observe_layer=observe_layer,
-        )
+        result = None
+        if not replaying:
+            result = run_network_inmemory(
+                hidden,
+                premix,
+                batch_for_layer=provider.batch_for_layer,
+                cache_for_layer=cache_for_layer,
+                weights_for_layer=weights.decode.layer if phase == "decode" else weights.for_layer,
+                runtime_for_layer=runtime_for_layer,
+                observe_layer=observe_layer,
+            )
         if progress is not None:
             progress(dict(stage="executing_output_head", epoch=epoch))
         output_result = run_output_boundary(
@@ -1439,7 +1515,26 @@ def run_network_chunk(
             dump_logits=contract.get("dump_logits", True),
             formal_accuracy="not_run",
         )
-        resident.release_values()
+        if graph is not None:
+            from .cache import publish_live_versions, resolve_layer_role
+            for layer in range(40):
+                batch = provider.batch_for_layer(layer)
+                live = provider.cache_for_layer(layer)
+                role = resolve_layer_role(layer)
+                for records in live:
+                    for state in records.values():
+                        publish_live_versions(role, state, epoch, batch["token_map_id"])
+                provider.observe_completed_layer(layer)
+                completed_layers.append(layer)
+            if not replaying:
+                graph.compiled = dict(executor.compiled)
+            runtime["decode_graph_replayed"] = replaying
+            runtime["graph_binding_seconds"] = graph.prepare_seconds
+            runtime["graph_admission_seconds"] = graph.admission_seconds
+            runtime["graph_dynamic_input_bytes_by_rank"] = [row.host.nbytes for row in graph.inputs]
+            runtime["distributed_graph_submissions"] = 1
+            runtime["graph_seconds"] = resident.recording.graph_seconds
+        resident.release_values(keep=graph.kept_values() if graph is not None else ())
         profiling = resident.profiling.finish_chunk()
         runtime["resident_runtime"] = resident.summary()
         write_json(runtime_path, runtime)

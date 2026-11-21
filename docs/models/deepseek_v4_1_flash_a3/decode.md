@@ -1,6 +1,13 @@
 # DeepSeek V4.1 Flash A3 Decode
 
-The 40-layer network uses DP4/TP4/EP16 and one persistent generation session.
+The default Decode graph advances one token through 40 layers on DP4/TP4/EP16,
+sharing weights and cache allocations with the separate Prefill graph.
+`decode_fwd.py` compiles it and `generate.py` runs it. Use `--staged-network`
+on the generation command for the host-scheduled session described below.
+The default graph runs encoder layers 0–19 and decoder layers 20–39 with one active token in an 80-row padded input. Decode aliases all seven Prefill cache allocations. See the [default forward](../../../models/deepseek_v4_1_flash_a3/README.md).
+
+## Staged execution
+
 Prefill and one-token Decode share TP4 operators, a compiled program registry,
 static weight handles, HCCL groups and paged cache allocations. Prefill uses
 capacities from 16 through 8192; one-token Decode retains capacity 16.
@@ -23,7 +30,7 @@ even when they own no local query.
 | Responsibility | Module |
 | --- | --- |
 | Shared programs, layer schedule and generation session | `network.py` |
-| Prefill request preparation and public forward | `prefill_fwd.py` |
+| Prefill request preparation and public forward | `staged_prefill.py` |
 | One-token Decode and standalone Decode command | `decode_network.py` |
 | Session static weight ownership and read/upload audit | `resident_weights.py` |
 | Decode binding to existing canonical operands | `resident_weights.py` (`DecodeNetworkWeights`) |
@@ -59,10 +66,10 @@ legacy full-width TP1 network and its independent FRACTAL_NZ weight bank are
 replaced by this shared ABI. Bounded operator validation entries retain their
 separate operator interfaces.
 
-## Generation
+## Staged generation
 
 ```bash
-python -m models.deepseek_v4_1_flash_a3.generate \
+python -m models.deepseek_v4_1_flash_a3.generate --staged-network \
   --checkpoint weights/deepseek-v4.1-flash-w8a8 \
   --prompt "Hello" --chunk-size 128 --max-new-tokens 4 --ignore-eos \
   --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
@@ -113,7 +120,7 @@ supplied history on the device before autoregressive steps. A history string
 alone does not fabricate a populated cache.
 
 ```bash
-python -m models.deepseek_v4_1_flash_a3.decode_fwd --network \
+python -m models.deepseek_v4_1_flash_a3.decode_network \
   --dp 4 --tp 4 --ep 16 --plan-only
 python -m models.deepseek_v4_1_flash_a3.decode_network \
   --checkpoint weights/deepseek-v4.1-flash-w8a8 \

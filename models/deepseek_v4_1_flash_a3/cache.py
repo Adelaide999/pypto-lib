@@ -246,7 +246,7 @@ def resolve_layer_role(layer_id, role=None):
     return dict(expected)
 
 
-def validate_live_state(role, original, live, epoch, token_map_id):
+def validate_live_state(role, original, live, epoch, token_map_id, *, candidate_check=None):
     """Reject stale selections and missing actual arenas before any layer mutation."""
     if role["engram_slot"] is not None:
         prepared = live.get("network_engram")
@@ -286,9 +286,12 @@ def validate_live_state(role, original, live, epoch, token_map_id):
             if tuple(live["versions"].get(name, ())) != (owner, epoch, token_map_id):
                 raise ValueError("Missing or stale live " + name + " ownership for this token map")
     if role["candidate_filter"]:
-        validate_live_refresh_candidates(
-            original, live["shared"], role["kv_source"], packed_requests=live.get("packed_requests", False)
-        )
+        if candidate_check is None:
+            validate_live_refresh_candidates(
+                original, live["shared"], role["kv_source"], packed_requests=live.get("packed_requests", False)
+            )
+        else:
+            candidate_check(original, live["shared"], role["kv_source"])
 
 
 def publish_live_versions(role, live, epoch, token_map_id):
