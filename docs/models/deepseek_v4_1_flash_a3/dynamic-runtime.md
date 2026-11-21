@@ -74,7 +74,7 @@ committed after all forty layers and the required output head complete. A
 device execution or reset failure invalidates the session; close it rather
 than replaying a possibly partially written batch.
 
-`prefill_fwd.prefill_batch` starts the session, and
+`staged_prefill.prefill_batch` starts the session, and
 `GenerationSession.advance_batch` continues it. For example, with a checkpoint
 and a measured `budget` dictionary:
 

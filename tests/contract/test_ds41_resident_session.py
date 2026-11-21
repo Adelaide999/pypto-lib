@@ -24,7 +24,7 @@ from safetensors.torch import save_file
 
 from models.deepseek_v4_1_flash_a3.cache import decode_cache_views
 from models.deepseek_v4_1_flash_a3.prefill_prepare import PackedTokenChunkInputs, TokenChunkInputs, cache_templates
-from models.deepseek_v4_1_flash_a3.prefill_resident import ResidentNetworkRuntime
+from models.deepseek_v4_1_flash_a3.prefill_resident import ResidentNetworkRuntime, _device_view
 from models.deepseek_v4_1_flash_a3.runtime_config import ExpertParallelConfig
 from models.deepseek_v4_1_flash_a3.weights import ResidentCheckpointOperands
 
@@ -72,11 +72,77 @@ def test_static_views_and_cache_aliases_keep_their_owner_and_reject_overruns():
         assert view.data_ptr == source.data_ptr
         assert view.buffer is source.buffer
         assert view.byte_offset == 16
+        nested = _device_view(view, value[6:8], base_offset=16)
+        assert nested.buffer is source.buffer
+        assert nested.data_ptr == source.data_ptr + 8
+        assert nested.byte_offset == 24
+        with pytest.raises(ValueError, match="exceeds"):
+            _device_view(view, value[11:14], base_offset=16)
         with pytest.raises(ValueError, match="exceeds"):
             decode_cache_views({"source": source}, {"decode": ("source", (9,))})
         with pytest.raises(ValueError, match="exceeds"):
             decode_cache_views({"source": source}, {"decode": ("source", (-1,))})
     assert worker.closed
+
+
+def test_decode_replay_updates_token_and_compressed_slots_in_place():
+    from models.deepseek_v4_1_flash_a3.decode_replay_inputs import Binding, DecodeReplayInputs
+    from models.deepseek_v4_1_flash_a3.prefill_prepare import build_chunk_metadata
+
+    rank, layer, capacity = 0, 2, 16
+    template = cache_templates({}, world=1)[0]
+    pages = [list(range(1 + i * 65, 66 + i * 65)) for i, _ in enumerate(template["groups"])]
+    plan = DecodeReplayInputs(rank)
+    bindings = {}
+    for name, dtype, shape in (("long_slots", torch.int64, (16, 2)), ("source_positions", torch.int64, (16,)),
+                               ("cache_length", torch.int64, (1,)), ("full_ids", torch.int64, (16,)),
+                               ("tp_signal", torch.int64, (1,))):
+        key = Binding(name, 0 if name == "full_ids" else 5 if name == "tp_signal" else layer, dtype, shape)
+        plan.reserve(key)
+        bindings[name] = key
+    pointer = None
+    for step, pos in enumerate((8191, 8192, 8193)):
+        token = 20 + step
+        data = build_chunk_metadata(template, template["layout"], pages, tokens=[token], context=pos,
+                                    tp_rank=0, active=True, reserved=5000)
+        row = dict(positions=data["positions"], actual_local_query_rows=1, full_input_ids=torch.tensor([token]),
+                   role=dict(kv_source=layer, ratio=2), cache_metadata=dict(actual_metadata=data["metadata"]))
+        provider = SimpleNamespace(capacity=capacity, topology={"tp": 4},
+                                   batch_for_layer=lambda layer: {"cases": {"fresh": [row]}})
+        payload = plan.update(provider, {"DP_engines": [{"requests": [{"live_token_mask": [1]}]}]},
+                              {"cases": {"fresh": [{}]}}, step * 100, step * 40, 5001)
+        if pointer is None:
+            pointer = payload.data_ptr()
+        assert payload.data_ptr() == pointer
+        values = {field: plan.views[key] for field, key in bindings.items()}
+        expected = data["metadata"][f"model.layers.{layer}.self_attn.long_kv_cache"]["global_metadata"]
+        assert torch.equal(values["long_slots"][0], expected["slot_mapping"][0])
+        assert (values["long_slots"][1:] == -1).all()
+        assert values["source_positions"][0] == (pos - 1 if pos % 2 else 0)
+        assert values["cache_length"].item() == (pos + 1) // 2
+        assert values["full_ids"][0] == token
+        assert values["tp_signal"].item() == step * 100 + 5
+
+
+def test_decode_router_rows_keep_their_device_owner_across_layer_boundaries():
+    from models.deepseek_v4_1_flash_a3.network import NetworkExecutor
+    from models.deepseek_v4_1_flash_a3.resident_decode import ResidentDecodeGraph
+
+    worker = HostWorker()
+    with ResidentNetworkRuntime([0], dict(dp=1, tp=1, ep=1), worker_factory=lambda rank: worker,
+                                device_fill=lambda ptr, size, byte, rank: ctypes.memset(ptr, byte, size)) as runtime:
+        graph = SimpleNamespace(routes={}, runtime=runtime)
+        executor = SimpleNamespace(resident=runtime, activation_banks={})
+        first = ResidentDecodeGraph.route_ids(graph, 0, 16)
+        handle = runtime.tensor(first, 0)
+        runtime.recording = graph
+        NetworkExecutor.retain_boundaries(executor, [{}], [{}])
+        second = ResidentDecodeGraph.route_ids(graph, 0, 16)
+        following = runtime.tensor(second, 0)
+        assert following.buffer is handle.buffer
+        assert following.data_ptr == handle.data_ptr + first.nbytes
+        assert runtime.tensor(first, 0).data_ptr == handle.data_ptr
+        runtime.recording = None
 
 
 def test_dispatch_reuses_dynamic_buffers_and_never_reuploads_static_or_cache_views():

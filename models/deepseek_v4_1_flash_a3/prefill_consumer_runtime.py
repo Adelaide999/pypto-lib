@@ -126,7 +126,11 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
             [selected, lengths, shared["topk_indices"], shared["topk_lengths"], query_rows],
             dict(indices=shared["topk_indices"], lengths=shared["topk_lengths"]), "index_select")
     else:
-        source_selected = pad(shared["topk_indices"][:query_rows], -1)
+        if state.get("runtime", {}).get("decode_graph") is not None:
+            # Only active rows are read. Bind the current index writer's device buffer directly.
+            source_selected = shared["topk_indices"][:capacity]
+        else:
+            source_selected = pad(shared["topk_indices"][:query_rows], -1)
         selected = torch.full((capacity, 512), -1, dtype=torch.int32)
         lengths = torch.zeros((capacity, 1), dtype=torch.int32)
         compressed = torch.full((capacity, 512), -1, dtype=torch.int32)
@@ -139,8 +143,12 @@ def run_consumer_attention(state, query, operands, execute, rank, case,
                 "compressed_attention")
     context = allocate_runtime_tensor(state.get("runtime", {}), (capacity, 32768), torch.bfloat16, rank)
     if network is not None:
-        controls = read_runtime_control(state.get("runtime", {}), indices[:query_rows], rank)
-        validate_network_sparse_indices(controls, original, network, query_rows)
+        graph = state.get("runtime", {}).get("decode_graph")
+        if graph is None:
+            controls = read_runtime_control(state.get("runtime", {}), indices[:query_rows], rank)
+            validate_network_sparse_indices(controls, original, network, query_rows)
+        else:
+            graph.sparse(indices, original, network, query_rows, rank)
         execute("network_compressed_attention", rank, case,
                 [query, indices, operands["sink"], source_cache, cache, context, query_rows],
                 dict(context=context), ("swa", "compressed_attention"))

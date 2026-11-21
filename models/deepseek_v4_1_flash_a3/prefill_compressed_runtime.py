@@ -332,8 +332,12 @@ def run_compressed_attention(
     indices = selection["indices"]
     context = zeros(capacity, 32768)
     if network is not None:
-        controls = read_runtime_control(state.get("runtime", {}), indices[:query_rows], rank)
-        validate_network_sparse_indices(controls, original, network, query_rows)
+        graph = state.get("runtime", {}).get("decode_graph")
+        if graph is None:
+            controls = read_runtime_control(state.get("runtime", {}), indices[:query_rows], rank)
+            validate_network_sparse_indices(controls, original, network, query_rows)
+        else:
+            graph.sparse(indices, original, network, query_rows, rank)
         execute(
             "network_compressed_attention",
             rank,

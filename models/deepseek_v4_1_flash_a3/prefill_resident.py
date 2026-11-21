@@ -43,7 +43,7 @@ def _device_view(allocation, value, base_offset=0):
     if offset + value.numel() * value.element_size() > allocation.nbytes:
         raise ValueError("Resident tensor view exceeds its allocation")
     return DeviceTensor(allocation.data_ptr + offset, value.shape, value.dtype,
-                        buffer=allocation.buffer, byte_offset=offset)
+                        buffer=allocation.buffer, byte_offset=allocation.byte_offset + offset)
 
 
 class _RankBatch:
@@ -307,6 +307,8 @@ class ResidentNetworkRuntime:
         self.device_active = {}
         self._aliases_by_buffer = {}
         self.rotations = {}
+        self._expert_mesh = None
+        self.decode_graph = self.recording = None
         self.programs = {}
         self.static_parameters = {}
         self.parameter_abis = {}
@@ -647,6 +649,15 @@ class ResidentNetworkRuntime:
         self.stats["device_weight_upload_calls"] += 1
         return self.retain_alias(view)
 
+    def expert_mesh(self, directory):
+        """Bind the generation's single-token EP16 graph on first Decode."""
+        from .resident_mesh import ResidentExpertMesh
+
+        if self._expert_mesh is None:
+            self._expert_mesh = ResidentExpertMesh(self, directory)
+            self._stack.callback(self._expert_mesh.close)
+        return self._expert_mesh
+
     def staging_worker(self, rank):
         """Create a separate public worker whose buffers never alias resident allocations."""
         if self._closed:
@@ -703,6 +714,9 @@ class ResidentNetworkRuntime:
                     raise ValueError("A compiled entry writes an immutable resident weight")
                 owner["device_written"] = True
             bound.append(self._view(owner["allocation"], value, owner.get("base_offset", 0)))
+        if self.recording is not None:
+            self.recording.stage(rank, compiled, bound, abi["effective_directions"])
+            return
         started = perf_counter()
         capture, call_config = self.profiling.prepare_call(compiled, rank, staged, bound, abi["params"],
                                                          empty_capture=empty_capture, ring_heap=self.ring_heap)
@@ -827,7 +841,10 @@ class ResidentNetworkRuntime:
                 if owner["readonly"] or owner["name"].startswith("raw/") or owner.get("device_written"):
                     raise ValueError("A device-owned allocation changed on the host: " + owner["name"])
                 copy = owner["host"]
-                self._copy(self.workers[rank], owner["allocation"].data_ptr, copy.data_ptr(), copy.numel(), 1)
+                if self.recording is not None:
+                    self.recording.initialize(rank, owner["allocation"], copy)
+                else:
+                    self._copy(self.workers[rank], owner["allocation"].data_ptr, copy.data_ptr(), copy.numel(), 1)
                 self._record_transfer(rank, "h2d_bytes", copy.numel())
                 owner["versions"] = {index: (tensor, tensor._version)
                                      for index, (tensor, _) in owner["versions"].items()}
@@ -838,21 +855,32 @@ class ResidentNetworkRuntime:
             if owner["source"]._version != owner["version"]:
                 if owner["device_written"]:
                     raise ValueError("A device activation descriptor was modified on the host")
-                self._copy(self.workers[rank], owner["allocation"].data_ptr, host.data_ptr(), host.numel(), 1)
+                if self.recording is not None:
+                    self.recording.initialize(rank, owner["allocation"], host)
+                else:
+                    self._copy(self.workers[rank], owner["allocation"].data_ptr, host.data_ptr(), host.numel(), 1)
                 self._record_transfer(rank, "h2d_bytes", host.numel())
                 owner["version"] = value._version
             return owner
         pool = self.free_values.setdefault((rank, host.numel()), [])
         if pool:
             allocation = pool.pop()
+            self.device_active[id(allocation.buffer)] = True
             if initialize:
-                self._copy(self.workers[rank], allocation.data_ptr, host.data_ptr(), host.numel(), 1)
+                if self.recording is not None:
+                    self.recording.initialize(rank, allocation, host)
+                else:
+                    self._copy(self.workers[rank], allocation.data_ptr, host.data_ptr(), host.numel(), 1)
         else:
-            allocation = self.workers[rank].alloc_tensor(host.shape, host.dtype, init=host if initialize else None)
+            allocation = self.workers[rank].alloc_tensor(host.shape, host.dtype,
+                init=host if initialize and self.recording is None else None)
             self.allocations[rank].append(allocation)
             self.device_owners[id(allocation.buffer)] = rank
             self.device_readonly[id(allocation.buffer)] = False
             self.stats["dynamic_allocations"] += 1
+            if initialize and self.recording is not None:
+                self.device_active[id(allocation.buffer)] = True
+                self.recording.initialize(rank, allocation, host)
         self.device_active[id(allocation.buffer)] = True
         if initialize:
             self._record_transfer(rank, "h2d_bytes", host.numel())
@@ -897,7 +925,10 @@ class ResidentNetworkRuntime:
                 owner["workspace"] = True
             allocation = owner["allocation"]
             if fill is not None:
-                self._device_fill(allocation.data_ptr, allocation.nbytes, 0 if fill == 0 else 255, rank)
+                if self.recording is not None:
+                    self.recording.fill(rank, allocation, 0 if fill == 0 else 255)
+                else:
+                    self._device_fill(allocation.data_ptr, allocation.nbytes, 0 if fill == 0 else 255, rank)
                 owner["device_written"] = True
                 self._record_transfer(rank, "workspace_fill_bytes", allocation.nbytes)
             self._record_transfer(rank, "workspace_requests", 1)
@@ -914,6 +945,8 @@ class ResidentNetworkRuntime:
         """Copy an explicitly requested host boundary without changing device authority."""
         if self._closed:
             raise RuntimeError("Resident runtime is closed")
+        if self.recording is not None and not self.recording.executed:
+            raise RuntimeError("Decode attempted a host read before its distributed graph completed")
         self._select(rank)
         key = rank, value.untyped_storage()._cdata
         if key not in self.values and key not in self.pinned:
@@ -982,7 +1015,10 @@ class ResidentNetworkRuntime:
         source_owner = self._value_owner(source, rank)
         target = _device_view(destination_owner["allocation"], destination, destination_owner.get("base_offset", 0))
         value = _device_view(source_owner["allocation"], source, source_owner.get("base_offset", 0))
-        self._device_copy(target.data_ptr, value.data_ptr, value.nbytes, rank)
+        if self.recording is not None:
+            self.recording.copy(rank, target, value)
+        else:
+            self._device_copy(target.data_ptr, value.data_ptr, value.nbytes, rank)
         self._record_transfer(rank, "d2d_bytes", value.nbytes)
         key = rank, destination.untyped_storage()._cdata
         owner = self.pinned.get(key, self.values.get(key))

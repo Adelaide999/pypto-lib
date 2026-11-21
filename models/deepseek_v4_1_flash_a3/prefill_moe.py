@@ -1043,6 +1043,23 @@ def _make_shared_moe_partition(
     channel_dtype = fused_channel_dtype if fused_activation else pl.FP32
     dequant_down = _shared_make_dequantize(capacity, hidden, channel_dtype=channel_dtype, reuse_workers=wide_prefill)
 
+    if fused_activation:
+        activate_quantized = activate
+    else:
+        @pl.jit.inline
+        def activate_quantized(
+            accumulator: pl.Tensor[[capacity, gate_up_width], pl.INT32],
+            channels: pl.Tensor[[gate_up_width], pl.FP32],
+            scales: pl.Tensor[[capacity, 8], pl.FP32],
+            payload: pl.Tensor[[capacity, intermediate], pl.INT8],
+            output_scale: pl.Tensor[[capacity, 8], pl.FP32],
+            active: pl.Scalar[pl.INT32],
+        ):
+            activation = pl.create_tensor([capacity, intermediate], dtype=activation_dtype)
+            activate(accumulator, channels, scales, activation, active)
+            quant_hidden(activation, payload, output_scale, active)
+            return payload, output_scale
+
     @pl.jit.inline
     def shared_moe_partition(
         x_payload: pl.Tensor[[capacity, hidden], pl.INT8],
@@ -1058,12 +1075,7 @@ def _make_shared_moe_partition(
         dot_gate_up(x_payload, gate_up_weight, gate_up_acc, active)
         hidden_payload = pl.create_tensor([capacity, intermediate], dtype=pl.INT8)
         hidden_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
-        if fused_activation:
-            activate(gate_up_acc, gate_up_scale, x_scale, hidden_payload, hidden_scale, active)
-        else:
-            activation = pl.create_tensor([capacity, intermediate], dtype=activation_dtype)
-            activate(gate_up_acc, gate_up_scale, x_scale, activation, active)
-            quant_hidden(activation, hidden_payload, hidden_scale, active)
+        activate_quantized(gate_up_acc, gate_up_scale, x_scale, hidden_payload, hidden_scale, active)
         down_acc = pl.create_tensor([capacity, hidden], dtype=pl.INT32)
         dot_down(hidden_payload, down_weight, down_acc, active)
         dequant_down(down_acc, down_scale, hidden_scale, output, active)

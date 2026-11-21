@@ -1,58 +1,76 @@
 # DeepSeek V4.1 Flash A3
 
-A3 Eco-Tech W8A8 operators, the complete 40-layer Prefill composition and
-persistent generation session, plus bounded and full 40-layer Decode paths.
-Decode compositions use the `decode_` prefix and share the existing operator
-owners for linear algebra, quantization, normalization, RoPE and cache operations.
+The default text-generation path runs two handwritten PyPTO programs on 16 A3
+devices (DP4, TP4, EP16). Each program owns its layer schedule and calls the
+phase-specific operators in `operators/`. One request runs in one TP group.
+All sixteen ranks participate in expert communication.
 
-- `prefill_fwd.prefill_fwd`: embedding, all 40 layers and vocabulary head.
-- `prefill_fwd.compile_prefill`: reusable compilation from request/cache geometry.
-- `network.py`: shared TP4 program registry, layer execution and generation session.
-- `resident_weights.py`: one static weight owner and per-logical-weight audit.
-- `generate.py`: DP4/TP4/EP16 Prefill followed by one-token Decode on the same workers.
-- `prefill_layer.py`: concurrent rank stages and bounded MoE slabs of up to 16 rows.
-- `prefill_resident.py`: persistent compute queues, device activations and HCCL transfers.
-- `decode_layer.py`: full-width Decode layer dispatch and SWA/Engram layer bodies.
-- `decode_swa.py`, `decode_c1a.py`, `decode_c2a.py`: Decode attention compositions.
-- `decode_moe_ep.py`: full-width expert-parallel dispatch and rank composition.
-- `decode_fwd.py --network` / `decode_network.py`: host-scheduled 40-layer
-  DP4/TP4/EP16 Decode with resident weights, persistent state, Engram stages and the
-  vocabulary head.
-- Intermediate activations stay in device storage across stages and layers;
-  HCCL exchanges use device pointers. Decode reuses one boundary, Prefill two.
-  Integer controls and final logits remain explicit host readbacks.
-- `prefill_moe.py` / `decode_moe.py`: phase routing, dispatch, shared experts,
-  Torch goldens and standalone validation.
-- `grouped_moe.py`: blocked-INT8 grouped experts for the resident generation network.
-- `expert_routed.py`: legacy NZ experts for bounded Decode compositions.
+| | Prefill | Decode |
+| --- | --- | --- |
+| Distributed entry | `prefill_fwd.l3_prefill_fwd` binds rank-local slices and communication windows | `decode_fwd.l3_decode_fwd` binds Decode views, valid counts and windows |
+| Per-rank schedule | `l2_prefill_fwd` iterates the requested layer range, normally 0 through 39 | `l2_decode_fwd` runs `decode_encoder` (0–19) and `decode_decoder` (20–39) |
+| Attention | Explicit modes 0–5 select SWA, C2A full, C2A reuse, C1A reindex across history, C1A reindex using candidates, and C1A reuse | The encoder and decoder call Decode-specific SWA, C2A and C1A kernels |
+| MoE | Each round admits 64 or 128 rows per TP rank, as selected at compile time. The graph routes to EP16, synchronizes dispatch and combine, and reuses its temporary slabs across rounds and layers | Graph-local expert dispatch and combine use the Decode valid counts and resident expert weights |
+| Input | Prepared embedding and Engram rows, positions, page tables, weights and typed cache tensors | Hidden and pre-mix rows, metadata, weights and views of the same caches. Single-request generation compiles a 16-row input allocation per active rank. The general Decode artifact has 80 rows |
 
-Historical regression runners, replay/capture paths and task admission tooling
-are removed. Operator files retain Torch goldens and standard validation
-entries. Arithmetic, rounding and cache semantics are preserved.
+The L3 signatures expose 87 tensor parameters for Prefill and 74 for Decode.
+Each phase has its own rank loop. Each rank owns 24 routed experts. Both
+phases share the W8A8 checkpoint bank and seven mutable allocations per rank:
+window KV payload and scales, compressed KV payload and scales, index payload
+and scales, and compressor state. Decode flattens the source and page axes as
+views of the Prefill allocations. The final active Prefill row supplies the
+first generated token. Each subsequent token takes one Decode call.
 
-See the [model documentation](../../docs/models/deepseek_v4_1_flash_a3/index.md),
-[Decode scope](../../docs/models/deepseek_v4_1_flash_a3/decode.md) and
-[module owners](MODULE_ALIGNMENT.md) for configuration, usage and current limits.
+## Compile and run
 
-The [native vLLM-Ascend accuracy workflow](../../docs/models/deepseek_v4_1_flash_a3/accuracy.md)
-uses fixed TP4/DP4/EP16 prompt/Decode traces and compares full-vocabulary logits,
-Top1 and TopK through the repository's `tools/` entries.
+From the repository root, compile into fresh directories. Prefill capacity
+must be a multiple of 16 in 16..8192. Both phases need the same history
+capacity, including reserved output positions.
 
-Generation defaults to 128-token Prefill chunks and accepts chunks up to 8192;
-Decode retains capacity 16. The context limit is 16384 tokens, including
-reserved output positions. For batch size 1, 8192 input tokens and eight output
-tokens, use `--tokens-file prompt-8192.json --chunk-size 8192 --max-new-tokens 8 --ignore-eos`
-on 16 allocated devices. The JSON file contains the prompt token
-ID array. This executes one Prefill chunk followed by seven Decode steps with
-the fixed DP4/TP4/EP16 topology.
-Timing reports separate weight initialization, Prefill, Decode and first-token
-wall time. Execution-only performance runs do not establish numerical accuracy.
+```bash
+model=models.deepseek_v4_1_flash_a3
+python -m "$model.prefill_fwd" --compile-only --capacity 128 \
+  --context-capacity 256 --output "$GRAPH_DIR/prefill"
+python -m "$model.decode_fwd" --compile-only \
+  --context-capacity 256 --output "$GRAPH_DIR/decode"
+```
 
-Add `--enable-chip-swimlane 1 --profile-phase all` to `generate.py` to capture
-the complete network's device dispatches. Capture is disabled by default;
-`--profile-phase prefill` or `decode` selects one phase, and level `4` records
-detailed scheduler information. Raw traces and conversion commands are saved
-under `OUTPUT/profiling/<phase>/chunk-*/rank-*/call-*`, independently for each
-logical rank and invocation. Use `--profile-output` to choose a fresh directory.
-See [network profiling](../../docs/models/deepseek_v4_1_flash_a3/index.md#network-profiling)
-for configuration, offline Perfetto conversion and timing scope.
+Run generation in a 16-device allocation. The driver checks the artifact
+manifests, loads the checkpoint once per session, and prepares the tensor
+inputs for each call.
+
+```bash
+python -m "$model.generate" --checkpoint "$CHECKPOINT" --devices "$TASK_DEVICE" \
+  --graph-dir "$GRAPH_DIR" --tokens 42,43 --max-new-tokens 2 --ignore-eos \
+  --output "$RUN_DIR"
+```
+
+Use `--prompt` for text or `--tokens-file` for a JSON array of token IDs.
+Omit `--graph-dir` to compile both phases under a fresh `--output` directory.
+Generation builds both programs with startup communication-window reservation. It
+acquires the two 16-rank domains after loading the checkpoint and reports their
+times in `window_reservation_seconds`. The first request then uses the retained
+windows. For reusable generation artifacts, add `--prepare-windows` to both
+`--compile-only` commands. Standalone compilation defaults to the tensor-only ABI.
+`generation/tokens.json` holds the generated IDs. `--dump-logits` saves the
+vocabulary vector for each emitted token.
+
+For the bundled 8192-token replay, build Prefill with `--capacity 8192`
+and `--prefill-moe-slab-rows 128`, Decode with `--decode-capacity 16`, and both
+programs with `--context-capacity 8200`. Run the compiled pair with
+
+```bash
+python -m "$model.prefill_fwd" --checkpoint "$CHECKPOINT" --devices "$TASK_DEVICE" \
+  --runtime-dir "$GRAPH_DIR/prefill" --decode-runtime-dir "$GRAPH_DIR/decode" \
+  --input-ids-json models/deepseek_v4_1_flash_a3/validation_data/input_ids.json \
+  --prefill-moe-slab-rows 128 --chunk-size 8192 --max-new-tokens 8 --ignore-eos --output "$RUN_DIR"
+```
+
+## Staged session
+
+Use `generate --staged-network` for the host-scheduled session. Packed batches,
+all-position logits, a 16-row Prefill MoE slab and staged chip profiling also
+select this path. Its JSON entry is `staged_prefill --config FILE`. The
+standalone staged Decode and bounded SWA entries are `decode_network` and
+`bounded_decode`. See the [ownership map](MODULE_ALIGNMENT.md) and the
+[staged session documentation](../../docs/models/deepseek_v4_1_flash_a3/index.md).

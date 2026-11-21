@@ -721,12 +721,16 @@ class NetworkCacheProvider:
     def observe_layer(self, layer_id, result):
         """Record completed core calls and preserve cross-layer allocation ownership."""
         _require(
-            self._chunk is not None and layer_id == len(self._completed_layers),
-            "Network completion must follow original physical order",
-        )
-        _require(
             {"hidden", "pre_mix", "states"} <= set(result),
             "The complete core did not return its required outputs",
+        )
+        self.observe_completed_layer(layer_id)
+
+    def observe_completed_layer(self, layer_id):
+        """Commit a completed single-layer or fused graph publication."""
+        _require(
+            self._chunk is not None and layer_id == len(self._completed_layers),
+            "Network completion must follow original physical order",
         )
         role = resolve_layer_role(layer_id)
         for rank in range(self.topology["ep"]):

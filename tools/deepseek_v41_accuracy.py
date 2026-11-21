@@ -179,7 +179,7 @@ def save_case(root, case, logits, vocabulary, **metadata):
 
 def capture_pypto(spec, cases_path, output, *, chunk_size=16):
     from models.deepseek_v4_1_flash_a3.decode_network import DecodeNetwork
-    from models.deepseek_v4_1_flash_a3.prefill_fwd import prefill_fwd
+    from models.deepseek_v4_1_flash_a3.staged_prefill import prefill_fwd
     from models.deepseek_v4_1_flash_a3.prefill_prepare import checkpoint_cache
     from models.deepseek_v4_1_flash_a3.runtime_config import prefill_execution_capacity
     from models.deepseek_v4_1_flash_a3.runtime_config import configure_devices

@@ -197,11 +197,13 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 raise ValueError("Layer descriptors require CPU shape and storage metadata")
             live = cache_state[rank][case]
             checked_live = live
-            if role["candidate_filter"]:
+            graph = runtime.get("decode_graph")
+            if role["candidate_filter"] and graph is None:
                 active = original["actual_local_query_rows"]
                 candidates = read_runtime_control(runtime, live["shared"]["candidates"][:active], rank)
                 checked_live = dict(live, shared=dict(live["shared"], candidates=candidates))
-            validate_live_state(role, original, checked_live, epoch, token_map_id)
+            check = None if graph is None else lambda row, shared, source: graph.candidates(row, shared, source, rank)
+            validate_live_state(role, original, checked_live, epoch, token_map_id, candidate_check=check)
         map_ranks(validate_rank_state)
     raw, operands, expert_weights = (
         weight_provider["raw"],
@@ -530,7 +532,8 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
             normed, router_input = zeros(rank, capacity, 5120), zeros(rank, capacity, 5120, dtype=torch.float32)
             logits = zeros(rank, capacity, 384, dtype=torch.float32)
             weights = zeros(rank, capacity, 6, dtype=torch.float32)
-            ids = zeros(rank, capacity, 6, dtype=torch.int32)
+            graph = runtime.get("decode_graph")
+            ids = graph.route_ids(rank, capacity) if graph is not None else zeros(rank, capacity, 6, dtype=torch.int32)
             token_ids = pad(state["original"]["input_ids"], rank)
             gate = raw[f"{prefix}.ffn.gate.weight"].float()
             execute_region(runtime, "ffn_dispatch_l2", rank, case, [
@@ -545,7 +548,10 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                             token_ids, logits, ids, weights, routing_rows],
                  dict(logits=logits, route_ids=ids, route_weights=weights), "router"),
             ])
-            host_route_ids = read_runtime_control(runtime, ids[:state["valid"]], rank)
+            if runtime.get("decode_graph") is not None:
+                host_route_ids = None
+            else:
+                host_route_ids = read_runtime_control(runtime, ids[:state["valid"]], rank)
             state.update(changed=changed, ffn_pre=pre, ffn_post=post, ffn_comb=comb, weights=weights,
                          route_ids=ids, host_route_ids=host_route_ids, normed=normed,
                          shared=zeros(rank, capacity, 5120), output_hidden=output,
@@ -568,9 +574,18 @@ def run_prefill_layer_inmemory(role, batch, local_hidden, local_pre, cache_state
                 total=zeros(rank, MAP_PAD, dtype=torch.int32), sent=zeros(rank, packet_rows, 5120), routed=zeros(rank, slab, 5120),
                 returned_routes=allocate_runtime_tensor(runtime, (routes, 4), torch.int64, rank, fill=-1),
             )
-    map_ranks(allocate_rank_slab)
-    max_physical = max(record["SP_physical_rows"] for records in batch["cases"].values() for record in records)
-    rounds = max(1, (max_physical + slab - 1) // slab)
+    if runtime.get("resident_experts") is not None:
+        case, records = next(iter(batch["cases"].items()))
+        owner, = (rank for rank, record in enumerate(records) if record["SP_valid_rows"])
+        state = states[owner][case]
+        arguments = [state["normed"], *expert_weights(owner, None), state["shared"], state["physical"]]
+        execute("shared", owner, case, arguments, {"shared": state["shared"]}, "shared")
+        runtime["resident_experts"](states, owner, case, weight_provider["grouped_expert"])
+        rounds = 0
+    else:
+        map_ranks(allocate_rank_slab)
+        max_physical = max(record["SP_physical_rows"] for records in batch["cases"].values() for record in records)
+        rounds = max(1, (max_physical + slab - 1) // slab)
     for round_id in range(rounds):
         base = round_id * slab
         valid_by_case = {

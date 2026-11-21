@@ -12,13 +12,17 @@ from importlib import import_module
 
 
 _EXPORTS = {
-    "prefill_batch": ("prefill_fwd", "prefill_batch"),
+    "l2_prefill_fwd": ("prefill_fwd", "l2_prefill_fwd"),
+    "l3_prefill_fwd": ("prefill_fwd", "l3_prefill_fwd"),
+    "l2_decode_fwd": ("decode_fwd", "l2_decode_fwd"),
+    "l3_decode_fwd": ("decode_fwd", "l3_decode_fwd"),
+    "prefill_batch": ("staged_prefill", "prefill_batch"),
     "RuntimeLimits": ("runtime_config", "RuntimeLimits"),
     "ParallelPlan": ("runtime_config", "ParallelPlan"),
     "RequestQuery": ("metadata", "RequestQuery"),
     "RequestHandle": ("metadata", "RequestHandle"),
     "RequestLedger": ("metadata", "RequestLedger"),
-    "run_prefill": ("prefill_fwd", "run_prefill"),
+    "run_prefill": ("staged_prefill", "run_prefill"),
     "A2A3OperatorConfig": ("operator_config", "A2A3OperatorConfig"),
     "A2A3_DTYPE_CONTRACT": ("operator_config", "A2A3_DTYPE_CONTRACT"),
     "make_candidate_block_pool": ("indexer", "make_candidate_block_pool"),
@@ -68,9 +72,9 @@ _EXPORTS = {
     "flatten_scale": ("weights", "flatten_scale"),
     "load_attention_weights": ("weights", "load_attention_weights"),
     "load_decoder_layer_weights": ("weights", "load_decoder_layer_weights"),
-    "compile_prefill": ("prefill_fwd", "compile_prefill"),
-    "make_decode_step": ("decode_fwd", "make_decode_step"),
-    "validate_decode_contract": ("decode_fwd", "validate_decode_contract"),
+    "compile_prefill": ("staged_prefill", "compile_prefill"),
+    "make_decode_step": ("bounded_decode", "make_decode_step"),
+    "validate_decode_contract": ("bounded_decode", "validate_decode_contract"),
 }
 
 
