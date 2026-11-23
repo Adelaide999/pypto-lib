@@ -39,13 +39,16 @@ N_HASH_LAYERS = 0
 
 # tiling
 GATE_INPUT_TILE = 4
-# Dense Prefill slabs use one 32-row panel per gate worker.  Combining it with
-# a 64-expert panel keeps the Acc/Mat buffers within the A3 per-core limits.
-# Decode capacity 16 keeps the 16-row MoE buffer ABI; larger slabs use 32-row gate panels.
-GATE_M_TILE = 32 if T >= 32 else 16
+# Dense Prefill slabs use one 64-row panel per gate worker.  The 64-row
+# panel was the best A3 gate shape in the single-card sweep while retaining
+# the 16-row capacity ABI for decode-sized slabs.
+GATE_M_TILE = 64 if T >= 64 else 32 if T >= 32 else 16
 GATE_N_TILE = 64 if T >= 64 else 16
 ROUTE_SELECT_T_TILE = 16
 ROUTE_SELECT_WORKERS = 48
+GATE_INPUT_WORKERS = 40
+GATE_QUANT_WORKERS = 48
+GATE_WORKERS = 48
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 # The 256-wide K tile halves the number of Cube launches for the 5120-wide gate.
 GATE_D_TILE = 256
@@ -140,21 +143,28 @@ def gate_normalized(
 
     quantized, quant_scale = quantize_activation(x_normed, num_tokens, D)
     scale_view = pl.reshape(x_norm_scale, [T_PAD, 1])
-    for block in pl.spmd(T_PAD // 16, name_hint="gate_quant_copy"):
-        row = block * 16
-        codes = pl.load(quantized, [row, 0], [16, D])
-        x_norm_mx = pl.store(codes, [row, 0], x_norm_mx)
-        factor = pl.load(quant_scale, [row, 0], [16, 1])
-        scale_view = pl.store(factor, [row, 0], scale_view)
-
+    quant_blocks = T_PAD // 16
+    quant_workers = pl.min(quant_blocks, GATE_QUANT_WORKERS)
+    for worker in pl.spmd(quant_workers, name_hint="gate_quant_copy"):
+        for block in pl.range(worker, quant_blocks, quant_workers):
+            row = block * 16
+            codes = pl.load(quantized, [row, 0], [16, D])
+            x_norm_mx = pl.store(codes, [row, 0], x_norm_mx)
+            factor = pl.load(quant_scale, [row, 0], [16, 1])
+            scale_view = pl.store(factor, [row, 0], scale_view)
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
-    for block in pl.spmd(T_PAD // GATE_INPUT_TILE, name_hint="gate_normalized_input"):
-        t0 = block * GATE_INPUT_TILE
-        valid_rows = pl.min(GATE_INPUT_TILE, pl.max(active_tokens - t0, 0))
-        normalized = pl.slice(x_normed, [GATE_INPUT_TILE, D], [t0, 0], valid_shape=[valid_rows, D])
-        normalized = pl.fillpad(normalized, pad_value=pl.PadValue.zero)
-        normalized = pl.set_validshape(normalized, GATE_INPUT_TILE, D)
-        xg_buf[t0 : t0 + GATE_INPUT_TILE, :] = pl.cast(normalized, pl.FP32)
+    input_rows = pl.max(active_tokens, pl.cast(1, pl.INDEX))
+    input_rows = (input_rows + GATE_M_TILE - 1) // GATE_M_TILE * GATE_M_TILE
+    input_blocks = input_rows // GATE_INPUT_TILE
+    input_workers = pl.min(input_blocks, GATE_INPUT_WORKERS)
+    for worker in pl.spmd(input_workers, name_hint="gate_normalized_input"):
+        for block in pl.range(worker, input_blocks, input_workers):
+            t0 = block * GATE_INPUT_TILE
+            valid_rows = pl.min(GATE_INPUT_TILE, pl.max(active_tokens - t0, 0))
+            normalized = pl.slice(x_normed, [GATE_INPUT_TILE, D], [t0, 0], valid_shape=[valid_rows, D])
+            normalized = pl.fillpad(normalized, pad_value=pl.PadValue.zero)
+            normalized = pl.set_validshape(normalized, GATE_INPUT_TILE, D)
+            xg_buf[t0 : t0 + GATE_INPUT_TILE, :] = pl.cast(normalized, pl.FP32)
 
     return gate_from_fp32(
         xg_buf, gate_w, gate_bias, num_tokens, indices, weights,
@@ -196,7 +206,7 @@ def gate_from_fp32(
     # Reserve the available clusters before any local Cube-to-Vector transfer.
     gate_bias_matrix = pl.reshape(gate_bias, [1, N_EXPERTS])
     gate_tasks = task_gate_tiles * ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
-    gate_workers = pl.min(gate_tasks, pl.system.available_cluster_count())
+    gate_workers = pl.min(gate_tasks, pl.min(GATE_WORKERS, pl.system.available_cluster_count()))
     for gate_worker in pl.spmd(gate_workers, name_hint="gate"):
         # The gate matrix is streamed once per expert tile. Bypassing L2 avoids
         # evicting the activations and routing buffers used by the following sort.
@@ -311,9 +321,11 @@ def golden_gate(tensors):
     active = int(tensors["num_tokens"])
     source = tensors["source"].clone()
     source[active:] = 0
-    tensors["codes"].copy_(golden_activation_int8(source))
+    tensors["codes"].zero_()
+    tensors["codes"][:T].copy_(golden_activation_int8(source))
     scale = (source.float().abs().amax(-1) * (1.0 / 127.0)).clamp_min(1e-30)
-    tensors["scales"].copy_(scale.reshape(1, T_PAD))
+    tensors["scales"].zero_()
+    tensors["scales"][:, :T].copy_(scale.reshape(1, T))
     tensors["indices"].zero_()
     tensors["weights"].zero_()
     if active:

@@ -112,6 +112,10 @@ def dispatch(
     send_starts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_starts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
     route_slots = pl.create_tensor([T, ROUTE_WIDTH], dtype=pl.INT32)
+    # Stage routes in destination-major order so each peer can receive a
+    # contiguous hidden and metadata range.
+    send_aux = pl.create_tensor([ROUTED_RECV_ROWS, AUX_WIDTH], dtype=pl.FP32)
+    send_totals = pl.create_tensor([N_RANKS], dtype=pl.INT32)
     meta_stage = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
     # Publish per-source route counts.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_publish", deps=[_reuse_tid], allow_early_resolve=True) as _meta_push_tid:
@@ -150,6 +154,7 @@ def dispatch(
                 dst=recv_meta, peer=dst, src=meta_stage,
                 dst_offsets=[my_rank, 0], src_offsets=[dst, 0], shape=[1, N_LOCAL],
             )
+            pl.write(send_totals, [dst], prefix)
             if dst != my_rank:
                 pld.system.notify(
                     target=arrived, peer=dst, offsets=[my_rank, 0],
@@ -181,33 +186,48 @@ def dispatch(
             pl.write(recv_count_out, [e, 1], expert_prefix)
             expert_prefix = expert_prefix + pl.cast((acc + 15) // 16 * 16, pl.INT32)
 
-    aux_stage = pl.create_tensor([T * TOPK, AUX_WIDTH], dtype=pl.FP32)
-    routes = pl.max(0, pl.min(num_tokens, T)) * TOPK
-    workers = pl.max(1, pl.min(routes, 48))
-    with pl.spmd(workers, name_hint="dispatch_push", deps=[_meta_push_tid], allow_early_resolve=False) as _push_tid:
+    active_tokens = pl.max(0, pl.min(num_tokens, T))
+    workers = pl.max(1, pl.min(active_tokens, 48))
+    with pl.spmd(workers, name_hint="dispatch_pack", deps=[_meta_push_tid], allow_early_resolve=False) as _pack_tid:
         worker = pl.tile.get_block_idx()
-        for route in pl.range(worker, routes, workers):
-            token = route // TOPK
-            choice = route % TOPK
-            eid = pl.read(indices, [token, choice])
-            dst = eid // N_LOCAL
-            slot = pl.read(route_slots, [token, choice])
-            start = pl.read(send_starts, [dst, eid % N_LOCAL])
-            row = my_rank * (T * TOPK) + start + slot
-            weight = pl.read(weights, [token, choice])
+        for token in pl.range(worker, active_tokens, workers):
+            # A token has TOPK destinations, but the quantized hidden vector
+            # is shared by all of them. Load it once and reuse the tile for
+            # each destination-major staging row.
+            source = pl.load(x_norm_mx_raw, [token, 0], [1, D])
             factor = pl.read(x_norm_scale, [0, token])
-            metadata = pl.tile.full([1, AUX_WIDTH], dtype=pl.FP32, value=0.0)
-            pl.tile.write(metadata, [0, 0], weight)
-            pl.tile.write(metadata, [0, 1], factor)
-            pl.tile.write(metadata, [0, 2], pl.cast(pl.cast(route, pl.INT32), pl.FP32))
-            pl.store(metadata, [route, 0], aux_stage)
+            for choice in pl.range(TOPK):
+                route = token * TOPK + choice
+                eid = pl.read(indices, [token, choice])
+                dst = eid // N_LOCAL
+                slot = pl.read(route_slots, [token, choice])
+                start = pl.read(send_starts, [dst, eid % N_LOCAL])
+                row = dst * (T * TOPK) + start + slot
+                weight = pl.read(weights, [token, choice])
+                metadata = pl.tile.full([1, AUX_WIDTH], dtype=pl.FP32, value=0.0)
+                pl.tile.write(metadata, [0, 0], weight)
+                pl.tile.write(metadata, [0, 1], factor)
+                pl.tile.write(metadata, [0, 2], pl.cast(pl.cast(route, pl.INT32), pl.FP32))
+                pl.store(metadata, [row, 0], send_aux)
+                pl.store(source, [row, 0], recv_x_out)
+
+    # The receiver computes the same expert prefixes from recv_meta.  One
+    # transfer per destination therefore replaces one transfer per route.
+    with pl.spmd(N_RANKS, name_hint="dispatch_push", deps=[_pack_tid], allow_early_resolve=False) as _push_tid:
+        dst = pl.tile.get_block_idx()
+        total = pl.cast(pl.read(send_totals, [dst]), pl.INDEX)
+        if total > 0:
+            source_base = pl.cast(dst * (T * TOPK), pl.INDEX)
+            destination_base = pl.cast(my_rank * (T * TOPK), pl.INDEX)
             pld.tensor.put(
-                dst=recv_x, peer=dst, src=x_norm_mx_raw,
-                dst_offsets=[row, 0], src_offsets=[token, 0], shape=[1, D],
+                dst=recv_x, peer=dst, src=recv_x_out,
+                dst_offsets=[destination_base, 0], src_offsets=[source_base, 0],
+                shape=[total, D], chunk_rows=RECV_TILE,
             )
             pld.tensor.put(
-                dst=recv_weights, peer=dst, src=aux_stage,
-                dst_offsets=[row, 0], src_offsets=[route, 0], shape=[1, AUX_WIDTH],
+                dst=recv_weights, peer=dst, src=send_aux,
+                dst_offsets=[destination_base, 0], src_offsets=[source_base, 0],
+                shape=[total, AUX_WIDTH], chunk_rows=RECV_TILE,
             )
 
     # Publish one epoch only after every local payload store completes.
@@ -263,7 +283,11 @@ def dispatch(
                             [RECV_TILE, D],
                             valid_shape=[gather_rows, D],
                         )
-                        recv_x_out = pl.store(
+                        # Keep the function argument as the backing tensor.
+                        # Rebinding it here makes the SSA value created by the
+                        # gather launch escape into the earlier bulk-push
+                        # launch, which fails LegalizeSpmdLaunches.
+                        pl.store(
                             recv_x_raw,
                             [out_row, 0],
                             recv_x_out,
@@ -314,8 +338,8 @@ def combine_scattered(
                     expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                 )
 
-    # Wait for local and peer routed-output stores. A two-row panel amortizes
-    # the 5120-wide hidden loads while retaining the compact worker schedule.
+    # Wait for local and peer routed-output stores. A two-token panel keeps the
+    # token-major routed rows contiguous while amortizing the 5120-wide loads.
     combine_blocks = (T + COMBINE_TOKEN_TILE - 1) // COMBINE_TOKEN_TILE
     with pl.spmd(combine_blocks, name_hint="combine_reduce", deps=[_cwait_tid]) as _reduce_tid:
         block = pl.tile.get_block_idx()
@@ -323,22 +347,23 @@ def combine_scattered(
         valid_rows = pl.min(COMBINE_TOKEN_TILE, pl.max(num_tokens - t0, 0))
         if valid_rows > 0:
             shared_rows = pl.load(shared_output, [t0, 0], [COMBINE_TOKEN_TILE, D])
-            acc_rows = pl.cast(shared_rows, target_type=pl.FP32)
-            for k in pl.range(TOPK):
-                routed_rows = pl.load(
-                    routed_output,
-                    [t0 * TOPK + k, 0],
-                    [COMBINE_TOKEN_TILE, D],
-                )
-                acc_rows = pl.add(acc_rows, pl.cast(routed_rows, target_type=pl.FP32))
-            ffn_rows = pl.cast(acc_rows, target_type=pl.BF16, mode="rint")
-            if valid_rows == COMBINE_TOKEN_TILE:
-                ffn_out = pl.store(ffn_rows, [t0, 0], ffn_out)
-            else:
-                for lane in pl.range(COMBINE_TOKEN_TILE):
-                    if lane < valid_rows:
-                        ffn_row = pl.tile.slice(ffn_rows, [1, D], [lane, 0])
-                        ffn_out = pl.store(ffn_row, [t0 + lane, 0], ffn_out)
+            routed_rows = pl.load(
+                routed_output,
+                [t0 * TOPK, 0],
+                [COMBINE_TOKEN_TILE * TOPK, D],
+            )
+            for lane in pl.range(COMBINE_TOKEN_TILE):
+                if lane < valid_rows:
+                    shared_row = pl.tile.slice(shared_rows, [1, D], [lane, 0])
+                    acc = pl.cast(shared_row, target_type=pl.FP32)
+                    route_base = lane * TOPK
+                    for k in pl.range(TOPK):
+                        routed_row = pl.tile.slice(
+                            routed_rows, [1, D], [route_base + k, 0],
+                        )
+                        acc = pl.add(acc, pl.cast(routed_row, target_type=pl.FP32))
+                    ffn_row = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                    ffn_out = pl.store(ffn_row, [t0 + lane, 0], ffn_out)
     # Every active row contributes TOPK routed outputs. Keep the count metadata
     # on one block so the 64-byte rows are written without dynamic-index races.
     with pl.spmd(1, name_hint="combine_counts", deps=[_reduce_tid]) as _counts_tid:
