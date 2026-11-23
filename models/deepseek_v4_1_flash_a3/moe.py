@@ -293,21 +293,29 @@ def combine_scattered(
                 )
 
     # Wait for local and peer routed-output stores.
-    with pl.spmd(T, name_hint="combine_reduce", deps=[_cwait_tid]) as _reduce_tid:
-        t = pl.tile.get_block_idx()
-        combined = pl.cast(0, pl.INT32)
-        if t < num_tokens:
-            shared_row = pl.load(shared_output, [t, 0], [1, D])
-            acc = pl.cast(shared_row, target_type=pl.FP32)
-            for k in pl.range(TOPK):
-                routed_row = pl.load(routed_output, [t * TOPK + k, 0], [1, D])
-                routed_fp32 = pl.cast(routed_row, target_type=pl.FP32)
-                acc = pl.add(acc, routed_fp32)
-                combined = combined + pl.cast(1, pl.INT32)
-            ffn_row = pl.cast(acc, target_type=pl.BF16, mode="rint")
-            ffn_out = pl.store(ffn_row, [t, 0], ffn_out)
-        pl.write(combined_counts, [t, 0], combined)
-    return _reduce_tid
+    reduce_workers = pl.max(1, pl.min(T, num_tokens))
+    with pl.spmd(reduce_workers, name_hint="combine_reduce", deps=[_cwait_tid]) as _reduce_tid:
+        worker = pl.tile.get_block_idx()
+        for t in pl.range(worker, T, reduce_workers):
+            if t < num_tokens:
+                shared_row = pl.load(shared_output, [t, 0], [1, D])
+                acc = pl.cast(shared_row, target_type=pl.FP32)
+                for k in pl.range(TOPK):
+                    routed_row = pl.load(routed_output, [t * TOPK + k, 0], [1, D])
+                    routed_fp32 = pl.cast(routed_row, target_type=pl.FP32)
+                    acc = pl.add(acc, routed_fp32)
+                ffn_row = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                ffn_out = pl.store(ffn_row, [t, 0], ffn_out)
+    # Every active row contributes TOPK routed outputs. Keep the count metadata
+    # on one block so the 64-byte rows are written without dynamic-index races.
+    with pl.spmd(1, name_hint="combine_counts", deps=[_reduce_tid]) as _counts_tid:
+        worker = pl.tile.get_block_idx()
+        for t in pl.range(worker, T, 1):
+            combined = pl.cast(0, pl.INT32)
+            if t < num_tokens:
+                combined = pl.cast(TOPK, pl.INT32)
+            pl.write(combined_counts, [t, 0], combined)
+    return _counts_tid
 
 
 @pl.jit.inline
