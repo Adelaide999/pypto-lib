@@ -504,11 +504,12 @@ def attention_tile(
 ):
     """Evaluate BF16 QK and PV products with FP32 online softmax."""
     sinks = pl.load(sink, [0, head_offset], [1, heads])
-    maximum = pl.tile.full([1, heads], dtype=pl.FP32, value=-1e30)
-    denominator = pl.tile.full([1, heads], dtype=pl.FP32, value=0.0)
     if window_only:
         maximum = pl.mul(sinks, 1.0)
         denominator = pl.tile.full([1, heads], dtype=pl.FP32, value=1.0)
+    else:
+        maximum = pl.tile.full([1, heads], dtype=pl.FP32, value=-1e30)
+        denominator = pl.tile.full([1, heads], dtype=pl.FP32, value=0.0)
     numerator = pl.tile.full([heads, HEAD_DIM], dtype=pl.FP32, value=0.0)
     reduction = pl.create_tile([heads, key_tile], dtype=pl.FP32)
     q_low = pl.load(query, [query_offset, 0], [heads, 256], target_memory=pl.MemorySpace.Mat)
@@ -593,7 +594,7 @@ def attend_window_tiled(
             head = block % head_blocks * SWA_HEAD_TILE
             q0 = token * LOCAL_H + head
             k0 = token * SWA_WINDOW
-            _swa_attention_tile(qflat, kflat, indices, sink_row, oflat, q0, k0, token, head, SWA_HEAD_TILE, SWA_WINDOW, SWA_WINDOW)
+            attention_tile(qflat, kflat, indices, sink_row, oflat, q0, k0, token, head, SWA_HEAD_TILE, SWA_WINDOW, SWA_WINDOW, True)
     return attention_done
 
 
