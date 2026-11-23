@@ -15,7 +15,7 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
 
-from .gemm import gemm_bf16_to_bf16, gemm_dynamic_int8
+from .gemm import gemm_bf16_to_bf16, gemm_dynamic_int8, prefill_gemm_int8_tiled, quantize_projection_activation
 
 import torch
 import torch.nn.functional as F
@@ -197,12 +197,12 @@ def quantize_index_query(
             reciprocal = pl.reinterpret_view(pl.shls(inverse_exponent, 23), pl.FP32)
             normalized = pl.row_expand_mul(values, reciprocal)
             magnitude = pl.minimum(pl.abs(normalized), 6.0)
-            # FP32 ULPs at 2**22, 2**23 and 2**24 are the three E2M1 spacings.
-            small_bias = pl.tile.full([INDEX_QUERY_SCALE_WIDTH, 32], dtype=pl.FP32, value=4194304.0)
-            middle = pl.tile.cmps(magnitude, 2.0, cmp_type=4)
-            bias = pl.tile.select(middle, 8388608.0, small_bias)
-            large = pl.tile.cmps(magnitude, 4.0, cmp_type=4)
-            bias = pl.tile.select(large, 16777216.0, bias)
+            # An FP32 bias with exponent 22 + floor(log2(max(x, 1))) gives
+            # the E2M1 spacing (0.5, 1, or 2) when adding and subtracting it.
+            bias_input = pl.maximum(magnitude, 1.0)
+            bias_exponent = pl.shrs(pl.reinterpret_view(bias_input, pl.INT32), 23)
+            bias_bits = pl.shls(pl.add(bias_exponent, 22), 23)
+            bias = pl.reinterpret_view(bias_bits, pl.FP32)
             biased = pl.add(magnitude, bias)
             rounded = pl.sub(biased, bias)
             sign = pl.shrs(pl.reinterpret_view(values, pl.INT32), 31)
@@ -597,9 +597,9 @@ def project_index_weights(
     ready = pl.system.task_dummy(deps=[])
     projected_result, projected_tid = gemm_bf16_to_bf16(
         x, weight, projected_weights, num_tokens, ready,
-        width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
-        workers=2147483647, name_hint="prefill_index_weights",
-        source_col=0, output_col=0, ordered=False, row_tile=16, stages=1,
+        width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=512,
+        workers=24, name_hint="prefill_index_weights",
+        source_col=0, output_col=0, ordered=False, row_tile=64, stages=2,
     )
     with pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="c1a_index_weights_scale") as weights_tid:
         block = pl.tile.get_block_idx()
@@ -629,10 +629,17 @@ def prepare_prefill_index_query(
     """Project, rotate, and quantize query rows with group-32 scales."""
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    gemm_dynamic_int8(
-        latent, query_weight, query_weight_scale, projected, num_tokens,
-        Q_LORA, INDEX_H * INDEX_DIM, "c1a_mx_projection", False, True,
-    )
+    if num_tokens >= 128:
+        payload, factor = quantize_projection_activation(latent, num_tokens, Q_LORA, True, True)
+        prefill_gemm_int8_tiled(
+            payload, factor, query_weight, query_weight_scale, projected, num_tokens,
+            Q_LORA, INDEX_QUERY_WIDTH, "c1a_mx_projection", 128, 256, False, 64,
+        )
+    else:
+        gemm_dynamic_int8(
+            latent, query_weight, query_weight_scale, projected, num_tokens,
+            Q_LORA, INDEX_QUERY_WIDTH, "c1a_mx_projection", False, True,
+        )
     if num_tokens >= 64:
         rotated = rotate_index_query(projected, cos, sin, projected, num_tokens)
     else:
@@ -1086,6 +1093,36 @@ def _select_c2a_topk(
     return selected
 
 
+@pl.jit.inline
+def _rank_paged_topk_leaf(
+    scores: pl.Tensor,
+    token: pl.Scalar[pl.INDEX],
+    begin: pl.Scalar[pl.INDEX],
+    length: pl.Scalar[pl.INDEX],
+    leaf_ids: pl.Tile[[1, LEAF], pl.INT32],
+    leaf_priority: pl.Tile[[1, LEAF], pl.INT32],
+):
+    cols = pl.min(LEAF, length - begin)
+    raw = pl.load(scores, [token, begin], [1, LEAF], valid_shape=[1, cols])
+    values = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
+    base = pl.cast(begin, pl.INT32)
+    indices = pl.add(leaf_ids, base)
+    bf16_bits = pl.shrs(pl.reinterpret_view(values, pl.INT32), 16)
+    sign = pl.shrs(bf16_bits, 15)
+    positive_rank = pl.add(bf16_bits, 32768)
+    negative_rank = pl.mul(bf16_bits, -1)
+    rank = pl.add(positive_rank, pl.mul(sign, pl.sub(positive_rank, negative_rank)))
+    priority = pl.sub(leaf_priority, base)
+    key_bits = pl.add(pl.shls(rank, TOPK_ORDER_BITS), priority)
+    finite = pl.tile.cmps(values, -1e29, cmp_type=4)
+    keys = pl.tile.select(finite, pl.reinterpret_view(key_bits, pl.FP32), 0.0)
+    pairs = pl.tile.sort32(keys, pl.reinterpret_view(indices, pl.UINT32))
+    pairs = pl.tile.mrgsort(pairs, block_len=64)
+    pairs = pl.tile.mrgsort(pairs, block_len=256)
+    pairs = pl.tile.mrgsort(pairs, block_len=1024)
+    return pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 0])
+
+
 @pl.jit.inline(auto_scope=False)
 def _select_paged_topk(
     scores: pl.Tensor,
@@ -1105,10 +1142,13 @@ def _select_paged_topk(
     width = pl.tensor.dim(scores, 1)
     table_width = pl.tensor.dim(table, 1)
     request_count = pl.tensor.dim(table, 0)
+    cached_pages = pl.min(table_width, TOPK_ORDER_WIDTH // 128)
     workers = pl.min(48, num_tokens)
     with pl.spmd(workers, name_hint="prefill_index_paged_topk", deps=[ready]) as selected:
         worker = pl.tile.get_block_idx()
         leaf_ids = pl.tile.arange(0, [1, LEAF], dtype=pl.INT32)
+        # Bias the combined score and position into the positive normal FP32 range.
+        leaf_priority = pl.add(pl.mul(leaf_ids, -1), TOPK_ORDER_WIDTH - 1 + 8388608)
         output_ids = pl.tile.arange(0, [1, INDEX_TOPK], dtype=pl.INT32)
         for token in pl.range(worker, num_tokens, workers):
             request = pl.read(requests, [token])
@@ -1128,27 +1168,9 @@ def _select_paged_topk(
                 if c2a:
                     use_scores = length > INDEX_TOPK
                 if use_scores:
-                    initial = pl.tile.full([1, TOPK_PAIR_WIDTH], dtype=pl.FP32, value=0.0)
-                    for begin, (previous,) in pl.range(0, length, LEAF, init_values=(initial,)):
-                        cols = pl.min(LEAF, length - begin)
-                        raw = pl.load(scores, [token, begin], [1, LEAF], valid_shape=[1, cols])
-                        values = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
-                        indices = pl.add(leaf_ids, pl.cast(begin, pl.INT32))
-                        bf16_bits = pl.shrs(pl.reinterpret_view(values, pl.INT32), 16)
-                        sign = pl.shrs(bf16_bits, 15)
-                        positive_rank = pl.add(bf16_bits, 32768)
-                        negative_rank = pl.mul(bf16_bits, -1)
-                        rank = pl.add(positive_rank, pl.mul(sign, pl.sub(positive_rank, negative_rank)))
-                        priority = pl.add(pl.mul(indices, -1), TOPK_ORDER_WIDTH - 1)
-                        # Bias the combined bits into the positive normal FP32 range.
-                        key_bits = pl.add(pl.shls(rank, TOPK_ORDER_BITS), pl.add(priority, 8388608))
-                        finite = pl.tile.cmps(values, -1e29, cmp_type=4)
-                        keys = pl.tile.select(finite, pl.reinterpret_view(key_bits, pl.FP32), 0.0)
-                        pairs = pl.tile.sort32(keys, pl.reinterpret_view(indices, pl.UINT32))
-                        pairs = pl.tile.mrgsort(pairs, block_len=64)
-                        pairs = pl.tile.mrgsort(pairs, block_len=256)
-                        pairs = pl.tile.mrgsort(pairs, block_len=1024)
-                        best = pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 0])
+                    initial = _rank_paged_topk_leaf(scores, token, 0, length, leaf_ids, leaf_priority)
+                    for begin, (previous,) in pl.range(LEAF, length, LEAF, init_values=(initial,)):
+                        best = _rank_paged_topk_leaf(scores, token, begin, length, leaf_ids, leaf_priority)
                         merge_tmp = pl.create_tile([1, 2 * TOPK_PAIR_WIDTH], dtype=pl.FP32)
                         merged = pl.tile.mrgsort(previous, best, tmp=merge_tmp)
                         running = pl.yield_(pl.tile.slice(merged, [1, TOPK_PAIR_WIDTH], [0, 0]))
@@ -1168,9 +1190,9 @@ def _select_paged_topk(
                     block_offsets = pl.sub(safe_ids, pl.shls(block_lanes, 3))
                     logical = pl.add(pl.shls(block_ids, 3), block_offsets)
                 page_slots = pl.shrs(logical, 7)
-                max_page_slot = pl.cast(table_width - 1, pl.INT32)
+                max_page_slot = pl.cast(cached_pages - 1, pl.INT32)
                 safe_slots = pl.minimum(pl.maximum(page_slots, 0), max_page_slot)
-                raw_pages = pl.load(table, [request, 0], [1, TOPK_ORDER_WIDTH // 128], valid_shape=[1, table_width])
+                raw_pages = pl.load(table, [request, 0], [1, TOPK_ORDER_WIDTH // 128], valid_shape=[1, cached_pages])
                 pages = pl.tile.fillpad(raw_pages, pad_value=pl.PadValue.zero)
                 page_ids = pl.tile.gather(pages, safe_slots, gather_tmp)
                 cache_limit = pl.cast(cache_pages - 1, pl.INT32)
@@ -1367,6 +1389,9 @@ def prefill_indexer(
         chunk = pl.min(active, pl.max(1, INDEX_MAX_LOGITS_BYTES // (width * 4)))
         if pool:
             chunk = pl.min(chunk, INDEX_POOL_QUERY_TILE)
+        elif linear_available and chunk < active and chunk >= INDEX_SCORE_QUERY_TILE:
+            # Align full score chunks to the paired-query tile.
+            chunk = chunk // INDEX_SCORE_QUERY_TILE * INDEX_SCORE_QUERY_TILE
         scores = pl.create_tensor([chunk, width], dtype=pl.FP32)
         for begin in pl.range(0, active, chunk):
             with pl.scope():
