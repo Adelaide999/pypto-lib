@@ -193,7 +193,7 @@ def normalize_quantize_projection_activation(
             mean = pl.mul(row_sum, 1.0 / width)
             rms_argument = pl.add(mean, eps)
             rsqrt_scratch = pl.create_tile([VEC_M_TILE, 1], dtype=pl.FP32)
-            inverse_rms = pl.tile.rsqrt(rms_argument, tmp=rsqrt_scratch)
+            inverse_rms = pl.tile.rsqrt(rms_argument, tmp=rsqrt_scratch, high_precision=True)
             normalized_fp32 = pl.row_expand_mul(value, inverse_rms)
             gamma = pl.cast(pl.load(weight_row, [0, 0], [1, width]), pl.FP32)
             weighted = pl.col_expand_mul(normalized_fp32, gamma)

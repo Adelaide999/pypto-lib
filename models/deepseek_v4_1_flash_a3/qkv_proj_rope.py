@@ -43,6 +43,70 @@ normalize_kv = make_blocked_rmsnorm(T_DYN, HEAD_DIM, EPS, dynamic_rows=True)
 
 
 @pl.jit.inline(auto_scope=False)
+def normalize_rope_kv(
+    source: pl.Tensor,
+    norm_weight: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Apply BF16 RMSNorm and rotate the KV tail for Decode rows."""
+    blocks = (num_tokens + 7) // 8
+    workers = pl.min(blocks, pl.system.available_cluster_count())
+    weight_row = pl.tensor.view(norm_weight, [1, HEAD_DIM])
+    for worker in pl.spmd(workers, name_hint="norm_rope_kv"):
+        for block in pl.range(worker, blocks, workers):
+            row = block * 8
+            rows = pl.max(0, pl.min(8, num_tokens - row))
+            raw = pl.load(source, [row, 0], [8, HEAD_DIM], valid_shape=[rows, HEAD_DIM])
+            padded = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), 8, HEAD_DIM)
+            value = pl.cast(padded, pl.FP32)
+            square = pl.mul(value, value)
+            norm_scratch = pl.create_tile([8, HEAD_DIM], dtype=pl.FP32)
+            row_sum = pl.row_sum(square, tmp_tile=norm_scratch)
+            mean = pl.mul(row_sum, 1.0 / HEAD_DIM)
+            rms_argument = pl.add(mean, EPS)
+            rsqrt_scratch = pl.create_tile([8, 1], dtype=pl.FP32)
+            row_inverse = pl.tile.rsqrt(rms_argument, tmp=rsqrt_scratch, high_precision=True)
+            gamma = pl.cast(pl.load(weight_row, [0, 0], [1, HEAD_DIM]), pl.FP32)
+            normalized = pl.col_expand_mul(pl.row_expand_mul(value, row_inverse), gamma)
+            normalized_bf16 = pl.cast(normalized, pl.BF16, mode="rint")
+            prefix = pl.tile.slice(
+                normalized_bf16,
+                [8, HEAD_DIM - ROPE_DIM],
+                [0, 0],
+                valid_shape=[rows, HEAD_DIM - ROPE_DIM],
+            )
+            pl.store(prefix, [row, 0], output)
+            tail_bf16 = pl.tile.slice(normalized_bf16, [8, ROPE_DIM], [0, HEAD_DIM - ROPE_DIM])
+            tail = pl.cast(tail_bf16, pl.FP32)
+            even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+            odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+            cosine = pl.load(rope_cos, [row, 0], [8, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
+            sine = pl.load(rope_sin, [row, 0], [8, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
+            cosine = pl.set_validshape(pl.fillpad(cosine, pad_value=pl.PadValue.zero), 8, ROPE_DIM // 2)
+            sine = pl.set_validshape(pl.fillpad(sine, pad_value=pl.PadValue.zero), 8, ROPE_DIM // 2)
+            rope_even_cos = pl.mul(even, cosine)
+            rope_odd_sin = pl.mul(odd, sine)
+            real = pl.sub(rope_even_cos, rope_odd_sin)
+            rope_even_sin = pl.mul(even, sine)
+            rope_odd_cos = pl.mul(odd, cosine)
+            imag = pl.add(rope_even_sin, rope_odd_cos)
+            real_lanes = pl.tile.full([8, ROPE_DIM], dtype=pl.FP32, value=0.0)
+            real_lanes = pl.tile.scatter_mask(real_lanes, real, mask_pattern=pl.tile.MaskPattern.P0101)
+            imag_lanes = pl.tile.full([8, ROPE_DIM], dtype=pl.FP32, value=0.0)
+            imag_lanes = pl.tile.scatter_mask(imag_lanes, imag, mask_pattern=pl.tile.MaskPattern.P1010)
+            real_bits = pl.reinterpret_view(real_lanes, pl.INT16)
+            imag_bits = pl.reinterpret_view(imag_lanes, pl.INT16)
+            rotated_bits = pl.or_(real_bits, imag_bits)
+            rotated = pl.reinterpret_view(rotated_bits, pl.FP32)
+            rounded = pl.cast(rotated, pl.BF16, mode="rint")
+            pl.store(pl.set_validshape(rounded, rows, ROPE_DIM), [row, HEAD_DIM - ROPE_DIM], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
 def _rotate_rope(
     query: pl.Tensor,
     output: pl.Tensor,
@@ -169,7 +233,7 @@ def make_q_proj_rope(*, prefill):
             padded_rows = (payload_rows + 15) // 16 * 16
             qb_payload = pl.create_tensor([padded_rows, Q_LORA], dtype=pl.INT8)
             qb_scales = pl.create_tensor([padded_rows, 1], dtype=pl.FP32)
-            query_latent, qb_payload, qb_scales = normalize_quantize_projection_activation(
+            normalize_quantize_projection_activation(
                 projected, q_norm_weight, query_latent, qb_payload, qb_scales,
                 num_tokens, Q_LORA, EPS,
             )
@@ -234,15 +298,12 @@ def make_kv_proj_rope(*, prefill):
             window_kv: pl.Tensor,
             num_tokens: pl.Scalar[pl.INT32],
         ):
-            gemm_int8_pair_columns(
+            gemm_int8(
                 payload, scales, wkv, wkv_scale, kv_projection, num_tokens,
-                D, HEAD_DIM, "proj_kv_decode_pair", KV_N_TILE, 256, False, 16,
+                D, HEAD_DIM, "proj_kv", KV_N_TILE, 256, False,
             )
-            for worker in pl.spmd((num_tokens + 7) // 8, name_hint="norm_kv"):
-                rms_norm(kv_projection, kv_norm_weight, window_kv, worker, num_tokens, width=HEAD_DIM)
-            window_kv = _rotate_rope(
-                window_kv, window_kv, rope_cos, rope_sin, 0, num_tokens,
-                1, HEAD_DIM, "rope_kv", False, False,
+            normalize_rope_kv(
+                kv_projection, kv_norm_weight, rope_cos, rope_sin, window_kv, num_tokens,
             )
             return kv_projection, window_kv
 
