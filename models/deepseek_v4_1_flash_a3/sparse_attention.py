@@ -77,21 +77,22 @@ SWA_PACKED_ROW_BYTES = HEAD_DIM + SWA_SCALE_BYTES
 CUBE_HEADS = max(16, LOCAL_H)
 HEAD_TILE = min(32, CUBE_HEADS)
 QUERY_HEAD_TILE = min(16, LOCAL_H)
-KEY_TILE = 320 if TP_SIZE == 1 else 128
+KEY_TILE = 128
 GATHER_KEY_TILE = 16
 TOKEN_TILE = 512
 WORKERS = 32
+PREFILL_ATTEND_WORKERS = 64
 GATHER_WORKERS = 64
 SELECTED_GATHER_TILE = 32
-CACHE_WORKERS = 32
+CACHE_WORKERS = 128
 WINDOW_PUBLISH_WORKER_TILE = 12
 PREFILL_WINDOW_ROW_TILE = 64
-SHARED_GATHER_WORKERS = 64
+SHARED_GATHER_WORKERS = 128
 CACHE_MAX_ROWS = 32768
 PACKED_QUERY_TILE = 32
 PACKED_COHORT_TILE = 24
 PACKED_HEAD_TILE = min(32, CUBE_HEADS) if TP_SIZE == 1 else 16
-PACKED_KEY_TILE = 128 if TP_SIZE == 1 else 64
+PACKED_KEY_TILE = 128
 PACKED_ATTEND_SLOT_TILE = 1 if TP_SIZE == 1 else 2
 PACKED_KEY_PARTS = SELECTED_KEYS // PACKED_KEY_TILE
 
@@ -1114,7 +1115,7 @@ def make_packed_swa_inputs(tokens=257, requests=4, seed=17, case="mixed", start_
     return values
 
 
-GOLDEN_SELECTED_KEY_TILE = 64
+GOLDEN_SELECTED_KEY_TILE = 128
 GOLDEN_PREFILL_KEY_TILE = 128
 
 
@@ -1407,6 +1408,7 @@ def attend_selected(
     num_tokens: pl.Scalar[pl.INT32],
     selected_ready: pl.Scalar[pl.TASK_ID],
     key_tile: pl.constexpr,
+    worker_limit: pl.constexpr = WORKERS,
 ):
     """Attend fixed sparse buffers with explicit probability tile boundaries."""
     tokens = pl.tensor.dim(query, 0)
@@ -1417,7 +1419,7 @@ def attend_selected(
     sink_row = pl.reshape(sink, [1, LOCAL_H])
     head_blocks = LOCAL_H // HEAD_TILE
     tasks = num_tokens * head_blocks
-    workers = pl.max(1, pl.min(tasks, WORKERS))
+    workers = pl.max(1, pl.min(tasks, worker_limit))
     with pl.spmd(workers, name_hint="sparse_online", deps=[selected_ready], optimizations=[pl.cross_core_slot(slot_num=1)]) as attended:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, tasks, workers):
@@ -1493,7 +1495,10 @@ def _attend_bf16_block(
             pl.tile.store(valid, [token, column], indices)
 
     result = pl.create_tensor([rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    attended = attend_selected(qbf16, selected, indices, sink, result, rows, selected_ready, KEY_TILE)
+    attended = attend_selected(
+        qbf16, selected, indices, sink, result, rows, selected_ready,
+        KEY_TILE, PREFILL_ATTEND_WORKERS,
+    )
     rflat = pl.reshape(result, [head_rows, HEAD_DIM])
     oflat = pl.reshape(output, [head_rows, HEAD_DIM])
     with pl.spmd(workers_q, name_hint="sparse_bf16_output", deps=[attended]) as converted:
@@ -1659,7 +1664,10 @@ def _attend_cache_shared(
                 decoded_window, decoded_compressed, wi, ci, selected, indices,
                 count, window_ready, compressed_ready, previous,
             )
-            previous = attend_selected(q, selected, indices, sink, out, count, gathered, key_tile)
+            previous = attend_selected(
+                q, selected, indices, sink, out, count, gathered,
+                key_tile, PREFILL_ATTEND_WORKERS,
+            )
     return output
 
 
@@ -1685,7 +1693,10 @@ def _attend_packed_block(
         window_indices, compressed_indices, selected, indices, num_tokens, query_ready, max_workers=GATHER_WORKERS,
         name_hint="c2a_gather", gather_keys=640,
     )
-    attended = attend_selected(query, selected, indices, sink, output, num_tokens, gathered, key_tile)
+    attended = attend_selected(
+        query, selected, indices, sink, output, num_tokens, gathered,
+        key_tile, PREFILL_ATTEND_WORKERS,
+    )
     return attended
 
 
