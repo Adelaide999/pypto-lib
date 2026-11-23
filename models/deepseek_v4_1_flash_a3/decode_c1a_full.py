@@ -23,7 +23,7 @@ from .sparse_attention import (
     attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
     WORKERS as ATTEND_WORKER_TILE,
 )
-from .hc import hc_project, hc_sinkhorn, hc_head_norm, hc_post
+from .hc import hc_decode_mixes, hc_head_norm_adaptive, hc_post_decode
 from .config import (
     LOCAL_T_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN,
     CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN,
@@ -108,10 +108,11 @@ def decode_c1a_full(
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn)
-    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
+    hc_decode_mixes(
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix,
+    )
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    x_ready = hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm)
+    x_ready = hc_head_norm_adaptive(x_hc, pre_mix, attn_norm_weight, x_norm)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
@@ -193,9 +194,9 @@ def decode_c1a_full(
         attn_out, output_window, output_arrived, reduced_output,
         group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
     )
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(
+    hc_post_decode_deps = pl.array.create(2, pl.TASK_ID)
+    hc_post_decode(
         reduced_output, x_hc, post_mix, residual_mix, output,
-        deps=hc_post_deps, prefill=False,
+        deps=hc_post_decode_deps,
     )
     return output

@@ -17,7 +17,7 @@ from .config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE
 from .sparse_attention import publish_window_row, swa_attention_partial
 from .qkv_proj_rope import decode_q_proj_rope as q_proj_rope, decode_kv_proj_rope as kv_proj_rope
 from .o_proj import decode_project_output as project_output, prefill_tp_output_all_reduce
-from .hc import hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding, hc_post
+from .hc import hc_decode_mixes, hc_head_norm_adaptive, zero_bf16_padding, hc_post_decode
 
 
 # model config
@@ -78,7 +78,7 @@ def decode_swa(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_head_norm(x_hc, incoming_pre_mix, attn_norm_weight, x_norm)
+    hc_head_norm_adaptive(x_hc, incoming_pre_mix, attn_norm_weight, x_norm)
 
     zero_bf16_padding(x_norm, pl.min(num_tokens, pl.tensor.dim(x_norm, 0)))
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
@@ -104,8 +104,10 @@ def decode_swa(
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     swa_attention_partial(q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens)
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn)
-    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
+    hc_decode_mixes(
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attention_pre_mix, post_mix, residual_mix,
+    )
     project_output(
         attended, wo_a, wo_b, rope_cos, rope_sin, attention_output, num_tokens, True,
     )
@@ -114,9 +116,9 @@ def decode_swa(
         attention_output, output_window, output_arrived, reduced_output,
         group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
     )
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(
+    hc_post_decode_deps = pl.array.create(2, pl.TASK_ID)
+    hc_post_decode(
         reduced_output, x_hc, post_mix, residual_mix, attention_hidden,
-        deps=hc_post_deps, prefill=False,
+        deps=hc_post_decode_deps,
     )
     return attention_hidden, attention_pre_mix
