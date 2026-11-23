@@ -61,6 +61,9 @@ PREFILL_PROJ_T_TILE = 32
 PREFILL_PROJ_N_TILE = 32
 PREFILL_PROJ_K_TILE = 1024
 PREFILL_SINKHORN_T_TILE = 16
+PREFILL_SINKHORN_LANES = PREFILL_SINKHORN_T_TILE * HC_MULT
+PREFILL_SINKHORN_LANE_BITS = (PREFILL_SINKHORN_LANES - 1).bit_length()
+PREFILL_SINKHORN_STREAM_BITS = (HC_MULT - 1).bit_length()
 PREFILL_WORKER_TILE = 48
 PREFILL_MERGE_T_TILE = 16
 PREFILL_POST_D_TILE = 2560
@@ -603,6 +606,26 @@ def hc_sinkhorn_prefill(
     workers = pl.min(blocks, PREFILL_WORKER_TILE)
     with pl.spmd(workers, name_hint="mhc_sinkhorn") as ready:
         worker = pl.tile.get_block_idx()
+        # Pack [token, row, column] as [column, token * HC_MULT + row].
+        lanes = pl.tile.arange(0, [1, PREFILL_SINKHORN_LANES * HC_MULT], dtype=pl.INT32)
+        axis = pl.shrs(lanes, PREFILL_SINKHORN_LANE_BITS)
+        lane = pl.sub(lanes, pl.shls(axis, PREFILL_SINKHORN_LANE_BITS))
+        pack_index = pl.add(pl.shls(lane, PREFILL_SINKHORN_STREAM_BITS), axis)
+        # Swap the two matrix axes independently for every token.
+        lane_token = pl.shrs(lane, PREFILL_SINKHORN_STREAM_BITS)
+        token_base = pl.shls(lane_token, PREFILL_SINKHORN_STREAM_BITS)
+        stream = pl.sub(lane, token_base)
+        transpose_index = pl.add(pl.shls(stream, PREFILL_SINKHORN_LANE_BITS), token_base)
+        transpose_index = pl.add(transpose_index, axis)
+        # The final column normalization leaves [row, token * HC_MULT + column].
+        output_row = pl.shrs(lanes, PREFILL_SINKHORN_STREAM_BITS)
+        output_column = pl.sub(lanes, pl.shls(output_row, PREFILL_SINKHORN_STREAM_BITS))
+        output_token = pl.shrs(output_row, PREFILL_SINKHORN_STREAM_BITS)
+        output_token_base = pl.shls(output_token, PREFILL_SINKHORN_STREAM_BITS)
+        output_stream = pl.sub(output_row, output_token_base)
+        unpack_index = pl.add(pl.shls(output_stream, PREFILL_SINKHORN_LANE_BITS), output_token_base)
+        unpack_index = pl.add(unpack_index, output_column)
+        gather_tmp = pl.create_tile([1, PREFILL_SINKHORN_LANES * HC_MULT], dtype=pl.INT32)
         for block in pl.range(worker, blocks, workers):
             token = block * PREFILL_SINKHORN_T_TILE
             rows = pl.min(PREFILL_SINKHORN_T_TILE, tokens - token)
@@ -642,82 +665,35 @@ def hc_sinkhorn_prefill(
             pl.store(pre, [token, 0], pre_mix)
             pl.store(post, [token, 0], post_mix)
 
-            residual0 = pl.load(
-                projected,
-                [token, 2 * HC_MULT],
-                [PREFILL_SINKHORN_T_TILE, MIX_PAD],
-                valid_shape=[rows, HC_MULT],
+            logits = pl.load(
+                projected, [token, 2 * HC_MULT], [PREFILL_SINKHORN_T_TILE, HC_MULT * HC_MULT],
+                valid_shape=[rows, HC_MULT * HC_MULT],
             )
-            residual1 = pl.load(
-                projected,
-                [token, 3 * HC_MULT],
-                [PREFILL_SINKHORN_T_TILE, MIX_PAD],
-                valid_shape=[rows, HC_MULT],
-            )
-            residual2 = pl.load(
-                projected,
-                [token, 4 * HC_MULT],
-                [PREFILL_SINKHORN_T_TILE, MIX_PAD],
-                valid_shape=[rows, HC_MULT],
-            )
-            residual3 = pl.load(
-                projected,
-                [token, 5 * HC_MULT],
-                [PREFILL_SINKHORN_T_TILE, MIX_PAD],
-                valid_shape=[rows, HC_MULT],
-            )
-            residual0 = pl.row_expand_mul(residual0, inverse)
-            residual1 = pl.row_expand_mul(residual1, inverse)
-            residual2 = pl.row_expand_mul(residual2, inverse)
-            residual3 = pl.row_expand_mul(residual3, inverse)
-            residual_bias0 = pl.load(bias, [0, 2 * HC_MULT], [1, MIX_PAD], valid_shape=[1, HC_MULT])
-            residual_bias1 = pl.load(bias, [0, 3 * HC_MULT], [1, MIX_PAD], valid_shape=[1, HC_MULT])
-            residual_bias2 = pl.load(bias, [0, 4 * HC_MULT], [1, MIX_PAD], valid_shape=[1, HC_MULT])
-            residual_bias3 = pl.load(bias, [0, 5 * HC_MULT], [1, MIX_PAD], valid_shape=[1, HC_MULT])
-            residual0 = pl.col_expand_add(pl.mul(residual0, scale2), residual_bias0)
-            residual1 = pl.col_expand_add(pl.mul(residual1, scale2), residual_bias1)
-            residual2 = pl.col_expand_add(pl.mul(residual2, scale2), residual_bias2)
-            residual3 = pl.col_expand_add(pl.mul(residual3, scale2), residual_bias3)
-            residual0 = pl.fillpad(residual0, pad_value=pl.PadValue.min)
-            residual1 = pl.fillpad(residual1, pad_value=pl.PadValue.min)
-            residual2 = pl.fillpad(residual2, pad_value=pl.PadValue.min)
-            residual3 = pl.fillpad(residual3, pad_value=pl.PadValue.min)
-            row_tmp = pl.create_tile(
-                [PREFILL_SINKHORN_T_TILE, MIX_PAD], dtype=pl.FP32
-            )
-            exp0 = pl.exp(pl.row_expand_sub(residual0, pl.row_max(residual0, row_tmp)))
-            exp1 = pl.exp(pl.row_expand_sub(residual1, pl.row_max(residual1, row_tmp)))
-            exp2 = pl.exp(pl.row_expand_sub(residual2, pl.row_max(residual2, row_tmp)))
-            exp3 = pl.exp(pl.row_expand_sub(residual3, pl.row_max(residual3, row_tmp)))
-            prob0 = pl.add(pl.row_expand_div(exp0, pl.row_sum(exp0, row_tmp)), HC_EPS)
-            prob1 = pl.add(pl.row_expand_div(exp1, pl.row_sum(exp1, row_tmp)), HC_EPS)
-            prob2 = pl.add(pl.row_expand_div(exp2, pl.row_sum(exp2, row_tmp)), HC_EPS)
-            prob3 = pl.add(pl.row_expand_div(exp3, pl.row_sum(exp3, row_tmp)), HC_EPS)
-            prob0 = pl.fillpad(pl.set_validshape(prob0, rows, HC_MULT), pad_value=pl.PadValue.zero)
-            prob1 = pl.fillpad(pl.set_validshape(prob1, rows, HC_MULT), pad_value=pl.PadValue.zero)
-            prob2 = pl.fillpad(pl.set_validshape(prob2, rows, HC_MULT), pad_value=pl.PadValue.zero)
-            prob3 = pl.fillpad(pl.set_validshape(prob3, rows, HC_MULT), pad_value=pl.PadValue.zero)
-            column_sum = pl.add(pl.add(prob0, prob1), pl.add(prob2, prob3))
-            column_sum = pl.add(column_sum, HC_EPS)
-            prob0 = pl.div(prob0, column_sum)
-            prob1 = pl.div(prob1, column_sum)
-            prob2 = pl.div(prob2, column_sum)
-            prob3 = pl.div(prob3, column_sum)
-            for _ in pl.unroll(HC_SINKHORN_ITER - 1):
-                norm0 = pl.row_expand_div(prob0, pl.add(pl.row_sum(prob0, row_tmp), HC_EPS))
-                norm1 = pl.row_expand_div(prob1, pl.add(pl.row_sum(prob1, row_tmp), HC_EPS))
-                norm2 = pl.row_expand_div(prob2, pl.add(pl.row_sum(prob2, row_tmp), HC_EPS))
-                norm3 = pl.row_expand_div(prob3, pl.add(pl.row_sum(prob3, row_tmp), HC_EPS))
-                column_sum = pl.add(pl.add(norm0, norm1), pl.add(norm2, norm3))
-                column_sum = pl.add(column_sum, HC_EPS)
-                prob0 = pl.div(norm0, column_sum)
-                prob1 = pl.div(norm1, column_sum)
-                prob2 = pl.div(norm2, column_sum)
-                prob3 = pl.div(norm3, column_sum)
-            pl.store(pl.set_validshape(prob0, rows, HC_MULT), [token, 0], residual_flat)
-            pl.store(pl.set_validshape(prob1, rows, HC_MULT), [token, HC_MULT], residual_flat)
-            pl.store(pl.set_validshape(prob2, rows, HC_MULT), [token, 2 * HC_MULT], residual_flat)
-            pl.store(pl.set_validshape(prob3, rows, HC_MULT), [token, 3 * HC_MULT], residual_flat)
+            residual_bias = pl.load(bias, [0, 2 * HC_MULT], [1, HC_MULT * HC_MULT])
+            logits = pl.row_expand_mul(logits, inverse)
+            logits = pl.col_expand_add(pl.mul(logits, scale2), residual_bias)
+            logits = pl.fillpad(logits, pad_value=pl.PadValue.zero)
+            logits = pl.set_validshape(logits, PREFILL_SINKHORN_T_TILE, HC_MULT * HC_MULT)
+            logits_flat = pl.reshape(logits, [1, PREFILL_SINKHORN_LANES * HC_MULT])
+            packed = pl.tile.gather(logits_flat, pack_index, gather_tmp)
+            packed = pl.reshape(packed, [HC_MULT, PREFILL_SINKHORN_LANES])
+            maximum = pl.col_max(packed)
+            exp_values = pl.exp(pl.col_expand_sub(packed, maximum))
+            denominator = pl.col_sum(exp_values)
+            probability = pl.add(pl.col_expand_div(exp_values, denominator), HC_EPS)
+
+            # Alternate the axes by transposing each token's four-by-four matrix.
+            for _ in pl.unroll(2 * HC_SINKHORN_ITER - 1):
+                flat = pl.reshape(probability, [1, PREFILL_SINKHORN_LANES * HC_MULT])
+                rearranged = pl.tile.gather(flat, transpose_index, gather_tmp)
+                transposed = pl.reshape(rearranged, [HC_MULT, PREFILL_SINKHORN_LANES])
+                denominator = pl.add(pl.col_sum(transposed), HC_EPS)
+                probability = pl.col_expand_div(transposed, denominator)
+            flat = pl.reshape(probability, [1, PREFILL_SINKHORN_LANES * HC_MULT])
+            compact = pl.tile.gather(flat, unpack_index, gather_tmp)
+            compact = pl.reshape(compact, [PREFILL_SINKHORN_T_TILE, HC_MULT * HC_MULT])
+            compact = pl.set_validshape(compact, rows, HC_MULT * HC_MULT)
+            pl.store(compact, [token, 0], residual_flat)
     return ready
 
 
