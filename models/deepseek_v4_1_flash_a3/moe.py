@@ -17,13 +17,14 @@ from .config import FLASH as M
 from .config import EP_SIZE, TP_SIZE
 from .config import MOE_TOKENS, N_LOCAL_EXPERTS, ROUTE_T_DYN
 from .config import T_DYN
+from .gate import gate_from_fp32
 from .gate import gate_normalized as npu_gate
 from .expert_shared import expert_shared
 from .expert_routed import (
     expert_routed_scatter,
 )
 from .hc import hc_pre, hc_post
-from .rmsnorm import rms_norm_tiled
+from .rmsnorm import prefill_ffn_norm_quant, rms_norm_tiled
 from .o_proj import prefill_tp_output_all_reduce
 
 
@@ -477,13 +478,23 @@ def prefill_moe_sublayer(
         if local_num_tokens > 0:
             local_ffn_input = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
             _compact_local_tokens(ffn_input, local_ffn_input, num_tokens, tp_rank)
-            norm_tokens = pl.tensor.dim(local_ffn_input, 0)
-            for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-                rms_norm_tiled(local_ffn_input, ffn_norm_weight, local_ffn_normed, norm_block, norm_tokens, output_fp32=False)
-            npu_gate(
-                local_ffn_normed, gate_weight, correction_bias, local_num_tokens,
-                x_norm_mx, x_norm_scale, indices, weights,
-            )
+            if prefill:
+                scale_view = pl.reshape(x_norm_scale, [TOKENS, 1])
+                gate_input = pl.create_tensor([TOKENS, D], dtype=pl.FP32)
+                prefill_ffn_norm_quant(
+                    local_ffn_input, ffn_norm_weight,
+                    local_ffn_normed, x_norm_mx, scale_view, gate_input,
+                    local_num_tokens, TOKENS,
+                )
+                gate_from_fp32(gate_input, gate_weight, correction_bias, local_num_tokens, indices, weights)
+            else:
+                norm_tokens = pl.tensor.dim(local_ffn_input, 0)
+                for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
+                    rms_norm_tiled(local_ffn_input, ffn_norm_weight, local_ffn_normed, norm_block, norm_tokens, output_fp32=False)
+                npu_gate(
+                    local_ffn_normed, gate_weight, correction_bias, local_num_tokens,
+                    x_norm_mx, x_norm_scale, indices, weights,
+                )
 
             expert_shared(
                 x_norm_mx, x_norm_scale,

@@ -158,7 +158,7 @@ def prefill_publish_window(
             maximum = pl.maximum(pl.row_max(pl.abs(values), tmp_tile=reduce_tmp), 1e-4)
             scale = pl.cast(pl.mul(maximum, 1.0 / 448.0), pl.BF16, mode="rint")
             normalized = pl.row_expand_div(values, pl.cast(scale, pl.FP32))
-            payload = encode_fp8(normalized, PREFILL_WINDOW_GROUP_TILE, 32)
+            payload = encode_fp8(normalized, PREFILL_WINDOW_GROUP_TILE, 32, integer_bits=True)
             payload = pl.reshape(payload, [PREFILL_WINDOW_ROW_TILE, HEAD_DIM])
             scale = pl.reshape(scale, [PREFILL_WINDOW_ROW_TILE, SWA_GROUPS])
             if contiguous:
@@ -202,7 +202,7 @@ def _publish_window_row(
         scale = pl.cast(raw_scale, pl.BF16, mode="rint")
         scale_fp32 = pl.cast(scale, pl.FP32)
         normalized = pl.row_expand_div(value, scale_fp32)
-        payload = encode_fp8(normalized, HEAD_DIM // 16, 32)
+        payload = encode_fp8(normalized, HEAD_DIM // 16, 32, integer_bits=False)
         payload_row = pl.reshape(payload, [1, HEAD_DIM * 2])
         flat = pl.store(pl.set_validshape(payload_row, 1, HEAD_DIM), [slot, 0], flat)
         scale_row = pl.reshape(scale, [1, HEAD_DIM // 16])

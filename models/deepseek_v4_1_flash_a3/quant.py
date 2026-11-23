@@ -46,14 +46,29 @@ FP4_E4M3_CODES = torch.tensor(
 
 
 @pl.jit.inline(auto_scope=False)
-def encode_fp8(value: pl.Tile[[CODE_ROWS_DYN, CODE_COLS_DYN], pl.FP32], rows: pl.constexpr, cols: pl.constexpr):
+def encode_fp8(
+    value: pl.Tile[[CODE_ROWS_DYN, CODE_COLS_DYN], pl.FP32],
+    rows: pl.constexpr,
+    cols: pl.constexpr,
+    integer_bits: pl.constexpr,
+):
     """Encode finite FP32 values as saturated E4M3FN bytes with nearest-even rounding."""
     value = pl.reshape(value, [rows, cols])
     bits = pl.reinterpret_view(value, pl.INT32)
-    sign = pl.ands(pl.cast(pl.cast(pl.shrs(bits, 24), pl.FP32), pl.INT16, mode="rint"), 128)
+    if not integer_bits:
+        sign_shifted = pl.cast(pl.shrs(bits, 24), pl.FP32)
+        sign_bits = pl.ands(pl.cast(sign_shifted, pl.INT16, mode="rint"), 128)
     magnitude = pl.minimum(pl.abs(value), 448.0)
     absolute_bits = pl.reinterpret_view(magnitude, pl.INT32)
-    tie = pl.cast(pl.cast(pl.ands(pl.cast(pl.cast(pl.shrs(absolute_bits, 20), pl.FP32), pl.INT16, mode="rint"), 1), pl.FP32), pl.INT32, mode="rint")
+    if integer_bits:
+        sign_integer = pl.mul(pl.shrs(bits, 31), -128)
+        retained = pl.shrs(absolute_bits, 20)
+        tie = pl.sub(retained, pl.shls(pl.shrs(retained, 1), 1))
+    else:
+        retained_fp32 = pl.cast(pl.shrs(absolute_bits, 20), pl.FP32)
+        retained_i16 = pl.cast(retained_fp32, pl.INT16, mode="rint")
+        tie_bits = pl.ands(retained_i16, 1)
+        tie = pl.cast(pl.cast(tie_bits, pl.FP32), pl.INT32, mode="rint")
     rounded_bits = pl.add(pl.add(absolute_bits, 524287), tie)
     normal_codes = pl.sub(pl.shrs(rounded_bits, 20), 960)
     subnormal_value = pl.mul(magnitude, 512.0)
@@ -61,8 +76,14 @@ def encode_fp8(value: pl.Tile[[CODE_ROWS_DYN, CODE_COLS_DYN], pl.FP32], rows: pl
     predicate = pl.tile.cmps(magnitude, 0.015625, cmp_type=2)
     select_tmp = pl.create_tile([1, 16], dtype=pl.UINT32)
     codes = pl.tile.sel(predicate, subnormal_codes, normal_codes, select_tmp)
-    codes = pl.add(pl.minimum(pl.maximum(codes, 0), 126), pl.cast(pl.cast(sign, pl.FP32), pl.INT32, mode="rint"))
-    signed = pl.sub(codes, pl.mul(pl.shrs(codes, 7), 256))
+    saturated = pl.minimum(pl.maximum(codes, 0), 126)
+    if integer_bits:
+        signed_codes = pl.add(saturated, sign_integer)
+    else:
+        sign_fp32 = pl.cast(sign_bits, pl.FP32)
+        sign_i32 = pl.cast(sign_fp32, pl.INT32, mode="rint")
+        signed_codes = pl.add(saturated, sign_i32)
+    signed = pl.sub(signed_codes, pl.mul(pl.shrs(signed_codes, 7), 256))
     return pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8)
 
 
@@ -122,7 +143,7 @@ def quantize_upward(source: pl.Tensor, rows: pl.constexpr, width: pl.constexpr):
     exponent = pl.shrs(pl.add(bits, 8388607), 23)
     scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
     normalized = pl.row_expand_div(groups, scale)
-    encoded = encode_fp8(normalized, rows * (width // 32), 32)
+    encoded = encode_fp8(normalized, rows * (width // 32), 32, integer_bits=False)
     payload = pl.reshape(encoded, [rows, width])
     signed = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
     codes = pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8)
@@ -252,7 +273,7 @@ def quantize_bf16_to_mxfp8(
     normalized = pl.row_expand_mul(groups, reciprocal)
     normalized = pl.maximum(normalized, -448.0)
     normalized = pl.minimum(normalized, 448.0)
-    payload_fp8 = encode_fp8(normalized, m_tile * (QUANT_K_TILE // 32), 32)
+    payload_fp8 = encode_fp8(normalized, m_tile * (QUANT_K_TILE // 32), 32, integer_bits=False)
     payload = pl.reshape(payload_fp8, [m_tile, QUANT_K_TILE])
     sign_bit = pl.shrs(exponent, 7)
     sign_offset = pl.mul(sign_bit, 256)
@@ -537,7 +558,7 @@ def validate_codecs(
     with pl.spmd(1, name_hint="validate_cache_codecs"):
         _block = pl.tile.get_block_idx()
         value = pl.load(source, [0, 0], [16, 256])
-        result = encode_fp8(value, 16, 256)
+        result = encode_fp8(value, 16, 256, integer_bits=False)
         encoded = pl.store(result, [0, 0], encoded)
         fp4_values = pl.load(fp4_source, [0, 0], [16, 256])
         fp4_scales = pl.load(fp4_factors, [0, 0], [16, 1])

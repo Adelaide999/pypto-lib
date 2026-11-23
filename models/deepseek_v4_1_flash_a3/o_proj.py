@@ -58,7 +58,7 @@ TP_COLUMNS = 1280
 TP_ROWS = 8 if MOE_TOKENS >= 64 else 1
 
 rotate_output = make_pipelined_rope(
-    T_DYN, LOCAL_H, HEAD_DIM, inverse=True, name_hint="inverse_rope_o", allow_early_resolve=False,
+    T_DYN, LOCAL_H, HEAD_DIM, inverse=True, name_hint="inverse_rope_o", allow_early_resolve=False, inplace=True,
 )
 
 
@@ -74,12 +74,12 @@ def make_project_output(*, prefill):
         num_tokens: pl.Scalar[pl.INT32],
         sequential: pl.constexpr,
     ):
-        """Apply inverse RoPE and grouped BF16 O-A/O-B projections."""
+        """Apply inverse RoPE and grouped BF16 O-A/O-B projections. Prefill consumes attention scratch."""
         tokens = pl.tensor.dim(output, 0)
-        rotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         if prefill:
-            rotated = rotate_output(attended, rope_cos, rope_sin, rotated, num_tokens)
+            rotated = rotate_output(attended, rope_cos, rope_sin, attended, num_tokens)
         else:
+            rotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             rotated = _rotate_rope(
                 attended, rotated, rope_cos, rope_sin, 0, num_tokens, LOCAL_H, HEAD_DIM, "inverse_rope_o", True, True,
             )
@@ -337,7 +337,12 @@ def l2_o_proj(
     output: pl.InOut[pl.Tensor[[32, D], pl.BF16]],
 ):
     num_tokens = pl.read(counts, [0])
-    o_proj(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens)
+    # Match the Prefill producer's writable scratch while keeping the replay input reusable.
+    scratch = pl.create_tensor([32, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    for block in pl.spmd(32, name_hint="o_proj_validation_input"):
+        row = pl.load(attended, [block, 0], [1, LOCAL_H * HEAD_DIM])
+        pl.store(row, [block, 0], scratch)
+    o_proj(scratch, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens)
     return output
 
 

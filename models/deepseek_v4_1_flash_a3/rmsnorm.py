@@ -11,6 +11,7 @@
 import pypto.language as pl
 import torch
 
+from .activation_quant import _prefill_quant_params
 from .config import FLASH as M, T_DYN
 
 
@@ -24,6 +25,7 @@ NORM_D_TILE = 512
 PREFILL_NORM_REDUCE_TILE = 2 * NORM_D_TILE
 PREFILL_NORM_STORE_TILE = 1280
 PREFILL_NORM_WORKERS = 48
+PREFILL_FFN_ROW_TILE = NORM_T_TILE // 2
 
 
 @pl.jit.inline
@@ -112,9 +114,6 @@ def prefill_rms_norm(
     workers = pl.min(blocks, PREFILL_NORM_WORKERS)
     for worker in pl.spmd(workers, name_hint="rms_norm"):
         gamma = pl.reshape(pl.load(weight, [0], [D]), [1, D])
-        lanes = pl.tile.arange(0, [1, NORM_T_TILE], dtype=pl.INT32)
-        first_partial = pl.mul(lanes, 2)
-        gather_scratch = pl.create_tile([1, NORM_T_TILE], dtype=pl.INT32)
         begin = worker * blocks // workers
         end = (worker + 1) * blocks // workers
         for block in pl.pipeline(begin, end, stage=1):
@@ -132,10 +131,10 @@ def prefill_rms_norm(
                 squares = pl.mul(flat, flat)
                 row_sums = pl.row_sum(squares, tmp_tile=scratch)
                 partial = pl.reshape(row_sums, [1, 2 * NORM_T_TILE])
-                for offset in pl.range(2):
-                    index = pl.add(first_partial, pl.cast(offset, pl.INT32))
-                    sub_sum = pl.tile.gather(partial, index, gather_scratch)
-                    sum_squares = pl.add(sum_squares, sub_sum)
+                first_sum = pl.tile.gather_mask(partial, mask_pattern=pl.tile.MaskPattern.P0101)
+                second_sum = pl.tile.gather_mask(partial, mask_pattern=pl.tile.MaskPattern.P1010)
+                sum_squares = pl.add(sum_squares, first_sum)
+                sum_squares = pl.add(sum_squares, second_sum)
             rsqrt_scratch = pl.create_tile([1, NORM_T_TILE], dtype=pl.FP32)
             mean_square = pl.add(pl.mul(sum_squares, 1.0 / D), EPS)
             inv_rms = pl.tile.rsqrt(mean_square, rsqrt_scratch, high_precision=True)
@@ -151,6 +150,99 @@ def prefill_rms_norm(
                 valid = pl.set_validshape(rounded, rows, PREFILL_NORM_STORE_TILE)
                 pl.store(valid, [row, col], output)
     return output
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_ffn_norm_quant(
+    x: pl.Tensor,
+    weight: pl.Tensor[[D], pl.BF16],
+    output: pl.Tensor,
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    gate_input: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    capacity: pl.constexpr,
+):
+    """Produce BF16 diagnostics, FP32 router inputs and INT8 expert inputs from one tile."""
+    blocks = capacity // PREFILL_FFN_ROW_TILE
+    workers = pl.min(blocks, PREFILL_NORM_WORKERS)
+    for worker in pl.spmd(workers, name_hint="prefill_ffn_norm_quant"):
+        gamma = pl.reshape(pl.load(weight, [0], [D]), [1, D])
+        # Each of the four rows occupies two consecutive vector lanes.
+        lanes = pl.tile.arange(0, [1, NORM_T_TILE], dtype=pl.INT32)
+        first_half = pl.mul(pl.shrs(lanes, 1), 2)
+        second_half = pl.add(first_half, 1)
+        scale_lanes = pl.mul(pl.sub(lanes, pl.mul(pl.shrs(lanes, 2), 4)), 2)
+        gather_tmp = pl.create_tile([1, NORM_T_TILE], dtype=pl.INT32)
+        begin = worker * blocks // workers
+        end = (worker + 1) * blocks // workers
+        for block in pl.range(begin, end):
+            row = block * PREFILL_FFN_ROW_TILE
+            rows = pl.max(0, pl.min(PREFILL_FFN_ROW_TILE, num_tokens - row))
+            source = pl.load(x, [row, 0], [PREFILL_FFN_ROW_TILE, D], valid_shape=[rows, D])
+            padded = pl.fillpad(source, pad_value=pl.PadValue.zero)
+            cached = pl.set_validshape(padded, PREFILL_FFN_ROW_TILE, D)
+            sum_squares = pl.tile.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
+            reduce_tmp = pl.create_tile([NORM_T_TILE, NORM_D_TILE], dtype=pl.FP32)
+            for col in pl.range(0, D, PREFILL_NORM_REDUCE_TILE):
+                reduce_panel = pl.tile.slice(cached, [PREFILL_FFN_ROW_TILE, PREFILL_NORM_REDUCE_TILE], [0, col])
+                reduce_value = pl.cast(reduce_panel, pl.FP32)
+                reduce_halves = pl.reshape(reduce_value, [NORM_T_TILE, NORM_D_TILE])
+                squares = pl.mul(reduce_halves, reduce_halves)
+                row_sums = pl.row_sum(squares, tmp_tile=reduce_tmp)
+                partial = pl.reshape(row_sums, [1, NORM_T_TILE])
+                # Accumulate the 512-column sums in the same order as the non-fused RMSNorm.
+                first_sum = pl.tile.gather(partial, first_half, gather_tmp)
+                sum_squares = pl.add(sum_squares, first_sum)
+                second_sum = pl.tile.gather(partial, second_half, gather_tmp)
+                sum_squares = pl.add(sum_squares, second_sum)
+            rsqrt_tmp = pl.create_tile([1, NORM_T_TILE], dtype=pl.FP32)
+            mean_square = pl.add(pl.mul(sum_squares, 1.0 / D), EPS)
+            inv_rms = pl.tile.rsqrt(mean_square, rsqrt_tmp, high_precision=True)
+            inverse_rows = pl.reshape(inv_rms, [NORM_T_TILE, 1])
+
+            norm_cache = pl.create_tile([PREFILL_FFN_ROW_TILE, D], dtype=pl.BF16)
+            peak_bits = pl.tile.full([NORM_T_TILE, PREFILL_NORM_STORE_TILE // 2], dtype=pl.INT16, value=0)
+            for col in pl.range(0, D, PREFILL_NORM_STORE_TILE):
+                norm_panel = pl.tile.slice(cached, [PREFILL_FFN_ROW_TILE, PREFILL_NORM_STORE_TILE], [0, col])
+                norm_value = pl.cast(norm_panel, pl.FP32)
+                weight_panel = pl.tile.slice(gamma, [1, PREFILL_NORM_STORE_TILE], [0, col])
+                weight_fp32 = pl.cast(weight_panel, pl.FP32)
+                norm_halves = pl.reshape(norm_value, [NORM_T_TILE, PREFILL_NORM_STORE_TILE // 2])
+                scaled = pl.row_expand_mul(norm_halves, inverse_rows)
+                scaled_rows = pl.reshape(scaled, [PREFILL_FFN_ROW_TILE, PREFILL_NORM_STORE_TILE])
+                weighted = pl.col_expand_mul(scaled_rows, weight_fp32)
+                rounded = pl.cast(weighted, pl.BF16, mode="rint")
+                norm_cache[0:PREFILL_FFN_ROW_TILE, col:col + PREFILL_NORM_STORE_TILE] = rounded
+                gate_panel = pl.cast(rounded, pl.FP32)
+                pl.store(gate_panel, [row, col], gate_input)
+                rounded_halves = pl.reshape(rounded, [NORM_T_TILE, PREFILL_NORM_STORE_TILE // 2])
+                rounded_bits = pl.reinterpret_view(rounded_halves, pl.INT16)
+                peak_bits = pl.maximum(peak_bits, pl.ands(rounded_bits, 32767))
+
+            # Publish the complete diagnostic slice, including zero-padded inactive rows.
+            pl.store(norm_cache, [row, 0], output)
+            peak = pl.cast(pl.reinterpret_view(peak_bits, pl.BF16), pl.FP32)
+            peak_tmp = pl.create_tile([NORM_T_TILE, PREFILL_NORM_STORE_TILE // 2], dtype=pl.FP32)
+            half_peaks = pl.reshape(pl.row_max(peak, tmp_tile=peak_tmp), [1, NORM_T_TILE])
+            first_peak = pl.tile.gather(half_peaks, first_half, gather_tmp)
+            second_peak = pl.tile.gather(half_peaks, second_half, gather_tmp)
+            maximum = pl.reshape(pl.maximum(first_peak, second_peak), [NORM_T_TILE, 1])
+            scale, quant_inverse = _prefill_quant_params(maximum)
+            gathered_scale = pl.tile.gather(pl.reshape(scale, [1, NORM_T_TILE]), scale_lanes, gather_tmp)
+            scale_column = pl.reshape(gathered_scale, [NORM_T_TILE, 1])
+            pl.store(pl.set_validshape(scale_column, PREFILL_FFN_ROW_TILE, 1), [row, 0], scales)
+            for col in pl.range(0, D, PREFILL_NORM_STORE_TILE):
+                quant_panel = pl.tile.slice(norm_cache, [PREFILL_FFN_ROW_TILE, PREFILL_NORM_STORE_TILE], [0, col])
+                quant_value = pl.cast(quant_panel, pl.FP32)
+                quant_halves = pl.reshape(quant_value, [NORM_T_TILE, PREFILL_NORM_STORE_TILE // 2])
+                normalized = pl.row_expand_mul(quant_halves, quant_inverse)
+                integer = pl.cast(normalized, pl.INT16, mode="rint")
+                exact_fp16 = pl.cast(integer, pl.FP16, mode="rint")
+                codes = pl.cast(exact_fp16, pl.INT8, mode="trunc")
+                code_rows = pl.reshape(codes, [PREFILL_FFN_ROW_TILE, PREFILL_NORM_STORE_TILE])
+                pl.store(code_rows, [row, col], payload)
+    return output, payload, scales, gate_input
 
 
 @pl.jit.inline
