@@ -98,9 +98,10 @@ def dispatch(
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
+    reuse_deps: pl.Array[1, pl.TASK_ID],
 ):
     x_norm_mx_raw = x_norm_mx
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reuse_wait") as _reuse_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reuse_wait", deps=[reuse_deps]) as _reuse_tid:
         _anchor = pl.read(indices, [0, 0])
     send_starts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_starts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -404,6 +405,7 @@ def prefill_moe_sublayer(
     ep_rank: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
+    reuse_deps: pl.Array[1, pl.TASK_ID],
 ):
     """Collapse mHC streams, normalize compact TP owner rows, and run the EP MoE."""
     hc_pre(
@@ -437,7 +439,7 @@ def prefill_moe_sublayer(
             )
         else:
             workers = pl.min(48, TOKENS // 4)
-            with pl.spmd(workers, name_hint="moe_empty_owner"):
+            with pl.spmd(workers, name_hint="moe_empty_owner", deps=[reuse_deps]) as empty_owner:
                 worker = pl.tile.get_block_idx()
                 for group in pl.range(worker, TOKENS // 4, workers):
                     first = group * 4
@@ -459,7 +461,7 @@ def prefill_moe_sublayer(
             recv_x_local, recv_scale_local_backing,
             recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
             recv_meta, recv_x, recv_weights,
-            arrived, data_arrived, local_num_tokens, ep_rank, moe_epoch,
+            arrived, data_arrived, local_num_tokens, ep_rank, moe_epoch, reuse_deps,
         )
 
         scatter_done = expert_routed_scatter(

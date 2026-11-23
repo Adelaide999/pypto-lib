@@ -15,7 +15,7 @@ import pypto.language.distributed as pld
 from .sparse_attention import (
     SWA_RUN_DESCRIPTOR_WIDTH as RUN_DESCRIPTOR_WIDTH, SWA_RUN_PARTS as RUN_PARTS,
     analyze_index_runs, attend_shared_cache, decode_shared_cache_after_publish,
-    prefill_publish_window_batched,
+    prefill_publish_window,
 )
 from .config import (
     WINDOW_CACHE_GROUP, FLASH as M, ORI_BLOCKS_DYN, T_DYN, TP_SIZE, PREFILL_MAX_TOKENS,
@@ -100,7 +100,7 @@ def prefill_swa_attention(
         kv_projection, kv,
         num_tokens,
     )
-    chunk_done = prefill_publish_window_batched(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
+    chunk_done = prefill_publish_window(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
     cache_blocks = pl.tensor.dim(window_cache, 0)
     cache_rows = cache_blocks * 128
     decoded_cache = pl.create_tensor([cache_blocks, 128, 1, HEAD_DIM], dtype=pl.BF16)

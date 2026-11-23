@@ -33,6 +33,7 @@ HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
 EPS = M.rms_norm_eps
 STATE_WIDTH = 2 * M.head_dim
+CMP_SCALE_WIDTH = HEAD_DIM // COMPRESSED_CACHE_GROUP
 
 # tiling
 C1A_PROJ_M_TILE = 48
@@ -41,6 +42,9 @@ C1A_PROJ_K_TILE = 512
 C2A_PROJ_M_TILE = 80
 C2A_PROJ_N_TILE = 64
 C2A_PROJ_K_TILE = 256
+CMP_PUBLISH_ROW_TILE = 4
+CMP_PUBLISH_GROUP_TILE = CMP_PUBLISH_ROW_TILE * HEAD_DIM // COMPRESSED_CACHE_GROUP
+CMP_PUBLISH_WORKER_TILE = 64
 
 
 rotate_prefill_compressed = make_pipelined_token_rope(T_DYN, HEAD_DIM, name_hint="rope_cmp", inplace=False)
@@ -142,31 +146,52 @@ def c1a_compressor_publish(
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
 ):
-    """Publish group-16 MXFP4 with BF16 scales and nearest-even rounding."""
+    """Publish group-16 MXFP4 and BF16 scales to unique physical rows."""
     cache_rows = pl.tensor.dim(cache, 0) * 128
     flat = pl.reshape(cache, [cache_rows, HEAD_DIM // 2])
-    flat_scale = pl.reshape(scales, [cache_rows, HEAD_DIM // COMPRESSED_CACHE_GROUP])
-    # Each physical cache page has one publishing worker.
-    workers = pl.min(num_tokens, 8)
+    flat_scale = pl.reshape(scales, [cache_rows, CMP_SCALE_WIDTH])
+    tokens = pl.tensor.dim(slots, 0)
+    slot_row = pl.reshape(slots, [1, tokens])
+    tiles = (num_tokens + CMP_PUBLISH_ROW_TILE - 1) // CMP_PUBLISH_ROW_TILE
+    workers = pl.max(1, pl.min(tiles, CMP_PUBLISH_WORKER_TILE))
     with pl.spmd(workers, name_hint="pub_cmp", deps=[cache_ready]) as published:
         worker = pl.tile.get_block_idx()
-        for t in pl.range(num_tokens):
-            slot = pl.read(slots, [t])
-            if slot >= 0 and (slot // 128) % workers == worker:
-                physical = pl.cast(slot, pl.INDEX)
-                row = pl.tile.load(source, [t, 0], [1, HEAD_DIM])
-                values = pl.reshape(pl.cast(row, pl.FP32), [HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP])
-                temporary = pl.tile.create([HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP], dtype=pl.FP32)
-                amax = pl.row_max(pl.abs(values), tmp_tile=temporary)
-                factors_raw = pl.maximum(pl.mul(amax, 1.0 / 6.0), 0.001953125)
-                stored_scale = pl.cast(factors_raw, pl.BF16, mode="rint")
-                factors = pl.cast(stored_scale, pl.FP32)
-                payload_bytes = encode_fp4(values, factors, HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP)
-                payload = pl.set_validshape(payload_bytes, 1, HEAD_DIM // 2)
-                scale_row = pl.reshape(stored_scale, [1, HEAD_DIM // COMPRESSED_CACHE_GROUP])
-                encoded = pl.set_validshape(scale_row, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP)
-                pl.tile.store(payload, [physical, 0], flat)
-                pl.tile.store(encoded, [physical, 0], flat_scale)
+        for tile in pl.range(worker, tiles, workers):
+            start = tile * CMP_PUBLISH_ROW_TILE
+            rows = pl.min(CMP_PUBLISH_ROW_TILE, num_tokens - start)
+            ids = pl.load(slot_row, [0, start], [1, CMP_PUBLISH_ROW_TILE], valid_shape=[1, rows])
+            first = pl.tile.read(ids, [0, 0])
+            contiguous = first >= 0
+            for lane in pl.unroll(1, CMP_PUBLISH_ROW_TILE):
+                if lane < rows:
+                    contiguous = contiguous and pl.tile.read(ids, [0, lane]) == first + lane
+
+            raw = pl.load(source, [start, 0], [CMP_PUBLISH_ROW_TILE, HEAD_DIM], valid_shape=[rows, HEAD_DIM])
+            padded = pl.fillpad(raw, pad_value=pl.PadValue.zero)
+            full = pl.set_validshape(padded, CMP_PUBLISH_ROW_TILE, HEAD_DIM)
+            values = pl.reshape(pl.cast(full, pl.FP32), [CMP_PUBLISH_GROUP_TILE, COMPRESSED_CACHE_GROUP])
+            scratch = pl.tile.create([CMP_PUBLISH_GROUP_TILE, COMPRESSED_CACHE_GROUP], dtype=pl.FP32)
+            amax = pl.row_max(pl.abs(values), tmp_tile=scratch)
+            factors_raw = pl.maximum(pl.mul(amax, 1.0 / 6.0), 0.001953125)
+            stored_scale = pl.cast(factors_raw, pl.BF16, mode="rint")
+            factors = pl.cast(stored_scale, pl.FP32)
+            codes = encode_fp4(values, factors, CMP_PUBLISH_GROUP_TILE, COMPRESSED_CACHE_GROUP)
+            payload = pl.reshape(codes, [CMP_PUBLISH_ROW_TILE, HEAD_DIM // 2])
+            scale = pl.reshape(stored_scale, [CMP_PUBLISH_ROW_TILE, CMP_SCALE_WIDTH])
+            if contiguous:
+                slot = pl.cast(first, pl.INDEX)
+                pl.store(pl.set_validshape(payload, rows, HEAD_DIM // 2), [slot, 0], flat)
+                pl.store(pl.set_validshape(scale, rows, CMP_SCALE_WIDTH), [slot, 0], flat_scale)
+            else:
+                for lane in pl.unroll(CMP_PUBLISH_ROW_TILE):
+                    if lane < rows:
+                        physical = pl.tile.read(ids, [0, lane])
+                        if physical >= 0:
+                            slot = pl.cast(physical, pl.INDEX)
+                            payload_row = pl.tile.slice(payload, [1, HEAD_DIM // 2], [lane, 0])
+                            scale_row = pl.tile.slice(scale, [1, CMP_SCALE_WIDTH], [lane, 0])
+                            pl.store(payload_row, [slot, 0], flat)
+                            pl.store(scale_row, [slot, 0], flat_scale)
     return published
 
 
@@ -315,21 +340,26 @@ def c2a_compressor_state_write(
     blocks = pl.tensor.dim(state_cache, 0)
     state_rows = blocks * STATE_CAPACITY
     flat = pl.reshape(state_cache, [state_rows, STATE_WIDTH])
-    workers = pl.max(pl.min(num_tokens, 16), 1)
+    starts = pl.tensor.dim(query_start_loc, 0)
+    requests = pl.max(0, pl.min(pl.tensor.dim(state_block_table, 0), starts - 1))
+    tail_rows = requests * STATE_CAPACITY
+    workers = pl.max(1, pl.min(tail_rows, 16))
     with pl.spmd(workers, name_hint="state_cmp", deps=[pair_ready]) as state_tid:
         worker = pl.tile.get_block_idx()
-        for t in pl.range(worker, num_tokens, workers):
-            request = pl.cast(pl.read(token_to_req_indices, [t]), pl.INDEX)
-            if request >= 0 and request < pl.tensor.dim(state_block_table, 0):
+        for row in pl.range(worker, tail_rows, workers):
+            request = row // STATE_CAPACITY
+            start = pl.max(0, pl.read(query_start_loc, [request]))
+            end = pl.min(pl.read(query_start_loc, [request + 1]), num_tokens)
+            token = end - STATE_CAPACITY + row % STATE_CAPACITY
+            if token >= start:
+                token_request = pl.read(token_to_req_indices, [token])
                 block = pl.cast(pl.read(state_block_table, [request, 0]), pl.INDEX)
-                if block >= 0 and block < blocks:
-                    start = pl.read(query_start_loc, [request])
-                    end = pl.min(pl.read(query_start_loc, [request + 1]), num_tokens)
-                    position = pl.read(position_ids, [t])
-                    if t >= start and t < end and t >= end - STATE_CAPACITY and position >= 0:
+                if token_request == request and block >= 0 and block < blocks:
+                    position = pl.read(position_ids, [token])
+                    if position >= 0:
                         slot = pl.cast(block * STATE_CAPACITY + position % STATE_CAPACITY, pl.INDEX)
-                        flat[slot : slot + 1, :HEAD_DIM] = kv_proj[t : t + 1, :]
-                        flat[slot : slot + 1, HEAD_DIM:] = score_proj[t : t + 1, :]
+                        flat[slot : slot + 1, :HEAD_DIM] = kv_proj[token : token + 1, :]
+                        flat[slot : slot + 1, HEAD_DIM:] = score_proj[token : token + 1, :]
     return state_tid
 
 
@@ -373,7 +403,7 @@ def c2a_compressor_publish(
     source_ready: pl.Scalar[pl.TASK_ID],
     max_workers: pl.constexpr,
 ):
-    """Rotate and publish compressed rows with one worker per physical page."""
+    """Rotate and publish compressed rows to unique physical slots."""
     blocks = pl.tensor.dim(cache, 0)
     cache_rows = blocks * 128
     flat = pl.reshape(cache, [cache_rows, (HEAD_DIM // 2)])
@@ -381,9 +411,11 @@ def c2a_compressor_publish(
     workers = pl.min(num_tokens, max_workers)
     with pl.spmd(workers, name_hint="rope_pub_cmp", deps=[cache_ready, source_ready]) as publish_tid:
         worker = pl.tile.get_block_idx()
-        for t in pl.range(num_tokens):
+        begin = num_tokens * worker // workers
+        end = num_tokens * (worker + 1) // workers
+        for t in pl.range(begin, end):
             slot_i64 = pl.read(slots, [t])
-            if slot_i64 >= 0 and (slot_i64 // 128) % workers == worker:
+            if slot_i64 >= 0:
                 slot = pl.cast(slot_i64, pl.INDEX)
                 row = pl.tile.load(latent, [t, 0], [1, HEAD_DIM])
                 tail_bf16 = pl.tile.slice(row, [1, ROPE_DIM], [0, HEAD_DIM - ROPE_DIM])

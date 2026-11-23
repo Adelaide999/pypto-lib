@@ -21,6 +21,7 @@ from .decode_indexer import (
 )
 from .sparse_attention import (
     attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
+    WORKERS as ATTEND_WORKER_TILE,
 )
 from .hc import hc_project, hc_sinkhorn, hc_head_norm, hc_post
 from .config import (
@@ -182,7 +183,7 @@ def decode_c1a_full(
         window_indices, topk_indices, selected, indices, num_tokens, selection_ready,
         max_workers=GATHER_WORKER_TILE, name_hint="c1a_gather", gather_keys=640,
     )
-    attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64)
+    attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64, ATTEND_WORKER_TILE)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     o_proj(
         attended, wo_a, wo_b, rope_cos, rope_sin, attn_out, num_tokens,

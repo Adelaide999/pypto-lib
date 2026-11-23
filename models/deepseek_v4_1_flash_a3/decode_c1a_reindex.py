@@ -21,6 +21,7 @@ from .decode_indexer import c1a_index, score_reindex, select_pool_index_topk
 from .qkv_proj_rope import decode_q_proj_rope as q_proj_rope, decode_kv_proj_rope as kv_proj_rope
 from .sparse_attention import (
     gather_packed, attend_selected, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
+    WORKERS as ATTEND_WORKER_TILE,
 )
 from .o_proj import decode_o_proj as o_proj, prefill_tp_output_all_reduce
 
@@ -139,7 +140,7 @@ def decode_c1a_reindex(
         window_indices, topk_indices, selected, indices, num_tokens, selection_ready,
         max_workers=GATHER_WORKER_TILE, name_hint="c1a_gather", gather_keys=640,
     )
-    attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64)
+    attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64, ATTEND_WORKER_TILE)
     inv_rms, partials = hc_project(x_hc, hc_attn_fn)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)

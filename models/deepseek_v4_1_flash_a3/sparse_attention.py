@@ -39,7 +39,7 @@ from .utils import packed_query_lengths, window_metadata
 
 
 import pypto.language as pl
-from .quant import decode_fp8, decode_fp4
+from .quant import decode_fp8, decode_fp4, fp4_bf16_bits
 from .quant import encode_fp8
 
 from .config import (
@@ -79,15 +79,26 @@ HEAD_TILE = min(32, CUBE_HEADS)
 QUERY_HEAD_TILE = min(16, LOCAL_H)
 KEY_TILE = 128
 GATHER_KEY_TILE = 16
+FP4_PAIR_TILE = GATHER_KEY_TILE * (HEAD_DIM // 2)
 TOKEN_TILE = 512
 WORKERS = 32
 PREFILL_ATTEND_WORKERS = 64
 GATHER_WORKERS = 64
-SELECTED_GATHER_TILE = 32
+SELECTED_GATHER_TILE = 64
 CACHE_WORKERS = 128
 WINDOW_PUBLISH_WORKER_TILE = 12
-PREFILL_WINDOW_ROW_TILE = 64
-SHARED_GATHER_WORKERS = 128
+PREFILL_WINDOW_ROW_TILE = 8
+PREFILL_WINDOW_GROUP_TILE = PREFILL_WINDOW_ROW_TILE * SWA_GROUPS
+STREAM_WORKER_TILE = 24
+STREAM_KEY_TILE = 2 * SELECTED_GATHER_TILE
+STREAM_HEAD_TILE = LOCAL_H // 2
+STREAM_FEATURE_TILE = HEAD_DIM // 2
+STREAM_PV_DELAY = 2
+STREAM_SLOTS = STREAM_PV_DELAY + 1
+STREAM_KEY_READY = 0
+STREAM_SCORE_READY = 1
+STREAM_PROB_READY = 2
+STREAM_PV_READY = 3
 CACHE_MAX_ROWS = 32768
 PACKED_QUERY_TILE = 32
 PACKED_COHORT_TILE = 24
@@ -110,7 +121,7 @@ SWA_RUN_PARTS = SWA_WINDOW // SWA_RUN_TILE
 SWA_RUN_DESCRIPTOR_WIDTH = 8
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def prefill_publish_window(
     kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
     slots: pl.Tensor[[T_DYN], pl.INT64],
@@ -119,34 +130,51 @@ def prefill_publish_window(
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
 ):
+    """Quantize token tiles and publish contiguous or scattered cache rows."""
     cache_rows = pl.tensor.dim(cache, 0) * 128
     flat = pl.reshape(cache, [cache_rows, HEAD_DIM])
-    scale_flat = pl.reshape(scales, [cache_rows, HEAD_DIM // 32])
-    rows_per_block = pl.max(1, pl.min(PREFILL_WINDOW_ROW_TILE, num_tokens // 32))
-    blocks = (num_tokens + rows_per_block - 1) // rows_per_block
-    with pl.spmd(blocks, name_hint="pub_win", deps=[cache_ready]) as publish_tid:
-        begin = pl.tile.get_block_idx() * rows_per_block
-        for t in pl.range(begin, pl.min(num_tokens, begin + rows_per_block)):
-            _publish_window_row(kv, slots, flat, scale_flat, t)
-    return publish_tid
-
-
-@pl.jit.inline
-def prefill_publish_window_batched(
-    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.UINT8],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-):
-    cache_rows = pl.tensor.dim(cache, 0) * 128
-    flat = pl.reshape(cache, [cache_rows, HEAD_DIM])
-    scale_flat = pl.reshape(scales, [cache_rows, HEAD_DIM // 32])
-    with pl.spmd(64, name_hint="prefill_swa_cache_publish", deps=[cache_ready]) as publish_tid:
+    scale_flat = pl.reshape(scales, [cache_rows, SWA_GROUPS])
+    tokens = pl.tensor.dim(kv, 0)
+    slot_row = pl.reshape(slots, [1, tokens])
+    blocks = (num_tokens + PREFILL_WINDOW_ROW_TILE - 1) // PREFILL_WINDOW_ROW_TILE
+    workers = pl.max(1, pl.min(blocks, GATHER_WORKERS))
+    with pl.spmd(workers, name_hint="pub_win", deps=[cache_ready]) as publish_tid:
         worker = pl.tile.get_block_idx()
-        for t in pl.range(worker, num_tokens, 64):
-            _publish_window_row(kv, slots, flat, scale_flat, t)
+        for block in pl.range(worker, blocks, workers):
+            start = block * PREFILL_WINDOW_ROW_TILE
+            rows = pl.min(PREFILL_WINDOW_ROW_TILE, num_tokens - start)
+            ids = pl.load(slot_row, [0, start], [1, PREFILL_WINDOW_ROW_TILE], valid_shape=[1, rows])
+            first = pl.tile.read(ids, [0, 0])
+            contiguous = first >= 0
+            for lane in pl.unroll(1, PREFILL_WINDOW_ROW_TILE):
+                if lane < rows:
+                    contiguous = contiguous and pl.tile.read(ids, [0, lane]) == first + lane
+
+            source = pl.load(kv, [start, 0], [PREFILL_WINDOW_ROW_TILE, HEAD_DIM], valid_shape=[rows, HEAD_DIM])
+            source = pl.fillpad(source, pad_value=pl.PadValue.zero)
+            values = pl.cast(pl.set_validshape(source, PREFILL_WINDOW_ROW_TILE, HEAD_DIM), pl.FP32)
+            values = pl.reshape(values, [PREFILL_WINDOW_GROUP_TILE, 32])
+            reduce_tmp = pl.create_tile([PREFILL_WINDOW_GROUP_TILE, 32], dtype=pl.FP32)
+            maximum = pl.maximum(pl.row_max(pl.abs(values), tmp_tile=reduce_tmp), 1e-4)
+            scale = pl.cast(pl.mul(maximum, 1.0 / 448.0), pl.BF16, mode="rint")
+            normalized = pl.row_expand_div(values, pl.cast(scale, pl.FP32))
+            payload = encode_fp8(normalized, PREFILL_WINDOW_GROUP_TILE, 32)
+            payload = pl.reshape(payload, [PREFILL_WINDOW_ROW_TILE, HEAD_DIM])
+            scale = pl.reshape(scale, [PREFILL_WINDOW_ROW_TILE, SWA_GROUPS])
+            if contiguous:
+                slot = pl.cast(first, pl.INDEX)
+                pl.store(pl.set_validshape(payload, rows, HEAD_DIM), [slot, 0], flat)
+                pl.store(pl.set_validshape(scale, rows, SWA_GROUPS), [slot, 0], scale_flat)
+            else:
+                for lane in pl.unroll(PREFILL_WINDOW_ROW_TILE):
+                    if lane < rows:
+                        physical = pl.tile.read(ids, [0, lane])
+                        if physical >= 0:
+                            slot = pl.cast(physical, pl.INDEX)
+                            payload_row = pl.tile.slice(payload, [1, HEAD_DIM], [lane, 0])
+                            scale_row = pl.tile.slice(scale, [1, SWA_GROUPS], [lane, 0])
+                            pl.store(payload_row, [slot, 0], flat)
+                            pl.store(scale_row, [slot, 0], scale_flat)
     return publish_tid
 
 
@@ -1408,7 +1436,7 @@ def attend_selected(
     num_tokens: pl.Scalar[pl.INT32],
     selected_ready: pl.Scalar[pl.TASK_ID],
     key_tile: pl.constexpr,
-    worker_limit: pl.constexpr = WORKERS,
+    worker_limit: pl.constexpr,
 ):
     """Attend fixed sparse buffers with explicit probability tile boundaries."""
     tokens = pl.tensor.dim(query, 0)
@@ -1545,11 +1573,24 @@ def decode_packed_caches(
     workers = pl.max(1, pl.min(compressed_rows // GATHER_KEY_TILE, CACHE_WORKERS))
     with pl.spmd(workers, name_hint="sparse_shared_compressed_decode", deps=[ready]) as compressed_ready:
         worker = pl.tile.get_block_idx()
+        byte = pl.cast(pl.tile.arange(0, [1, 256], dtype=pl.INT32), pl.INT16, mode="rint")
+        low = pl.cast(pl.cast(fp4_bf16_bits(byte), pl.FP32), pl.INT32, mode="rint")
+        high = pl.cast(pl.cast(fp4_bf16_bits(pl.shrs(byte, 4)), pl.FP32), pl.INT32, mode="rint")
+        low_bits = pl.sub(low, pl.mul(pl.shrs(low, 31), 65536))
+        pair_table = pl.add(low_bits, pl.shls(high, 16))
+        pair_tmp = pl.create_tile([1, FP4_PAIR_TILE], dtype=pl.INT32)
         for block in pl.range(worker, compressed_rows // GATHER_KEY_TILE, workers):
             row = block * GATHER_KEY_TILE
             c_payload = pl.tile.load(c, [row, 0], [GATHER_KEY_TILE, HEAD_DIM // 2])
             c_factors = pl.tile.load(cs, [row, 0], [GATHER_KEY_TILE, HEAD_DIM // 16])
-            c_values = decode_fp4(c_payload, GATHER_KEY_TILE, HEAD_DIM)
+            signed = pl.reinterpret_view(c_payload, pl.INT8)
+            half = pl.cast(signed, pl.FP16)
+            byte_ids = pl.ands(pl.cast(half, pl.INT16, mode="rint"), 255)
+            wide_ids = pl.cast(pl.cast(byte_ids, pl.FP32), pl.INT32, mode="rint")
+            pair_indices = pl.reshape(wide_ids, [1, FP4_PAIR_TILE])
+            pair_bits = pl.tile.gather(pair_table, pair_indices, pair_tmp)
+            values = pl.reinterpret_view(pair_bits, pl.BF16, shape=[1, GATHER_KEY_TILE * HEAD_DIM])
+            c_values = pl.reshape(values, [GATHER_KEY_TILE, HEAD_DIM])
             c_grouped = pl.reshape(c_values, [GATHER_KEY_TILE * (HEAD_DIM // 16), 16])
             # BF16 scales can exceed the FP16 range; multiply in FP32.
             c_scales = pl.cast(c_factors, pl.FP32)
@@ -1563,64 +1604,245 @@ def decode_packed_caches(
 
 
 @pl.jit.inline(auto_scope=False)
-def gather_decoded_rows(
-    cache: pl.Tensor,
+def _matches_decoded_run(
     ids: pl.Tile[[1, SELECTED_GATHER_TILE], pl.INT32],
+    expected: pl.Tile[[1, SELECTED_GATHER_TILE], pl.INT32],
 ):
-    """Copy contiguous physical rows together and leave masked lanes zero."""
-    first = pl.tile.read(ids, [0, 0])
-    expected = pl.tile.ci(first, [1, SELECTED_GATHER_TILE], dtype=pl.INT32)
-    delta = pl.abs(pl.cast(pl.sub(ids, expected), pl.FP32))
-    checks = pl.tile.full([8, SELECTED_GATHER_TILE], dtype=pl.FP32, value=0.0)
-    checks = pl.tile.assemble(checks, delta, [0, 0])
-    scratch = pl.tile.create([8, SELECTED_GATHER_TILE], dtype=pl.FP32)
-    error = pl.tile.read(pl.row_max(checks, tmp_tile=scratch), [0, 0])
-    start = pl.cast(first, pl.INDEX)
-    values = pl.tile.full([SELECTED_GATHER_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-    if first >= 0 and error == 0.0:
-        values = pl.tile.load(cache, [start, 0], [SELECTED_GATHER_TILE, HEAD_DIM])
-    else:
-        for lane in pl.range(SELECTED_GATHER_TILE):
-            physical = pl.tile.read(ids, [0, lane])
-            if physical >= 0:
-                row = pl.cast(physical, pl.INDEX)
-                values = pl.tile.gather_row(values, cache, [lane, 0], [row, 0], [1, HEAD_DIM])
-    return values
+    mismatch = pl.tile.cmp(ids, expected, cmp_type=1)
+    bits = pl.tile.reinterpret_view(mismatch, pl.INT32)
+    return pl.tile.read(bits, [0, 0]) == 0 and pl.tile.read(bits, [0, 1]) == 0
 
 
 @pl.jit.inline(auto_scope=False)
-def gather_decoded_caches(
-    decoded_window: pl.Tensor[[CACHE_WINDOW_ROWS, HEAD_DIM], pl.BF16],
-    decoded_compressed: pl.Tensor[[CACHE_COMPRESSED_ROWS, HEAD_DIM], pl.BF16],
-    wi: pl.Tensor[[T_DYN, 128], pl.INT32],
-    ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
-    indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    window_ready: pl.Scalar[pl.TASK_ID],
-    compressed_ready: pl.Scalar[pl.TASK_ID],
-    previous: pl.Scalar[pl.TASK_ID],
+def _copy_decoded_window_runs(
+    cache: pl.Tensor,
+    ids: pl.Tile[[1, SELECTED_GATHER_TILE], pl.INT32],
+    output: pl.Tensor,
+    output_row: pl.Scalar[pl.INDEX],
+    first: pl.Scalar[pl.INT32],
+    last: pl.Scalar[pl.INT32],
 ):
-    selected_rows = pl.tensor.dim(selected, 0) * SELECTED_KEYS
-    dst = pl.reshape(selected, [selected_rows, HEAD_DIM])
-    workers = pl.max(1, pl.min(num_tokens * (SELECTED_KEYS // SELECTED_GATHER_TILE), SHARED_GATHER_WORKERS))
-    with pl.spmd(
-        workers, name_hint="sparse_shared_cache_gather",
-        deps=[window_ready, compressed_ready, previous],
-    ) as gathered:
+    rows = pl.cast(WINDOW_KEYS - first % WINDOW_KEYS, pl.INDEX)
+    copied = pl.cast(0, pl.INT32)
+    if first >= 0 and rows < SELECTED_GATHER_TILE:
+        second = pl.tile.read(ids, [0, rows])
+        if second >= 0 and last - second == SELECTED_GATHER_TILE - rows - 1:
+            columns = pl.tile.arange(0, [1, SELECTED_GATHER_TILE], dtype=pl.INT32)
+            first_sequence = pl.tile.ci(first, [1, SELECTED_GATHER_TILE], dtype=pl.INT32)
+            second_base = second - pl.cast(rows, pl.INT32)
+            second_sequence = pl.tile.ci(second_base, [1, SELECTED_GATHER_TILE], dtype=pl.INT32)
+            rows_f32 = pl.cast(pl.cast(rows, pl.INT32), pl.FP32)
+            first_mask = pl.tile.cmps(pl.cast(columns, pl.FP32), rows_f32, cmp_type=2)
+            expected = pl.tile.select(first_mask, first_sequence, second_sequence)
+            if _matches_decoded_run(ids, expected):
+                first_row = pl.cast(first, pl.INDEX)
+                second_row = pl.cast(second, pl.INDEX)
+                values = pl.tile.create([SELECTED_GATHER_TILE, HEAD_DIM], dtype=pl.BF16)
+                values = pl.tile.gather_row(
+                    values, cache, [0, 0], [first_row, 0], [SELECTED_GATHER_TILE, HEAD_DIM],
+                    valid_shape=[rows, HEAD_DIM],
+                )
+                values = pl.tile.gather_row(
+                    values, cache, [rows, 0], [second_row, 0], [SELECTED_GATHER_TILE, HEAD_DIM],
+                    valid_shape=[SELECTED_GATHER_TILE - rows, HEAD_DIM],
+                )
+                pl.tile.store(values, [output_row, 0], output)
+                copied = pl.cast(1, pl.INT32)
+    return copied
+
+
+@pl.jit.inline(auto_scope=False)
+def gather_decoded_rows(
+    cache: pl.Tensor,
+    ids: pl.Tile[[1, SELECTED_GATHER_TILE], pl.INT32],
+    output: pl.Tensor,
+    output_row: pl.Scalar[pl.INDEX],
+    sliding_window: pl.constexpr,
+):
+    """Copy contiguous rows, gather irregular rows, and fill masked lanes."""
+    first = pl.tile.read(ids, [0, 0])
+    last = pl.tile.read(ids, [0, SELECTED_GATHER_TILE - 1])
+    contiguous = pl.cast(0, pl.INT32)
+    if first >= 0 and last - first == SELECTED_GATHER_TILE - 1:
+        expected = pl.tile.ci(first, [1, SELECTED_GATHER_TILE], dtype=pl.INT32)
+        # The 64-lane comparison mask occupies two INT32 words.
+        contiguous = pl.cast(_matches_decoded_run(ids, expected), pl.INT32)
+    if contiguous != 0:
+        start = pl.cast(first, pl.INDEX)
+        contiguous_rows = pl.tile.load(cache, [start, 0], [SELECTED_GATHER_TILE, HEAD_DIM])
+        pl.tile.store(contiguous_rows, [output_row, 0], output)
+    else:
+        copied = pl.cast(0, pl.INT32)
+        if sliding_window:
+            copied = _copy_decoded_window_runs(cache, ids, output, output_row, first, last)
+        if copied == 0:
+            values = pl.tile.full([SELECTED_GATHER_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            has_values = pl.cast(1, pl.INT32)
+            if first < 0 and last < 0:
+                sign = pl.shrs(ids, 31)
+                valid = pl.tile.cmps(sign, 0, cmp_type=0)
+                valid_bits = pl.tile.reinterpret_view(valid, pl.INT32)
+                valid_low = pl.tile.read(valid_bits, [0, 0])
+                valid_high = pl.tile.read(valid_bits, [0, 1])
+                has_values = pl.cast(valid_low != 0 or valid_high != 0, pl.INT32)
+            if has_values != 0:
+                for lane in pl.range(SELECTED_GATHER_TILE):
+                    physical = pl.tile.read(ids, [0, lane])
+                    if physical >= 0:
+                        row = pl.cast(physical, pl.INDEX)
+                        values = pl.tile.gather_row(values, cache, [lane, 0], [row, 0], [1, HEAD_DIM])
+            pl.tile.store(values, [output_row, 0], output)
+
+
+@pl.jit.inline(auto_scope=False)
+def _stream_decoded_kv(
+    query: pl.Tensor,
+    window: pl.Tensor,
+    compressed: pl.Tensor,
+    wi: pl.Tensor,
+    ci: pl.Tensor,
+    sink: pl.Tensor,
+    output: pl.Tensor,
+    active: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+    indices_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Stream selected BF16 KV tiles through a per-worker ring."""
+    capacity = pl.tensor.dim(query, 0)
+    query_rows = capacity * LOCAL_H
+    qflat = pl.reshape(query, [query_rows, HEAD_DIM])
+    oflat = pl.reshape(output, [query_rows, HEAD_DIM])
+    sinks = pl.reshape(sink, [1, LOCAL_H])
+    parts = pl.create_tensor([capacity, 1], dtype=pl.INT32)
+    token_groups = (active + 7) // 8
+    workers = pl.max(1, pl.min(token_groups, STREAM_WORKER_TILE * 2))
+    with pl.spmd(workers, name_hint="prefill_sparse_kv_part_count", deps=[indices_ready]) as counted:
         worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, num_tokens * (SELECTED_KEYS // SELECTED_GATHER_TILE), workers):
-            token = block // (SELECTED_KEYS // SELECTED_GATHER_TILE)
-            column = block % (SELECTED_KEYS // SELECTED_GATHER_TILE) * SELECTED_GATHER_TILE
-            if column < 128:
-                ids = pl.tile.load(wi, [token, column], [1, SELECTED_GATHER_TILE])
-                values = gather_decoded_rows(decoded_window, ids)
-            else:
-                ids = pl.tile.load(ci, [token, column - 128], [1, SELECTED_GATHER_TILE])
-                values = gather_decoded_rows(decoded_compressed, ids)
-            pl.tile.store(values, [token * SELECTED_KEYS + column, 0], dst)
-            pl.tile.store(ids, [token, column], indices)
-    return gathered
+        columns = pl.tile.arange(0, [1, INDEX_TOPK], dtype=pl.INT32)
+        part_codes = pl.cast(pl.add(pl.tile.shrs(columns, 7), 2), pl.FP32)
+        scratch = pl.create_tile([8, INDEX_TOPK], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        for group in pl.range(worker, token_groups, workers):
+            start = group * 8
+            valid_rows = pl.min(active - start, 8)
+            count_ids = pl.load(ci, [start, 0], [8, INDEX_TOPK], valid_shape=[valid_rows, INDEX_TOPK])
+            ids_f32 = pl.cast(count_ids, pl.FP32)
+            visible = pl.minimum(pl.maximum(pl.add(ids_f32, 1.0), 0.0), 1.0)
+            marked = pl.col_expand_mul(visible, part_codes)
+            last = pl.maximum(pl.row_max(marked, tmp_tile=scratch), 1.0)
+            pl.store(pl.set_validshape(pl.cast(last, pl.INT32), valid_rows, 1), [start, 0], parts)
+
+    blocks = pl.max(1, pl.min(active, STREAM_WORKER_TILE))
+    stages = blocks * STREAM_SLOTS
+    key_ring = pl.create_tensor([stages * STREAM_KEY_TILE, HEAD_DIM], dtype=pl.BF16)
+    scores = pl.create_tensor([stages * LOCAL_H, STREAM_KEY_TILE], dtype=pl.FP32)
+    weights = pl.create_tensor([stages * LOCAL_H, STREAM_KEY_TILE], dtype=pl.BF16)
+    projections = pl.create_tensor([stages * LOCAL_H, HEAD_DIM], dtype=pl.FP32)
+    ffts = pl.create_tensor([256], dtype=pl.INT64)
+    with pl.spmd(blocks, name_hint="prefill_sparse_kv_pipeline", deps=[counted, ready]) as complete:
+        worker = pl.tile.get_block_idx()
+        pl.system.set_ffts(ffts)
+        for token in pl.range(worker, active, blocks):
+            live = pl.read(parts, [token, 0])
+            kv_l1 = pl.create_tile([STREAM_SLOTS * STREAM_KEY_TILE, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Mat)
+            q = pl.load(qflat, [token * LOCAL_H, 0], [LOCAL_H, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+            for step in pl.range(live + STREAM_PV_DELAY):
+                if step < live:
+                    slot = step % STREAM_SLOTS
+                    stage = worker * STREAM_SLOTS + slot
+                    l1_row = slot * STREAM_KEY_TILE
+                    pl.system.sync_wait(STREAM_KEY_READY, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
+                    kv_l1 = pl.gather_row(kv_l1, key_ring, [l1_row, 0], [stage * STREAM_KEY_TILE, 0], [STREAM_KEY_TILE, HEAD_DIM])
+                    k = pl.tile.slice(pl.tile.transpose_view(kv_l1), [HEAD_DIM, STREAM_KEY_TILE], [0, l1_row])
+                    qk = pl.matmul(q, k, out_dtype=pl.FP32)
+                    pl.store(qk, [stage * LOCAL_H, 0], scores)
+                    pl.system.sync_set(STREAM_SCORE_READY, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
+                if step >= STREAM_PV_DELAY:
+                    part = step - STREAM_PV_DELAY
+                    slot = part % STREAM_SLOTS
+                    stage = worker * STREAM_SLOTS + slot
+                    pl.system.sync_wait(STREAM_PROB_READY, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
+                    prob = pl.load(weights, [stage * LOCAL_H, 0], [LOCAL_H, STREAM_KEY_TILE], target_memory=pl.MemorySpace.Mat)
+                    v = pl.tile.slice(kv_l1, [STREAM_KEY_TILE, HEAD_DIM], [slot * STREAM_KEY_TILE, 0])
+                    pv = pl.matmul(prob, v, out_dtype=pl.FP32)
+                    pl.store(pv, [stage * LOCAL_H, 0], projections)
+                    pl.system.sync_set(STREAM_PV_READY, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
+
+            for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                pl.system.set_ffts(ffts)
+                head = lane * STREAM_HEAD_TILE
+                initial_m = pl.tile.full([1, STREAM_HEAD_TILE], dtype=pl.FP32, value=-1e30)
+                initial_l = pl.tile.full([1, STREAM_HEAD_TILE], dtype=pl.FP32, value=0.0)
+                initial_left = pl.tile.full([STREAM_HEAD_TILE, STREAM_FEATURE_TILE], dtype=pl.FP32, value=0.0)
+                initial_right = pl.tile.full([STREAM_HEAD_TILE, STREAM_FEATURE_TILE], dtype=pl.FP32, value=0.0)
+                for step, (m, l, left, right, alpha_old, alpha_new) in pl.range(
+                    live + STREAM_PV_DELAY + 1,
+                    init_values=(initial_m, initial_l, initial_left, initial_right, initial_l, initial_l),
+                ):
+                    if step < live:
+                        stage = worker * STREAM_SLOTS + step % STREAM_SLOTS
+                        dst_row = stage * STREAM_KEY_TILE + lane * SELECTED_GATHER_TILE
+                        if step == 0:
+                            w_ids = pl.tile.load(wi, [token, lane * SELECTED_GATHER_TILE], [1, SELECTED_GATHER_TILE])
+                            gather_decoded_rows(window, w_ids, key_ring, dst_row, True)
+                        else:
+                            col = (step - 1) * STREAM_KEY_TILE + lane * SELECTED_GATHER_TILE
+                            c_ids = pl.tile.load(ci, [token, col], [1, SELECTED_GATHER_TILE])
+                            gather_decoded_rows(compressed, c_ids, key_ring, dst_row, False)
+                        pl.system.sync_set(STREAM_KEY_READY, pipe=pl.PipeType.MTE3, ffts_mode=2, core_type=pl.KernelType.AIV)
+
+                    if step > 0 and step <= live:
+                        part = step - 1
+                        stage_row = (worker * STREAM_SLOTS + part % STREAM_SLOTS) * LOCAL_H + head
+                        pl.system.sync_wait(STREAM_SCORE_READY, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
+                        score = pl.load(scores, [stage_row, 0], [STREAM_HEAD_TILE, STREAM_KEY_TILE], target_memory=pl.MemorySpace.Vec)
+                        score_ids = pl.tile.load(wi, [token, 0], [1, STREAM_KEY_TILE])
+                        if part > 0:
+                            score_ids = pl.tile.load(ci, [token, (part - 1) * STREAM_KEY_TILE], [1, STREAM_KEY_TILE])
+                        wide = pl.cast(score_ids, pl.FP32)
+                        valid = pl.minimum(pl.maximum(pl.add(wide, 1.0), 0.0), 1.0)
+                        bias = pl.mul(pl.sub(valid, 1.0), 1e30)
+                        scaled = pl.col_expand_add(pl.mul(score, SCALE), bias)
+                        tmp = pl.create_tile([STREAM_HEAD_TILE, STREAM_KEY_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                        local_m = pl.reshape(pl.row_max(scaled, tmp), [1, STREAM_HEAD_TILE])
+                        next_m = pl.maximum(m, local_m)
+                        alpha = pl.exp(pl.sub(m, next_m))
+                        max_col = pl.reshape(next_m, [STREAM_HEAD_TILE, 1])
+                        p = pl.col_expand_mul(pl.exp(pl.row_expand_sub(scaled, max_col)), valid)
+                        local_l = pl.reshape(pl.row_sum(p, tmp), [1, STREAM_HEAD_TILE])
+                        next_l = pl.add(pl.mul(l, alpha), local_l)
+                        pl.store(pl.cast(p, pl.BF16, mode="rint"), [stage_row, 0], weights)
+                        pl.system.sync_set(STREAM_PROB_READY, pipe=pl.PipeType.MTE3, ffts_mode=2, core_type=pl.KernelType.AIV)
+                        softmax_m, softmax_l, softmax_alpha = pl.yield_(next_m, next_l, alpha)
+                    else:
+                        softmax_m, softmax_l, softmax_alpha = pl.yield_(m, l, initial_l)
+
+                    if step >= STREAM_PV_DELAY + 1:
+                        part = step - STREAM_PV_DELAY - 1
+                        stage_row = (worker * STREAM_SLOTS + part % STREAM_SLOTS) * LOCAL_H + head
+                        pl.system.sync_wait(STREAM_PV_READY, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
+                        left_pv = pl.load(projections, [stage_row, 0], [STREAM_HEAD_TILE, STREAM_FEATURE_TILE])
+                        right_pv = pl.load(projections, [stage_row, STREAM_FEATURE_TILE], [STREAM_HEAD_TILE, STREAM_FEATURE_TILE])
+                        alpha_col = pl.reshape(alpha_old, [STREAM_HEAD_TILE, 1])
+                        next_left = pl.add(pl.row_expand_mul(left, alpha_col), left_pv)
+                        next_right = pl.add(pl.row_expand_mul(right, alpha_col), right_pv)
+                        merge_left, merge_right = pl.yield_(next_left, next_right)
+                    else:
+                        merge_left, merge_right = pl.yield_(left, right)
+                    final_m, final_l, final_left, final_right, final_old, final_new = pl.yield_(
+                        softmax_m, softmax_l, merge_left, merge_right, alpha_new, softmax_alpha,
+                    )
+
+                local_sink = pl.load(sinks, [0, head], [1, STREAM_HEAD_TILE], target_memory=pl.MemorySpace.Vec)
+                final_max = pl.maximum(local_sink, final_m)
+                correction = pl.exp(pl.sub(final_m, final_max))
+                final_den = pl.add(pl.mul(final_l, correction), pl.exp(pl.sub(local_sink, final_max)))
+                scale = pl.reshape(pl.div(correction, final_den), [STREAM_HEAD_TILE, 1])
+                out_left = pl.cast(pl.row_expand_mul(final_left, scale), pl.BF16, mode="rint")
+                out_right = pl.cast(pl.row_expand_mul(final_right, scale), pl.BF16, mode="rint")
+                row = token * LOCAL_H + head
+                pl.store(out_left, [row, 0], oflat)
+                pl.store(out_right, [row, STREAM_FEATURE_TILE], oflat)
+    return complete
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1636,8 +1858,6 @@ def _attend_cache_shared(
     output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     query_ready: pl.Scalar[pl.TASK_ID],
-    key_tile: pl.constexpr,
-    token_tile: pl.constexpr,
 ):
     window_rows = pl.tensor.dim(window, 0) * 128
     compressed_rows = pl.tensor.dim(compressed, 0) * 128
@@ -1647,27 +1867,11 @@ def _attend_cache_shared(
         window, window_scale, compressed, compressed_scale,
         decoded_window, decoded_compressed, query_ready,
     )
-    half_tile = token_tile // 2
-    streams = pl.min(2, (num_tokens + half_tile - 1) // half_tile)
-    for stream in pl.parallel(streams):
-        capacity = pl.min(half_tile, num_tokens - stream * half_tile)
-        selected = pl.create_tensor([capacity, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
-        indices = pl.create_tensor([capacity, SELECTED_KEYS], dtype=pl.INT32)
-        previous = query_ready
-        for offset in pl.range(stream * half_tile, num_tokens, token_tile):
-            count = pl.min(half_tile, num_tokens - offset)
-            q = pl.slice(query, [count, LOCAL_H * HEAD_DIM], [offset, 0])
-            wi = pl.slice(window_indices, [count, 128], [offset, 0])
-            ci = pl.slice(compressed_indices, [count, INDEX_TOPK], [offset, 0])
-            out = pl.slice(output, [count, LOCAL_H * HEAD_DIM], [offset, 0])
-            gathered = gather_decoded_caches(
-                decoded_window, decoded_compressed, wi, ci, selected, indices,
-                count, window_ready, compressed_ready, previous,
-            )
-            previous = attend_selected(
-                q, selected, indices, sink, out, count, gathered,
-                key_tile, PREFILL_ATTEND_WORKERS,
-            )
+    ready = pl.system.task_dummy(deps=[window_ready, compressed_ready])
+    _stream_decoded_kv(
+        query, decoded_window, decoded_compressed, window_indices, compressed_indices,
+        sink, output, num_tokens, ready, query_ready,
+    )
     return output
 
 
@@ -1729,7 +1933,7 @@ def attend_packed(
     if use_shared == 1:
         output = _attend_cache_shared(
             query, window_indices, window, window_scale, compressed_indices,
-            compressed, compressed_scale, sink, output, num_tokens, ready, key_tile, token_tile,
+            compressed, compressed_scale, sink, output, num_tokens, ready,
         )
     else:
         if TP_SIZE == 1 and num_tokens <= 12:
