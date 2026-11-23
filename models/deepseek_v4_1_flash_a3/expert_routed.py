@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 from .config import EXPERT_N_TILE, EXPERT_K_TILE, FLASH as M, MOE_TOKENS
 from .config import N_LOCAL_EXPERTS, ROUTE_T_DYN
-from .gemm import expert_swiglu, gemm_dynamic_int8
+from .gemm import expert_down, expert_swiglu
 
 
 # model config
@@ -61,11 +61,9 @@ def expert_routed_compute(
     hidden = pl.create_tensor([capacity, MOE_INTER], dtype=pl.BF16)
     expert_swiglu(
         source, source_scale, w1, scale1, w3, scale3, route_weights, hidden, count,
-        D, MOE_INTER, EXPERT_N_TILE, EXPERT_K_TILE, SWIGLU_LIMIT, True, "routed_swiglu", output_major,
+        D, MOE_INTER, EXPERT_N_TILE, EXPERT_K_TILE, SWIGLU_LIMIT, True, "routed_swiglu", output_major, prefill,
     )
-    return gemm_dynamic_int8(
-        hidden, w2, scale2, output, count, MOE_INTER, D, "routed_down", output_major, prefill,
-    )
+    return expert_down(hidden, w2, scale2, output, count, MOE_INTER, D, "routed_down", output_major, prefill)
 
 
 @pl.jit.inline(auto_scope=False)

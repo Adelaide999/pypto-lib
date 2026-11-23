@@ -27,6 +27,8 @@ MM_N_DYN = pl.dynamic("A3_MM_N_DYN")
 MM_S_DYN = pl.dynamic("A3_MM_S_DYN")
 
 DOT_K_TILE = 16
+PREFILL_EXPERT_LARGE_M_TILE = 64
+PREFILL_EXPERT_DOWN_N_TILE = 256
 
 
 @pl.jit.inline(auto_scope=False)
@@ -374,6 +376,7 @@ def expert_swiglu_tiled(
     count: pl.Scalar[pl.INT32], width: pl.constexpr, intermediate: pl.constexpr,
     n_tile: pl.constexpr, k_tile: pl.constexpr, limit: pl.constexpr,
     weighted: pl.constexpr, hint: pl.constexpr, output_major: pl.constexpr, row_tile: pl.constexpr,
+    k_stages: pl.constexpr,
 ):
     """Share the activation panel between the two INT8 expert projections."""
     panels = intermediate // n_tile
@@ -388,20 +391,36 @@ def expert_swiglu_tiled(
             gate_acc = pl.set_validshape(gate_seed, rows, n_tile)
             up_seed = pl.tile.create([row_tile, n_tile], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc, compact=True)
             up_acc = pl.set_validshape(up_seed, rows, n_tile)
-            for k in pl.range(0, width, k_tile):
-                source = pl.load(x, [row, k], [row_tile, k_tile], valid_shape=[rows, k_tile])
-                if output_major:
-                    gate_nk = pl.load(w1, [col, k], [n_tile, k_tile], target_memory=pl.MemorySpace.Mat)
-                    gate_t = pl.tile.transpose_view(gate_nk)
-                    up_nk = pl.load(w3, [col, k], [n_tile, k_tile], target_memory=pl.MemorySpace.Mat)
-                    up_t = pl.tile.transpose_view(up_nk)
-                    gate_acc = pl.matmul_acc(gate_acc, source, gate_t, init_cond=(k == 0))
-                    up_acc = pl.matmul_acc(up_acc, source, up_t, init_cond=(k == 0))
-                else:
-                    gate_weights = pl.load(w1, [k, col], [k_tile, n_tile])
-                    up_weights = pl.load(w3, [k, col], [k_tile, n_tile])
-                    gate_acc = pl.matmul_acc(gate_acc, source, gate_weights, init_cond=(k == 0))
-                    up_acc = pl.matmul_acc(up_acc, source, up_weights, init_cond=(k == 0))
+            if k_stages > 1:
+                for k in pl.pipeline(0, width, k_tile, stage=k_stages):
+                    source = pl.load(x, [row, k], [row_tile, k_tile], valid_shape=[rows, k_tile])
+                    if output_major:
+                        gate_nk = pl.load(w1, [col, k], [n_tile, k_tile], target_memory=pl.MemorySpace.Mat)
+                        gate_t = pl.tile.transpose_view(gate_nk)
+                        up_nk = pl.load(w3, [col, k], [n_tile, k_tile], target_memory=pl.MemorySpace.Mat)
+                        up_t = pl.tile.transpose_view(up_nk)
+                        gate_acc = pl.matmul_acc(gate_acc, source, gate_t, init_cond=(k == 0))
+                        up_acc = pl.matmul_acc(up_acc, source, up_t, init_cond=(k == 0))
+                    else:
+                        gate_weights = pl.load(w1, [k, col], [k_tile, n_tile])
+                        up_weights = pl.load(w3, [k, col], [k_tile, n_tile])
+                        gate_acc = pl.matmul_acc(gate_acc, source, gate_weights, init_cond=(k == 0))
+                        up_acc = pl.matmul_acc(up_acc, source, up_weights, init_cond=(k == 0))
+            else:
+                for k in pl.range(0, width, k_tile):
+                    source = pl.load(x, [row, k], [row_tile, k_tile], valid_shape=[rows, k_tile])
+                    if output_major:
+                        gate_nk = pl.load(w1, [col, k], [n_tile, k_tile], target_memory=pl.MemorySpace.Mat)
+                        gate_t = pl.tile.transpose_view(gate_nk)
+                        up_nk = pl.load(w3, [col, k], [n_tile, k_tile], target_memory=pl.MemorySpace.Mat)
+                        up_t = pl.tile.transpose_view(up_nk)
+                        gate_acc = pl.matmul_acc(gate_acc, source, gate_t, init_cond=(k == 0))
+                        up_acc = pl.matmul_acc(up_acc, source, up_t, init_cond=(k == 0))
+                    else:
+                        gate_weights = pl.load(w1, [k, col], [k_tile, n_tile])
+                        up_weights = pl.load(w3, [k, col], [k_tile, n_tile])
+                        gate_acc = pl.matmul_acc(gate_acc, source, gate_weights, init_cond=(k == 0))
+                        up_acc = pl.matmul_acc(up_acc, source, up_weights, init_cond=(k == 0))
             scale = pl.load(factor, [row, 0], [row_tile, 1], valid_shape=[rows, 1])
             gate_scale = pl.load(s1, [0, col], [1, n_tile])
             up_scale = pl.load(s3, [0, col], [1, n_tile])
@@ -426,14 +445,72 @@ def expert_swiglu(
     w3: pl.Tensor, s3: pl.Tensor, route: pl.Tensor, hidden: pl.Tensor,
     count: pl.Scalar[pl.INT32], width: pl.constexpr, intermediate: pl.constexpr,
     n_tile: pl.constexpr, k_tile: pl.constexpr, limit: pl.constexpr,
-    weighted: pl.constexpr, hint: pl.constexpr, output_major: pl.constexpr,
+    weighted: pl.constexpr, hint: pl.constexpr, output_major: pl.constexpr, prefill: pl.constexpr,
 ):
     """Select a row tile for the number of tokens assigned to this expert."""
-    if count >= 32:
-        expert_swiglu_tiled(x, factor, w1, s1, w3, s3, route, hidden, count, width, intermediate, 128, k_tile, limit, weighted, hint, output_major, 32)
+    if prefill:
+        if count > PREFILL_EXPERT_LARGE_M_TILE:
+            expert_swiglu_tiled(
+                x, factor, w1, s1, w3, s3, route, hidden, count, width, intermediate,
+                n_tile, k_tile, limit, weighted, hint, output_major, PREFILL_EXPERT_LARGE_M_TILE, 2,
+            )
+        elif count >= 17:
+            expert_swiglu_tiled(
+                x, factor, w1, s1, w3, s3, route, hidden, count, width, intermediate,
+                128, k_tile, limit, weighted, hint, output_major, 32, 2,
+            )
+        else:
+            expert_swiglu_tiled(
+                x, factor, w1, s1, w3, s3, route, hidden, count, width, intermediate,
+                n_tile, k_tile, limit, weighted, hint, output_major, 16, 2,
+            )
+    elif count >= 32:
+        expert_swiglu_tiled(
+            x, factor, w1, s1, w3, s3, route, hidden, count, width, intermediate,
+            128, k_tile, limit, weighted, hint, output_major, 32, 1,
+        )
     else:
-        expert_swiglu_tiled(x, factor, w1, s1, w3, s3, route, hidden, count, width, intermediate, n_tile, k_tile, limit, weighted, hint, output_major, 16)
+        expert_swiglu_tiled(
+            x, factor, w1, s1, w3, s3, route, hidden, count, width, intermediate,
+            n_tile, k_tile, limit, weighted, hint, output_major, 16, 1,
+        )
     return hidden
+
+
+@pl.jit.inline(auto_scope=False)
+def expert_down(
+    hidden: pl.Tensor,
+    weight: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Tensor,
+    count: pl.Scalar[pl.INT32],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    hint: pl.constexpr,
+    output_major: pl.constexpr,
+    prefill: pl.constexpr,
+):
+    """Quantize the expert activation and project it back to the model width."""
+    payload, scale = quantize_projection_activation(hidden, count, width, True, prefill)
+    if prefill:
+        if count > PREFILL_EXPERT_LARGE_M_TILE:
+            prefill_gemm_int8_tiled(
+                payload, scale, weight, weight_scale, output, count, width, output_width,
+                hint, 128, 256, output_major, PREFILL_EXPERT_LARGE_M_TILE,
+            )
+        elif count > 16:
+            prefill_gemm_int8_tiled(
+                payload, scale, weight, weight_scale, output, count, width, output_width,
+                hint, PREFILL_EXPERT_DOWN_N_TILE, 256, output_major, 32,
+            )
+        else:
+            prefill_gemm_int8_tiled(
+                payload, scale, weight, weight_scale, output, count, width, output_width,
+                hint, PREFILL_EXPERT_DOWN_N_TILE, 256, output_major, 16,
+            )
+    else:
+        gemm_int8(payload, scale, weight, weight_scale, output, count, width, output_width, hint, 128, 256, output_major)
+    return output
 
 
 @pl.jit.inline(auto_scope=False)

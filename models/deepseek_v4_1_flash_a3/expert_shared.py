@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from .config import EXPERT_N_TILE, EXPERT_K_TILE, FLASH as M, MOE_TOKENS
-from .gemm import expert_swiglu, gemm_dynamic_int8
+from .gemm import expert_down, expert_swiglu
 
 
 # model config
@@ -58,11 +58,9 @@ def expert_shared(
     hidden = pl.create_tensor([padded_rows, MOE_INTER], dtype=pl.BF16)
     expert_swiglu(
         x_local, scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        scale, hidden, num_tokens, D, MOE_INTER, EXPERT_N_TILE, EXPERT_K_TILE, SWIGLU_LIMIT, False, "shared_swiglu", output_major,
+        scale, hidden, num_tokens, D, MOE_INTER, EXPERT_N_TILE, EXPERT_K_TILE, SWIGLU_LIMIT, False, "shared_swiglu", output_major, prefill,
     )
-    return gemm_dynamic_int8(
-        hidden, shared_w2, shared_w2_scale, sh, num_tokens, MOE_INTER, D, "shared_down", output_major, prefill,
-    )
+    return expert_down(hidden, shared_w2, shared_w2_scale, sh, num_tokens, MOE_INTER, D, "shared_down", output_major, prefill)
 
 
 def golden_expert_shared(payload, activation_scale, w1, scale1, w3, scale3, w2, scale2):
