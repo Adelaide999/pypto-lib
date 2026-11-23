@@ -48,6 +48,9 @@ N_TILE = 256
 PREFILL_M_TILE = 128
 PREFILL_MIN_ROWS = 1024
 D_TILE = 512
+ROT_TILE = 32
+ROT_M_TILE = 64
+ROT_WORKER_TILE = 24
 
 
 @pl.jit.inline
@@ -99,6 +102,27 @@ def engram_unrotate(
     return output
 
 
+@pl.jit.inline(auto_scope=False)
+def prefill_engram_unrotate(source: pl.Tensor, rotation: pl.Tensor, output: pl.Tensor):
+    """Apply each FP32 rotation block to a panel of residual streams on Cube."""
+    rows = pl.tensor.dim(source, 0) * HC_MULT
+    source_flat = pl.reshape(source, [rows, D])
+    output_flat = pl.reshape(output, [rows, D])
+    rotation_flat = pl.reshape(rotation, [D, ROT_TILE])
+    for worker in pl.spmd(ROT_WORKER_TILE, name_hint="engram_unrotate_cube"):
+        for block in pl.range(worker, D // ROT_TILE, ROT_WORKER_TILE):
+            column = block * ROT_TILE
+            weight = pl.load(rotation_flat, [column, 0], [ROT_TILE, ROT_TILE], target_memory=pl.MemorySpace.Mat)
+            weight_t = pl.tile.transpose_view(weight)
+            for row in pl.pipeline(0, rows, ROT_M_TILE, stage=2):
+                valid_rows = pl.min(ROT_M_TILE, rows - row)
+                value = pl.load(source_flat, [row, column], [ROT_M_TILE, ROT_TILE], valid_shape=[valid_rows, ROT_TILE])
+                result = pl.tile.matmul(value, weight_t)
+                result = pl.set_validshape(result, valid_rows, ROT_TILE)
+                pl.store(result, [row, column], output_flat)
+    return output
+
+
 @pl.jit.inline
 def engram_gate(
     kv: pl.Tensor,
@@ -107,6 +131,7 @@ def engram_gate(
     x: pl.Tensor,
     out: pl.Tensor,
     output_fp32: pl.constexpr,
+    kv_bf16: pl.constexpr,
 ):
     """Gate projected keys and values into each residual stream copy."""
     t_dim = pl.tensor.dim(kv, 0)
@@ -126,6 +151,8 @@ def engram_gate(
         for d0 in pl.range(0, D, D_TILE):
             x_raw = pl.load(query_flat, [t0, c * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
             key_raw = pl.load(kv, [t0, c * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
+            if kv_bf16:
+                key_raw = pl.cast(key_raw, pl.FP32)
             key_d = pl.set_validshape(pl.fillpad(key_raw, pad_value=pl.PadValue.zero), T_TILE, D_TILE)
             x_d = pl.set_validshape(pl.fillpad(x_raw, pad_value=pl.PadValue.zero), T_TILE, D_TILE)
             sq_x = pl.add(sq_x, pl.reshape(pl.row_sum(pl.mul(x_d, x_d), reduction_tmp), [1, T_TILE]))
@@ -146,6 +173,8 @@ def engram_gate(
         for d0 in pl.range(0, D, D_TILE):
             output_source = pl.load(x_flat, [t0, c * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
             output_value = pl.load(kv, [t0, HC_MULT * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
+            if kv_bf16:
+                output_value = pl.cast(output_value, pl.FP32)
             gated = pl.row_expand_mul(output_value, gate)
             y = pl.add(output_source, gated)
             y_bf16 = pl.cast(y, target_type=pl.BF16, mode="rint")
@@ -183,12 +212,21 @@ def make_engram_from_rows(*, prefill):
                 ENGRAM_K, KV_OUT, N_TILE, K_TILE, 24, "engram_projection", 0, 0, False, 64, stages=2,
             )
         pl.dump_tag(kv)
-        kv_fp32 = pl.create_tensor([tokens, KV_OUT], dtype=pl.FP32)
-        engram_cast_to_fp32(kv, kv_fp32)
-        original_query = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
-        engram_unrotate(x, rotation, original_query)
-        pl.dump_tag(original_query)
-        engram_gate(kv_fp32, weight, original_query, x, out, output_fp32=True)
+        if prefill:
+            original_query = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
+            if tokens >= PREFILL_MIN_ROWS:
+                prefill_engram_unrotate(x, rotation, original_query)
+            else:
+                engram_unrotate(x, rotation, original_query)
+            pl.dump_tag(original_query)
+            engram_gate(kv, weight, original_query, x, out, output_fp32=True, kv_bf16=True)
+        else:
+            kv_fp32 = pl.create_tensor([tokens, KV_OUT], dtype=pl.FP32)
+            engram_cast_to_fp32(kv, kv_fp32)
+            original_query = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
+            engram_unrotate(x, rotation, original_query)
+            pl.dump_tag(original_query)
+            engram_gate(kv_fp32, weight, original_query, x, out, output_fp32=True, kv_bf16=False)
         return out
 
     return engram_from_rows
