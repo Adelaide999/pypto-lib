@@ -155,15 +155,20 @@ def dispatch(
                     value=moe_epoch, op=pld.NotifyOp.Set,
                 )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_wait") as _meta_wait_tid:
+    # Metadata is consumed by the gather stage, so finalize it in the same
+    # core-group task that waits for peer counts.  This removes one graph task
+    # while keeping the metadata dependency ahead of every gather worker.
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dispatch_meta_wait_finalize",
+        deps=[_meta_push_tid],
+    ) as _meta_wait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.defer_wait(
                     signal=arrived, offsets=[src, 0],
                     expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                 )
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_finalize", deps=[_meta_push_tid, _meta_wait_tid], allow_early_resolve=True) as _meta_tid:
         source_prefix = pl.array.create(N_RANKS, pl.INT32)
         for src in pl.range(N_RANKS):
             source_prefix[src] = 0
@@ -233,7 +238,7 @@ def dispatch(
         expert_rows = pl.cast(pl.read(recv_count_out, [e, 0]), pl.INDEX)
         expert_tiles = (expert_rows + RECV_TILE - 1) // RECV_TILE
         if expert_tiles > 0:
-            with pl.spmd(expert_tiles, name_hint="dispatch_gather", deps=[_wait_tid, _push_tid, _meta_tid],
+            with pl.spmd(expert_tiles, name_hint="dispatch_gather", deps=[_wait_tid, _push_tid, _meta_wait_tid],
                          allow_early_resolve=False) as gather_tid:
                 tile_row = pl.tile.get_block_idx() * RECV_TILE
                 tile_end = pl.min(tile_row + RECV_TILE, expert_rows)
