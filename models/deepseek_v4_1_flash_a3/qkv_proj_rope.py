@@ -269,6 +269,7 @@ def make_q_proj_rope(*, prefill):
             gemm_int8_pair_columns(
                 payload, scales, wq_a, wq_a_scale, projected, num_tokens,
                 D, Q_LORA, "proj_q_a_decode_pair_k512", 128, 512, False, 16,
+                rope_cos, rope_sin, False, 0, 0,
             )
             payload_rows = pl.tensor.dim(projected, 0)
             padded_rows = (payload_rows + 15) // 16 * 16
@@ -281,11 +282,8 @@ def make_q_proj_rope(*, prefill):
             gemm_int8_pair_columns(
                 qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
                 Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b_decode_pair", Q_B_N_TILE,
-                256, False, 16,
-            )
-            query = _rotate_rope(
-                query, query, rope_cos, rope_sin, 0, num_tokens,
-                LOCAL_H, HEAD_DIM, "attention_q_rope", False, False,
+                256, False, 16, rope_cos, rope_sin, True,
+                ROPE_DIM, HEAD_DIM - ROPE_DIM - Q_B_N_TILE,
             )
             return query_latent, query, qb_payload, qb_scales
 

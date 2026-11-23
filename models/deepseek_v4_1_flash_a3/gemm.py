@@ -198,14 +198,20 @@ def gemm_int8_pair_columns(
     k_tile: pl.constexpr,
     output_major: pl.constexpr,
     row_tile: pl.constexpr,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    fuse_rope: pl.constexpr,
+    rope_dim: pl.constexpr,
+    rope_offset: pl.constexpr,
 ):
     """Compute two adjacent output panels while reusing each activation tile.
 
-    Decode Q-A, Q-B and KV all use an even number of output panels. The
-    paired schedule keeps one activation tile live while it feeds two Cube
-    products, reducing repeated activation loads and the number of SPMD
-    blocks. The weight ABI remains the canonical [K, N] layout used by the
-    existing projections.
+    Decode Q-A and Q-B use an even number of output panels. The paired
+    schedule keeps one activation tile live while it feeds two Cube products,
+    reducing repeated activation loads and the number of SPMD blocks. The
+    weight ABI remains the canonical [K, N] layout used by the existing
+    projections. Q-B can optionally apply RoPE to its second output panel
+    before the result is stored.
     """
     panels = output_width // n_tile
     pairs = panels // 2
@@ -278,6 +284,52 @@ def gemm_int8_pair_columns(
             second_value = pl.row_expand_mul(pl.cast(second_acc, pl.FP32), a_scale)
             second_value = pl.col_expand_mul(second_value, second_scale)
             second_value = pl.cast(second_value, pl.BF16, mode="rint")
+            if fuse_rope:
+                second_value = pl.set_validshape(second_value, row_tile, n_tile)
+                tail_bf16 = pl.tile.slice(
+                    second_value, [row_tile, rope_dim], [0, rope_offset],
+                )
+                tail = pl.cast(tail_bf16, pl.FP32)
+                even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+                odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+                cosine = pl.load(
+                    rope_cos, [row, 0], [row_tile, rope_dim // 2],
+                    valid_shape=[valid_rows, rope_dim // 2],
+                )
+                sine = pl.load(
+                    rope_sin, [row, 0], [row_tile, rope_dim // 2],
+                    valid_shape=[valid_rows, rope_dim // 2],
+                )
+                cosine = pl.set_validshape(
+                    pl.fillpad(cosine, pad_value=pl.PadValue.zero),
+                    row_tile, rope_dim // 2,
+                )
+                sine = pl.set_validshape(
+                    pl.fillpad(sine, pad_value=pl.PadValue.zero),
+                    row_tile, rope_dim // 2,
+                )
+                real = pl.sub(pl.mul(even, cosine), pl.mul(odd, sine))
+                imag = pl.add(pl.mul(even, sine), pl.mul(odd, cosine))
+                real_lanes = pl.tile.full([row_tile, rope_dim], dtype=pl.FP32, value=0.0)
+                real_lanes = pl.tile.scatter_mask(
+                    real_lanes, real, mask_pattern=pl.tile.MaskPattern.P0101,
+                )
+                imag_lanes = pl.tile.full([row_tile, rope_dim], dtype=pl.FP32, value=0.0)
+                imag_lanes = pl.tile.scatter_mask(
+                    imag_lanes, imag, mask_pattern=pl.tile.MaskPattern.P1010,
+                )
+                real_bits = pl.reinterpret_view(real_lanes, pl.INT16)
+                imag_bits = pl.reinterpret_view(imag_lanes, pl.INT16)
+                rotated = pl.reinterpret_view(pl.or_(real_bits, imag_bits), pl.FP32)
+                rotated = pl.cast(rotated, pl.BF16, mode="rint")
+                prefix = pl.tile.slice(
+                    second_value, [row_tile, rope_offset], [0, 0],
+                )
+                fused_value = pl.tile.full(
+                    [row_tile, n_tile], dtype=pl.BF16, value=0.0,
+                )
+                fused_value = pl.tile.assemble(fused_value, prefix, [0, 0])
+                second_value = pl.tile.assemble(fused_value, rotated, [0, rope_offset])
             output = pl.store(
                 pl.set_validshape(second_value, valid_rows, n_tile),
                 [row, second_col], output,
