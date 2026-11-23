@@ -10,7 +10,7 @@
 
 
 import pypto.language as pl
-from .gemm import quantize_activation
+from .activation_quant import quantize_projection_activation
 import pypto.language.distributed as pld
 
 from .hc import hc_pre
@@ -93,7 +93,7 @@ def prefill_c2a_reuse_attention(
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales = quantize_activation(x, num_tokens, D)
+    proj_payload, proj_scales = quantize_projection_activation(x, num_tokens, D, True, True)
     q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,

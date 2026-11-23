@@ -2114,7 +2114,7 @@ def l2_decode_indexer_validation(
     projected = pl.create_tensor([pl.tensor.dim(x, 0), INDEX_QUERY_WIDTH], dtype=pl.BF16)
     gemm_dynamic_int8(
         latent, query_weight, query_weight_scale, projected, num_tokens,
-        Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q", False,
+        Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q", False, False,
     )
     query_tid = quantize_index_query(projected, cos, sin, query, query_scale, num_tokens, entry)
     weights_tid = project_index_weights(x, weight_projection, weights, num_tokens, entry)

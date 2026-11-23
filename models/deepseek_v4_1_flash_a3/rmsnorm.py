@@ -16,11 +16,14 @@ from .config import FLASH as M, T_DYN
 
 # model config
 D = M.hidden_size
-
-
 EPS = M.rms_norm_eps
+
+# tiling
 NORM_T_TILE = 8
 NORM_D_TILE = 512
+PREFILL_NORM_REDUCE_TILE = 2 * NORM_D_TILE
+PREFILL_NORM_STORE_TILE = 1280
+PREFILL_NORM_WORKERS = 48
 
 
 @pl.jit.inline
@@ -95,6 +98,59 @@ def rms_norm_tiled_compensated(
 ):
     """Normalize final projection inputs with compensated FP32 chunk sums."""
     return _rms_norm_tiled(x, norm_w, x_normed, block, num_tokens, compensated=True, output_fp32=False)
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_rms_norm(
+    x: pl.Tensor,
+    weight: pl.Tensor[[D], pl.BF16],
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Normalize Prefill rows with a resident BF16 tile and paired 512-column reductions."""
+    blocks = (num_tokens + NORM_T_TILE - 1) // NORM_T_TILE
+    workers = pl.min(blocks, PREFILL_NORM_WORKERS)
+    for worker in pl.spmd(workers, name_hint="rms_norm"):
+        gamma = pl.reshape(pl.load(weight, [0], [D]), [1, D])
+        lanes = pl.tile.arange(0, [1, NORM_T_TILE], dtype=pl.INT32)
+        first_partial = pl.mul(lanes, 2)
+        gather_scratch = pl.create_tile([1, NORM_T_TILE], dtype=pl.INT32)
+        begin = worker * blocks // workers
+        end = (worker + 1) * blocks // workers
+        for block in pl.pipeline(begin, end, stage=1):
+            row = block * NORM_T_TILE
+            rows = pl.min(NORM_T_TILE, num_tokens - row)
+            raw = pl.load(x, [row, 0], [NORM_T_TILE, D], valid_shape=[rows, D])
+            padded = pl.fillpad(raw, pad_value=pl.PadValue.zero)
+            cached = pl.set_validshape(padded, NORM_T_TILE, D)
+            sum_squares = pl.tile.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
+            scratch = pl.create_tile([2 * NORM_T_TILE, NORM_D_TILE], dtype=pl.FP32)
+            for col in pl.range(0, D, PREFILL_NORM_REDUCE_TILE):
+                panel = pl.tile.slice(cached, [NORM_T_TILE, PREFILL_NORM_REDUCE_TILE], [0, col])
+                value = pl.cast(panel, pl.FP32)
+                flat = pl.reshape(value, [2 * NORM_T_TILE, NORM_D_TILE])
+                squares = pl.mul(flat, flat)
+                row_sums = pl.row_sum(squares, tmp_tile=scratch)
+                partial = pl.reshape(row_sums, [1, 2 * NORM_T_TILE])
+                for offset in pl.range(2):
+                    index = pl.add(first_partial, pl.cast(offset, pl.INT32))
+                    sub_sum = pl.tile.gather(partial, index, gather_scratch)
+                    sum_squares = pl.add(sum_squares, sub_sum)
+            rsqrt_scratch = pl.create_tile([1, NORM_T_TILE], dtype=pl.FP32)
+            mean_square = pl.add(pl.mul(sum_squares, 1.0 / D), EPS)
+            inv_rms = pl.tile.rsqrt(mean_square, rsqrt_scratch, high_precision=True)
+            inverse_rows = pl.reshape(inv_rms, [NORM_T_TILE, 1])
+            for col in pl.range(0, D, PREFILL_NORM_STORE_TILE):
+                output_panel = pl.tile.slice(cached, [NORM_T_TILE, PREFILL_NORM_STORE_TILE], [0, col])
+                output_value = pl.cast(output_panel, pl.FP32)
+                weight_panel_bf16 = pl.tile.slice(gamma, [1, PREFILL_NORM_STORE_TILE], [0, col])
+                weight_panel = pl.cast(weight_panel_bf16, pl.FP32)
+                scaled = pl.row_expand_mul(output_value, inverse_rows)
+                weighted = pl.col_expand_mul(scaled, weight_panel)
+                rounded = pl.cast(weighted, pl.BF16, mode="rint")
+                valid = pl.set_validshape(rounded, rows, PREFILL_NORM_STORE_TILE)
+                pl.store(valid, [row, col], output)
+    return output
 
 
 @pl.jit.inline

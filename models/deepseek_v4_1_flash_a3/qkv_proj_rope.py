@@ -13,11 +13,11 @@ import pypto.language as pl
 import torch
 
 from .activation_quant import (
+    _quantize_prefill_rows,
     _tile_rsqrt_for_norm,
+    normalize_quantize_prefill_projection,
     normalize_quantize_projection_activation,
-    quantize_projection_activation,
 )
-from .blocked_rmsnorm import make_blocked_rmsnorm
 from .config import FLASH as M, T_DYN, TP_SIZE
 from .gemm import (
     gemm_int8,
@@ -27,7 +27,7 @@ from .gemm import (
     prefill_gemm_int8_tiled,
 )
 from .rmsnorm import golden_rms_norm, rms_norm
-from .rope import make_pipelined_rope, make_pipelined_token_rope
+from .rope import make_pipelined_rope, make_prefill_kv_norm_rope
 
 
 # model config
@@ -55,10 +55,7 @@ ROPE_WORKER_TILE = 32
 rotate_prefill_q = make_pipelined_rope(
     T_DYN, LOCAL_H, HEAD_DIM, inverse=False, name_hint="attention_q_rope", allow_early_resolve=False, inplace=True,
 )
-rotate_prefill_kv = make_pipelined_token_rope(T_DYN, HEAD_DIM, name_hint="rope_kv", inplace=True)
-
-normalize_q = make_blocked_rmsnorm(T_DYN, Q_LORA, EPS, dynamic_rows=True)
-normalize_kv = make_blocked_rmsnorm(T_DYN, HEAD_DIM, EPS, dynamic_rows=True)
+normalize_rotate_prefill_kv = make_prefill_kv_norm_rope(T_DYN, HEAD_DIM, EPS)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -212,14 +209,20 @@ def make_q_proj_rope(*, prefill):
                     payload, scales, wq_a, wq_a_scale, projected, num_tokens,
                     D, Q_LORA, "proj_q_a", Q_A_N_TILE, 256, False,
                 )
+            padded_rows = (tokens + 15) // 16 * 16
+            qb_payload = pl.create_tensor([padded_rows, Q_LORA], dtype=pl.INT8)
+            qb_scales = pl.create_tensor([padded_rows, 1], dtype=pl.FP32)
             if num_tokens >= 64:
-                normalize_q(projected, q_norm_weight, query_latent, num_tokens)
+                normalize_quantize_prefill_projection(
+                    projected, q_norm_weight, query_latent, qb_payload, qb_scales,
+                    num_tokens, padded_rows, Q_LORA, EPS,
+                )
             else:
                 for worker in pl.spmd((num_tokens + 7) // 8, name_hint="norm_q_latent"):
                     rms_norm(projected, q_norm_weight, query_latent, worker, num_tokens, width=Q_LORA)
-            qb_payload, qb_scales = quantize_projection_activation(
-                query_latent, num_tokens, Q_LORA, True,
-            )
+                _quantize_prefill_rows(
+                    query_latent, qb_payload, qb_scales, num_tokens, padded_rows, Q_LORA, Q_LORA,
+                )
             if num_tokens >= PREFILL_Q_B_MIN_ROWS:
                 prefill_gemm_int8_tiled(
                     qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
@@ -319,13 +322,13 @@ def make_kv_proj_rope(*, prefill):
                     D, HEAD_DIM, "proj_kv", KV_N_TILE, 256, False,
                 )
             if num_tokens >= 64:
-                normalize_kv(kv_projection, kv_norm_weight, window_kv, num_tokens)
+                window_kv = normalize_rotate_prefill_kv(
+                    kv_projection, kv_norm_weight,
+                    rope_cos, rope_sin, window_kv, num_tokens,
+                )
             else:
                 for worker in pl.spmd((num_tokens + 7) // 8, name_hint="norm_kv"):
                     rms_norm(kv_projection, kv_norm_weight, window_kv, worker, num_tokens, width=HEAD_DIM)
-            if num_tokens >= 64:
-                window_kv = rotate_prefill_kv(window_kv, rope_cos, rope_sin, window_kv, num_tokens)
-            else:
                 window_kv = _rotate_rope(
                     window_kv, window_kv, rope_cos, rope_sin, 0, num_tokens,
                     1, HEAD_DIM, "rope_kv", False, False,

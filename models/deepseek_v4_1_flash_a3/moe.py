@@ -406,6 +406,7 @@ def prefill_moe_sublayer(
     tp_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
     reuse_deps: pl.Array[1, pl.TASK_ID],
+    prefill: pl.constexpr,
 ):
     """Collapse mHC streams, normalize compact TP owner rows, and run the EP MoE."""
     hc_pre(
@@ -435,7 +436,7 @@ def prefill_moe_sublayer(
                 shared_w1, shared_w1_scale,
                 shared_w3, shared_w3_scale,
                 shared_w2, shared_w2_scale,
-                shared_output, local_num_tokens, True,
+                shared_output, local_num_tokens, True, prefill,
             )
         else:
             workers = pl.min(48, TOKENS // 4)
@@ -470,7 +471,7 @@ def prefill_moe_sublayer(
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
             recv_route_local,
-            routed_output, input_ready,
+            routed_output, input_ready, prefill,
         )
         combined_counts = pl.create_tensor([TOKENS, 16], dtype=pl.INT32)
         output_ready = combine_scattered(

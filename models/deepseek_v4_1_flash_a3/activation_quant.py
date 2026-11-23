@@ -115,15 +115,121 @@ def _quantize_cached_rows(
 
 
 @pl.jit.inline(auto_scope=False)
+def _prefill_quant_params(maximum: pl.Tile[[VEC_M_TILE, 1], pl.FP32]):
+    factor = pl.maximum(pl.mul(maximum, 1.0 / 127.0), 1e-30)
+    divisor = pl.reshape(pl.maximum(maximum, 127e-30), [1, VEC_M_TILE])
+    numerator = pl.tile.full([1, VEC_M_TILE], dtype=pl.FP32, value=127.0)
+    multiplier = pl.div(numerator, divisor)
+    # Preserve exact powers of two. Round other multipliers up for the peak/2 tie.
+    bits = pl.reinterpret_view(multiplier, pl.INT32)
+    exponent = pl.shls(pl.shrs(bits, 23), 23)
+    bias = pl.minimum(pl.sub(bits, exponent), 1)
+    biased = pl.reinterpret_view(pl.add(bits, bias), pl.FP32)
+    return factor, pl.reshape(biased, [VEC_M_TILE, 1])
+
+
+@pl.jit.inline(auto_scope=False)
+def _quantize_prefill_rows(
+    source: pl.Tensor,
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    active: pl.Scalar[pl.INT32],
+    padded_rows: pl.Scalar[pl.INDEX],
+    width: pl.constexpr,
+    panel_width: pl.constexpr,
+):
+    """Read BF16 activations once and encode from the cached row tile."""
+    blocks = padded_rows // VEC_M_TILE
+    workers = pl.min(blocks, PREFILL_QUANT_WORKERS)
+    for worker in pl.spmd(workers, name_hint="prefill_activation_quant"):
+        begin = worker * blocks // workers
+        end = (worker + 1) * blocks // workers
+        for block in pl.range(begin, end):
+            row = block * VEC_M_TILE
+            valid = pl.max(0, pl.min(VEC_M_TILE, active - row))
+            raw = pl.load(source, [row, 0], [VEC_M_TILE, width], valid_shape=[valid, width])
+            padded = pl.fillpad(raw, pad_value=pl.PadValue.zero)
+            cached = pl.set_validshape(padded, VEC_M_TILE, width)
+            peak_bits = pl.tile.full([VEC_M_TILE, panel_width], dtype=pl.INT16, value=0)
+            for col in pl.range(0, width, panel_width):
+                panel = pl.tile.slice(cached, [VEC_M_TILE, panel_width], [0, col])
+                panel_bits = pl.reinterpret_view(panel, pl.INT16)
+                magnitude_bits = pl.ands(panel_bits, 32767)
+                peak_bits = pl.maximum(peak_bits, magnitude_bits)
+            peak_bf16 = pl.reinterpret_view(peak_bits, pl.BF16)
+            peak = pl.cast(peak_bf16, pl.FP32)
+            scratch = pl.create_tile([VEC_M_TILE, panel_width], dtype=pl.FP32)
+            maximum = pl.row_max(peak, tmp_tile=scratch)
+            factor, inverse = _prefill_quant_params(maximum)
+            pl.store(factor, [row, 0], scales)
+            for col in pl.range(0, width, panel_width):
+                panel = pl.tile.slice(cached, [VEC_M_TILE, panel_width], [0, col])
+                value = pl.cast(panel, pl.FP32)
+                normalized = pl.row_expand_mul(value, inverse)
+                # Round to integer before converting the exact codes through FP16.
+                rounded = pl.cast(normalized, pl.INT16, mode="rint")
+                exact_fp16 = pl.cast(rounded, pl.FP16, mode="rint")
+                codes = pl.cast(exact_fp16, pl.INT8, mode="trunc")
+                pl.store(codes, [row, col], payload)
+    return payload, scales
+
+
+@pl.jit.inline(auto_scope=False)
+def normalize_quantize_prefill_projection(
+    source: pl.Tensor, weight: pl.Tensor, normalized: pl.Tensor,
+    payload: pl.Tensor, scales: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32], padded_rows: pl.Scalar[pl.INDEX],
+    width: pl.constexpr, eps: pl.constexpr,
+):
+    """Normalize Q-latent rows and quantize the rounded BF16 values in the same tile."""
+    blocks = padded_rows // VEC_M_TILE
+    workers = pl.min(blocks, PREFILL_QUANT_WORKERS)
+    for worker in pl.spmd(workers, name_hint="prefill_q_norm_quant"):
+        gamma = pl.reshape(pl.cast(pl.load(weight, [0], [width]), pl.FP32), [1, width])
+        begin = worker * blocks // workers
+        end = (worker + 1) * blocks // workers
+        for block in pl.range(begin, end):
+            row = block * VEC_M_TILE
+            rows = pl.max(0, pl.min(VEC_M_TILE, num_tokens - row))
+            raw = pl.load(source, [row, 0], [VEC_M_TILE, width], valid_shape=[rows, width])
+            padded = pl.fillpad(raw, pad_value=pl.PadValue.zero)
+            value = pl.cast(pl.set_validshape(padded, VEC_M_TILE, width), pl.FP32)
+            square = pl.mul(value, value)
+            scratch = pl.create_tile([VEC_M_TILE, width], dtype=pl.FP32)
+            total = pl.reshape(pl.row_sum(square, tmp_tile=scratch), [1, VEC_M_TILE])
+            mean = pl.add(pl.mul(total, 1.0 / width), eps)
+            rsqrt_scratch = pl.create_tile([1, VEC_M_TILE], dtype=pl.FP32)
+            inv = pl.tile.rsqrt(mean, rsqrt_scratch, high_precision=True)
+            scaled = pl.row_expand_mul(value, pl.reshape(inv, [VEC_M_TILE, 1]))
+            weighted = pl.col_expand_mul(scaled, gamma)
+            rounded = pl.cast(weighted, pl.BF16, mode="rint")
+            pl.store(pl.set_validshape(rounded, rows, width), [row, 0], normalized)
+            activation = pl.cast(rounded, pl.FP32)
+            peak = pl.row_max(pl.abs(activation), tmp_tile=scratch)
+            scale, inverse = _prefill_quant_params(peak)
+            pl.store(scale, [row, 0], scales)
+            quant = pl.row_expand_mul(activation, inverse)
+            encoded = pl.cast(quant, pl.INT32, mode="rint")
+            pl.store(pl.cast(encoded, pl.INT8, mode="trunc"), [row, 0], payload)
+    return normalized, payload, scales
+
+
+@pl.jit.inline(auto_scope=False)
 def quantize_projection_activation(
     source: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], width: pl.constexpr, dense_query: pl.constexpr,
+    prefill: pl.constexpr,
 ):
     """Quantize the resident A3 checkpoint's padded rows with ties-to-even rounding."""
     capacity = pl.tensor.dim(source, 0)
     padded_rows = (capacity + 15) // 16 * 16
     payload = pl.create_tensor([padded_rows, width], dtype=pl.INT8)
     scale = pl.create_tensor([padded_rows, 1], dtype=pl.FP32)
-    if padded_rows <= 32:
+    if prefill:
+        if width == 2304:
+            _quantize_prefill_rows(source, payload, scale, num_tokens, padded_rows, width, 768)
+        else:
+            _quantize_prefill_rows(source, payload, scale, num_tokens, padded_rows, width, 1280)
+    elif padded_rows <= 32:
         panels = (width + QUANT_REDUCE_TILE - 1) // QUANT_REDUCE_TILE
         partials = pl.create_tensor([padded_rows // 8 * panels, 8], dtype=pl.FP32)
         with pl.spmd(padded_rows // 8 * panels, name_hint="quant_absmax") as partials_ready:
@@ -238,4 +344,4 @@ def normalize_quantize_projection_activation(
 @pl.jit.inline(auto_scope=False)
 def quantize_activation(source: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], width: pl.constexpr):
     """Quantize A3 checkpoint activations using the matching width and row schedule."""
-    return quantize_projection_activation(source, num_tokens, width, True)
+    return quantize_projection_activation(source, num_tokens, width, True, False)

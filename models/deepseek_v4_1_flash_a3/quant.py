@@ -194,6 +194,34 @@ def decode_fp4(payload: pl.Tile[[CODE_ROWS_DYN, CODE_COLS_DYN], pl.UINT8], rows:
 
 
 @pl.jit.inline(auto_scope=False)
+def make_fp8_cache_table():
+    """Prepare the FP32 bits for each signed E4M3FN byte."""
+    codes = pl.tile.arange(-128, [1, 256], dtype=pl.INT32)
+    signed = pl.cast(codes, pl.INT8, mode="trunc")
+    payload = pl.reinterpret_view(signed, pl.UINT8)
+    value = pl.cast(decode_fp8(payload, 1, 256), pl.FP32)
+    return pl.reinterpret_view(value, pl.INT32)
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_fp8_cache_values(
+    payload: pl.Tile[[CODE_ROWS_DYN, CODE_COLS_DYN], pl.UINT8],
+    table: pl.Tile[[1, 256], pl.INT32],
+    rows: pl.constexpr,
+    width: pl.constexpr,
+):
+    """Look up the E4M3FN bytes of a Prefill cache tile."""
+    bytes_flat = pl.reshape(payload, [1, rows * width])
+    signed = pl.reinterpret_view(bytes_flat, pl.INT8)
+    offset = pl.add(pl.cast(signed, pl.FP16), 128.0)
+    index = pl.cast(pl.cast(offset, pl.FP32), pl.INT32, mode="rint")
+    scratch = pl.create_tile([1, rows * width], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+    bits = pl.tile.gather(table, index, scratch)
+    values = pl.reinterpret_view(bits, pl.FP32)
+    return pl.reshape(values, [rows, width])
+
+
+@pl.jit.inline(auto_scope=False)
 def quantize_bf16_to_mxfp8(
     x: pl.Tensor,
     t0: pl.Scalar[pl.INT32],

@@ -78,7 +78,7 @@ from .prefill_c2a_full import prefill_c2a_full_attention
 from .prefill_c2a_reuse import prefill_c2a_reuse_attention
 from .prefill_c1a_reindex import prefill_c1a_reindex_attention
 from .prefill_c1a_reuse import prefill_c1a_reuse_attention
-from .rmsnorm import rms_norm_tiled
+from .rmsnorm import prefill_rms_norm
 
 RANKS = C.EP_SIZE
 D = M.hidden_size
@@ -378,7 +378,7 @@ def _prefill_moe(
                 recv_meta, recv_x, recv_weights, arrived, data_arrived,
                 routed_output, combine_arrived, ffn_input, owned, round_next, post, residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
-                active, ep_rank, ep_rank % TP_SIZE, epoch, completion,
+                active, ep_rank, ep_rank % TP_SIZE, epoch, completion, True,
             )
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_counts"):
                 for counter in pl.range(3):
@@ -646,11 +646,7 @@ def l2_prefill_fwd(
                 encoder_normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
                 hc_head(encoder_hidden, encoder_pre, encoder_collapsed)
                 norm_tokens = pl.tensor.dim(encoder_collapsed, 0)
-                for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-                    rms_norm_tiled(
-                        encoder_collapsed, layer_attn_norm, encoder_normalized, norm_block, norm_tokens,
-                        output_fp32=False,
-                    )
+                prefill_rms_norm(encoder_collapsed, layer_attn_norm, encoder_normalized, norm_tokens)
                 publisher_ready = prefill_publish_decoder(
                     encoder_normalized, c1a_compressor_wkv, layer_compressor_norm, layer_index_wk, layer_index_norm,
                     rope_cos[1], rope_sin[1], c1a_compressed_slots,
@@ -680,8 +676,7 @@ def l2_prefill_fwd(
                     collapsed, attn_pre, attn_post, attn_residual,
                 )
                 norm_tokens = pl.tensor.dim(collapsed, 0)
-                for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-                    rms_norm_tiled(collapsed, layer_attn_norm, normalized, norm_block, norm_tokens, output_fp32=False)
+                prefill_rms_norm(collapsed, layer_attn_norm, normalized, norm_tokens)
                 mode = 0
                 cache_slot = 0
                 rope_slot = 0

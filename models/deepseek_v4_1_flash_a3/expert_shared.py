@@ -50,6 +50,7 @@ def expert_shared(
     sh: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     output_major: pl.constexpr,
+    prefill: pl.constexpr,
 ):
     """Compute the shared INT8 SwiGLU expert with BF16 activation rounding."""
     scale = pl.reshape(x_local_scale, [T_PAD, 1])
@@ -59,7 +60,9 @@ def expert_shared(
         x_local, scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         scale, hidden, num_tokens, D, MOE_INTER, EXPERT_N_TILE, EXPERT_K_TILE, SWIGLU_LIMIT, False, "shared_swiglu", output_major,
     )
-    return gemm_dynamic_int8(hidden, shared_w2, shared_w2_scale, sh, num_tokens, MOE_INTER, D, "shared_down", output_major)
+    return gemm_dynamic_int8(
+        hidden, shared_w2, shared_w2_scale, sh, num_tokens, MOE_INTER, D, "shared_down", output_major, prefill,
+    )
 
 
 def golden_expert_shared(payload, activation_scale, w1, scale1, w3, scale3, w2, scale2):
@@ -86,7 +89,7 @@ def l2_expert_shared(
     scale2: pl.Tensor[[1, D], pl.FP32],
     output: pl.Out[pl.Tensor[[T_PAD, D], pl.BF16]],
 ):
-    expert_shared(source, scale, w1, scale1, w3, scale3, w2, scale2, output, T, False)
+    expert_shared(source, scale, w1, scale1, w3, scale3, w2, scale2, output, T, False, False)
     return output
 
 

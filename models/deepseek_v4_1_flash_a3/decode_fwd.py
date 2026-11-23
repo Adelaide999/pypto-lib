@@ -348,7 +348,7 @@ def decode_encoder(
                 recv_meta, recv_x, recv_weights, arrived, data_arrived,
                 routed_output, combine_arrived, ffn_input, ffn_owned, pre_mix, ffn_post, ffn_residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
-                local_moe_tokens, rank, rank % TP_SIZE, layer + 1, ffn_reuse_deps,
+                local_moe_tokens, rank, rank % TP_SIZE, layer + 1, ffn_reuse_deps, False,
             )
             prefill_ffn_restore(
                 attention_hidden, ffn_owned, ffn_post, ffn_residual,
@@ -570,7 +570,7 @@ def decode_decoder(
                 recv_meta, recv_x, recv_weights, arrived, data_arrived,
                 routed_output, combine_arrived, ffn_input, ffn_owned, pre_mix, ffn_post, ffn_residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
-                local_moe_tokens, rank, rank % TP_SIZE, layer + 1, ffn_reuse_deps,
+                local_moe_tokens, rank, rank % TP_SIZE, layer + 1, ffn_reuse_deps, False,
             )
             prefill_ffn_restore(
                 attention_hidden, ffn_owned, ffn_post, ffn_residual,

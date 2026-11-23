@@ -39,8 +39,7 @@ from .utils import packed_query_lengths, window_metadata
 
 
 import pypto.language as pl
-from .quant import decode_fp8, decode_fp4, fp4_bf16_bits
-from .quant import encode_fp8
+from .quant import decode_fp4, decode_fp8, decode_fp8_cache_values, encode_fp8, fp4_bf16_bits, make_fp8_cache_table
 
 from .config import (
     FLASH as M, CMP_BLOCKS_DYN, MAX_BATCH_PER_DP, ORI_BLOCKS_DYN, T_DYN, TP_SIZE,
@@ -86,6 +85,7 @@ PREFILL_ATTEND_WORKERS = 64
 GATHER_WORKERS = 64
 SELECTED_GATHER_TILE = 64
 CACHE_WORKERS = 128
+PREFILL_FP8_CACHE_WORKERS = 48
 WINDOW_PUBLISH_WORKER_TILE = 12
 PREFILL_WINDOW_ROW_TILE = 8
 PREFILL_WINDOW_GROUP_TILE = PREFILL_WINDOW_ROW_TILE * SWA_GROUPS
@@ -1551,16 +1551,20 @@ def decode_packed_caches(
     window_rows = pl.tensor.dim(window, 0) * 128
     w = pl.reshape(window, [window_rows, HEAD_DIM])
     ws = pl.reshape(window_scale, [window_rows, HEAD_DIM // 32])
-    workers = pl.max(1, pl.min(window_rows // GATHER_KEY_TILE, CACHE_WORKERS))
+    blocks = window_rows // GATHER_KEY_TILE
+    workers = pl.max(1, pl.min(blocks, PREFILL_FP8_CACHE_WORKERS))
     with pl.spmd(workers, name_hint="sparse_shared_window_decode", deps=[ready]) as window_ready:
         worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, window_rows // GATHER_KEY_TILE, workers):
+        window_table = make_fp8_cache_table()
+        begin = worker * blocks // workers
+        end = (worker + 1) * blocks // workers
+        for block in pl.range(begin, end):
             row = block * GATHER_KEY_TILE
             w_payload = pl.tile.load(w, [row, 0], [GATHER_KEY_TILE, HEAD_DIM])
             w_factors = pl.tile.load(ws, [row, 0], [GATHER_KEY_TILE, HEAD_DIM // 32])
             w_scales = pl.cast(w_factors, pl.FP32)
             w_scale_column = pl.reshape(w_scales, [GATHER_KEY_TILE * (HEAD_DIM // 32), 1])
-            w_values = pl.cast(decode_fp8(w_payload, GATHER_KEY_TILE, HEAD_DIM), pl.FP32)
+            w_values = decode_fp8_cache_values(w_payload, window_table, GATHER_KEY_TILE, HEAD_DIM)
             w_grouped = pl.reshape(w_values, [GATHER_KEY_TILE * (HEAD_DIM // 32), 32])
             w_scaled = pl.row_expand_mul(w_grouped, w_scale_column)
             w_decoded = pl.cast(w_scaled, pl.BF16, mode="rint")

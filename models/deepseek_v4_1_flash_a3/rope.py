@@ -70,6 +70,71 @@ def make_pipelined_token_rope(capacity, head_dim, *, name_hint, inplace):
     return rope
 
 
+def make_prefill_kv_norm_rope(capacity, head_dim, eps):
+    """Normalize KV rows and rotate their BF16 tails in double-buffered tiles."""
+    nope = head_dim - 64
+    rows = TOKEN_ROPE_ROWS_TILE
+    elements = rows * 64
+    coeffs = rows * 32
+
+    @pl.jit.inline(auto_scope=False)
+    def kv_norm_rope(
+        source: pl.Tensor[[capacity, head_dim], pl.BF16],
+        weight: pl.Tensor[[head_dim], pl.BF16],
+        cosine: pl.Tensor[[capacity, 32], pl.FP32],
+        sine: pl.Tensor[[capacity, 32], pl.FP32],
+        output: pl.Tensor[[capacity, head_dim], pl.BF16],
+        active: pl.Scalar[pl.INT32],
+    ):
+        blocks = (active + rows - 1) // rows
+        workers = pl.min(blocks, ROPE_WORKER_LIMIT)
+        for worker in pl.spmd(workers, name_hint="rope_kv"):
+            gamma = pl.reshape(pl.cast(pl.load(weight, [0], [head_dim]), pl.FP32), [1, head_dim])
+            lanes = pl.tile.arange(0, [1, elements], dtype=pl.INT32)
+            pairs = pl.shrs(lanes, 1)
+            odd = pl.sub(lanes, pl.shls(pairs, 1))
+            parity = pl.sub(pl.shls(odd, 1), 1)
+            swap_idx = pl.sub(lanes, parity)
+            sign = pl.cast(parity, pl.FP32)
+            begin = worker * blocks // workers
+            end = (worker + 1) * blocks // workers
+            for block in pl.pipeline(begin, end, stage=2):
+                row = block * rows
+                valid = pl.min(rows, active - row)
+                raw = pl.load(source, [row, 0], [rows, head_dim], valid_shape=[valid, head_dim])
+                padded = pl.fillpad(raw, pad_value=pl.PadValue.zero)
+                value = pl.cast(pl.set_validshape(padded, rows, head_dim), pl.FP32)
+                squared = pl.mul(value, value)
+                sum_scratch = pl.create_tile([rows, head_dim], dtype=pl.FP32)
+                sum_squares = pl.reshape(pl.row_sum(squared, tmp_tile=sum_scratch), [1, rows])
+                mean = pl.add(pl.mul(sum_squares, 1.0 / head_dim), eps)
+                rsqrt_scratch = pl.create_tile([1, rows], dtype=pl.FP32)
+                inv_rms = pl.tile.rsqrt(mean, rsqrt_scratch, high_precision=True)
+                normalized = pl.row_expand_mul(value, pl.reshape(inv_rms, [rows, 1]))
+                weighted = pl.col_expand_mul(normalized, gamma)
+                rounded = pl.cast(weighted, pl.BF16, mode="rint")
+                prefix = pl.tile.slice(rounded, [rows, nope], [0, 0])
+                pl.tile.store(prefix, [row, 0], output, shapes=[valid, nope])
+                tail = pl.tile.slice(rounded, [rows, 64], [0, nope])
+                flat = pl.reshape(pl.cast(tail, pl.FP32), [1, elements])
+                scratch = pl.create_tile([1, elements], dtype=pl.INT32)
+                swapped = pl.tile.gather(flat, swap_idx, scratch)
+                c_tile = pl.load(cosine, [row, 0], [rows, 32], valid_shape=[valid, 32])
+                s_tile = pl.load(sine, [row, 0], [rows, 32], valid_shape=[valid, 32])
+                c_table = pl.reshape(pl.set_validshape(c_tile, rows, 32), [1, coeffs])
+                s_table = pl.reshape(pl.set_validshape(s_tile, rows, 32), [1, coeffs])
+                c = pl.tile.gather(c_table, pairs, scratch)
+                s = pl.mul(pl.tile.gather(s_table, pairs, scratch), sign)
+                direct = pl.mul(flat, c)
+                cross = pl.mul(swapped, s)
+                result = pl.reshape(pl.add(direct, cross), [rows, 64])
+                rotated = pl.cast(result, pl.BF16, mode="rint")
+                pl.store(pl.set_validshape(rotated, valid, 64), [row, nope], output)
+        return output
+
+    return kv_norm_rope
+
+
 def make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow_early_resolve, inplace=False):
     """Rotate heads sharing a token's coefficients. In-place callers pass x as output."""
     width = heads * head_dim

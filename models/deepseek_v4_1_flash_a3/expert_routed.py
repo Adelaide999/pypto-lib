@@ -54,6 +54,7 @@ def expert_routed_compute(
     output: pl.Tensor[[EXPERT_ROWS_DYN, D], pl.BF16],
     count: pl.Scalar[pl.INT32],
     output_major: pl.constexpr,
+    prefill: pl.constexpr,
 ):
     """Apply a routed W8A8 expert with route weighting before hidden quantization."""
     capacity = pl.max(16, (count + 15) // 16 * 16)
@@ -62,7 +63,9 @@ def expert_routed_compute(
         source, source_scale, w1, scale1, w3, scale3, route_weights, hidden, count,
         D, MOE_INTER, EXPERT_N_TILE, EXPERT_K_TILE, SWIGLU_LIMIT, True, "routed_swiglu", output_major,
     )
-    return gemm_dynamic_int8(hidden, w2, scale2, output, count, MOE_INTER, D, "routed_down", output_major)
+    return gemm_dynamic_int8(
+        hidden, w2, scale2, output, count, MOE_INTER, D, "routed_down", output_major, prefill,
+    )
 
 
 @pl.jit.inline(auto_scope=False)
@@ -80,6 +83,7 @@ def expert_routed_scatter(
     recv_route: pl.Tensor,
     routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
     input_ready: pl.Scalar[pl.TASK_ID],
+    prefill: pl.constexpr,
 ):
     """Compute compact INT8 expert rows and return weighted outputs to their owners."""
     total_rows = pl.tensor.dim(recv_x, 0)
@@ -101,7 +105,7 @@ def expert_routed_scatter(
             expert_routed_compute(
                 source, source_scale, route_weights,
                 routed_w1[expert], scale1, routed_w3[expert], scale3, routed_w2[expert], scale2,
-                output, count, True,
+                output, count, True, prefill,
             )
             workers = pl.min(32, (count + 3) // 4)
             with pl.spmd(workers, name_hint="routed_return") as returned:
@@ -146,7 +150,10 @@ def l2_expert_routed(
     output: pl.InOut[pl.Tensor[[VALIDATION_T_TILE, D], pl.BF16]],
 ):
     count = pl.read(counts, [0])
-    expert_routed_compute(source, source_scale, route_weights, w1, scale1, w3, scale3, w2, scale2, output, count, False)
+    expert_routed_compute(
+        source, source_scale, route_weights, w1, scale1, w3, scale3, w2, scale2,
+        output, count, False, False,
+    )
     return output
 
 

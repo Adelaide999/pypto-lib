@@ -10,7 +10,7 @@
 
 
 import pypto.language as pl
-from .gemm import quantize_activation
+from .activation_quant import quantize_projection_activation
 import pypto.language.distributed as pld
 from .sparse_attention import (
     SWA_RUN_DESCRIPTOR_WIDTH as RUN_DESCRIPTOR_WIDTH, SWA_RUN_PARTS as RUN_PARTS,
@@ -92,7 +92,7 @@ def prefill_swa_attention(
         for row in pl.range(worker, num_tokens, WORKER_TILE):
             kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_input_payload, kv_input_scales = quantize_activation(x, num_tokens, D)
+    kv_input_payload, kv_input_scales = quantize_projection_activation(x, num_tokens, D, True, True)
     kv_proj_rope(
         kv_input_payload, kv_input_scales,
         wkv, wkv_scale, kv_norm_weight,

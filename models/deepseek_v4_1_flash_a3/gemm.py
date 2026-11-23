@@ -17,7 +17,7 @@ if not __package__:
 
 import torch
 import pypto.language as pl
-from .activation_quant import quantize_activation
+from .activation_quant import quantize_activation, quantize_projection_activation
 from .quant import decode_fp8, decode_scale
 
 
@@ -388,9 +388,10 @@ def gemm_dynamic_int8(
     output_width: pl.constexpr,
     name_hint: pl.constexpr,
     output_major: pl.constexpr,
+    prefill: pl.constexpr,
 ):
     """Quantize BF16 token rows and project an INT8 weight matrix."""
-    payload, scale = quantize_activation(source, num_tokens, width)
+    payload, scale = quantize_projection_activation(source, num_tokens, width, True, prefill)
     return gemm_int8(payload, scale, weight, weight_scale, output, num_tokens, width, output_width, name_hint, 128, 256, output_major)
 
 

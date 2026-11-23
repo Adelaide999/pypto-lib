@@ -9,7 +9,7 @@
 """Packed-prefill C1A reuse attention wired through mHC."""
 
 import pypto.language as pl
-from .gemm import quantize_activation
+from .activation_quant import quantize_projection_activation
 import pypto.language.distributed as pld
 from .config import (
     FLASH as M, TP_SIZE, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, PREFILL_MAX_TOKENS,
@@ -92,7 +92,7 @@ def prefill_c1a_reuse_attention(
     if num_tokens > 0:
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
         query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        proj_payload, proj_scales = quantize_activation(x, num_tokens, D)
+        proj_payload, proj_scales = quantize_projection_activation(x, num_tokens, D, True, True)
         q_proj_rope(
             proj_payload, proj_scales,
             wq_a, wq_a_scale, q_norm_weight,

@@ -649,7 +649,10 @@ def prepare_prefill_index_query(
     """Project, rotate, and quantize query rows with group-32 scales."""
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    gemm_dynamic_int8(latent, query_weight, query_weight_scale, projected, num_tokens, Q_LORA, INDEX_H * INDEX_DIM, "c1a_mx_projection", False)
+    gemm_dynamic_int8(
+        latent, query_weight, query_weight_scale, projected, num_tokens,
+        Q_LORA, INDEX_H * INDEX_DIM, "c1a_mx_projection", False, True,
+    )
     if num_tokens >= 64:
         rotated = rotate_index_query(projected, cos, sin, projected, num_tokens)
     else:
