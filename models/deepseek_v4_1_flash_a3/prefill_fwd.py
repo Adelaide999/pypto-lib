@@ -66,7 +66,7 @@ from .hc import hc_post
 from .hc import hc_head, hc_pre, zero_bf16_padding
 from .input_pack import HIDDEN_TILE, gather_rows, pack_x_hc, prepare_compressed_lens
 from .rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
-from .engram import ENGRAM_K, KV_OUT, engram_from_rows
+from .engram import ENGRAM_K, KV_OUT, prefill_engram_from_rows
 from .lm_head import GROUP_LOGIT_ROWS, final_output
 from .moe import ROUTED_RECV_ROWS, prefill_moe_sublayer, prefill_ffn_restore
 from .moe import AUX_WIDTH, SIGNAL_PAD, clear_moe_signals
@@ -666,7 +666,7 @@ def l2_prefill_fwd(
             if layer == 1 or layer == 14:
                 with pl.scope():
                     engram_slot = layer // 14
-                    engram_from_rows(
+                    prefill_engram_from_rows(
                         engram_lookup[engram_slot], engram_wkv[engram_slot], engram_weight[engram_slot], engram_rotation, hidden, hidden,
                     )
             with pl.scope():

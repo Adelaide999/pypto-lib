@@ -24,6 +24,7 @@ from .gemm import (
     gemm_int8_pair_columns,
     gemm_int8_tiled,
     golden_dynamic_int8,
+    prefill_gemm_int8_tiled,
 )
 from .rmsnorm import golden_rms_norm, rms_norm
 from .rope import make_pipelined_rope, make_pipelined_token_rope
@@ -38,9 +39,17 @@ Q_LORA = M.q_lora_rank
 EPS = M.rms_norm_eps
 
 # tiling
-Q_A_N_TILE = 64
+Q_A_N_TILE = 128
 Q_B_N_TILE = 256
 KV_N_TILE = 64
+PREFILL_QKV_MIN_ROWS = 512
+PREFILL_Q_B_MIN_ROWS = 1024
+PREFILL_Q_A_M_TILE = 128
+PREFILL_Q_A_K_TILE = 512
+PREFILL_Q_B_KV_M_TILE = 64
+PREFILL_Q_B_KV_N_TILE = 256
+PREFILL_Q_B_K_TILE = 128
+PREFILL_Q_B_KV_K_TILE = 256
 ROPE_WORKER_TILE = 32
 
 rotate_prefill_q = make_pipelined_rope(
@@ -193,10 +202,16 @@ def make_q_proj_rope(*, prefill):
         ):
             tokens = pl.tensor.dim(query_latent, 0)
             projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-            gemm_int8(
-                payload, scales, wq_a, wq_a_scale, projected, num_tokens,
-                D, Q_LORA, "proj_q_a", 128, 256, False,
-            )
+            if num_tokens >= PREFILL_QKV_MIN_ROWS:
+                prefill_gemm_int8_tiled(
+                    payload, scales, wq_a, wq_a_scale, projected, num_tokens, D, Q_LORA, "proj_q_a",
+                    Q_A_N_TILE, PREFILL_Q_A_K_TILE, False, PREFILL_Q_A_M_TILE,
+                )
+            else:
+                gemm_int8(
+                    payload, scales, wq_a, wq_a_scale, projected, num_tokens,
+                    D, Q_LORA, "proj_q_a", Q_A_N_TILE, 256, False,
+                )
             if num_tokens >= 64:
                 normalize_q(projected, q_norm_weight, query_latent, num_tokens)
             else:
@@ -205,10 +220,23 @@ def make_q_proj_rope(*, prefill):
             qb_payload, qb_scales = quantize_projection_activation(
                 query_latent, num_tokens, Q_LORA, True,
             )
-            gemm_int8(
-                qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
-                Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", Q_B_N_TILE, 256, False,
-            )
+            if num_tokens >= PREFILL_Q_B_MIN_ROWS:
+                prefill_gemm_int8_tiled(
+                    qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
+                    Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b",
+                    PREFILL_Q_B_KV_N_TILE, PREFILL_Q_B_K_TILE, False, PREFILL_Q_B_KV_M_TILE,
+                )
+            elif num_tokens >= PREFILL_QKV_MIN_ROWS:
+                prefill_gemm_int8_tiled(
+                    qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
+                    Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b",
+                    PREFILL_Q_B_KV_N_TILE, PREFILL_Q_B_KV_K_TILE, False, PREFILL_Q_B_KV_M_TILE,
+                )
+            else:
+                gemm_int8(
+                    qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
+                    Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", Q_B_N_TILE, 256, False,
+                )
             if num_tokens >= 64:
                 query = rotate_prefill_q(query, rope_cos, rope_sin, query, num_tokens)
             else:
@@ -280,10 +308,16 @@ def make_kv_proj_rope(*, prefill):
             window_kv: pl.Tensor,
             num_tokens: pl.Scalar[pl.INT32],
         ):
-            gemm_int8(
-                payload, scales, wkv, wkv_scale, kv_projection, num_tokens,
-                D, HEAD_DIM, "proj_kv", KV_N_TILE, 256, False,
-            )
+            if num_tokens >= PREFILL_QKV_MIN_ROWS:
+                prefill_gemm_int8_tiled(
+                    payload, scales, wkv, wkv_scale, kv_projection, num_tokens, D, HEAD_DIM, "proj_kv",
+                    PREFILL_Q_B_KV_N_TILE, PREFILL_Q_B_KV_K_TILE, False, PREFILL_Q_B_KV_M_TILE,
+                )
+            else:
+                gemm_int8(
+                    payload, scales, wkv, wkv_scale, kv_projection, num_tokens,
+                    D, HEAD_DIM, "proj_kv", KV_N_TILE, 256, False,
+                )
             if num_tokens >= 64:
                 normalize_kv(kv_projection, kv_norm_weight, window_kv, num_tokens)
             else:

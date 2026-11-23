@@ -21,7 +21,7 @@ import pypto.language as pl
 import torch
 
 from .config import FLASH as M, T_DYN
-from .gemm import gemm_bf16_to_bf16
+from .gemm import gemm_bf16_to_bf16, gemm_bf16_to_bf16_columns_first
 
 
 # model config
@@ -45,6 +45,8 @@ DOT_SCALE = D**-0.5
 T_TILE = 16
 K_TILE = 128
 N_TILE = 256
+PREFILL_M_TILE = 128
+PREFILL_MIN_ROWS = 1024
 D_TILE = 512
 
 
@@ -155,31 +157,45 @@ def engram_gate(
     return out
 
 
-@pl.jit.inline(auto_scope=False)
-def engram_from_rows(
-    lookup: pl.Tensor,
-    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16],
-    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    rotation: pl.Tensor[[D // 32, 32, 32], pl.FP32],
-    x: pl.Tensor,
-    out: pl.Tensor,
-):
-    """Project host-gathered BF16 rows and gate the FP32 residual stream."""
-    tokens = pl.tensor.dim(x, 0)
-    kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
-    ready = pl.system.task_dummy(deps=[])
-    gemm_bf16_to_bf16(
-        lookup, wkv_weight, kv, tokens, ready,
-        ENGRAM_K, KV_OUT, N_TILE, K_TILE, 24, "engram_projection", 0, 0, False, 64, stages=2,
-    )
-    pl.dump_tag(kv)
-    kv_fp32 = pl.create_tensor([tokens, KV_OUT], dtype=pl.FP32)
-    engram_cast_to_fp32(kv, kv_fp32)
-    original_query = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
-    engram_unrotate(x, rotation, original_query)
-    pl.dump_tag(original_query)
-    engram_gate(kv_fp32, weight, original_query, x, out, output_fp32=True)
-    return out
+def make_engram_from_rows(*, prefill):
+    @pl.jit.inline(auto_scope=False)
+    def engram_from_rows(
+        lookup: pl.Tensor,
+        wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16],
+        weight: pl.Tensor[[HC_MULT, D], pl.FP32],
+        rotation: pl.Tensor[[D // 32, 32, 32], pl.FP32],
+        x: pl.Tensor,
+        out: pl.Tensor,
+    ):
+        """Project host-gathered BF16 rows and gate the FP32 residual stream."""
+        tokens = pl.tensor.dim(x, 0)
+        kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
+        ready = pl.system.task_dummy(deps=[])
+        if prefill and tokens >= PREFILL_MIN_ROWS:
+            # Visit multiple rows while the same weight columns are in cache.
+            gemm_bf16_to_bf16_columns_first(
+                lookup, wkv_weight, kv, tokens, ready,
+                ENGRAM_K, KV_OUT, N_TILE, K_TILE, 24, "engram_projection", 0, 0, False, PREFILL_M_TILE, stages=2,
+            )
+        else:
+            gemm_bf16_to_bf16(
+                lookup, wkv_weight, kv, tokens, ready,
+                ENGRAM_K, KV_OUT, N_TILE, K_TILE, 24, "engram_projection", 0, 0, False, 64, stages=2,
+            )
+        pl.dump_tag(kv)
+        kv_fp32 = pl.create_tensor([tokens, KV_OUT], dtype=pl.FP32)
+        engram_cast_to_fp32(kv, kv_fp32)
+        original_query = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
+        engram_unrotate(x, rotation, original_query)
+        pl.dump_tag(original_query)
+        engram_gate(kv_fp32, weight, original_query, x, out, output_fp32=True)
+        return out
+
+    return engram_from_rows
+
+
+engram_from_rows = make_engram_from_rows(prefill=False)
+prefill_engram_from_rows = make_engram_from_rows(prefill=True)
 
 
 @pl.jit(auto_scope=False)
