@@ -995,25 +995,20 @@ def hc_post_decode(
     output: pl.Tensor,
     deps: pl.Array[2, pl.TASK_ID],
 ):
-    """Select the short-slab fused path without regressing multi-token decode."""
+    """Decode mHC-post with paired output streams for short token slabs."""
     t_dim = pl.tensor.dim(sublayer, 0)
-    if t_dim <= 1:
-        residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
-        residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
-        output_flat = pl.reshape(output, [t_dim, HC_DIM])
-        total_work = t_dim * (D // DECODE_POST_D_TILE) * (HC_MULT // DECODE_POST_STREAM_TILE)
-        workers = pl.min(total_work, POST_WORKER_TILE)
-        with pl.spmd(workers, name_hint="hc_post_decode", deps=[deps]):
-            worker = pl.tile.get_block_idx()
-            for block in pl.pipeline(worker, total_work, POST_WORKER_TILE, stage=1):
-                hc_post_decode_block(
-                    sublayer, residual_flat, post_mix, residual_mix_flat, output_flat,
-                    block, DECODE_POST_STREAM_TILE,
-                )
-    else:
-        hc_post_decode_common(
-            sublayer, residual, post_mix, residual_mix, output, deps=deps,
-        )
+    residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
+    residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
+    output_flat = pl.reshape(output, [t_dim, HC_DIM])
+    total_work = t_dim * (D // DECODE_POST_D_TILE) * (HC_MULT // DECODE_POST_STREAM_TILE)
+    workers = pl.min(total_work, POST_WORKER_TILE)
+    with pl.spmd(workers, name_hint="hc_post_decode", deps=[deps]):
+        worker = pl.tile.get_block_idx()
+        for block in pl.pipeline(worker, total_work, POST_WORKER_TILE, stage=1):
+            hc_post_decode_block(
+                sublayer, residual_flat, post_mix, residual_mix_flat, output_flat,
+                block, DECODE_POST_STREAM_TILE,
+            )
     return output
 @pl.jit.inline(auto_scope=False)
 def hc_post_block(
@@ -1048,42 +1043,6 @@ def hc_post_block(
         value = pl.add(value, update)
         output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + D_TILE] = value
     return output_flat
-
-
-@pl.jit.inline
-def hc_post_decode_common(
-    sublayer: pl.Tensor,
-    residual: pl.Tensor,
-    post_mix: pl.Tensor,
-    residual_mix: pl.Tensor,
-    output: pl.Tensor,
-    deps: pl.Array[2, pl.TASK_ID],
-):
-    """Decode mHC-post path for multi-token slabs."""
-    t_dim = pl.tensor.dim(sublayer, 0)
-    residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
-    residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
-    output_flat = pl.reshape(output, [t_dim, HC_DIM])
-    total_work = t_dim * (D // D_TILE)
-    full_work = total_work // POST_WORKER_TILE * POST_WORKER_TILE
-    tail_work = (total_work - full_work) * HC_MULT
-    workers = pl.min(total_work * HC_MULT, POST_WORKER_TILE)
-    with pl.spmd(workers, name_hint="hc_post_decode_common", deps=[deps]):
-        worker = pl.tile.get_block_idx()
-        for block in pl.pipeline(worker, full_work, POST_WORKER_TILE, stage=1):
-            hc_post_block(
-                sublayer, residual_flat, post_mix, residual_mix_flat, output_flat,
-                block, HC_MULT,
-            )
-        for tail in pl.range(worker, tail_work, POST_WORKER_TILE):
-            tail_chunk = full_work + tail // HC_MULT
-            tail_stream = (tail_chunk // (D // D_TILE)) * HC_MULT + tail % HC_MULT
-            tail_block = tail_stream * (D // D_TILE) + tail_chunk % (D // D_TILE)
-            hc_post_block(
-                sublayer, residual_flat, post_mix, residual_mix_flat, output_flat,
-                tail_block, 1,
-            )
-    return output
 
 
 @pl.jit.inline
