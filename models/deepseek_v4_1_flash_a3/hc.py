@@ -52,7 +52,9 @@ HEAD_D_TILE = 5120
 PRE_NORM_T_TILE = 8
 PRE_NORM_D_TILE = 256
 POST_WORKER_TILE = 64
-PREFILL_RMS_D_TILE = 256
+# Eight FP32 row sums fill one 32-byte reduction output.
+PREFILL_RMS_D_TILE = D // 2
+PREFILL_COLLAPSE_ROWS = D // PREFILL_RMS_D_TILE
 PREFILL_RMS_ROWS = HC_DIM // PREFILL_RMS_D_TILE
 PREFILL_RMS_T_TILE = 8
 PREFILL_PROJ_T_TILE = 32
@@ -504,38 +506,17 @@ def hc_project_prefill(
     """Batch Prefill RMS, projection and incoming-stream collapse."""
     tokens = pl.tensor.dim(x_hc, 0)
     flat = pl.reshape(x_hc, [tokens, HC_DIM])
-    flat_chunks = pl.reshape(flat, [tokens * PREFILL_RMS_ROWS, PREFILL_RMS_D_TILE])
+    streams = pl.reshape(x_hc, [tokens * PREFILL_RMS_ROWS, PREFILL_RMS_D_TILE])
+    collapsed_chunks = pl.reshape(output, [tokens * PREFILL_COLLAPSE_ROWS, PREFILL_RMS_D_TILE])
     inverse = pl.create_tensor([tokens, PREFILL_RMS_T_TILE], dtype=pl.FP32)
-    collapsed_chunks = pl.reshape(
-        output, [tokens * (D // PREFILL_RMS_D_TILE), PREFILL_RMS_D_TILE]
-    )
     workers = pl.min(tokens, PREFILL_WORKER_TILE)
     for worker in pl.spmd(workers, name_hint="mhc_rms"):
         for token in pl.range(worker, tokens, workers):
-            chunk_start = token * PREFILL_RMS_ROWS
-            values = pl.load(
-                flat_chunks,
-                [chunk_start, 0],
-                [PREFILL_RMS_ROWS, PREFILL_RMS_D_TILE],
-            )
-            values_fp32 = values
-
-            stream0 = pl.slice(values_fp32, [D // PREFILL_RMS_D_TILE, PREFILL_RMS_D_TILE], [0, 0])
-            stream1 = pl.slice(
-                values_fp32,
-                [D // PREFILL_RMS_D_TILE, PREFILL_RMS_D_TILE],
-                [D // PREFILL_RMS_D_TILE, 0],
-            )
-            stream2 = pl.slice(
-                values_fp32,
-                [D // PREFILL_RMS_D_TILE, PREFILL_RMS_D_TILE],
-                [2 * D // PREFILL_RMS_D_TILE, 0],
-            )
-            stream3 = pl.slice(
-                values_fp32,
-                [D // PREFILL_RMS_D_TILE, PREFILL_RMS_D_TILE],
-                [3 * D // PREFILL_RMS_D_TILE, 0],
-            )
+            values = pl.load(streams, [token * PREFILL_RMS_ROWS, 0], [PREFILL_RMS_ROWS, PREFILL_RMS_D_TILE])
+            stream0 = pl.slice(values, [PREFILL_COLLAPSE_ROWS, PREFILL_RMS_D_TILE], [0, 0])
+            stream1 = pl.slice(values, [PREFILL_COLLAPSE_ROWS, PREFILL_RMS_D_TILE], [PREFILL_COLLAPSE_ROWS, 0])
+            stream2 = pl.slice(values, [PREFILL_COLLAPSE_ROWS, PREFILL_RMS_D_TILE], [2 * PREFILL_COLLAPSE_ROWS, 0])
+            stream3 = pl.slice(values, [PREFILL_COLLAPSE_ROWS, PREFILL_RMS_D_TILE], [3 * PREFILL_COLLAPSE_ROWS, 0])
             weight0 = pl.read(incoming_pre_mix, [token, 0])
             weight1 = pl.read(incoming_pre_mix, [token, 1])
             weight2 = pl.read(incoming_pre_mix, [token, 2])
@@ -544,17 +525,13 @@ def hc_project_prefill(
             second_pair = pl.add(pl.mul(stream2, weight2), pl.mul(stream3, weight3))
             collapsed = pl.add(first_pair, second_pair)
             collapsed = pl.cast(collapsed, pl.BF16, mode="rint")
-            pl.store(
-                collapsed,
-                [token * (D // PREFILL_RMS_D_TILE), 0],
-                collapsed_chunks,
-            )
+            pl.store(collapsed, [token * PREFILL_COLLAPSE_ROWS, 0], collapsed_chunks)
 
-            square = pl.mul(values_fp32, values_fp32)
+            square = pl.mul(values, values)
             sum_tmp = pl.create_tile([PREFILL_RMS_ROWS, PREFILL_RMS_D_TILE], dtype=pl.FP32)
             partial_sums = pl.row_sum(square, sum_tmp)
-            square_sum = 0.0
-            for chunk in pl.range(PREFILL_RMS_ROWS):
+            square_sum = pl.tile.read(partial_sums, [0, 0])
+            for chunk in pl.unroll(1, PREFILL_RMS_ROWS):
                 square_sum = square_sum + pl.tile.read(partial_sums, [chunk, 0])
             zero = pl.tile.full(
                 [1, PREFILL_RMS_T_TILE], dtype=pl.FP32, value=0.0
@@ -1084,32 +1061,32 @@ def hc_post(
     residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
     output_flat = pl.reshape(output, [t_dim, HC_DIM])
     if prefill:
-        tiles = t_dim * HC_MULT
+        # Each hidden tile supplies all four output streams.
+        tiles = t_dim * (D // PREFILL_POST_D_TILE)
         workers = pl.min(tiles, PREFILL_POST_WORKERS)
         with pl.spmd(workers, name_hint="hc_post_prefill", deps=[deps]):
             worker = pl.tile.get_block_idx()
             for block in pl.pipeline(worker, tiles, PREFILL_POST_WORKERS, stage=2):
-                token = block // HC_MULT
-                out_h = block % HC_MULT
-                for d0 in pl.pipeline(0, D, PREFILL_POST_D_TILE, stage=2):
-                    value = pl.cast(
-                        sublayer[token : token + 1, d0 : d0 + PREFILL_POST_D_TILE],
-                        pl.FP32,
-                    )
-                    value = pl.mul(value, pl.read(post_mix, [token, out_h]))
-                    for source_stream in pl.unroll(HC_MULT):
-                        source = residual_flat[
-                            token : token + 1,
-                            source_stream * D + d0 : source_stream * D + d0 + PREFILL_POST_D_TILE,
-                        ]
-                        coefficient = pl.read(
-                            residual_mix_flat, [token, source_stream * HC_MULT + out_h]
-                        )
-                        value = pl.add(value, pl.mul(source, coefficient))
-                    output_flat[
-                        token : token + 1,
-                        out_h * D + d0 : out_h * D + d0 + PREFILL_POST_D_TILE,
-                    ] = value
+                token = block // (D // PREFILL_POST_D_TILE)
+                d0 = (block % (D // PREFILL_POST_D_TILE)) * PREFILL_POST_D_TILE
+                hidden = pl.load(sublayer, [token, d0], [1, PREFILL_POST_D_TILE])
+                update = pl.cast(hidden, pl.FP32)
+                residual0 = pl.load(residual_flat, [token, d0], [1, PREFILL_POST_D_TILE])
+                residual1 = pl.load(residual_flat, [token, D + d0], [1, PREFILL_POST_D_TILE])
+                residual2 = pl.load(residual_flat, [token, 2 * D + d0], [1, PREFILL_POST_D_TILE])
+                residual3 = pl.load(residual_flat, [token, 3 * D + d0], [1, PREFILL_POST_D_TILE])
+                for out_h in pl.unroll(HC_MULT):
+                    post_weight = pl.read(post_mix, [token, out_h])
+                    weight0 = pl.read(residual_mix_flat, [token, out_h])
+                    weight1 = pl.read(residual_mix_flat, [token, HC_MULT + out_h])
+                    weight2 = pl.read(residual_mix_flat, [token, 2 * HC_MULT + out_h])
+                    weight3 = pl.read(residual_mix_flat, [token, 3 * HC_MULT + out_h])
+                    value = pl.mul(update, post_weight)
+                    value = pl.add(value, pl.mul(residual0, weight0))
+                    value = pl.add(value, pl.mul(residual1, weight1))
+                    value = pl.add(value, pl.mul(residual2, weight2))
+                    value = pl.add(value, pl.mul(residual3, weight3))
+                    pl.store(value, [token, out_h * D + d0], output_flat)
     else:
         hc_post_decode(
             sublayer, residual, post_mix, residual_mix, output, deps=deps,
