@@ -19,7 +19,12 @@ from .activation_quant import (
 )
 from .blocked_rmsnorm import make_blocked_rmsnorm
 from .config import FLASH as M, T_DYN, TP_SIZE
-from .gemm import gemm_int8, gemm_int8_pair_columns, golden_dynamic_int8
+from .gemm import (
+    gemm_int8,
+    gemm_int8_pair_columns,
+    gemm_int8_tiled,
+    golden_dynamic_int8,
+)
 from .rmsnorm import golden_rms_norm, rms_norm
 from .rope import make_pipelined_rope, make_pipelined_token_rope
 
@@ -232,7 +237,7 @@ def make_q_proj_rope(*, prefill):
             projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
             gemm_int8_pair_columns(
                 payload, scales, wq_a, wq_a_scale, projected, num_tokens,
-                D, Q_LORA, "proj_q_a_decode_pair", 128, 256, False, 16,
+                D, Q_LORA, "proj_q_a_decode_pair_k512", 128, 512, False, 16,
             )
             payload_rows = pl.tensor.dim(projected, 0)
             padded_rows = (payload_rows + 15) // 16 * 16
@@ -306,9 +311,9 @@ def make_kv_proj_rope(*, prefill):
             window_kv: pl.Tensor,
             num_tokens: pl.Scalar[pl.INT32],
         ):
-            gemm_int8(
+            gemm_int8_tiled(
                 payload, scales, wkv, wkv_scale, kv_projection, num_tokens,
-                D, HEAD_DIM, "proj_kv", KV_N_TILE, 256, False,
+                D, HEAD_DIM, "proj_kv_decode_k512_n128", 128, 512, False, 16,
             )
             normalize_rope_kv(
                 kv_projection, kv_norm_weight, rope_cos, rope_sin, window_kv, num_tokens,

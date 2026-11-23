@@ -22,7 +22,6 @@ from models.deepseek_v4_1_flash_a3.rmsnorm import golden_rms_norm, rms_norm
 
 
 CAPACITY = 64
-TOKENS = 1
 D = M.hidden_size
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
@@ -83,7 +82,7 @@ def decode_kv_proj_baseline(
 l2_decode_kv_proj_baseline = make_l2(decode_kv_proj_baseline)
 
 
-def make_values() -> dict[str, torch.Tensor]:
+def make_values(tokens: int) -> dict[str, torch.Tensor]:
     gen = torch.Generator().manual_seed(1122)
     return {
         "payload": torch.randint(-127, 128, (CAPACITY, D), dtype=torch.int8, generator=gen),
@@ -93,7 +92,7 @@ def make_values() -> dict[str, torch.Tensor]:
         "kv_norm_weight": torch.ones(HEAD_DIM, dtype=torch.bfloat16),
         "rope_cos": torch.ones((CAPACITY, ROPE_DIM // 2), dtype=torch.float32),
         "rope_sin": torch.zeros((CAPACITY, ROPE_DIM // 2), dtype=torch.float32),
-        "counts": torch.tensor([TOKENS], dtype=torch.int32),
+        "counts": torch.tensor([tokens], dtype=torch.int32),
     }
 
 
@@ -102,8 +101,9 @@ def golden(values: dict[str, torch.Tensor]) -> None:
     projection = golden_dynamic_int8(source, values["wkv"], values["wkv_scale"])
     window = golden_rms_norm(projection, values["kv_norm_weight"])
     window = golden_rope_tail(window, values["rope_cos"], values["rope_sin"])
-    values["kv_projection"][:TOKENS].copy_(projection[:TOKENS])
-    values["window_kv"][:TOKENS].copy_(window[:TOKENS])
+    tokens = int(values["counts"].item())
+    values["kv_projection"][:tokens].copy_(projection[:tokens])
+    values["window_kv"][:tokens].copy_(window[:tokens])
 
 
 def main() -> None:
@@ -111,11 +111,12 @@ def main() -> None:
     parser.add_argument("--platform", choices=("a2a3",), default="a2a3")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--mode", choices=("baseline", "candidate"), default="candidate")
+    parser.add_argument("--tokens", type=int, choices=(1, 16, CAPACITY), default=1)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
 
-    values = make_values()
+    values = make_values(args.tokens)
     specs = [
         TensorSpec(name, list(value.shape), value.dtype, init_value=value)
         for name, value in values.items()
@@ -130,10 +131,10 @@ def main() -> None:
         golden_fn=golden,
         compare_fn={
             "kv_projection": ratio_allclose(
-                atol=0.003, rtol=0.03, max_error_ratio=0.005, valid_rows=TOKENS,
+                atol=0.003, rtol=0.03, max_error_ratio=0.005, valid_rows=args.tokens,
             ),
             "window_kv": ratio_allclose(
-                atol=0.003, rtol=0.03, max_error_ratio=0.005, valid_rows=TOKENS,
+                atol=0.003, rtol=0.03, max_error_ratio=0.005, valid_rows=args.tokens,
             ),
         },
         config={"backend_type": args.platform, "execution_mode": False, "device_id": args.device},
@@ -142,6 +143,7 @@ def main() -> None:
     report = {
         "passed": result.passed,
         "mode": args.mode,
+        "tokens": args.tokens,
         "compile_only": args.compile_only,
         "build": str(result.work_dir),
         "error": str(result.error) if result.error else None,
