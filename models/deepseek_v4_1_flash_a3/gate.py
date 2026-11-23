@@ -41,7 +41,8 @@ N_HASH_LAYERS = 0
 GATE_INPUT_TILE = 4
 # Dense Prefill slabs use one 32-row panel per gate worker.  Combining it with
 # a 64-expert panel keeps the Acc/Mat buffers within the A3 per-core limits.
-GATE_M_TILE = 32
+# Decode capacity 16 keeps the 16-row MoE buffer ABI; larger slabs use 32-row gate panels.
+GATE_M_TILE = 32 if T >= 32 else 16
 GATE_N_TILE = 64 if T >= 64 else 16
 ROUTE_SELECT_T_TILE = 16
 ROUTE_SELECT_WORKERS = 48
