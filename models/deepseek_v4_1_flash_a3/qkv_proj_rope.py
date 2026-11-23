@@ -12,7 +12,11 @@
 import pypto.language as pl
 import torch
 
-from .activation_quant import normalize_quantize_projection_activation, quantize_projection_activation
+from .activation_quant import (
+    _tile_rsqrt_for_norm,
+    normalize_quantize_projection_activation,
+    quantize_projection_activation,
+)
 from .blocked_rmsnorm import make_blocked_rmsnorm
 from .config import FLASH as M, T_DYN, TP_SIZE
 from .gemm import gemm_int8, gemm_int8_pair_columns, golden_dynamic_int8
@@ -63,10 +67,12 @@ def normalize_rope_kv(
             padded = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), 8, HEAD_DIM)
             value = pl.cast(padded, pl.FP32)
             square = pl.mul(value, value)
-            row_sum = pl.row_sum(square)
+            norm_scratch = pl.create_tile([8, HEAD_DIM], dtype=pl.FP32)
+            row_sum = pl.row_sum(square, tmp_tile=norm_scratch)
             mean = pl.mul(row_sum, 1.0 / HEAD_DIM)
             rms_argument = pl.add(mean, EPS)
-            row_inverse = pl.rsqrt(rms_argument, high_precision=True)
+            rsqrt_scratch = pl.create_tile([8, 1], dtype=pl.FP32)
+            row_inverse = _tile_rsqrt_for_norm(rms_argument, rsqrt_scratch)
             gamma = pl.cast(pl.load(weight_row, [0, 0], [1, HEAD_DIM]), pl.FP32)
             normalized = pl.col_expand_mul(pl.row_expand_mul(value, row_inverse), gamma)
             normalized_bf16 = pl.cast(normalized, pl.BF16, mode="rint")

@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Per-token W8A8 quantization for A3 projections and experts."""
 
+import inspect
+
 import pypto.language as pl
 
 
@@ -16,6 +18,22 @@ VEC_M_TILE = 8
 PREFILL_QUANT_WORKERS = 48
 QUANT_REDUCE_TILE = 1024
 CHECKPOINT_ROWS = pl.dynamic("CHECKPOINT_QUANT_ROWS")
+_TILE_RSQRT_HAS_HIGH_PRECISION = "high_precision" in inspect.signature(pl.tile.rsqrt).parameters
+
+if _TILE_RSQRT_HAS_HIGH_PRECISION:
+    @pl.jit.inline(auto_scope=False)
+    def _tile_rsqrt_for_norm(
+        value: pl.Tile[[VEC_M_TILE, 1], pl.FP32],
+        scratch: pl.Tile[[VEC_M_TILE, 1], pl.FP32],
+    ):
+        return pl.tile.rsqrt(value, tmp=scratch, high_precision=True)
+else:
+    @pl.jit.inline(auto_scope=False)
+    def _tile_rsqrt_for_norm(
+        value: pl.Tile[[VEC_M_TILE, 1], pl.FP32],
+        scratch: pl.Tile[[VEC_M_TILE, 1], pl.FP32],
+    ):
+        return pl.tile.rsqrt(value, tmp=scratch)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -188,10 +206,12 @@ def normalize_quantize_projection_activation(
             padded = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), VEC_M_TILE, width)
             value = pl.cast(padded, pl.FP32)
             square = pl.mul(value, value)
-            row_sum = pl.row_sum(square)
+            norm_scratch = pl.create_tile([VEC_M_TILE, width], dtype=pl.FP32)
+            row_sum = pl.row_sum(square, tmp_tile=norm_scratch)
             mean = pl.mul(row_sum, 1.0 / width)
             rms_argument = pl.add(mean, eps)
-            inverse_rms = pl.rsqrt(rms_argument, high_precision=True)
+            rsqrt_scratch = pl.create_tile([VEC_M_TILE, 1], dtype=pl.FP32)
+            inverse_rms = _tile_rsqrt_for_norm(rms_argument, rsqrt_scratch)
             normalized_fp32 = pl.row_expand_mul(value, inverse_rms)
             gamma = pl.cast(pl.load(weight_row, [0, 0], [1, width]), pl.FP32)
             weighted = pl.col_expand_mul(normalized_fp32, gamma)
