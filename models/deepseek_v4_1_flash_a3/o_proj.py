@@ -52,6 +52,8 @@ HC_DIM = M.hc_dim
 O_A_N_TILE = 128
 O_B_N_TILE = 128
 K_TILE = 128
+PREFILL_O_M_TILE = 128
+PREFILL_O_N_TILE = 256
 D_TILE = 512
 TP_COLUMNS = 1280
 TP_ROWS = 4 if MOE_TOKENS >= 64 else 1
@@ -87,20 +89,40 @@ def make_project_output(*, prefill):
         for group in pl.parallel(LOCAL_O_GROUPS):
             source_col = pl.cast(group * O_GROUP_IN, pl.INT32)
             output_col = pl.cast(group * O_LORA, pl.INT32)
-            if not sequential and num_tokens >= 64:
+            if prefill and not sequential and num_tokens >= PREFILL_O_M_TILE:
                 gemm_bf16_to_bf16(
                     rotated, wo_a[group], projected, num_tokens, ready,
-                    O_GROUP_IN, O_LORA, 256, 128, 24, "proj_o_a", source_col, output_col, False, 64,
+                    O_GROUP_IN, O_LORA, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_a",
+                    source_col, output_col, False, PREFILL_O_M_TILE, stages=2,
+                )
+            elif not sequential and num_tokens >= 64:
+                gemm_bf16_to_bf16(
+                    rotated, wo_a[group], projected, num_tokens, ready,
+                    O_GROUP_IN, O_LORA, 256, K_TILE, 24, "proj_o_a",
+                    source_col, output_col, False, 64, stages=1,
                 )
             else:
                 gemm_bf16_to_bf16(
                     rotated, wo_a[group], projected, num_tokens, ready,
-                    O_GROUP_IN, O_LORA, O_A_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_a", source_col, output_col, sequential, 16,
+                    O_GROUP_IN, O_LORA, O_A_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_a",
+                    source_col, output_col, sequential, 16, stages=1,
                 )
-        if not sequential and num_tokens >= 64:
-            gemm_bf16_to_bf16(projected, wo_b, output, num_tokens, ready, LOCAL_O_WIDTH, D, 256, 128, 24, "proj_o_b", 0, 0, False, 64)
+        if prefill and not sequential and num_tokens >= PREFILL_O_M_TILE:
+            gemm_bf16_to_bf16(
+                projected, wo_b, output, num_tokens, ready,
+                LOCAL_O_WIDTH, D, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_b", 0, 0, False, PREFILL_O_M_TILE, stages=2,
+            )
+        elif not sequential and num_tokens >= 64:
+            gemm_bf16_to_bf16(
+                projected, wo_b, output, num_tokens, ready,
+                LOCAL_O_WIDTH, D, 256, K_TILE, 24, "proj_o_b", 0, 0, False, 64, stages=1,
+            )
         else:
-            gemm_bf16_to_bf16(projected, wo_b, output, num_tokens, ready, LOCAL_O_WIDTH, D, O_B_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_b", 0, 0, sequential, 16)
+            gemm_bf16_to_bf16(
+                projected, wo_b, output, num_tokens, ready,
+                LOCAL_O_WIDTH, D, O_B_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_b",
+                0, 0, sequential, 16, stages=1,
+            )
         return output
 
     return project_output

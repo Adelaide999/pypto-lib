@@ -24,6 +24,7 @@ from .config import (
 )
 from .rmsnorm import golden_rms_norm, rms_norm
 from .quant import encode_fp4
+from .rope import make_pipelined_token_rope
 
 
 # model config
@@ -40,6 +41,9 @@ C1A_PROJ_K_TILE = 512
 C2A_PROJ_M_TILE = 80
 C2A_PROJ_N_TILE = 64
 C2A_PROJ_K_TILE = 256
+
+
+rotate_prefill_compressed = make_pipelined_token_rope(T_DYN, HEAD_DIM, name_hint="rope_cmp", inplace=False)
 
 
 @pl.jit.inline
@@ -87,12 +91,14 @@ def compressor_rope(
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    blocks = num_tokens
-    workers = pl.min(blocks, 12)
-    with pl.spmd(workers, name_hint="rope_cmp"):
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, blocks, workers):
-            _compressor_rope_block(x, cos, sin, output, block)
+    if num_tokens >= 64:
+        output = rotate_prefill_compressed(x, cos, sin, output, num_tokens)
+    else:
+        workers = pl.min(num_tokens, 12)
+        with pl.spmd(workers, name_hint="rope_cmp"):
+            worker = pl.tile.get_block_idx()
+            for block in pl.range(worker, num_tokens, workers):
+                _compressor_rope_block(x, cos, sin, output, block)
     return output
 
 

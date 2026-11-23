@@ -12,6 +12,62 @@ import pypto.language as pl
 
 
 ROPE_WORKER_LIMIT = 48
+TOKEN_ROPE_ROWS_TILE = 16
+
+
+def make_pipelined_token_rope(capacity, head_dim, *, name_hint, inplace):
+    """Rotate single-head rows in double-buffered token tiles."""
+    nope = head_dim - 64
+    load_start = nope if inplace else 0
+    load_width = head_dim - load_start
+    rows = TOKEN_ROPE_ROWS_TILE
+    elements = rows * 64
+
+    @pl.jit.inline
+    def rope(
+        source: pl.Tensor[[capacity, head_dim], pl.BF16],
+        cosine: pl.Tensor[[capacity, 32], pl.FP32],
+        sine: pl.Tensor[[capacity, 32], pl.FP32],
+        output: pl.InOut[pl.Tensor[[capacity, head_dim], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        blocks = (active + rows - 1) // rows
+        workers = pl.min(blocks, ROPE_WORKER_LIMIT)
+        for worker in pl.spmd(workers, name_hint=name_hint):
+            lanes = pl.cast(pl.tile.arange(0, [1, elements], dtype=pl.INT32), pl.FP32)
+            pairs = pl.cast(pl.mul(lanes, 0.5), pl.INT32, mode="trunc")
+            parity = pl.sub(lanes, pl.mul(pl.cast(pairs, pl.FP32), 2.0))
+            swap_idx = pl.cast(pl.sub(pl.add(lanes, 1.0), pl.mul(parity, 2.0)), pl.INT32)
+            sign = pl.sub(pl.mul(parity, 2.0), 1.0)
+            start = worker * blocks // workers
+            end = (worker + 1) * blocks // workers
+            for block in pl.pipeline(start, end, stage=2):
+                row = block * rows
+                valid = pl.min(rows, active - row)
+                loaded = pl.load(source, [row, load_start], [rows, load_width], valid_shape=[valid, load_width])
+                value = pl.set_validshape(loaded, rows, load_width)
+                tail = pl.tile.slice(value, [rows, 64], [0, nope - load_start])
+                flat = pl.reshape(pl.cast(tail, pl.FP32), [1, elements])
+                scratch = pl.create_tile([1, elements], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+                swapped = pl.tile.gather(flat, swap_idx, scratch)
+                c_tile = pl.load(cosine, [row, 0], [rows, 32], valid_shape=[valid, 32])
+                s_tile = pl.load(sine, [row, 0], [rows, 32], valid_shape=[valid, 32])
+                c_table = pl.reshape(pl.set_validshape(c_tile, rows, 32), [1, rows * 32])
+                s_table = pl.reshape(pl.set_validshape(s_tile, rows, 32), [1, rows * 32])
+                c = pl.tile.gather(c_table, pairs, scratch)
+                s = pl.mul(pl.tile.gather(s_table, pairs, scratch), sign)
+                direct = pl.mul(flat, c)
+                cross = pl.mul(swapped, s)
+                result = pl.reshape(pl.add(direct, cross), [rows, 64])
+                rotated = pl.cast(result, pl.BF16, mode="rint")
+                if inplace:
+                    pl.store(pl.set_validshape(rotated, valid, 64), [row, nope], output)
+                else:
+                    combined = pl.tile.assemble(value, rotated, [0, nope])
+                    pl.store(pl.set_validshape(combined, valid, head_dim), [row, 0], output)
+        return output
+
+    return rope
 
 
 def make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow_early_resolve, inplace=False):

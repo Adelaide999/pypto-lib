@@ -168,7 +168,10 @@ def engram_from_rows(
     tokens = pl.tensor.dim(x, 0)
     kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
     ready = pl.system.task_dummy(deps=[])
-    gemm_bf16_to_bf16(lookup, wkv_weight, kv, tokens, ready, ENGRAM_K, KV_OUT, 256, 128, 24, "engram_projection", 0, 0, False, 64)
+    gemm_bf16_to_bf16(
+        lookup, wkv_weight, kv, tokens, ready,
+        ENGRAM_K, KV_OUT, N_TILE, K_TILE, 24, "engram_projection", 0, 0, False, 64, stages=2,
+    )
     pl.dump_tag(kv)
     kv_fp32 = pl.create_tensor([tokens, KV_OUT], dtype=pl.FP32)
     engram_cast_to_fp32(kv, kv_fp32)
