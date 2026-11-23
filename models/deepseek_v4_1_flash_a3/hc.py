@@ -75,6 +75,7 @@ DECODE_NORM_T_TILE = 8
 DECODE_NORM_D_TILE = 512
 DECODE_POST_STREAM_TILE = 4
 DECODE_POST_D_TILE = 1280
+DECODE_POST_D_TILE_WIDE = 2560
 
 
 @pl.jit.inline
@@ -936,17 +937,18 @@ def hc_post_decode_block(
     output_flat: pl.Tensor,
     block: pl.Scalar[pl.INDEX],
     stream_tile: pl.constexpr,
+    d_tile: pl.constexpr,
 ):
     """Process one Decode hidden-width tile while sharing residual loads."""
-    pair_block = block // (D // DECODE_POST_D_TILE)
+    pair_block = block // (D // d_tile)
     t = pair_block // (HC_MULT // stream_tile)
     out_base = (pair_block % (HC_MULT // stream_tile)) * stream_tile
-    d0 = (block % (D // DECODE_POST_D_TILE)) * DECODE_POST_D_TILE
-    x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + DECODE_POST_D_TILE], pl.FP32)
-    residual0 = residual_flat[t : t + 1, d0 : d0 + DECODE_POST_D_TILE]
-    residual1 = residual_flat[t : t + 1, D + d0 : D + d0 + DECODE_POST_D_TILE]
-    residual2 = residual_flat[t : t + 1, 2 * D + d0 : 2 * D + d0 + DECODE_POST_D_TILE]
-    residual3 = residual_flat[t : t + 1, 3 * D + d0 : 3 * D + d0 + DECODE_POST_D_TILE]
+    d0 = (block % (D // d_tile)) * d_tile
+    x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + d_tile], pl.FP32)
+    residual0 = residual_flat[t : t + 1, d0 : d0 + d_tile]
+    residual1 = residual_flat[t : t + 1, D + d0 : D + d0 + d_tile]
+    residual2 = residual_flat[t : t + 1, 2 * D + d0 : 2 * D + d0 + d_tile]
+    residual3 = residual_flat[t : t + 1, 3 * D + d0 : 3 * D + d0 + d_tile]
     for out_offset in pl.unroll(stream_tile):
         out_h = out_base + out_offset
         update = pl.mul(x_tile, pl.read(post_mix, [t, out_h]))
@@ -958,8 +960,35 @@ def hc_post_decode_block(
         term3 = pl.mul(residual3, pl.read(residual_mix_flat, [t, 3 * HC_MULT + out_h]))
         value = pl.add(value, term3)
         value = pl.add(value, update)
-        output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + DECODE_POST_D_TILE] = value
+        output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + d_tile] = value
     return output_flat
+
+
+@pl.jit.inline
+def hc_post_decode_run(
+    sublayer: pl.Tensor,
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    output: pl.Tensor,
+    deps: pl.Array[2, pl.TASK_ID],
+    d_tile: pl.constexpr,
+):
+    """Run one Decode mHC-post tile shape after its producer dependencies."""
+    t_dim = pl.tensor.dim(sublayer, 0)
+    residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
+    residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
+    output_flat = pl.reshape(output, [t_dim, HC_DIM])
+    total_work = t_dim * (D // d_tile) * (HC_MULT // DECODE_POST_STREAM_TILE)
+    workers = pl.min(total_work, POST_WORKER_TILE)
+    with pl.spmd(workers, name_hint="hc_post_decode", deps=[deps]):
+        worker = pl.tile.get_block_idx()
+        for block in pl.pipeline(worker, total_work, POST_WORKER_TILE, stage=1):
+            hc_post_decode_block(
+                sublayer, residual_flat, post_mix, residual_mix_flat, output_flat,
+                block, DECODE_POST_STREAM_TILE, d_tile,
+            )
+    return output
 
 
 @pl.jit.inline
@@ -971,20 +1000,18 @@ def hc_post_decode(
     output: pl.Tensor,
     deps: pl.Array[2, pl.TASK_ID],
 ):
-    """Decode mHC-post with paired output streams for short token slabs."""
+    """Route short and multi-token Decode slabs to their measured tile shapes."""
     t_dim = pl.tensor.dim(sublayer, 0)
-    residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
-    residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
-    output_flat = pl.reshape(output, [t_dim, HC_DIM])
-    total_work = t_dim * (D // DECODE_POST_D_TILE) * (HC_MULT // DECODE_POST_STREAM_TILE)
-    workers = pl.min(total_work, POST_WORKER_TILE)
-    with pl.spmd(workers, name_hint="hc_post_decode", deps=[deps]):
-        worker = pl.tile.get_block_idx()
-        for block in pl.pipeline(worker, total_work, POST_WORKER_TILE, stage=1):
-            hc_post_decode_block(
-                sublayer, residual_flat, post_mix, residual_mix_flat, output_flat,
-                block, DECODE_POST_STREAM_TILE,
-            )
+    if t_dim <= 1:
+        hc_post_decode_run(
+            sublayer, residual, post_mix, residual_mix, output, deps,
+            DECODE_POST_D_TILE,
+        )
+    else:
+        hc_post_decode_run(
+            sublayer, residual, post_mix, residual_mix, output, deps,
+            DECODE_POST_D_TILE_WIDE,
+        )
     return output
 @pl.jit.inline(auto_scope=False)
 def hc_post_block(
