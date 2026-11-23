@@ -272,6 +272,7 @@ def l2_prefill_c1a_reindex_sharded(
     hc_pre(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
         hc_collapsed, next_pre_mix, post_mix, residual_mix,
+        prefill=True,
     )
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
     for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
@@ -457,6 +458,7 @@ def prefill_c1a_reindex(
     hc_pre(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
         hidden, next_pre_mix, post_mix, residual_mix,
+        prefill=True,
     )
     norm_tokens = pl.tensor.dim(hidden, 0)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
@@ -465,7 +467,10 @@ def prefill_c1a_reindex(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, request_ids, compressed_lens, index_cache, index_cache_scale, index_block_table, pool_block_ids, pool_block_counts, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices, output_window, output_arrived, attn_out, group_base, tp_rank, num_tokens, attention_epoch, scatter_output=False, use_candidates=True,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
+    hc_post(
+        attn_out, x_hc, post_mix, residual_mix, output,
+        deps=hc_post_deps, prefill=True,
+    )
     return output
 
 

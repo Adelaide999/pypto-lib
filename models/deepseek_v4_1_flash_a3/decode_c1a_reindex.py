@@ -153,5 +153,8 @@ def decode_c1a_reindex(
         group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(reduced_output, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
+    hc_post(
+        reduced_output, x_hc, post_mix, residual_mix, output,
+        deps=hc_post_deps, prefill=False,
+    )
     return output

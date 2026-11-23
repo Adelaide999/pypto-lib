@@ -354,6 +354,7 @@ def decode_encoder(
                 attention_hidden, ffn_owned, ffn_post, ffn_residual,
                 ffn_window, ffn_arrived, x_mixed, x_hc,
                 rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, local_moe_tokens, layer + 1,
+                prefill=False,
             )
     return x_hc, pre_mix, token_rope_cos, token_rope_sin
 
@@ -576,6 +577,7 @@ def decode_decoder(
                 attention_hidden, ffn_owned, ffn_post, ffn_residual,
                 ffn_window, ffn_arrived, x_mixed, x_hc,
                 rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, local_moe_tokens, layer + 1,
+                prefill=False,
             )
     clear_moe_signals(x_hc, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     return x_hc

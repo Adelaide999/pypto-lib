@@ -176,6 +176,7 @@ def prefill_c2a_reuse_sp(
     hc_pre(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
         hc_collapsed, next_pre_mix, post_mix, residual_mix,
+        prefill=True,
     )
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
     for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
@@ -249,6 +250,7 @@ def prefill_c2a_reuse(
     hc_pre(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
         hc_collapsed, next_pre_mix, post_mix, residual_mix,
+        prefill=True,
     )
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
     for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
@@ -262,7 +264,10 @@ def prefill_c2a_reuse(
         attention_partial, output_window, output_arrived, attn_output, group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attn_output, x_hc, post_mix, residual_mix, x_hc_out, deps=hc_post_deps)
+    hc_post(
+        attn_output, x_hc, post_mix, residual_mix, x_hc_out,
+        deps=hc_post_deps, prefill=True,
+    )
     return x_hc_out
 
 

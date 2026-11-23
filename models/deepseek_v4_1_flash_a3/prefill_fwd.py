@@ -387,6 +387,7 @@ def _prefill_moe(
             prefill_ffn_restore(
                 round_hidden, owned, post, residual, ffn_window, ffn_arrived,
                 round_mixed, round_output, ep_rank // TP_SIZE * TP_SIZE, ep_rank % TP_SIZE, active, epoch,
+                prefill=True,
             )
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_complete") as completed:
                 hidden_anchor = pl.read(round_output, [0, 0, 0])
@@ -674,6 +675,7 @@ def l2_prefill_fwd(
                 hc_pre(
                     hidden, delayed_pre, layer_attn_fn, layer_attn_scale, layer_attn_base,
                     collapsed, attn_pre, attn_post, attn_residual,
+                    prefill=True,
                 )
                 norm_tokens = pl.tensor.dim(collapsed, 0)
                 prefill_rms_norm(collapsed, layer_attn_norm, normalized, norm_tokens)
@@ -707,7 +709,10 @@ def l2_prefill_fwd(
                     zero_bf16_padding(attn_output, pl.cast(0, pl.INT32))
                 hc_post_deps = pl.array.create(2, pl.TASK_ID)
                 hc_post_deps[0] = moe_ready
-                hc_post(attn_output, hidden, attn_post, attn_residual, attn_hidden, deps=hc_post_deps)
+                hc_post(
+                    attn_output, hidden, attn_post, attn_residual, attn_hidden,
+                    deps=hc_post_deps, prefill=True,
+                )
         moe_ready = _prefill_moe(
             attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
             layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
