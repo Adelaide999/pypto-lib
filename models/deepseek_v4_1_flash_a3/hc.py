@@ -562,7 +562,7 @@ def hc_project_prefill(
             square_sum_tile = pl.add(zero, square_sum)
             rms_arg = pl.add(pl.mul(square_sum_tile, HC_DIM_INV), NORM_EPS)
             rsqrt_tmp = pl.create_tile([1, PREFILL_RMS_T_TILE], dtype=pl.FP32)
-            inverse_tile = pl.tile.rsqrt(rms_arg, rsqrt_tmp)
+            inverse_tile = pl.tile.rsqrt(rms_arg, rsqrt_tmp, high_precision=True)
             pl.store(inverse_tile, [token, 0], inverse)
 
     accumulated = pl.create_tensor([tokens, MIX_PAD], dtype=pl.FP32)
