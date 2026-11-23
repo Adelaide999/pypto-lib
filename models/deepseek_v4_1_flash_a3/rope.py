@@ -63,8 +63,9 @@ def make_pipelined_token_rope(capacity, head_dim, *, name_hint, inplace):
                 if inplace:
                     pl.store(pl.set_validshape(rotated, valid, 64), [row, nope], output)
                 else:
-                    combined = pl.tile.assemble(value, rotated, [0, nope])
-                    pl.store(pl.set_validshape(combined, valid, head_dim), [row, 0], output)
+                    prefix = pl.load(source, [row, 0], [rows, nope], valid_shape=[valid, nope])
+                    pl.store(prefix, [row, 0], output)
+                    pl.store(pl.set_validshape(rotated, valid, 64), [row, nope], output)
         return output
 
     return rope
@@ -187,8 +188,9 @@ def make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow_
                 if inplace:
                     pl.store(rotated, [row, nope], target)
                 else:
-                    combined = pl.tile.assemble(block_value, rotated, [0, nope])
-                    pl.store(combined, [row, 0], target)
+                    prefix = pl.load(source, [row, 0], [rows, nope])
+                    pl.store(prefix, [row, 0], target)
+                    pl.store(rotated, [row, nope], target)
         return output
 
     return rope

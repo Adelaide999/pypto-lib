@@ -285,9 +285,9 @@ def gemm_int8_pair_columns(
             second_value = pl.col_expand_mul(second_value, second_scale)
             second_value = pl.cast(second_value, pl.BF16, mode="rint")
             if fuse_rope:
-                second_value = pl.set_validshape(second_value, row_tile, n_tile)
+                rope_value = pl.set_validshape(second_value, row_tile, n_tile)
                 tail_bf16 = pl.tile.slice(
-                    second_value, [row_tile, rope_dim], [0, rope_offset],
+                    rope_value, [row_tile, rope_dim], [0, rope_offset],
                 )
                 tail = pl.cast(tail_bf16, pl.FP32)
                 even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
@@ -323,17 +323,24 @@ def gemm_int8_pair_columns(
                 rotated = pl.reinterpret_view(pl.or_(real_bits, imag_bits), pl.FP32)
                 rotated = pl.cast(rotated, pl.BF16, mode="rint")
                 prefix = pl.tile.slice(
-                    second_value, [row_tile, rope_offset], [0, 0],
+                    rope_value, [row_tile, rope_offset], [0, 0],
+                    valid_shape=[valid_rows, rope_offset],
                 )
-                fused_value = pl.tile.full(
-                    [row_tile, n_tile], dtype=pl.BF16, value=0.0,
+                rotated = pl.tile.slice(
+                    rotated, [row_tile, rope_dim], [0, 0],
+                    valid_shape=[valid_rows, rope_dim],
                 )
-                fused_value = pl.tile.assemble(fused_value, prefix, [0, 0])
-                second_value = pl.tile.assemble(fused_value, rotated, [0, rope_offset])
-            output = pl.store(
-                pl.set_validshape(second_value, valid_rows, n_tile),
-                [row, second_col], output,
-            )
+                output = pl.store(
+                    prefix, [row, second_col], output,
+                )
+                output = pl.store(
+                    rotated, [row, second_col + rope_offset], output,
+                )
+            else:
+                output = pl.store(
+                    pl.set_validshape(second_value, valid_rows, n_tile),
+                    [row, second_col], output,
+                )
     return output
 
 

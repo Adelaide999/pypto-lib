@@ -269,7 +269,7 @@ def make_q_proj_rope(*, prefill):
             gemm_int8_pair_columns(
                 payload, scales, wq_a, wq_a_scale, projected, num_tokens,
                 D, Q_LORA, "proj_q_a_decode_pair_k512", 128, 512, False, 16,
-                rope_cos, rope_sin, False, 0, 0,
+                rope_cos, rope_sin, False, ROPE_DIM, ROPE_DIM,
             )
             payload_rows = pl.tensor.dim(projected, 0)
             padded_rows = (payload_rows + 15) // 16 * 16
