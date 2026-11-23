@@ -12,10 +12,10 @@
 import pypto.language as pl
 import torch
 
-from .activation_quant import quantize_projection_activation
+from .activation_quant import normalize_quantize_projection_activation, quantize_projection_activation
 from .blocked_rmsnorm import make_blocked_rmsnorm
 from .config import FLASH as M, T_DYN, TP_SIZE
-from .gemm import gemm_int8, golden_dynamic_int8
+from .gemm import gemm_int8, gemm_int8_pair_columns, golden_dynamic_int8
 from .rmsnorm import golden_rms_norm, rms_norm
 from .rope import make_pipelined_rope
 
@@ -101,37 +101,88 @@ def _rotate_rope(
 
 
 def make_q_proj_rope(*, prefill):
-    @pl.jit.inline(auto_scope=False)
-    def q_proj_rope(
-        payload: pl.Tensor,
-        scales: pl.Tensor,
-        wq_a: pl.Tensor,
-        wq_a_scale: pl.Tensor,
-        q_norm_weight: pl.Tensor,
-        wq_b: pl.Tensor,
-        wq_b_scale: pl.Tensor,
-        rope_cos: pl.Tensor,
-        rope_sin: pl.Tensor,
-        query_latent: pl.Tensor,
-        query: pl.Tensor,
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        """Project INT8 Q-A/Q-B weights, normalize latent rows, and rotate query heads."""
-        tokens = pl.tensor.dim(query_latent, 0)
-        projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        gemm_int8(payload, scales, wq_a, wq_a_scale, projected, num_tokens, D, Q_LORA, "proj_q_a", 128, 256, False)
-        if prefill and num_tokens >= 64:
-            normalize_q(projected, q_norm_weight, query_latent, num_tokens)
-        else:
-            for worker in pl.spmd((num_tokens + 7) // 8, name_hint="norm_q_latent"):
-                rms_norm(projected, q_norm_weight, query_latent, worker, num_tokens, width=Q_LORA)
-        qb_payload, qb_scales = quantize_projection_activation(query_latent, num_tokens, Q_LORA, prefill)
-        gemm_int8(qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens, Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", Q_B_N_TILE, 256, False)
-        if prefill and num_tokens >= 64:
-            query = rotate_prefill_q(query, rope_cos, rope_sin, query, num_tokens)
-        else:
-            query = _rotate_rope(query, query, rope_cos, rope_sin, 0, num_tokens, LOCAL_H, HEAD_DIM, "attention_q_rope", False, False)
-        return query_latent, query, qb_payload, qb_scales
+    if prefill:
+        @pl.jit.inline(auto_scope=False)
+        def q_proj_rope(
+            payload: pl.Tensor,
+            scales: pl.Tensor,
+            wq_a: pl.Tensor,
+            wq_a_scale: pl.Tensor,
+            q_norm_weight: pl.Tensor,
+            wq_b: pl.Tensor,
+            wq_b_scale: pl.Tensor,
+            rope_cos: pl.Tensor,
+            rope_sin: pl.Tensor,
+            query_latent: pl.Tensor,
+            query: pl.Tensor,
+            num_tokens: pl.Scalar[pl.INT32],
+        ):
+            tokens = pl.tensor.dim(query_latent, 0)
+            projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+            gemm_int8(
+                payload, scales, wq_a, wq_a_scale, projected, num_tokens,
+                D, Q_LORA, "proj_q_a", 128, 256, False,
+            )
+            if num_tokens >= 64:
+                normalize_q(projected, q_norm_weight, query_latent, num_tokens)
+            else:
+                for worker in pl.spmd((num_tokens + 7) // 8, name_hint="norm_q_latent"):
+                    rms_norm(projected, q_norm_weight, query_latent, worker, num_tokens, width=Q_LORA)
+            qb_payload, qb_scales = quantize_projection_activation(
+                query_latent, num_tokens, Q_LORA, True,
+            )
+            gemm_int8(
+                qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
+                Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", Q_B_N_TILE, 256, False,
+            )
+            if num_tokens >= 64:
+                query = rotate_prefill_q(query, rope_cos, rope_sin, query, num_tokens)
+            else:
+                query = _rotate_rope(
+                    query, query, rope_cos, rope_sin, 0, num_tokens,
+                    LOCAL_H, HEAD_DIM, "attention_q_rope", False, False,
+                )
+            return query_latent, query, qb_payload, qb_scales
+    else:
+        @pl.jit.inline(auto_scope=False)
+        def q_proj_rope(
+            payload: pl.Tensor,
+            scales: pl.Tensor,
+            wq_a: pl.Tensor,
+            wq_a_scale: pl.Tensor,
+            q_norm_weight: pl.Tensor,
+            wq_b: pl.Tensor,
+            wq_b_scale: pl.Tensor,
+            rope_cos: pl.Tensor,
+            rope_sin: pl.Tensor,
+            query_latent: pl.Tensor,
+            query: pl.Tensor,
+            num_tokens: pl.Scalar[pl.INT32],
+        ):
+            tokens = pl.tensor.dim(query_latent, 0)
+            projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+            gemm_int8_pair_columns(
+                payload, scales, wq_a, wq_a_scale, projected, num_tokens,
+                D, Q_LORA, "proj_q_a_decode_pair", 128, 256, False, 16,
+            )
+            payload_rows = pl.tensor.dim(projected, 0)
+            padded_rows = (payload_rows + 15) // 16 * 16
+            qb_payload = pl.create_tensor([padded_rows, Q_LORA], dtype=pl.INT8)
+            qb_scales = pl.create_tensor([padded_rows, 1], dtype=pl.FP32)
+            query_latent, qb_payload, qb_scales = normalize_quantize_projection_activation(
+                projected, q_norm_weight, query_latent, qb_payload, qb_scales,
+                num_tokens, Q_LORA, EPS,
+            )
+            gemm_int8_pair_columns(
+                qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
+                Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b_decode_pair", Q_B_N_TILE,
+                256, False, 16,
+            )
+            query = _rotate_rope(
+                query, query, rope_cos, rope_sin, 0, num_tokens,
+                LOCAL_H, HEAD_DIM, "attention_q_rope", False, False,
+            )
+            return query_latent, query, qb_payload, qb_scales
 
     return q_proj_rope
 
@@ -141,28 +192,59 @@ decode_q_proj_rope = make_q_proj_rope(prefill=False)
 
 
 def make_kv_proj_rope(*, prefill):
-    @pl.jit.inline(auto_scope=False)
-    def kv_proj_rope(
-        payload: pl.Tensor,
-        scales: pl.Tensor,
-        wkv: pl.Tensor,
-        wkv_scale: pl.Tensor,
-        kv_norm_weight: pl.Tensor,
-        rope_cos: pl.Tensor,
-        rope_sin: pl.Tensor,
-        kv_projection: pl.Tensor,
-        window_kv: pl.Tensor,
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        """Project INT8 KV weights, normalize latent rows, and rotate their tails."""
-        gemm_int8(payload, scales, wkv, wkv_scale, kv_projection, num_tokens, D, HEAD_DIM, "proj_kv", KV_N_TILE, 256, False)
-        if prefill and num_tokens >= 64:
-            normalize_kv(kv_projection, kv_norm_weight, window_kv, num_tokens)
-        else:
+    if prefill:
+        @pl.jit.inline(auto_scope=False)
+        def kv_proj_rope(
+            payload: pl.Tensor,
+            scales: pl.Tensor,
+            wkv: pl.Tensor,
+            wkv_scale: pl.Tensor,
+            kv_norm_weight: pl.Tensor,
+            rope_cos: pl.Tensor,
+            rope_sin: pl.Tensor,
+            kv_projection: pl.Tensor,
+            window_kv: pl.Tensor,
+            num_tokens: pl.Scalar[pl.INT32],
+        ):
+            gemm_int8(
+                payload, scales, wkv, wkv_scale, kv_projection, num_tokens,
+                D, HEAD_DIM, "proj_kv", KV_N_TILE, 256, False,
+            )
+            if num_tokens >= 64:
+                normalize_kv(kv_projection, kv_norm_weight, window_kv, num_tokens)
+            else:
+                for worker in pl.spmd((num_tokens + 7) // 8, name_hint="norm_kv"):
+                    rms_norm(kv_projection, kv_norm_weight, window_kv, worker, num_tokens, width=HEAD_DIM)
+            window_kv = _rotate_rope(
+                window_kv, window_kv, rope_cos, rope_sin, 0, num_tokens,
+                1, HEAD_DIM, "rope_kv", False, False,
+            )
+            return kv_projection, window_kv
+    else:
+        @pl.jit.inline(auto_scope=False)
+        def kv_proj_rope(
+            payload: pl.Tensor,
+            scales: pl.Tensor,
+            wkv: pl.Tensor,
+            wkv_scale: pl.Tensor,
+            kv_norm_weight: pl.Tensor,
+            rope_cos: pl.Tensor,
+            rope_sin: pl.Tensor,
+            kv_projection: pl.Tensor,
+            window_kv: pl.Tensor,
+            num_tokens: pl.Scalar[pl.INT32],
+        ):
+            gemm_int8_pair_columns(
+                payload, scales, wkv, wkv_scale, kv_projection, num_tokens,
+                D, HEAD_DIM, "proj_kv_decode_pair", KV_N_TILE, 256, False, 16,
+            )
             for worker in pl.spmd((num_tokens + 7) // 8, name_hint="norm_kv"):
                 rms_norm(kv_projection, kv_norm_weight, window_kv, worker, num_tokens, width=HEAD_DIM)
-        window_kv = _rotate_rope(window_kv, window_kv, rope_cos, rope_sin, 0, num_tokens, 1, HEAD_DIM, "rope_kv", False, False)
-        return kv_projection, window_kv
+            window_kv = _rotate_rope(
+                window_kv, window_kv, rope_cos, rope_sin, 0, num_tokens,
+                1, HEAD_DIM, "rope_kv", False, False,
+            )
+            return kv_projection, window_kv
 
     return kv_proj_rope
 

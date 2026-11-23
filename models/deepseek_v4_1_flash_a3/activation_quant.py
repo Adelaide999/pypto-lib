@@ -89,9 +89,7 @@ def _quantize_cached_rows(
                 numerator = pl.tile.full([1, VEC_M_TILE], dtype=pl.FP32, value=127.0)
                 inverse = pl.reshape(pl.div(numerator, pl.maximum(row_peak, 1e-30)), [VEC_M_TILE, 1])
                 scale = pl.mul(maximum, 1.0 / 127.0)
-                ones = pl.tile.full([VEC_M_TILE, 8], dtype=pl.FP32, value=1.0)
-                scale_rows = pl.row_expand_mul(ones, scale)
-                pl.store(pl.set_validshape(scale_rows, rows, 8), [row, 0], scales)
+                pl.store(pl.set_validshape(scale, rows, 1), [row, 0], scales)
                 rounded = pl.cast(pl.row_expand_mul(fp, inverse), pl.INT32, mode="rint")
                 codes = pl.cast(rounded, pl.INT8, mode="trunc")
                 pl.store(pl.set_validshape(codes, rows, width), [row, 0], payload)
@@ -164,6 +162,59 @@ def quantize_projection_activation(
                 for k0 in pl.range(0, width, 256):
                     _encode_checkpoint_panel(source, payload, row, k0, rows, denominator, inverse)
     return payload, scale
+
+
+@pl.jit.inline(auto_scope=False)
+def normalize_quantize_projection_activation(
+    source: pl.Tensor,
+    norm_weight: pl.Tensor,
+    normalized: pl.Tensor,
+    payload: pl.Tensor,
+    scale: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    width: pl.constexpr,
+    eps: pl.constexpr,
+):
+    """Apply BF16 RMSNorm and checkpoint INT8 quantization to projection rows."""
+    capacity = pl.tensor.dim(source, 0)
+    blocks = ((capacity + 15) // 16 * 16) // VEC_M_TILE
+    workers = pl.min(blocks, pl.system.available_cluster_count())
+    weight_row = pl.tensor.view(norm_weight, [1, width])
+    for worker in pl.spmd(workers, name_hint="decode_norm_quant"):
+        for block in pl.range(worker, blocks, workers):
+            row = block * VEC_M_TILE
+            rows = pl.max(0, pl.min(VEC_M_TILE, num_tokens - row))
+            raw = pl.load(source, [row, 0], [VEC_M_TILE, width], valid_shape=[rows, width])
+            padded = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), VEC_M_TILE, width)
+            value = pl.cast(padded, pl.FP32)
+            square = pl.mul(value, value)
+            norm_scratch = pl.create_tile([VEC_M_TILE, width], dtype=pl.FP32)
+            row_sum = pl.row_sum(square, tmp_tile=norm_scratch)
+            mean = pl.mul(row_sum, 1.0 / width)
+            rms_argument = pl.add(mean, eps)
+            rsqrt_scratch = pl.create_tile([VEC_M_TILE, 1], dtype=pl.FP32)
+            inverse_rms = pl.tile.rsqrt(rms_argument, tmp=rsqrt_scratch)
+            normalized_fp32 = pl.row_expand_mul(value, inverse_rms)
+            gamma = pl.cast(pl.load(weight_row, [0, 0], [1, width]), pl.FP32)
+            weighted = pl.col_expand_mul(normalized_fp32, gamma)
+            normalized_bf16 = pl.cast(weighted, pl.BF16, mode="rint")
+            normalized = pl.store(
+                pl.set_validshape(normalized_bf16, rows, width),
+                [row, 0],
+                normalized,
+            )
+            quantized_fp32 = pl.cast(normalized_bf16, pl.FP32)
+            scratch = pl.create_tile([VEC_M_TILE, width], dtype=pl.FP32)
+            maximum = pl.row_max(pl.abs(quantized_fp32), tmp_tile=scratch)
+            factor = pl.reshape(pl.maximum(pl.mul(maximum, 1.0 / 127.0), 1e-30), [VEC_M_TILE, 1])
+            pl.store(factor, [row, 0], scale)
+            denominator = pl.reshape(pl.mul(pl.maximum(maximum, 127e-30), 1.0 / 128.0), [VEC_M_TILE, 1])
+            inverse = pl.recip(denominator)
+            for k0 in pl.range(0, width, K_TILE):
+                part = pl.tile.slice(quantized_fp32, [VEC_M_TILE, K_TILE], [0, k0])
+                encoded = _checkpoint_codes(part, denominator, inverse)
+                pl.store(encoded, [row, k0], payload)
+    return normalized, payload, scale
 
 
 @pl.jit.inline(auto_scope=False)

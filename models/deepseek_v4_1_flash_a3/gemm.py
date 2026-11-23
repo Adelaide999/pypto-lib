@@ -177,6 +177,108 @@ def gemm_int8_tiled(
 
 
 @pl.jit.inline(auto_scope=False)
+def gemm_int8_pair_columns(
+    payload: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    name_hint: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+    output_major: pl.constexpr,
+    row_tile: pl.constexpr,
+):
+    """Compute two adjacent output panels while reusing each activation tile.
+
+    Decode Q-A, Q-B and KV all use an even number of output panels. The
+    paired schedule keeps one activation tile live while it feeds two Cube
+    products, reducing repeated activation loads and the number of SPMD
+    blocks. The weight ABI remains the canonical [K, N] layout used by the
+    existing projections.
+    """
+    panels = output_width // n_tile
+    pairs = panels // 2
+    blocks = (num_tokens + row_tile - 1) // row_tile * pairs
+    workers = pl.max(1, pl.min(blocks, pl.system.available_cluster_count()))
+    for worker in pl.spmd(workers, name_hint=name_hint):
+        for block in pl.range(worker, blocks, workers):
+            row = block // pairs * row_tile
+            first_panel = block % pairs * 2
+            first_col = first_panel * n_tile
+            second_col = first_col + n_tile
+            valid_rows = pl.max(0, pl.min(row_tile, num_tokens - row))
+            first_seed = pl.tile.create(
+                [row_tile, n_tile], dtype=pl.INT32,
+                target_memory=pl.MemorySpace.Acc, compact=True,
+            )
+            second_seed = pl.tile.create(
+                [row_tile, n_tile], dtype=pl.INT32,
+                target_memory=pl.MemorySpace.Acc, compact=True,
+            )
+            first_acc = pl.set_validshape(first_seed, valid_rows, n_tile)
+            second_acc = pl.set_validshape(second_seed, valid_rows, n_tile)
+            for k0 in pl.range(0, width, k_tile):
+                source = pl.load(
+                    payload, [row, k0], [row_tile, k_tile],
+                    valid_shape=[valid_rows, k_tile],
+                )
+                if output_major:
+                    first_nk = pl.load(
+                        weight, [first_col, k0], [n_tile, k_tile],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    second_nk = pl.load(
+                        weight, [second_col, k0], [n_tile, k_tile],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    first_weight_mat = pl.tile.transpose_view(first_nk)
+                    second_weight_mat = pl.tile.transpose_view(second_nk)
+                    first_acc = pl.matmul_acc(
+                        first_acc, source, first_weight_mat, init_cond=(k0 == 0),
+                    )
+                    second_acc = pl.matmul_acc(
+                        second_acc, source, second_weight_mat, init_cond=(k0 == 0),
+                    )
+                else:
+                    first_weight_vec = pl.load(weight, [k0, first_col], [k_tile, n_tile])
+                    second_weight_vec = pl.load(weight, [k0, second_col], [k_tile, n_tile])
+                    first_acc = pl.matmul_acc(
+                        first_acc, source, first_weight_vec, init_cond=(k0 == 0),
+                    )
+                    second_acc = pl.matmul_acc(
+                        second_acc, source, second_weight_vec, init_cond=(k0 == 0),
+                    )
+
+            a_scale = pl.load(
+                activation_scale, [row, 0], [row_tile, 1],
+                valid_shape=[valid_rows, 1],
+            )
+            first_scale = pl.load(weight_scale, [0, first_col], [1, n_tile])
+            second_scale = pl.load(weight_scale, [0, second_col], [1, n_tile])
+
+            first_value = pl.row_expand_mul(pl.cast(first_acc, pl.FP32), a_scale)
+            first_value = pl.col_expand_mul(first_value, first_scale)
+            first_value = pl.cast(first_value, pl.BF16, mode="rint")
+            output = pl.store(
+                pl.set_validshape(first_value, valid_rows, n_tile),
+                [row, first_col], output,
+            )
+
+            second_value = pl.row_expand_mul(pl.cast(second_acc, pl.FP32), a_scale)
+            second_value = pl.col_expand_mul(second_value, second_scale)
+            second_value = pl.cast(second_value, pl.BF16, mode="rint")
+            output = pl.store(
+                pl.set_validshape(second_value, valid_rows, n_tile),
+                [row, second_col], output,
+            )
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
 def gemm_int8(
     payload: pl.Tensor,
     activation_scale: pl.Tensor,
