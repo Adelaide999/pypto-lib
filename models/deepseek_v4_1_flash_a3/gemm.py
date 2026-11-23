@@ -318,6 +318,7 @@ def gemm_bf16_to_bf16(
     output_col: pl.Scalar[pl.INT32],
     ordered: pl.constexpr,
     row_tile: pl.constexpr,
+    stages: pl.constexpr,
 ):
     """Project BF16 ND buffers with explicit FP32 accumulation and column offsets."""
     blocks = (num_tokens + row_tile - 1) // row_tile * (output_width // n_tile)
@@ -343,7 +344,7 @@ def gemm_bf16_to_bf16(
             else:
                 cube_seed = pl.tile.create([row_tile, n_tile], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc, compact=True)
                 cube_acc = pl.set_validshape(cube_seed, rows, n_tile)
-                for k in pl.range(0, width, k_tile):
+                for k in pl.pipeline(0, width, k_tile, stage=stages):
                     cube_a = pl.load(source, [row, source_col + k], [row_tile, k_tile], valid_shape=[rows, k_tile])
                     cube_w = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
                     cube_acc = pl.matmul_acc(cube_acc, cube_a, cube_w, init_cond=(k == 0))

@@ -617,7 +617,8 @@ def project_index_weights(
     projected_result, projected_tid = gemm_bf16_to_bf16(
         x, weight, projected_weights, num_tokens, ready,
         width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
-        workers=2147483647, name_hint="prefill_index_weights", source_col=0, output_col=0, ordered=False, row_tile=16,
+        workers=2147483647, name_hint="prefill_index_weights",
+        source_col=0, output_col=0, ordered=False, row_tile=16, stages=1,
     )
     with pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="c1a_index_weights_scale") as weights_tid:
         block = pl.tile.get_block_idx()
@@ -1096,7 +1097,8 @@ def prefill_index_key_project(
     projected_result, projected_tid = gemm_bf16_to_bf16(
         latent, weight, projected, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=2147483647, name_hint="prefill_index_key", source_col=0, output_col=0, ordered=False, row_tile=16,
+        workers=2147483647, name_hint="prefill_index_key",
+        source_col=0, output_col=0, ordered=False, row_tile=16, stages=1,
     )
     norm_blocks = (num_tokens + M_TILE - 1) // M_TILE
     with pl.spmd(norm_blocks, name_hint="prefill_c2a_index_norm", deps=[pool_ready]) as norm_tid:
@@ -1129,7 +1131,8 @@ def publish_c1a_index_key(
     projected_result, projected_tid = gemm_bf16_to_bf16(
         compressed_latent, index_wk, index_projection, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=2147483647, name_hint="prefill_index_key", source_col=0, output_col=0, ordered=False, row_tile=16,
+        workers=2147483647, name_hint="prefill_index_key",
+        source_col=0, output_col=0, ordered=False, row_tile=16, stages=1,
     )
     index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     norm_blocks = (num_tokens + 7) // 8

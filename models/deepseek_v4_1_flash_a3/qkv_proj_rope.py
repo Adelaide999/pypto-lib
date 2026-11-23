@@ -17,7 +17,7 @@ from .blocked_rmsnorm import make_blocked_rmsnorm
 from .config import FLASH as M, T_DYN, TP_SIZE
 from .gemm import gemm_int8, golden_dynamic_int8
 from .rmsnorm import golden_rms_norm, rms_norm
-from .rope import make_pipelined_rope
+from .rope import make_pipelined_rope, make_pipelined_token_rope
 
 
 # model config
@@ -37,6 +37,7 @@ ROPE_WORKER_TILE = 32
 rotate_prefill_q = make_pipelined_rope(
     T_DYN, LOCAL_H, HEAD_DIM, inverse=False, name_hint="attention_q_rope", allow_early_resolve=False, inplace=True,
 )
+rotate_prefill_kv = make_pipelined_token_rope(T_DYN, HEAD_DIM, name_hint="rope_kv", inplace=True)
 
 normalize_q = make_blocked_rmsnorm(T_DYN, Q_LORA, EPS, dynamic_rows=True)
 normalize_kv = make_blocked_rmsnorm(T_DYN, HEAD_DIM, EPS, dynamic_rows=True)
@@ -161,7 +162,13 @@ def make_kv_proj_rope(*, prefill):
         else:
             for worker in pl.spmd((num_tokens + 7) // 8, name_hint="norm_kv"):
                 rms_norm(kv_projection, kv_norm_weight, window_kv, worker, num_tokens, width=HEAD_DIM)
-        window_kv = _rotate_rope(window_kv, window_kv, rope_cos, rope_sin, 0, num_tokens, 1, HEAD_DIM, "rope_kv", False, False)
+        if prefill and num_tokens >= 64:
+            window_kv = rotate_prefill_kv(window_kv, rope_cos, rope_sin, window_kv, num_tokens)
+        else:
+            window_kv = _rotate_rope(
+                window_kv, window_kv, rope_cos, rope_sin, 0, num_tokens,
+                1, HEAD_DIM, "rope_kv", False, False,
+            )
         return kv_projection, window_kv
 
     return kv_proj_rope

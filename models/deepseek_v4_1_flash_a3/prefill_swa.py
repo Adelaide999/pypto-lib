@@ -25,7 +25,7 @@ from .hc import prefill_sp_post
 from .hc import hc_pre, zero_bf16_padding
 from .rmsnorm import rms_norm_tiled
 from .qkv_proj_rope import q_proj_rope, kv_proj_rope
-from .o_proj import retire_prefill_signals, project_output, prefill_sp_output_reduce_scatter
+from .o_proj import o_proj, prefill_sp_output_reduce_scatter, retire_prefill_signals
 from .prefill_cp_allgather import make_prefill_sp_input_allgather
 
 
@@ -151,9 +151,7 @@ def prefill_swa_attention(
             descriptors, chunk_indices, attn_sink,
             attended, active, decoded_ready, index_ready,
         )
-        project_output(
-            attended, wo_a, wo_b, chunk_cos, chunk_sin, chunk_partial, active, True,
-        )
+        o_proj(attended, wo_a, wo_b, chunk_cos, chunk_sin, chunk_partial, active)
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
             worker = pl.tile.get_block_idx()
             for row in pl.range(worker, active, WORKER_TILE):
