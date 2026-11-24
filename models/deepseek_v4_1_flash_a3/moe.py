@@ -487,12 +487,14 @@ def prefill_moe_sublayer(
     moe_epoch: pl.Scalar[pl.INT32],
     reuse_deps: pl.Array[1, pl.TASK_ID],
     prefill: pl.constexpr,
+    hc_precomputed: pl.constexpr = False,
 ):
     """Collapse mHC streams, normalize compact TP owner rows, and run the EP MoE."""
-    hc_pre(
-        x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        ffn_input, next_pre_mix, post_mix, residual_mix, prefill=prefill,
-    )
+    if not hc_precomputed:
+        hc_pre(
+            x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+            ffn_input, next_pre_mix, post_mix, residual_mix, prefill=prefill,
+        )
     local_num_tokens = _local_token_count(num_tokens, tp_rank)
     local_ffn_owned = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
     round_counts = pl.create_tensor([3], dtype=pl.INT32)

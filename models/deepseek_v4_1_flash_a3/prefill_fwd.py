@@ -336,9 +336,25 @@ def _prefill_moe(
     """Execute one interleaved TP slab per EP round."""
     capacity = pl.tensor.dim(x_hc, 0)
     output_flat = pl.reshape(x_next, [capacity, HC_DIM])
+    # Batch the layer's mHC pre rows once and reuse slices in every MoE round.
+    # The previous slab-local calls launched the same projection and Sinkhorn
+    # pipeline separately for each round.
+    prefill_ffn_input = pl.create_tensor([capacity, D], dtype=pl.BF16)
+    prefill_post = pl.create_tensor([capacity, HC_MULT], dtype=pl.FP32)
+    prefill_residual = pl.create_tensor(
+        [capacity, HC_MULT, HC_MULT], dtype=pl.FP32
+    )
+    hc_pre(
+        x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        prefill_ffn_input, next_pre_mix, prefill_post, prefill_residual,
+        prefill=True,
+    )
     round_tokens = MOE_TOKENS * TP_SIZE
     rounds = (CAPACITY + round_tokens - 1) // round_tokens
     completion = pl.array.create(1, pl.TASK_ID)
+    # Keep the slab pipeline independent from the layer-wide pre transform.
+    # Consumers of the sliced precomputed buffers carry the data dependency,
+    # while packing and transport can overlap the tail of mHC pre.
     completion[0] = reuse_ready
     for round_id in pl.range(rounds):
         with pl.scope():
@@ -361,9 +377,11 @@ def _prefill_moe(
             round_output = pl.slice(x_next, [rows, HC_MULT, D], [begin, 0, 0])
             round_next = pl.slice(next_pre_mix, [rows, HC_MULT], [begin, 0])
             round_mixed = pl.slice(slab_mixed, [rows, D], [0, 0])
-            post = pl.create_tensor([rows, HC_MULT], dtype=pl.FP32)
-            residual = pl.create_tensor([rows, HC_MULT, HC_MULT], dtype=pl.FP32)
-            ffn_input = pl.create_tensor([rows, D], dtype=pl.BF16)
+            post = pl.slice(prefill_post, [rows, HC_MULT], [begin, 0])
+            residual = pl.slice(
+                prefill_residual, [rows, HC_MULT, HC_MULT], [begin, 0, 0]
+            )
+            ffn_input = pl.slice(prefill_ffn_input, [rows, D], [begin, 0])
             owned = pl.create_tensor([rows, D], dtype=pl.BF16)
             epoch = (moe_epoch - 1) * rounds + round_id + 1
             route_offset = round_id * MOE_TOKENS
@@ -378,7 +396,7 @@ def _prefill_moe(
                 recv_meta, recv_x, recv_weights, arrived, data_arrived,
                 routed_output, combine_arrived, ffn_input, owned, round_next, post, residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
-                active, ep_rank, ep_rank % TP_SIZE, epoch, completion, True,
+                active, ep_rank, ep_rank % TP_SIZE, epoch, completion, True, True,
             )
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_counts"):
                 for counter in pl.range(3):
