@@ -123,7 +123,7 @@ def decode_c1a_reindex(
     )
     selection_ready = select_pool_index_topk(
         scores, pool_block_ids, pool_block_counts, index_block_table, request_ids, compressed_lens,
-        topk_indices, num_tokens, scores_tid,
+        topk_indices, num_tokens, scores_tid, scores_bf16=True,
     )
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     selected_ret, indices_ret, gather_tid = gather_packed(

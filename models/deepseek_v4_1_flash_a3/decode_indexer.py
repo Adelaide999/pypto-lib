@@ -1242,6 +1242,7 @@ def _make_index_topk_pairs(query_rows=False, stable_bf16=False):
 
 
 _sort_index_topk_leaf, _merge_index_topk_rows = _make_index_topk_pairs()
+_sort_pool_topk_leaf_bf16, _ = _make_index_topk_pairs(stable_bf16=True)
 _sort_c2a_topk_leaf, _merge_c2a_topk_rows = _make_index_topk_pairs(query_rows=True)
 
 
@@ -1497,6 +1498,41 @@ def _materialize_pool_index_topk(
     return output
 
 
+@pl.jit.inline
+def _map_pool_topk_rows(
+    pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
+    block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    token: pl.Scalar[pl.INDEX],
+    compact: pl.Tile[[1, INDEX_TOPK], pl.INT32],
+):
+    """Restore the cache-row ABI in ascending compact index order."""
+    request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
+    valid_pages = pl.min(pl.tensor.dim(block_table, 1), TOPK_CACHED_PAGES)
+    if request >= 0 and request < pl.tensor.dim(block_table, 0) and valid_pages > 0:
+        capacity = pl.tensor.dim(pool_block_ids, 1)
+        raw_pool = pl.load(pool_block_ids, [token, 0], [1, 2048], valid_shape=[1, capacity])
+        pool = pl.tile.fillpad(raw_pool, pad_value=pl.PadValue.zero)
+        raw_pages = pl.load(block_table, [request, 0], [1, TOPK_CACHED_PAGES], valid_shape=[1, valid_pages])
+        pages = pl.tile.fillpad(raw_pages, pad_value=pl.PadValue.zero)
+        scratch = pl.tile.create([1, INDEX_TOPK], dtype=pl.INT32)
+        compact_safe = pl.maximum(compact, 0)
+        slots = pl.tile.shrs(compact_safe, 3)
+        blocks = pl.tile.gather(pool, slots, scratch)
+        logical = pl.add(pl.mul(blocks, 8), pl.sub(compact_safe, pl.mul(slots, 8)))
+        page_indices = pl.tile.shrs(logical, 7)
+        safe_pages = pl.minimum(pl.maximum(page_indices, 0), pl.cast(valid_pages - 1, pl.INT32))
+        page_ids = pl.tile.gather(pages, safe_pages, scratch)
+        rows = pl.add(pl.mul(page_ids, _TOPK_PAGE), pl.sub(logical, pl.mul(page_indices, _TOPK_PAGE)))
+        valid = pl.tile.cmps(compact, -1, cmp_type=1)
+        physical = pl.tile.select(valid, rows, -1)
+        pl.store(physical, [token, 0], output)
+    else:
+        invalid = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
+        pl.store(invalid, [token, 0], output)
+
+
 @pl.jit.inline(auto_scope=False)
 def select_pool_index_topk(
     index_scores: pl.Tensor[[T_DYN, INDEX_POOL_POSITIONS_DYN], pl.FP32],
@@ -1508,6 +1544,7 @@ def select_pool_index_topk(
     output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     scores_ready: pl.Scalar[pl.TASK_ID],
+    scores_bf16: pl.constexpr = False,
 ):
     """Select candidate scores and restore the original physical cache-row ABI."""
     width = pl.tensor.dim(index_scores, 1)
@@ -1536,7 +1573,10 @@ def select_pool_index_topk(
                 logical_begin = leaf * _TOPK_LEAF_TILE
                 valid_count = pl.min(_TOPK_LEAF_TILE, width - logical_begin)
                 output_slot = token * leaf_count + leaf
-                _sort_index_topk_leaf(index_scores, pair_arena, token, logical_begin, valid_count, output_slot)
+                if scores_bf16:
+                    _sort_pool_topk_leaf_bf16(index_scores, pair_arena, token, logical_begin, valid_count, output_slot)
+                else:
+                    _sort_index_topk_leaf(index_scores, pair_arena, token, logical_begin, valid_count, output_slot)
         with pl.spmd(32, name_hint="pool_topk_merge", deps=[leaf_tid]) as merge_tid:
             worker = pl.tile.get_block_idx()
             for token in pl.range(worker, num_tokens, 32):
@@ -1557,19 +1597,25 @@ def select_pool_index_topk(
                         count = output_count
                 root = pl.load(pair_arena, [base, 0], [1, _TOPK_PAIR_WIDTH])
                 root_scores = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P0101)
-                cutoff = pl.tile.read(root_scores, [0, INDEX_TOPK - 1])
-                root_ones = pl.tile.full([1, INDEX_TOPK], dtype=pl.FP32, value=1.0)
-                above_flags = pl.tile.select(pl.tile.cmps(root_scores, cutoff, cmp_type=4), root_ones, 0.0)
-                sums64 = pl.col_sum(pl.reshape(above_flags, [8, 64]))
-                sums8 = pl.col_sum(pl.reshape(sums64, [8, 8]))
-                above = pl.cast(0, pl.INDEX)
-                for lane in pl.unroll(8):
-                    partial = pl.cast(pl.tile.read(sums8, [0, lane]), pl.INT32)
-                    above = above + pl.cast(partial, pl.INDEX)
-                _materialize_pool_index_topk(
-                    index_scores, pool_block_ids, block_table, request_ids, output,
-                    token, width, cutoff, INDEX_TOPK - above,
-                )
+                if scores_bf16 and width <= 16384:
+                    root_ids = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                    valid = pl.tile.cmps(root_scores, 0.0, cmp_type=4)
+                    compact = _order_topk_rows(pl.tile.select(valid, root_ids, -1))
+                    _map_pool_topk_rows(pool_block_ids, block_table, request_ids, output, token, compact)
+                else:
+                    cutoff = pl.tile.read(root_scores, [0, INDEX_TOPK - 1])
+                    root_ones = pl.tile.full([1, INDEX_TOPK], dtype=pl.FP32, value=1.0)
+                    above_flags = pl.tile.select(pl.tile.cmps(root_scores, cutoff, cmp_type=4), root_ones, 0.0)
+                    sums64 = pl.col_sum(pl.reshape(above_flags, [8, 64]))
+                    sums8 = pl.col_sum(pl.reshape(sums64, [8, 8]))
+                    above = pl.cast(0, pl.INDEX)
+                    for lane in pl.unroll(8):
+                        partial = pl.cast(pl.tile.read(sums8, [0, lane]), pl.INT32)
+                        above = above + pl.cast(partial, pl.INDEX)
+                    _materialize_pool_index_topk(
+                        index_scores, pool_block_ids, block_table, request_ids, output,
+                        token, width, cutoff, INDEX_TOPK - above,
+                    )
         result = pl.yield_(merge_tid)
     return result
 
@@ -1717,8 +1763,8 @@ def _write_c2a_short_topk(
 
 
 @pl.jit.inline
-def _order_c2a_physical_rows(rows: pl.Tile[[1, INDEX_TOPK], pl.INT32]):
-    """Sort valid physical rows first and keep -1 padding at the end."""
+def _order_topk_rows(rows: pl.Tile[[1, INDEX_TOPK], pl.INT32]):
+    """Sort valid row indices and keep -1 padding at the end."""
     keys = pl.tile.select(pl.tile.cmps(pl.cast(rows, pl.FP32), pl.cast(pl.cast(-1, pl.INT32), pl.FP32), cmp_type=4), pl.mul(pl.cast(rows, pl.FP32), -1.0), _TOPK_SORT_FLOOR)
     ordered = pl.tile.sort32(keys, pl.reinterpret_view(rows, pl.UINT32))
     ordered = pl.tile.mrgsort(ordered, block_len=64)
@@ -1738,7 +1784,7 @@ def _sort_c2a_long_topk_physical(
 ):
     """Keep C2A long-history output in ascending physical-row order."""
     rows = pl.load(output, [token, 0], [1, INDEX_TOPK], target_memory=pl.MemorySpace.Vec)
-    final = _order_c2a_physical_rows(rows)
+    final = _order_topk_rows(rows)
     pl.store(final, [token, 0], output)
     return output
 
@@ -1882,7 +1928,7 @@ def _make_select_c2a_index_topk(leaf_workers=32, row_workers=32, all_long=False,
                         scratch = pl.tile.create([1, INDEX_TOPK], dtype=pl.INT32)
                         page_ids = pl.tile.gather(pages, page_offsets, scratch)
                         physical = pl.add(pl.mul(page_ids, 128), pl.sub(logical, pl.mul(page_offsets, 128)))
-                        ordered = _order_c2a_physical_rows(pl.tile.select(valid, physical, -1))
+                        ordered = _order_topk_rows(pl.tile.select(valid, physical, -1))
                         pl.store(ordered, [token, 0], output)
                     else:
                         cutoff = pl.tile.read(root_scores, [0, INDEX_TOPK - 1])
