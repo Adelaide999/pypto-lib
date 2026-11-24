@@ -18,7 +18,7 @@ if not __package__:
 
 from .gemm import gemm_bf16_to_bf16, gemm_dynamic_int8, gemm_int8
 import pypto.language as pl
-from .quant import CODE_ROWS_DYN, decode_fp4, decode_scale
+from .quant import CODE_ROWS_DYN, decode_fp4, decode_scale, fp4_bf16_bits
 from .rmsnorm import make_norm_with_deps
 from .config import (
     B_DYN, CMP_POSITIONS_DYN, FLASH, INDEX_BLOCKS_DYN, INDEX_CACHE_GROUP, INDEX_POOL_BLOCKS_DYN,
@@ -692,6 +692,35 @@ def publish_index_rows(
 
 
 @pl.jit.inline(auto_scope=False)
+def _index_fp4_pairs():
+    byte = pl.cast(pl.tile.arange(0, [1, 256], dtype=pl.INT32), pl.INT16, mode="rint")
+    low = pl.cast(pl.cast(fp4_bf16_bits(byte), pl.FP32), pl.INT32, mode="rint")
+    high = pl.cast(pl.cast(fp4_bf16_bits(pl.shrs(byte, 4)), pl.FP32), pl.INT32, mode="rint")
+    low_bits = pl.sub(low, pl.mul(pl.shrs(low, 31), 65536))
+    return pl.add(low_bits, pl.shls(high, 16))
+
+
+@pl.jit.inline(auto_scope=False)
+def _index_key_score_tile(
+    payload: pl.Tile[[32, INDEX_DIM // 2], pl.UINT8],
+    scale_codes: pl.Tile[[1, 32 * _SCALE_COUNT], pl.UINT8],
+    pair_table: pl.Tile[[1, 256], pl.INT32],
+):
+    packed = pl.reinterpret_view(payload, pl.INT8)
+    fp16 = pl.cast(packed, pl.FP16)
+    byte_ids = pl.ands(pl.cast(fp16, pl.INT16, mode="rint"), 255)
+    indices = pl.cast(pl.cast(byte_ids, pl.FP32), pl.INT32, mode="rint")
+    flat_indices = pl.reshape(indices, [1, 16 * INDEX_DIM])
+    scratch = pl.tile.create([1, 16 * INDEX_DIM], dtype=pl.INT32)
+    pairs = pl.tile.gather(pair_table, flat_indices, scratch)
+    values = pl.reinterpret_view(pairs, pl.BF16, shape=[1, 32 * INDEX_DIM])
+    factors = pl.reshape(decode_scale(scale_codes, 1, 32 * _SCALE_COUNT), [32 * _SCALE_COUNT, 1])
+    groups = pl.reshape(pl.cast(values, pl.FP32), [32 * _SCALE_COUNT, INDEX_CACHE_GROUP])
+    scaled = pl.cast(pl.row_expand_mul(groups, factors), pl.BF16, mode="rint")
+    return pl.reshape(scaled, [32, INDEX_DIM])
+
+
+@pl.jit.inline(auto_scope=False)
 def _score_single_paged_query(
     query: pl.Tensor,
     query_scale: pl.Tensor,
@@ -727,6 +756,7 @@ def _score_single_paged_query(
     unpack_workers = pl.min(48, pages * 4)
     with pl.spmd(unpack_workers, name_hint="idx_expand_keys", deps=[cache_ready]) as expanded_k:
         unpack_worker = pl.tile.get_block_idx()
+        pair_table = _index_fp4_pairs()
         unpack_request = pl.read(request_ids, [0])
         unpack_visible = pl.min(width, pl.read(lengths, [0]))
         if unpack_visible > skip_threshold and unpack_request >= 0 and unpack_request < request_count:
@@ -738,7 +768,7 @@ def _score_single_paged_query(
                     k_codes = pl.load(key_payloads, [physical, 0], [32, INDEX_DIM // 2], target_memory=pl.MemorySpace.Vec)
                     k_scales = pl.load(key_scales, [0, physical * _SCALE_COUNT], [1, 32 * _SCALE_COUNT],
                                        target_memory=pl.MemorySpace.Vec)
-                    k_decoded = _decode_index_score_tile(k_codes, k_scales, 32)
+                    k_decoded = _index_key_score_tile(k_codes, k_scales, pair_table)
                     pl.store(k_decoded, [block * 32, 0], key_values)
     with pl.spmd(
         workers, name_hint="idx_score_single", sync_start=True,
