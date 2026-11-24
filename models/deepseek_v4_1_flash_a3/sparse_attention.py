@@ -137,7 +137,7 @@ def prefill_publish_window(
     tokens = pl.tensor.dim(kv, 0)
     slot_row = pl.reshape(slots, [1, tokens])
     blocks = (num_tokens + PREFILL_WINDOW_ROW_TILE - 1) // PREFILL_WINDOW_ROW_TILE
-    workers = pl.max(1, pl.min(blocks, GATHER_WORKERS))
+    workers = pl.max(1, pl.min(blocks, PREFILL_FP8_CACHE_WORKERS))
     with pl.spmd(workers, name_hint="pub_win", deps=[cache_ready]) as publish_tid:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, workers):

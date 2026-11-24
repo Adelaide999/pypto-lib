@@ -26,6 +26,7 @@ import torch.nn.functional as F
 
 from .config import EXPERT_N_TILE, EXPERT_K_TILE, FLASH as M, MOE_TOKENS
 from .config import N_LOCAL_EXPERTS, ROUTE_T_DYN
+from .expert_prefill import PREFILL_FUSED_MAX_ROWS, prefill_expert_compute
 from .gemm import expert_down, expert_swiglu
 
 
@@ -57,13 +58,20 @@ def expert_routed_compute(
     prefill: pl.constexpr,
 ):
     """Apply a routed W8A8 expert with route weighting before hidden quantization."""
-    capacity = pl.max(16, (count + 15) // 16 * 16)
-    hidden = pl.create_tensor([capacity, MOE_INTER], dtype=pl.BF16)
-    expert_swiglu(
-        source, source_scale, w1, scale1, w3, scale3, route_weights, hidden, count,
-        D, MOE_INTER, EXPERT_N_TILE, EXPERT_K_TILE, SWIGLU_LIMIT, True, "routed_swiglu", output_major, prefill,
-    )
-    return expert_down(hidden, w2, scale2, output, count, MOE_INTER, D, "routed_down", output_major, prefill)
+    if prefill and output_major and count <= PREFILL_FUSED_MAX_ROWS:
+        prefill_expert_compute(
+            source, source_scale, route_weights, w1, scale1, w3, scale3, w2, scale2,
+            output, count, True,
+        )
+    else:
+        capacity = pl.max(16, (count + 15) // 16 * 16)
+        hidden = pl.create_tensor([capacity, MOE_INTER], dtype=pl.BF16)
+        expert_swiglu(
+            source, source_scale, w1, scale1, w3, scale3, route_weights, hidden, count,
+            D, MOE_INTER, EXPERT_N_TILE, EXPERT_K_TILE, SWIGLU_LIMIT, True, "routed_swiglu", output_major, prefill,
+        )
+        expert_down(hidden, w2, scale2, output, count, MOE_INTER, D, "routed_down", output_major, prefill)
+    return output
 
 
 @pl.jit.inline(auto_scope=False)

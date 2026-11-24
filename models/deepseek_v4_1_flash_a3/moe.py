@@ -565,14 +565,12 @@ def prefill_moe_sublayer(
         shared_output = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
         if local_num_tokens > 0:
             if prefill:
-                local_ffn_input = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
-                _compact_local_tokens(ffn_input, local_ffn_input, num_tokens, tp_rank)
                 scale_view = pl.reshape(x_norm_scale, [TOKENS, 1])
                 gate_input = pl.create_tensor([TOKENS, D], dtype=pl.FP32)
                 prefill_ffn_norm_quant(
-                    local_ffn_input, ffn_norm_weight,
+                    ffn_input, ffn_norm_weight,
                     local_ffn_normed, x_norm_mx, scale_view, gate_input,
-                    local_num_tokens, TOKENS,
+                    local_num_tokens, tp_rank, TOKENS,
                 )
                 gate_from_fp32(gate_input, gate_weight, correction_bias, local_num_tokens, indices, weights)
             else:

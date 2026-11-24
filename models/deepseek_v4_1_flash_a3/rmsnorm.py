@@ -12,7 +12,7 @@ import pypto.language as pl
 import torch
 
 from .activation_quant import _prefill_quant_params
-from .config import FLASH as M, T_DYN
+from .config import FLASH as M, T_DYN, TP_SIZE
 
 
 # model config
@@ -160,10 +160,11 @@ def prefill_ffn_norm_quant(
     payload: pl.Tensor,
     scales: pl.Tensor,
     gate_input: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
+    local_tokens: pl.Scalar[pl.INDEX],
+    tp_rank: pl.Scalar[pl.INT32],
     capacity: pl.constexpr,
 ):
-    """Produce BF16 diagnostics, FP32 router inputs and INT8 expert inputs from one tile."""
+    """Normalize TP owner rows and produce BF16, FP32 router and INT8 expert inputs."""
     blocks = capacity // PREFILL_FFN_ROW_TILE
     workers = pl.min(blocks, PREFILL_NORM_WORKERS)
     for worker in pl.spmd(workers, name_hint="prefill_ffn_norm_quant"):
@@ -178,10 +179,13 @@ def prefill_ffn_norm_quant(
         end = (worker + 1) * blocks // workers
         for block in pl.range(begin, end):
             row = block * PREFILL_FFN_ROW_TILE
-            rows = pl.max(0, pl.min(PREFILL_FFN_ROW_TILE, num_tokens - row))
-            source = pl.load(x, [row, 0], [PREFILL_FFN_ROW_TILE, D], valid_shape=[rows, D])
-            padded = pl.fillpad(source, pad_value=pl.PadValue.zero)
-            cached = pl.set_validshape(padded, PREFILL_FFN_ROW_TILE, D)
+            cached = pl.tile.full([PREFILL_FFN_ROW_TILE, D], dtype=pl.BF16, value=0.0)
+            for lane in pl.unroll(PREFILL_FFN_ROW_TILE):
+                local_row = row + lane
+                if local_row < local_tokens:
+                    owner_row = local_row * TP_SIZE + tp_rank
+                    owner_tile = pl.load(x, [owner_row, 0], [1, D])
+                    cached[lane : lane + 1, :] = owner_tile
             sum_squares = pl.tile.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
             reduce_tmp = pl.create_tile([NORM_T_TILE, NORM_D_TILE], dtype=pl.FP32)
             for col in pl.range(0, D, PREFILL_NORM_REDUCE_TILE):
