@@ -753,7 +753,7 @@ def _score_single_paged_query(
         raw_query = pl.tile.load(query, [0, 0], [1, INDEX_H * INDEX_DIM // 2])
         q_codes = pl.reshape(raw_query, [INDEX_H, INDEX_DIM // 2])
         q_bytes = pl.tile.load(query_scale, [0, 0], [1, INDEX_H * _SCALE_COUNT])
-        q_decoded = _decode_index_score_tile(q_codes, q_bytes, INDEX_H)
+        q_decoded = _index_key_score_tile(q_codes, q_bytes, _index_fp4_pairs(), INDEX_H)
         pl.tile.store(q_decoded, [0, 0], query_values)
     unpack_workers = pl.min(48, pages * 4)
     with pl.spmd(unpack_workers, name_hint="idx_expand_keys", deps=[cache_ready]) as expanded_k:
