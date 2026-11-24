@@ -87,6 +87,116 @@ def _compressor_rope_block(
     return output
 
 
+@pl.jit.inline
+def _decode_norm_rope_block(
+    source: pl.Tensor,
+    norm_weight: pl.Tensor,
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    latent: pl.Tensor,
+    output: pl.Tensor,
+    block: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Normalize and rotate one eight-row Decode tile without a round-trip."""
+    row = block * 8
+    rows = pl.max(0, pl.min(8, num_tokens - row))
+    raw = pl.load(source, [row, 0], [8, HEAD_DIM], valid_shape=[rows, HEAD_DIM])
+    padded = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), 8, HEAD_DIM)
+    value = pl.cast(padded, pl.FP32)
+    square = pl.mul(value, value)
+    scratch = pl.create_tile([8, HEAD_DIM], dtype=pl.FP32)
+    row_sum = pl.row_sum(square, tmp_tile=scratch)
+    mean = pl.add(pl.mul(row_sum, 1.0 / HEAD_DIM), EPS)
+    inverse = pl.tile.rsqrt(mean, pl.create_tile([8, 1], dtype=pl.FP32))
+    gamma = pl.reshape(
+        pl.cast(pl.load(norm_weight, [0], [HEAD_DIM]), pl.FP32),
+        [1, HEAD_DIM],
+    )
+    normalized = pl.cast(
+        pl.col_expand_mul(pl.row_expand_mul(value, inverse), gamma),
+        pl.BF16,
+        mode="rint",
+    )
+    normalized_view = pl.tile.slice(
+        normalized, [8, HEAD_DIM], [0, 0],
+        valid_shape=[rows, HEAD_DIM],
+    )
+    pl.store(normalized_view, [row, 0], latent)
+
+    prefix = pl.tile.slice(
+        normalized, [8, HEAD_DIM - ROPE_DIM], [0, 0],
+        valid_shape=[rows, HEAD_DIM - ROPE_DIM],
+    )
+    pl.store(prefix, [row, 0], output)
+    tail = pl.cast(
+        pl.tile.slice(
+            normalized, [8, ROPE_DIM], [0, HEAD_DIM - ROPE_DIM],
+            valid_shape=[rows, ROPE_DIM],
+        ),
+        pl.FP32,
+    )
+    even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+    odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+    cosine = pl.load(cos, [row, 0], [8, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
+    sine = pl.load(sin, [row, 0], [8, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
+    cosine = pl.set_validshape(
+        pl.fillpad(cosine, pad_value=pl.PadValue.zero),
+        8, ROPE_DIM // 2,
+    )
+    sine = pl.set_validshape(
+        pl.fillpad(sine, pad_value=pl.PadValue.zero),
+        8, ROPE_DIM // 2,
+    )
+    real = pl.sub(pl.mul(even, cosine), pl.mul(odd, sine))
+    imag = pl.add(pl.mul(even, sine), pl.mul(odd, cosine))
+    real_lanes = pl.tile.scatter_mask(
+        pl.tile.full([8, ROPE_DIM], dtype=pl.FP32, value=0.0),
+        real, mask_pattern=pl.tile.MaskPattern.P0101,
+    )
+    imag_lanes = pl.tile.scatter_mask(
+        pl.tile.full([8, ROPE_DIM], dtype=pl.FP32, value=0.0),
+        imag, mask_pattern=pl.tile.MaskPattern.P1010,
+    )
+    bits = pl.or_(
+        pl.reinterpret_view(real_lanes, pl.INT16),
+        pl.reinterpret_view(imag_lanes, pl.INT16),
+    )
+    rotated = pl.tile.slice(
+        pl.reinterpret_view(bits, pl.FP32), [8, ROPE_DIM], [0, 0],
+        valid_shape=[rows, ROPE_DIM],
+    )
+    pl.store(
+        pl.cast(rotated, pl.BF16, mode="rint"),
+        [row, HEAD_DIM - ROPE_DIM],
+        output,
+    )
+    return latent, output
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_compressor_norm_rope(
+    source: pl.Tensor,
+    norm_weight: pl.Tensor,
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    latent: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    """Fuse the Decode compressor RMSNorm and RoPE stages."""
+    blocks = (num_tokens + 7) // 8
+    workers = pl.min(blocks, 12)
+    with pl.spmd(workers, name_hint="norm_rope_cmp", deps=[ready]) as completed:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, blocks, workers):
+            _decode_norm_rope_block(
+                source, norm_weight, cos, sin, latent, output, block, num_tokens,
+            )
+    return latent, completed
+
+
 @pl.jit.inline(auto_scope=False)
 def compressor_rope(
     x: pl.Tensor,
