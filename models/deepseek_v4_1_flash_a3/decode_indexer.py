@@ -168,6 +168,126 @@ def _index_scores(
 
 
 @pl.jit.inline(auto_scope=False)
+def _predecode_index_queries(
+    query: pl.Tensor,
+    query_scale: pl.Tensor,
+    weights: pl.Tensor,
+    query_values: pl.Tensor,
+    head_weights: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    query_ready: pl.Scalar[pl.TASK_ID],
+    weights_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Decode each FP4 query once before the parallel score workers start."""
+    capacity = pl.tensor.dim(query, 0)
+    query_flat = pl.reshape(query, [capacity * INDEX_H, INDEX_DIM // 2])
+    query_scale_flat = pl.reshape(query_scale, [1, capacity * INDEX_H * _SCALE_COUNT])
+    workers = pl.max(1, pl.min(num_tokens, 8))
+    with pl.spmd(workers, name_hint="idx_decode_query", deps=[query_ready, weights_ready]) as decoded:
+        worker = pl.tile.get_block_idx()
+        pair_table = _index_fp4_pairs()
+        for token in pl.range(worker, num_tokens, workers):
+            q_codes = pl.load(query_flat, [token * INDEX_H, 0], [INDEX_H, INDEX_DIM // 2])
+            q_scale_codes = pl.load(
+                query_scale_flat,
+                [0, token * INDEX_H * _SCALE_COUNT],
+                [1, INDEX_H * _SCALE_COUNT],
+            )
+            q_value = _index_key_score_tile(q_codes, q_scale_codes, pair_table, INDEX_H)
+            pl.store(q_value, [token * INDEX_H, 0], query_values)
+
+            raw_weight = pl.cast(pl.load(weights, [token, 0], [1, INDEX_H]), pl.FP32)
+            scaled_weight = pl.mul(raw_weight, 0.015625)
+            rounded_weight = pl.cast(scaled_weight, pl.BF16, mode="rint")
+            pl.store(rounded_weight, [token, 0], head_weights)
+    return decoded
+
+
+@pl.jit.inline(auto_scope=False)
+def _index_scores_predecoded(
+    query_values: pl.Tensor,
+    head_weights: pl.Tensor,
+    index_cache: pl.Tensor,
+    index_cache_scale: pl.Tensor,
+    block_table: pl.Tensor,
+    request_ids: pl.Tensor,
+    lengths: pl.Tensor,
+    output: pl.Tensor,
+    valid: pl.Tensor[[VALID_ROWS_DYN, VALID_COLS_DYN], pl.INT32],
+    width: pl.Scalar[pl.INDEX],
+    table_width: pl.Scalar[pl.INDEX],
+    skip_threshold: pl.Scalar[pl.INT32],
+    gathered_rows: pl.Scalar[pl.INDEX],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Score packed histories while reusing one decoded query per token."""
+    worker = pl.tile.get_block_idx()
+    workers = pl.tile.get_block_num()
+    key_flat = index_cache
+    scale_flat = index_cache_scale
+    panels = (width + 63) // 64
+    pair_table = _index_fp4_pairs()
+    for token in pl.range(num_tokens):
+        start = (worker + workers - token * panels % workers) % workers
+        length = pl.max(0, pl.min(width, pl.read(lengths, [token])))
+        q_value = pl.load(query_values, [token * INDEX_H, 0], [INDEX_H, INDEX_DIM])
+        head_weight = pl.reshape(
+            pl.cast(pl.load(head_weights, [token, 0], [1, INDEX_H]), pl.FP32),
+            [INDEX_H, 1],
+        )
+        request = pl.read(request_ids, [token])
+        for panel in pl.range(start, panels, workers):
+            begin = panel * 64
+            page = pl.cast(-1, pl.INT32)
+            if gathered_rows > 0:
+                length = width
+                page = pl.cast(0, pl.INT32)
+            elif length > skip_threshold and begin < length:
+                if request >= 0 and begin // 128 < table_width:
+                    page = pl.read(block_table, [pl.cast(request, pl.INDEX), begin // 128])
+            negative = pl.reinterpret_view(
+                pl.tile.full([1, 64], dtype=pl.INT32, value=-8388608), pl.FP32,
+            )
+            valid_cols = pl.min(64, width - begin)
+            if page >= 0:
+                if gathered_rows > 0:
+                    key_row = token * gathered_rows + begin
+                else:
+                    key_row = pl.cast(page, pl.INDEX) * 128 + begin % 128
+                k_codes = pl.load(key_flat, [key_row, 0], [64, INDEX_DIM // 2])
+                k_codes_scale = pl.load(
+                    scale_flat, [0, key_row * _SCALE_COUNT], [1, 64 * _SCALE_COUNT],
+                )
+                k_value = _index_key_score_tile(k_codes, k_codes_scale, pair_table, 64)
+                dot = pl.matmul(q_value, pl.tile.transpose(k_value, 0, 1), out_dtype=pl.FP32)
+                rounded = pl.cast(dot, pl.BF16, mode="rint")
+                relu = pl.maximum(pl.cast(rounded, pl.FP32), 0.0)
+                weighted = pl.row_expand_mul(relu, head_weight)
+                weighted = pl.cast(pl.cast(weighted, pl.BF16, mode="rint"), pl.FP32)
+                score = pl.tile.slice(weighted, [1, 64], [0, 0])
+                for pair in pl.unroll(15):
+                    left = pl.tile.slice(weighted, [1, 64], [1 + 2 * pair, 0])
+                    right = pl.tile.slice(weighted, [1, 64], [2 + 2 * pair, 0])
+                    score = pl.add(score, pl.add(left, right))
+                score = pl.add(score, pl.tile.slice(weighted, [1, 64], [31, 0]))
+                score = pl.cast(pl.cast(score, pl.BF16, mode="rint"), pl.FP32)
+                lanes = pl.add(pl.tile.arange(0, [1, 64], dtype=pl.INT32), pl.cast(begin, pl.INT32))
+                if gathered_rows > 0:
+                    mask_values = pl.load(valid, [0, token * gathered_rows + begin], [1, 64])
+                    mask = pl.tile.cmps(mask_values, 1, cmp_type=0)
+                else:
+                    mask = pl.tile.cmps(
+                        pl.cast(lanes, pl.FP32), pl.cast(pl.cast(length, pl.INT32), pl.FP32), cmp_type=2,
+                    )
+                masked = pl.tile.select(mask, score, negative)
+                pl.store(pl.set_validshape(masked, 1, valid_cols), [token, begin], output)
+            else:
+                pl.store(pl.set_validshape(negative, 1, valid_cols), [token, begin], output)
+    return output
+
+
+
+@pl.jit.inline(auto_scope=False)
 def quantize_index_query(
     source: pl.Tensor[[T_DYN, INDEX_QUERY_WIDTH], pl.BF16],
     cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -942,17 +1062,36 @@ def make_index_scores(skip_short=False, request_workers=32):
                 skip_threshold, 16,
             )
         else:
-            with pl.spmd(
-                launch_workers, name_hint="idx_score_req", sync_start=True,
-                deps=[cache_ready, query_ready, weights_ready],
-            ) as fallback_tid:
-                _worker = pl.tile.get_block_idx()
-                _index_scores(
-                    query_flat, query_scales_flat, weights, payload_flat, scales_flat,
-                    block_table, request_ids, lengths, output, unused_valid,
-                    width, table_width, pl.cast(skip_threshold, pl.INT32), 0, num_tokens,
+            if request_workers <= 16:
+                query_values = pl.create_tensor([capacity * INDEX_H, INDEX_DIM], dtype=pl.BF16)
+                head_weights = pl.create_tensor([capacity, INDEX_H], dtype=pl.BF16)
+                query_decode_tid = _predecode_index_queries(
+                    query, query_scale, weights, query_values, head_weights,
+                    num_tokens, query_ready, weights_ready,
                 )
-            score_tid = fallback_tid
+                with pl.spmd(
+                    launch_workers, name_hint="idx_score_req", sync_start=True,
+                    deps=[cache_ready, query_decode_tid],
+                ) as fallback_tid:
+                    _worker = pl.tile.get_block_idx()
+                    _index_scores_predecoded(
+                        query_values, head_weights, payload_flat, scales_flat,
+                        block_table, request_ids, lengths, output, unused_valid,
+                        width, table_width, pl.cast(skip_threshold, pl.INT32), 0, num_tokens,
+                    )
+                score_tid = fallback_tid
+            else:
+                with pl.spmd(
+                    launch_workers, name_hint="idx_score_req", sync_start=True,
+                    deps=[cache_ready, query_ready, weights_ready],
+                ) as fallback_tid:
+                    _worker = pl.tile.get_block_idx()
+                    _index_scores(
+                        query_flat, query_scales_flat, weights, payload_flat, scales_flat,
+                        block_table, request_ids, lengths, output, unused_valid,
+                        width, table_width, pl.cast(skip_threshold, pl.INT32), 0, num_tokens,
+                    )
+                score_tid = fallback_tid
         return score_tid
 
     return score
