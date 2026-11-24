@@ -438,9 +438,12 @@ def hc_sinkhorn_decode_token(
 
 
 @pl.jit.inline
-def hc_decode_token_rms(x_hc: pl.Tensor, t_dim: pl.Scalar[pl.INDEX], t_linear: pl.Scalar[pl.INDEX]):
+def hc_decode_token_rms(
+    x_hc: pl.Tensor,
+    t_dim: pl.Scalar[pl.INDEX],
+    inv_rms: pl.Tensor,
+):
     """Compute the FP32 residual RMS for the short Decode paths."""
-    inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     # Partition each token into vector-length rows and keep its reduction local.
     rms_view = pl.reshape(x_hc, [t_dim * DECODE_RMS_ROWS, DECODE_RMS_ROW_WIDTH])
     for token in pl.spmd(t_dim, name_hint="mhc_rms", allow_early_resolve=True):
@@ -457,10 +460,9 @@ def hc_decode_token_rms(x_hc: pl.Tensor, t_dim: pl.Scalar[pl.INDEX], t_linear: p
             total = total + pl.tile.read(sums, [0, lane])
         padded = pl.add(pl.tile.full([1, 8], dtype=pl.FP32, value=0.0), total)
         inverse_tmp = pl.create_tile([1, 8], dtype=pl.FP32)
-        inverse = pl.tile.rsqrt(pl.add(pl.mul(padded, HC_DIM_INV), NORM_EPS), inverse_tmp, high_precision=True)
+        inverse = pl.tile.rsqrt(pl.add(pl.mul(padded, HC_DIM_INV), NORM_EPS), inverse_tmp)
         inverse = pl.reshape(inverse, [8, 1])
         pl.store(pl.set_validshape(inverse, 1, 1), [token, 0], inv_rms)
-    return inv_rms
 
 
 @pl.jit.inline
@@ -543,7 +545,8 @@ def hc_decode_mixes_separate_token(x_hc: pl.Tensor, function: pl.Tensor, scale: 
     # Residual normalization takes longer than the two sigmoids. Start it
     # as soon as its own projection completes.
     tokens = pl.tensor.dim(x_hc, 0)
-    inv = hc_decode_token_rms(x_hc, tokens, LINEAR_T_TILE)
+    inv = pl.create_tensor([LINEAR_T_TILE, 1], dtype=pl.FP32)
+    hc_decode_token_rms(x_hc, tokens, inv)
     residual_projection = hc_short_split_linear(x_hc, function, 8, 16, 10, 512)
     hc_short_split_coefficients(
         inv, residual_projection, scale, base, pre_mix, post_mix, residual_mix, True, 8, 16, 10,
@@ -633,16 +636,21 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor):
 
 
 @pl.jit.inline
-def hc_project_decode(x_hc: pl.Tensor, function: pl.Tensor, short_attention: pl.constexpr):
+def hc_project_decode(
+    x_hc: pl.Tensor,
+    function: pl.Tensor,
+    inv_rms: pl.Tensor,
+    mixes_partials: pl.Tensor,
+    short_attention: pl.constexpr,
+):
     """Compute the inverse RMS and split-K coefficient projection."""
     t_dim = pl.tensor.dim(x_hc, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
 
     if short_attention:
-        inv_rms = hc_decode_token_rms(x_hc, t_dim, t_linear)
+        hc_decode_token_rms(x_hc, t_dim, inv_rms)
     else:
-        inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
         for block in pl.spmd((t_dim + T_TILE - 1) // T_TILE, name_hint="mhc_rms"):
             t0 = block * T_TILE
             valid_rows = pl.min(T_TILE, t_dim - t0)
@@ -661,7 +669,6 @@ def hc_project_decode(x_hc: pl.Tensor, function: pl.Tensor, short_attention: pl.
                 pl.rsqrt(rms_arg, high_precision=True), [T_TILE, 1]
             )
 
-    mixes_partials = pl.create_tensor([DECODE_LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
     for task in pl.spmd(
         (t_linear // LINEAR_T_TILE) * DECODE_LINEAR_OK,
         name_hint="mhc_linear", allow_early_resolve=short_attention,
@@ -689,7 +696,6 @@ def hc_project_decode(x_hc: pl.Tensor, function: pl.Tensor, short_attention: pl.
         partial = split * t_linear + t0
         mixes_partials[partial : partial + LINEAR_T_TILE, 0:MIX_PAD] = acc
 
-    return inv_rms, mixes_partials
 
 
 @pl.jit.inline
@@ -735,7 +741,7 @@ def hc_project_prefill(
             square_sum_tile = pl.add(zero, square_sum)
             rms_arg = pl.add(pl.mul(square_sum_tile, HC_DIM_INV), NORM_EPS)
             rsqrt_tmp = pl.create_tile([1, PREFILL_RMS_T_TILE], dtype=pl.FP32)
-            inverse_tile = pl.tile.rsqrt(rms_arg, rsqrt_tmp, high_precision=True)
+            inverse_tile = pl.tile.rsqrt(rms_arg, rsqrt_tmp)
             pl.store(inverse_tile, [token, 0], inverse)
 
     accumulated = pl.create_tensor([tokens, MIX_PAD], dtype=pl.FP32)
@@ -1018,7 +1024,7 @@ def hc_head_norm_decode(
             square_sum = square_sum + pl.tile.read(partials, [0, lane])
         rms_arg = pl.mul(pl.tile.full([1, 8], dtype=pl.FP32, value=1.0 / D), square_sum)
         rsqrt_tmp = pl.create_tile([1, 8], dtype=pl.FP32)
-        inverse = pl.tile.rsqrt(pl.add(rms_arg, NORM_EPS), rsqrt_tmp, high_precision=True)
+        inverse = pl.tile.rsqrt(pl.add(rms_arg, NORM_EPS), rsqrt_tmp)
         scaled = pl.mul(values, pl.tile.read(inverse, [0, 0]))
         gamma = pl.cast(pl.load(gamma_flat, [0, 0], [1, D]), pl.FP32)
         result = pl.cast(pl.mul(scaled, gamma), pl.BF16, mode="rint")
@@ -1054,7 +1060,11 @@ def hc_ffn_decode_mixes(
     residual_mix: pl.Tensor,
 ):
     """Compute FFN coefficients after Decode attention has collapsed the streams."""
-    inv_rms, partials = hc_project_decode(x_hc, function, short_attention=False)
+    t_dim = pl.tensor.dim(x_hc, 0)
+    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
+    inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
+    partials = pl.create_tensor([DECODE_LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
+    hc_project_decode(x_hc, function, inv_rms, partials, short_attention=False)
     return hc_sinkhorn_decode(inv_rms, partials, scale, base, pre_mix, post_mix, residual_mix)
 
 
