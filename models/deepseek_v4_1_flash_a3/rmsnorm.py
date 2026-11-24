@@ -22,6 +22,8 @@ EPS = M.rms_norm_eps
 # tiling
 NORM_T_TILE = 8
 NORM_D_TILE = 512
+DECODE_NORM_REDUCE_ROWS = ((D // NORM_D_TILE + NORM_T_TILE - 1) // NORM_T_TILE) * NORM_T_TILE
+DECODE_NORM_WIDTH_TILE = DECODE_NORM_REDUCE_ROWS * NORM_D_TILE
 PREFILL_NORM_REDUCE_TILE = 2 * NORM_D_TILE
 PREFILL_NORM_STORE_TILE = 1280
 PREFILL_NORM_WORKERS = 48
@@ -100,6 +102,43 @@ def rms_norm_tiled_compensated(
 ):
     """Normalize final projection inputs with compensated FP32 chunk sums."""
     return _rms_norm_tiled(x, norm_w, x_normed, block, num_tokens, compensated=True, output_fp32=False)
+
+
+@pl.jit.inline
+def decode_rms_norm_owner_row(
+    source: pl.Tensor[[T_DYN, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    output: pl.Tensor,
+    owner: pl.Scalar[pl.INT32],
+):
+    """Normalize one Decode owner row with the original 512-column reduction order."""
+    weight = pl.reshape(norm_w, [1, D])
+    for row in pl.spmd(1, name_hint="decode_moe_owner_norm"):
+        values = pl.load(source, [owner, 0], [1, DECODE_NORM_WIDTH_TILE], valid_shape=[1, D])
+        padded = pl.fillpad(values, pad_value=pl.PadValue.zero)
+        padded = pl.set_validshape(padded, 1, DECODE_NORM_WIDTH_TILE)
+        value_fp32 = pl.cast(padded, pl.FP32)
+        chunks = pl.reshape(value_fp32, [DECODE_NORM_REDUCE_ROWS, NORM_D_TILE])
+        squares = pl.mul(chunks, chunks)
+        reduce_tmp = pl.create_tile([DECODE_NORM_REDUCE_ROWS, NORM_D_TILE], dtype=pl.FP32)
+        partials = pl.row_sum(squares, tmp_tile=reduce_tmp)
+        sum_squares = pl.tile.read(partials, [0, 0])
+        for kb in pl.unroll(1, D // NORM_D_TILE):
+            sum_squares = sum_squares + pl.tile.read(partials, [kb, 0])
+        sum_tile = pl.tile.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
+        sum_tile = pl.add(sum_tile, sum_squares)
+        mean_square = pl.mul(sum_tile, 1.0 / D)
+        rms_arg = pl.add(mean_square, EPS)
+        inverse_tmp = pl.create_tile([1, NORM_T_TILE], dtype=pl.FP32)
+        inverse = pl.tile.rsqrt(rms_arg, inverse_tmp, high_precision=True)
+        gamma = pl.load(weight, [0, 0], [1, D])
+        gamma_fp32 = pl.cast(gamma, pl.FP32)
+        real_values = pl.tile.slice(value_fp32, [1, D], [0, 0])
+        scaled = pl.mul(real_values, pl.tile.read(inverse, [0, 0]))
+        weighted = pl.mul(scaled, gamma_fp32)
+        rounded = pl.cast(weighted, pl.BF16, mode="rint")
+        pl.store(rounded, [row, 0], output)
+    return output
 
 
 @pl.jit.inline(auto_scope=False)

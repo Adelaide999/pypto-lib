@@ -24,7 +24,7 @@ from .expert_routed import (
     expert_routed_scatter,
 )
 from .hc import hc_decode_mixes, hc_ffn_decode_mixes, hc_pre, hc_post
-from .rmsnorm import prefill_ffn_norm_quant, rms_norm_tiled
+from .rmsnorm import decode_rms_norm_owner_row, prefill_ffn_norm_quant, rms_norm_tiled
 from .o_proj import decode_tp_output_post_token, prefill_tp_output_all_reduce
 
 
@@ -604,9 +604,7 @@ def _decode_ffn_owner_norm(
 ):
     """Normalize the owner rows, reading a lone row directly from mHC output."""
     if local_tokens == 1:
-        owner_row = pl.slice(source, [1, D], [tp_rank, 0])
-        for block in pl.spmd(1, name_hint="decode_moe_owner_norm"):
-            rms_norm_tiled(owner_row, norm_weight, output, block, 1, output_fp32=False)
+        decode_rms_norm_owner_row(source, norm_weight, output, tp_rank)
     else:
         compact = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
         _compact_local_tokens(source, compact, num_tokens, tp_rank)
