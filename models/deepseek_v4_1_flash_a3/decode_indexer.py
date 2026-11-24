@@ -1775,10 +1775,43 @@ def _make_c2a_short_topk(row_workers):
     return short_stage
 
 
+@pl.jit.inline
+def _merge_c2a_pair_tiles(
+    left: pl.Tile[[1, _TOPK_PAIR_WIDTH], pl.FP32],
+    right: pl.Tile[[1, _TOPK_PAIR_WIDTH], pl.FP32],
+):
+    scratch = pl.tile.create([1, 2 * _TOPK_PAIR_WIDTH], dtype=pl.FP32)
+    merged = pl.tile.mrgsort(left, right, tmp=scratch)
+    return pl.tile.slice(merged, [1, _TOPK_PAIR_WIDTH], [0, 0])
+
+
+@pl.jit.inline
+def _merge_c2a_small_history(
+    pairs: pl.Tensor,
+    token: pl.Scalar[pl.INDEX],
+    leaf_count: pl.Scalar[pl.INDEX],
+):
+    # Each leaf stores its best INDEX_TOPK pairs. Keep the intermediate
+    # pairs in Vector memory when a history fits in at most four leaves.
+    first = pl.load(pairs, [token, 0], [1, _TOPK_PAIR_WIDTH])
+    root = pl.tile.slice(first, [1, _TOPK_PAIR_WIDTH], [0, 0])
+    if leaf_count >= 2:
+        second = pl.load(pairs, [token, _TOPK_PAIR_WIDTH], [1, _TOPK_PAIR_WIDTH])
+        root = _merge_c2a_pair_tiles(root, second)
+    if leaf_count >= 3:
+        third = pl.load(pairs, [token, 2 * _TOPK_PAIR_WIDTH], [1, _TOPK_PAIR_WIDTH])
+        tail = pl.tile.slice(third, [1, _TOPK_PAIR_WIDTH], [0, 0])
+        if leaf_count == 4:
+            fourth = pl.load(pairs, [token, 3 * _TOPK_PAIR_WIDTH], [1, _TOPK_PAIR_WIDTH])
+            tail = _merge_c2a_pair_tiles(tail, fourth)
+        root = _merge_c2a_pair_tiles(root, tail)
+    return root
+
+
 def _make_select_c2a_index_topk(leaf_workers=32, row_workers=32, all_long=False, stable_bf16=False):
     sort_leaf, merge_rows = _make_index_topk_pairs(query_rows=True, stable_bf16=stable_bf16)
     materialize = _make_materialize_index_topk()
-    short_stage = _c2a_topk_all_long_ready if all_long else _make_c2a_short_topk(row_workers)
+    short_stage = _c2a_topk_all_long_ready if all_long or stable_bf16 else _make_c2a_short_topk(row_workers)
 
     @pl.jit.inline(auto_scope=False)
     def select_c2a_index_topk(
@@ -1814,22 +1847,26 @@ def _make_select_c2a_index_topk(leaf_workers=32, row_workers=32, all_long=False,
             worker = pl.tile.get_block_idx()
             for token in pl.range(worker, num_tokens, row_workers):
                 if pl.read(lengths, [token]) > INDEX_TOPK:
-                    count = leaf_count
-                    for _ in pl.range(21):
-                        if count > 1:
-                            output_count = (count + 1) // 2
-                            for output_slot in pl.range(output_count):
-                                left = output_slot * 2
-                                right = left + 1
-                                if right < count:
-                                    merge_rows(pair_storage, left, right, output_slot, token)
-                                else:
-                                    forwarded = pl.load(
-                                        pair_storage, [token, left * _TOPK_PAIR_WIDTH], [1, _TOPK_PAIR_WIDTH]
-                                    )
-                                    pl.store(forwarded, [token, output_slot * _TOPK_PAIR_WIDTH], pair_storage)
-                            count = output_count
-                    root = pl.load(pair_storage, [token, 0], [1, _TOPK_PAIR_WIDTH])
+                    if stable_bf16 and leaf_count <= 4:
+                        root = _merge_c2a_small_history(pair_storage, token, leaf_count)
+                    else:
+                        count = leaf_count
+                        for _ in pl.range(21):
+                            if count > 1:
+                                output_count = (count + 1) // 2
+                                for output_slot in pl.range(output_count):
+                                    left = output_slot * 2
+                                    right = left + 1
+                                    if right < count:
+                                        merge_rows(pair_storage, left, right, output_slot, token)
+                                    else:
+                                        forwarded = pl.load(
+                                            pair_storage, [token, left * _TOPK_PAIR_WIDTH], [1, _TOPK_PAIR_WIDTH]
+                                        )
+                                        pl.store(forwarded, [token, output_slot * _TOPK_PAIR_WIDTH], pair_storage)
+                                count = output_count
+                        loaded_root = pl.load(pair_storage, [token, 0], [1, _TOPK_PAIR_WIDTH])
+                        root = pl.tile.slice(loaded_root, [1, _TOPK_PAIR_WIDTH], [0, 0])
                     root_scores = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P0101)
                     if stable_bf16 and width <= 16384:
                         valid = pl.tile.cmps(root_scores, 0.0, cmp_type=4)
@@ -1860,6 +1897,8 @@ def _make_select_c2a_index_topk(leaf_workers=32, row_workers=32, all_long=False,
                             index_scores, block_table, request_ids, output,
                             token, width, cutoff, INDEX_TOPK - above,
                         )
+                elif stable_bf16 and not all_long:
+                    _write_c2a_short_topk(block_table, request_ids, lengths, output, token)
 
         if stable_bf16 and width <= 16384:
             result = pl.yield_(merge_tid)
