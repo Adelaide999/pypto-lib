@@ -460,7 +460,7 @@ def hc_decode_token_rms(
             total = total + pl.tile.read(sums, [0, lane])
         padded = pl.add(pl.tile.full([1, 8], dtype=pl.FP32, value=0.0), total)
         inverse_tmp = pl.create_tile([1, 8], dtype=pl.FP32)
-        inverse = pl.tile.rsqrt(pl.add(pl.mul(padded, HC_DIM_INV), NORM_EPS), inverse_tmp)
+        inverse = pl.tile.rsqrt(pl.add(pl.mul(padded, HC_DIM_INV), NORM_EPS), inverse_tmp, high_precision=True)
         inverse = pl.reshape(inverse, [8, 1])
         pl.store(pl.set_validshape(inverse, 1, 1), [token, 0], inv_rms)
 
@@ -741,7 +741,7 @@ def hc_project_prefill(
             square_sum_tile = pl.add(zero, square_sum)
             rms_arg = pl.add(pl.mul(square_sum_tile, HC_DIM_INV), NORM_EPS)
             rsqrt_tmp = pl.create_tile([1, PREFILL_RMS_T_TILE], dtype=pl.FP32)
-            inverse_tile = pl.tile.rsqrt(rms_arg, rsqrt_tmp)
+            inverse_tile = pl.tile.rsqrt(rms_arg, rsqrt_tmp, high_precision=True)
             pl.store(inverse_tile, [token, 0], inverse)
 
     accumulated = pl.create_tensor([tokens, MIX_PAD], dtype=pl.FP32)
@@ -1024,7 +1024,7 @@ def hc_head_norm_decode(
             square_sum = square_sum + pl.tile.read(partials, [0, lane])
         rms_arg = pl.mul(pl.tile.full([1, 8], dtype=pl.FP32, value=1.0 / D), square_sum)
         rsqrt_tmp = pl.create_tile([1, 8], dtype=pl.FP32)
-        inverse = pl.tile.rsqrt(pl.add(rms_arg, NORM_EPS), rsqrt_tmp)
+        inverse = pl.tile.rsqrt(pl.add(rms_arg, NORM_EPS), rsqrt_tmp, high_precision=True)
         scaled = pl.mul(values, pl.tile.read(inverse, [0, 0]))
         gamma = pl.cast(pl.load(gamma_flat, [0, 0], [1, D]), pl.FP32)
         result = pl.cast(pl.mul(scaled, gamma), pl.BF16, mode="rint")
