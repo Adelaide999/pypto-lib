@@ -139,7 +139,7 @@ def decode_c1a_reindex(
     selected_ret, indices_ret, gather_tid = gather_packed(
         window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
         window_indices, topk_indices, selected, indices, num_tokens, selection_ready,
-        max_workers=GATHER_WORKER_TILE, name_hint="c1a_gather", gather_keys=640,
+        max_workers=GATHER_WORKER_TILE, name_hint="c1a_gather", gather_keys=640, decode=True,
     )
     attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64, ATTEND_WORKER_TILE)
     hc_decode_mixes(

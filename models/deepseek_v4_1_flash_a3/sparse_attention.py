@@ -1282,6 +1282,60 @@ def golden_merge_attention_stats(
 
 
 @pl.jit.inline(auto_scope=False)
+def _decode_gather_fp4(payload: pl.Tile[[GATHER_KEY_TILE, HEAD_DIM // 2], pl.UINT8]):
+    """Expand both E2M1 nibbles with one lookup per packed byte."""
+    bytes_i16 = pl.cast(pl.tile.arange(0, [1, 256], dtype=pl.INT32), pl.INT16, mode="rint")
+    low = pl.cast(pl.cast(fp4_bf16_bits(bytes_i16), pl.FP32), pl.INT32, mode="rint")
+    high = pl.cast(pl.cast(fp4_bf16_bits(pl.shrs(bytes_i16, 4)), pl.FP32), pl.INT32, mode="rint")
+    low_unsigned = pl.sub(low, pl.mul(pl.shrs(low, 31), 65536))
+    pair_table = pl.add(low_unsigned, pl.shls(high, 16))
+    signed = pl.reinterpret_view(payload, pl.INT8)
+    raw = pl.cast(pl.cast(signed, pl.FP16), pl.INT16, mode="rint")
+    byte_ids = pl.ands(raw, 255)
+    wide_ids = pl.cast(pl.cast(byte_ids, pl.FP32), pl.INT32, mode="rint")
+    pair_indices = pl.reshape(wide_ids, [1, FP4_PAIR_TILE])
+    pair_tmp = pl.create_tile([1, FP4_PAIR_TILE], dtype=pl.INT32)
+    pair_bits = pl.tile.gather(pair_table, pair_indices, pair_tmp)
+    values = pl.reinterpret_view(pair_bits, pl.BF16, shape=[1, GATHER_KEY_TILE * HEAD_DIM])
+    return pl.reshape(values, [GATHER_KEY_TILE, HEAD_DIM])
+
+
+@pl.jit.inline(auto_scope=False)
+def _decode_window_fp8(payload: pl.Tile[[GATHER_KEY_TILE, HEAD_DIM], pl.UINT8]):
+    """Widen E4M3FN cache values to FP16 without changing any finite value."""
+    raw = pl.reinterpret_view(payload, pl.INT8)
+    code = pl.cast(pl.cast(raw, pl.FP16), pl.INT16, mode="rint")
+    magnitude = pl.ands(code, 127)
+    normal_exponent_and_significand = pl.shls(magnitude, 7)
+    normal_bits = pl.add(normal_exponent_and_significand, 8192)
+    normal = pl.reinterpret_view(normal_bits, pl.FP16)
+    magnitude_half = pl.cast(magnitude, pl.FP16)
+    subnormal = pl.mul(magnitude_half, 0.001953125)
+    is_subnormal = pl.tile.cmps(magnitude_half, 8.0, cmp_type=2)
+    select_tmp = pl.create_tile([1, 16], dtype=pl.UINT32)
+    absolute = pl.tile.sel(is_subnormal, subnormal, normal, select_tmp)
+    sign_bit = pl.shls(pl.ands(code, 128), 8)
+    bits = pl.or_(sign_bit, pl.reinterpret_view(absolute, pl.INT16))
+    return pl.reinterpret_view(bits, pl.FP16)
+
+
+@pl.jit.inline(auto_scope=False)
+def _decode_window_run_start(ids: pl.Tile[[1, GATHER_KEY_TILE], pl.INT32]):
+    first = pl.tile.read(ids, [0, 0])
+    last = pl.tile.read(ids, [0, GATHER_KEY_TILE - 1])
+    start = pl.cast(-1, pl.INT32)
+    if first >= 0 and last - first == GATHER_KEY_TILE - 1:
+        expected = pl.tile.ci(first, [1, GATHER_KEY_TILE], dtype=pl.INT32)
+        mismatch = pl.tile.cmp(ids, expected, cmp_type=1)
+        # Only the first two bytes of the packed mask are live.
+        low = pl.tile.read(mismatch, [0, 0])
+        high = pl.tile.read(mismatch, [0, 1])
+        if low == 0 and high == 0:
+            start = first
+    return start
+
+
+@pl.jit.inline(auto_scope=False)
 def gather_packed(
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.UINT8],
     window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
@@ -1296,6 +1350,7 @@ def gather_packed(
     max_workers: pl.constexpr,
     name_hint: pl.constexpr,
     gather_keys: pl.constexpr,
+    decode: pl.constexpr,
 ):
     """Gather packed cache rows and dequantize them once for all query heads."""
     window_rows = pl.tensor.dim(window, 0) * 128
@@ -1312,27 +1367,40 @@ def gather_packed(
         for block in pl.range(worker, num_tokens * (gather_keys // GATHER_KEY_TILE), workers):
             token = block // (gather_keys // GATHER_KEY_TILE)
             column = block % (gather_keys // GATHER_KEY_TILE) * GATHER_KEY_TILE
+            run_start = pl.cast(-1, pl.INT32)
             if column < 128:
                 ids = pl.tile.load(wi, [token, column], [1, GATHER_KEY_TILE])
                 safe_ids = pl.maximum(ids, 0)
                 w_payload = pl.tile.create([GATHER_KEY_TILE, HEAD_DIM], dtype=pl.UINT8)
-                w_factors = pl.tile.create([GATHER_KEY_TILE, 32], dtype=pl.BF16)
-                for lane in pl.range(GATHER_KEY_TILE):
-                    physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
-                    w_payload = pl.tile.gather_row(w_payload, w, [lane, 0], [physical, 0], [1, HEAD_DIM])
-                    w_factors = pl.tile.gather_row(w_factors, ws, [lane, 0], [physical, 0], [1, HEAD_DIM // 32])
-                w_scales = pl.cast(w_factors, pl.FP32)
-                # Compact sixteen scale values from each padded 32-wide row.
-                w_columns = pl.tile.arange(0, [1, GATHER_KEY_TILE * (HEAD_DIM // 32)], dtype=pl.INT32)
-                w_row_ids = pl.shrs(w_columns, 4)
-                w_row_bias = pl.shls(w_row_ids, 4)
-                w_order = pl.add(w_columns, w_row_bias)
-                w_scale_bits = pl.reinterpret_view(w_scales, pl.INT32)
-                w_gather_tmp = pl.tile.create([1, GATHER_KEY_TILE * (HEAD_DIM // 32)], dtype=pl.INT32)
-                w_valid_bits = pl.tile.gather(w_scale_bits, w_order, w_gather_tmp)
-                w_scales = pl.reinterpret_view(w_valid_bits, pl.FP32)
-                w_scale_column = pl.reshape(w_scales, [GATHER_KEY_TILE * (HEAD_DIM // 32), 1])
-                w_values = pl.cast(decode_fp8(w_payload, GATHER_KEY_TILE, HEAD_DIM), pl.FP32)
+                if decode:
+                    run_start = _decode_window_run_start(ids)
+                if run_start >= 0:
+                    physical = pl.cast(run_start, pl.INDEX)
+                    w_payload = pl.tile.load(w, [physical, 0], [GATHER_KEY_TILE, HEAD_DIM])
+                    contiguous_scales = pl.tile.load(ws, [physical, 0], [GATHER_KEY_TILE, HEAD_DIM // 32])
+                    contiguous_scales_fp32 = pl.cast(contiguous_scales, pl.FP32)
+                    w_scale_column = pl.reshape(contiguous_scales_fp32, [GATHER_KEY_TILE * (HEAD_DIM // 32), 1])
+                else:
+                    w_factors = pl.tile.create([GATHER_KEY_TILE, 32], dtype=pl.BF16)
+                    for lane in pl.range(GATHER_KEY_TILE):
+                        physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
+                        w_payload = pl.tile.gather_row(w_payload, w, [lane, 0], [physical, 0], [1, HEAD_DIM])
+                        w_factors = pl.tile.gather_row(w_factors, ws, [lane, 0], [physical, 0], [1, HEAD_DIM // 32])
+                    w_scales = pl.cast(w_factors, pl.FP32)
+                    # Compact sixteen scale values from each padded 32-wide row.
+                    w_columns = pl.tile.arange(0, [1, GATHER_KEY_TILE * (HEAD_DIM // 32)], dtype=pl.INT32)
+                    w_row_ids = pl.shrs(w_columns, 4)
+                    w_row_bias = pl.shls(w_row_ids, 4)
+                    w_order = pl.add(w_columns, w_row_bias)
+                    w_scale_bits = pl.reinterpret_view(w_scales, pl.INT32)
+                    w_gather_tmp = pl.tile.create([1, GATHER_KEY_TILE * (HEAD_DIM // 32)], dtype=pl.INT32)
+                    w_valid_bits = pl.tile.gather(w_scale_bits, w_order, w_gather_tmp)
+                    compact_scales = pl.reinterpret_view(w_valid_bits, pl.FP32)
+                    w_scale_column = pl.reshape(compact_scales, [GATHER_KEY_TILE * (HEAD_DIM // 32), 1])
+                if decode:
+                    w_values = pl.cast(_decode_window_fp8(w_payload), pl.FP32)
+                else:
+                    w_values = pl.cast(decode_fp8(w_payload, GATHER_KEY_TILE, HEAD_DIM), pl.FP32)
                 w_grouped = pl.reshape(w_values, [GATHER_KEY_TILE * (HEAD_DIM // 32), 32])
                 w_scaled = pl.row_expand_mul(w_grouped, w_scale_column)
                 w_decoded = pl.cast(w_scaled, pl.BF16, mode="rint")
@@ -1346,7 +1414,10 @@ def gather_packed(
                     physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
                     c_payload = pl.tile.gather_row(c_payload, c, [lane, 0], [physical, 0], [1, HEAD_DIM // 2])
                     c_factors = pl.tile.gather_row(c_factors, cs, [lane, 0], [physical, 0], [1, HEAD_DIM // 16])
-                c_values = decode_fp4(c_payload, GATHER_KEY_TILE, HEAD_DIM)
+                if decode:
+                    c_values = _decode_gather_fp4(c_payload)
+                else:
+                    c_values = decode_fp4(c_payload, GATHER_KEY_TILE, HEAD_DIM)
                 c_grouped = pl.reshape(c_values, [GATHER_KEY_TILE * (HEAD_DIM // 16), 16])
                 # BF16 scales can exceed the FP16 range; multiply in FP32.
                 c_scales = pl.cast(c_factors, pl.FP32)
@@ -1355,10 +1426,11 @@ def gather_packed(
                 c_decoded = pl.cast(c_scaled, pl.BF16, mode="rint")
                 decoded = pl.reshape(c_decoded, [GATHER_KEY_TILE, HEAD_DIM])
             pl.tile.store(decoded, [token * SELECTED_KEYS + column, 0], dst)
-            zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            for lane in pl.range(GATHER_KEY_TILE):
-                if pl.tile.read(ids, [0, lane]) < 0:
-                    pl.tile.store(zero, [token * SELECTED_KEYS + column + lane, 0], dst)
+            if run_start < 0:
+                zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                for lane in pl.range(GATHER_KEY_TILE):
+                    if pl.tile.read(ids, [0, lane]) < 0:
+                        pl.tile.store(zero, [token * SELECTED_KEYS + column + lane, 0], dst)
             pl.tile.store(ids, [token, column], indices)
     return selected, indices, gathered
 
@@ -1383,7 +1455,7 @@ def gather_packed_chunk(
     selected, combined, gathered = gather_packed(
         window_cache, window_scales, compressed_cache, compressed_scales,
         window_chunk, compressed_chunk, selected, combined, active, chunk_done, max_workers=GATHER_WORKERS,
-        name_hint="c2a_gather", gather_keys=640,
+        name_hint="c2a_gather", gather_keys=640, decode=False,
     )
     return gathered
 
@@ -1900,7 +1972,7 @@ def _attend_packed_block(
     selected, indices, gathered = gather_packed(
         window, window_scale, compressed, compressed_scale,
         window_indices, compressed_indices, selected, indices, num_tokens, query_ready, max_workers=GATHER_WORKERS,
-        name_hint="c2a_gather", gather_keys=640,
+        name_hint="c2a_gather", gather_keys=640, decode=False,
     )
     attended = attend_selected(
         query, selected, indices, sink, output, num_tokens, gathered,
@@ -2052,7 +2124,8 @@ def attend_packed_cohorts(
         output_a = pl.slice(output, [active_a, LOCAL_H * HEAD_DIM], [start, 0])
         selected_a, combined_a, gathered_a = gather_packed(
             window, window_scale, compressed, compressed_scale,
-            wi_a, ci_a, selected_a, combined_a, active_a, done_a, max_workers=32, name_hint=gather_name, gather_keys=640,
+            wi_a, ci_a, selected_a, combined_a, active_a, done_a, max_workers=32,
+            name_hint=gather_name, gather_keys=640, decode=False,
         )
         done_a = _attend_cohort(
             query_a, selected_a, combined_a, sink, output_a, 0, active_a, gathered_a, name_hint=attn_name,
@@ -2065,7 +2138,8 @@ def attend_packed_cohorts(
             output_b = pl.slice(output, [active_b, LOCAL_H * HEAD_DIM], [start + width, 0])
             selected_b, combined_b, gathered_b = gather_packed(
                 window, window_scale, compressed, compressed_scale,
-                wi_b, ci_b, selected_b, combined_b, active_b, done_b, max_workers=32, name_hint=gather_name, gather_keys=640,
+                wi_b, ci_b, selected_b, combined_b, active_b, done_b, max_workers=32,
+                name_hint=gather_name, gather_keys=640, decode=False,
             )
             done_b = _attend_cohort(
                 query_b, selected_b, combined_b, sink, output_b, 0, active_b, gathered_b, name_hint=attn_name,
