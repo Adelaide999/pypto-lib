@@ -353,7 +353,7 @@ def _prefill_moe(
     round_tokens = MOE_TOKENS * TP_SIZE
     rounds = (CAPACITY + round_tokens - 1) // round_tokens
     owner_payload = pl.create_tensor([LOCAL_MOE_ROWS, D], dtype=pl.INT8)
-    owner_scales = pl.create_tensor([1, LOCAL_MOE_ROWS], dtype=pl.FP32)
+    owner_scales = pl.create_tensor([LOCAL_MOE_ROWS, 1], dtype=pl.FP32)
     prepare_prefill_routes(
         prefill_ffn_input, norm_weight, gate_weight, correction_bias,
         gate_inputs, owner_payload, owner_scales, gate_indices, gate_weights,
@@ -397,7 +397,8 @@ def _prefill_moe(
             local_gate_indices = pl.slice(gate_indices, [MOE_TOKENS, TOPK], [route_offset, 0])
             local_gate_weights = pl.slice(gate_weights, [MOE_TOKENS, TOPK], [route_offset, 0])
             local_payload = pl.slice(owner_payload, [MOE_TOKENS, D], [route_offset, 0])
-            local_scales = pl.slice(owner_scales, [1, MOE_TOKENS], [0, route_offset])
+            scale_rows = owner_scales[route_offset : route_offset + MOE_TOKENS, :]
+            local_scales = pl.reshape(scale_rows, [1, MOE_TOKENS])
             owned_result, round_counts = prefill_moe_sublayer(
                 round_hidden, round_pre, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_weight,
                 gate_weight, correction_bias,
