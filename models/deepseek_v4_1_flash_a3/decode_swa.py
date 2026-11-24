@@ -17,7 +17,7 @@ from .config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE
 from .sparse_attention import publish_window_row, swa_attention_partial
 from .qkv_proj_rope import decode_q_proj_rope as q_proj_rope, decode_kv_proj_rope as kv_proj_rope
 from .o_proj import decode_project_output as project_output, prefill_tp_output_all_reduce
-from .hc import hc_decode_mixes, hc_head_norm_adaptive, zero_bf16_padding, hc_post_decode
+from .hc import hc_decode_mixes, hc_head_norm_adaptive, zero_bf16_padding, hc_post_collapse
 
 
 # model config
@@ -66,6 +66,7 @@ def decode_swa(
     attention_output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
     attention_hidden: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
     attention_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    ffn_input: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     output_window: pld.DistributedTensor,
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -116,9 +117,8 @@ def decode_swa(
         attention_output, output_window, output_arrived, reduced_output,
         group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
     )
-    hc_post_decode_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post_decode(
-        reduced_output, x_hc, post_mix, residual_mix, attention_hidden,
-        deps=hc_post_decode_deps,
+    hc_post_collapse(
+        reduced_output, x_hc, post_mix, residual_mix, attention_pre_mix,
+        attention_hidden, ffn_input,
     )
     return attention_hidden, attention_pre_mix

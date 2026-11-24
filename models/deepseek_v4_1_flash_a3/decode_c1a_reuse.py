@@ -16,7 +16,7 @@ from .config import (
     COMPRESSED_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN,
     LOCAL_T_DYN,
 )
-from .hc import hc_decode_mixes, hc_head_norm_adaptive, hc_post_decode
+from .hc import hc_decode_mixes, hc_head_norm_adaptive, hc_post_collapse
 from .qkv_proj_rope import decode_q_proj_rope as q_proj_rope, decode_kv_proj_rope as kv_proj_rope
 from .sparse_attention import (
     gather_packed, attend_selected, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
@@ -71,6 +71,7 @@ def decode_c1a_reuse(
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
     next_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    ffn_input: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     output_window: pld.DistributedTensor,
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -126,9 +127,8 @@ def decode_c1a_reuse(
         attn_out, output_window, output_arrived, reduced_output,
         group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
     )
-    hc_post_decode_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post_decode(
-        reduced_output, x_hc, post_mix, residual_mix, output,
-        deps=hc_post_decode_deps,
+    hc_post_collapse(
+        reduced_output, x_hc, post_mix, residual_mix, next_pre_mix,
+        output, ffn_input,
     )
     return output
