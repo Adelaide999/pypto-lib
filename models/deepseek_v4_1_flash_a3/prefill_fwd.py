@@ -325,6 +325,8 @@ def _prefill_moe(
     slab_mixed: pl.Tensor[[MOE_TOKENS * TP_SIZE, D], pl.BF16],
     statistics: pl.Tensor[[MOE_ROUNDS, 3], pl.INT32],
     gate_inputs: pl.Tensor[[LOCAL_MOE_ROWS, D], pl.BF16],
+    owner_payload: pl.Tensor[[LOCAL_MOE_ROWS, D], pl.INT8],
+    owner_scales: pl.Tensor[[LOCAL_MOE_ROWS, 1], pl.FP32],
     gate_indices: pl.Tensor[[LOCAL_MOE_ROWS, TOPK], pl.INT32],
     gate_weights: pl.Tensor[[LOCAL_MOE_ROWS, TOPK], pl.FP32],
     reuse_ready: pl.Scalar[pl.TASK_ID],
@@ -352,13 +354,12 @@ def _prefill_moe(
     )
     round_tokens = MOE_TOKENS * TP_SIZE
     rounds = (CAPACITY + round_tokens - 1) // round_tokens
-    owner_payload = pl.create_tensor([LOCAL_MOE_ROWS, D], dtype=pl.INT8)
-    owner_scales = pl.create_tensor([LOCAL_MOE_ROWS, 1], dtype=pl.FP32)
-    prepare_prefill_routes(
-        prefill_ffn_input, norm_weight, gate_weight, correction_bias,
-        gate_inputs, owner_payload, owner_scales, gate_indices, gate_weights,
-        num_tokens, ep_rank % TP_SIZE, LOCAL_MOE_ROWS,
-    )
+    with pl.scope():
+        prepare_prefill_routes(
+            prefill_ffn_input, norm_weight, gate_weight, correction_bias,
+            gate_inputs, owner_payload, owner_scales, gate_indices, gate_weights,
+            num_tokens, ep_rank % TP_SIZE, LOCAL_MOE_ROWS,
+        )
     completion = pl.array.create(1, pl.TASK_ID)
     # Keep the slab pipeline independent from the layer-wide pre transform.
     # Consumers of the sliced precomputed buffers carry the data dependency,
@@ -605,6 +606,8 @@ def l2_prefill_fwd(
     slab_hidden = pl.create_tensor([MOE_TOKENS * TP_SIZE, HC_MULT, D], dtype=pl.FP32)
     slab_pre = pl.create_tensor([MOE_TOKENS * TP_SIZE, HC_MULT], dtype=pl.FP32)
     slab_mixed = pl.create_tensor([MOE_TOKENS * TP_SIZE, D], dtype=pl.BF16)
+    owner_payload = pl.create_tensor([LOCAL_MOE_ROWS, D], dtype=pl.INT8)
+    owner_scales = pl.create_tensor([LOCAL_MOE_ROWS, 1], dtype=pl.FP32)
     moe_ready = pl.system.task_dummy(deps=[])
     for layer in pl.range(first_layer, last_layer):
         stage = layer // 20
@@ -749,7 +752,7 @@ def l2_prefill_fwd(
             layer_shared_w3, layer_shared_w3_scale, next_pre, next_hidden,
             recv_meta, recv_x, recv_weights, arrived, data_arrived,
             routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, moe_statistics[layer],
-            moe_gate_inputs, moe_route_indices[layer], moe_route_weights[layer],
+            moe_gate_inputs, owner_payload, owner_scales, moe_route_indices[layer], moe_route_weights[layer],
             moe_ready, active, rank, layer - first_layer + 1, ffn_window, ffn_arrived,
         )
     final_slot = (2 * ((last_layer - 1) // 20 - first_layer // 20) + (last_layer - first_layer) % 2) * CAPACITY

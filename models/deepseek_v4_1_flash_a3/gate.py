@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4.1 MoE FFN router (decode): RMSNorm + gate + topk + normalize."""
+"""DeepSeek-V4.1 MoE router projection, scoring and normalized TopK."""
 
 import sys
 from pathlib import Path
@@ -55,6 +55,14 @@ GATE_D_TILE = 256
 PREFILL_GATE_M_TILE = 128
 PREFILL_GATE_N_TILE = 128
 PREFILL_GATE_K_TILE = 128
+PREFILL_GATE_PANEL_TILE = 1024
+PREFILL_DENSE_MIN_ROWS = 320
+PREFILL_COMPACT_ROWS = 512
+PREFILL_SMALL_M_TILE = 64
+PREFILL_SMALL_N_TILE = 32
+PREFILL_COMPACT_N_TILE = 64
+PREFILL_COMPACT_K_TILE = 256
+PREFILL_COMPACT_SORT_TILE = 8
 QUANT_TILE = 256
 QUANT_TASK_TILE = QUANT_TILE * 4
 MX_GROUP = 32
@@ -174,7 +182,7 @@ def gate_normalized(
     )
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def gate_from_fp32(
     xg_buf: pl.Tensor,
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
@@ -185,6 +193,96 @@ def gate_from_fp32(
     capacity: pl.constexpr,
     decode: pl.constexpr,
 ):
+    """Route independent owner panels, including a partial final panel."""
+    if not decode and N_EXPERTS == SCORE_PAD and capacity > PREFILL_GATE_PANEL_TILE:
+        full_rows = capacity // PREFILL_GATE_PANEL_TILE * PREFILL_GATE_PANEL_TILE
+        for start in pl.parallel(0, full_rows, PREFILL_GATE_PANEL_TILE):
+            with pl.scope():
+                stop = start + PREFILL_GATE_PANEL_TILE
+                rows = pl.min(PREFILL_GATE_PANEL_TILE, pl.max(num_tokens - start, 0))
+                _route_gate_panel(
+                    xg_buf[start:stop, :], gate_w, gate_bias, rows,
+                    indices[start:stop, :], weights[start:stop, :], PREFILL_GATE_PANEL_TILE, decode,
+                )
+        if capacity % PREFILL_GATE_PANEL_TILE != 0:
+            tail_rows = pl.max(num_tokens - full_rows, 0)
+            _route_gate_panel(
+                xg_buf[full_rows:capacity, :], gate_w, gate_bias, tail_rows,
+                indices[full_rows:capacity, :], weights[full_rows:capacity, :],
+                capacity % PREFILL_GATE_PANEL_TILE, decode,
+            )
+    else:
+        _route_gate_panel(xg_buf, gate_w, gate_bias, num_tokens, indices, weights, capacity, decode)
+    return weights
+
+
+@pl.jit.inline
+def _route_gate_panel(
+    xg_buf: pl.Tensor,
+    gate_w: pl.Tensor,
+    gate_bias: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    indices: pl.Tensor,
+    weights: pl.Tensor,
+    capacity: pl.constexpr,
+    decode: pl.constexpr,
+):
+    dense = not decode and N_EXPERTS == SCORE_PAD
+    small = capacity <= PREFILL_GATE_M_TILE and capacity % PREFILL_SMALL_M_TILE == 0
+    aligned = capacity % PREFILL_GATE_M_TILE == 0
+    medium = aligned and capacity > PREFILL_GATE_M_TILE and capacity <= PREFILL_COMPACT_ROWS
+    large = aligned and capacity > PREFILL_COMPACT_ROWS
+    if not decode and num_tokens <= 0:
+        empty_tiles = pl.max(1, (capacity + ROUTE_SELECT_T_TILE - 1) // ROUTE_SELECT_T_TILE)
+        for row in pl.spmd(empty_tiles, name_hint="gate_empty_panel"):
+            start = row * ROUTE_SELECT_T_TILE
+            rows = pl.min(ROUTE_SELECT_T_TILE, capacity - start)
+            ids = pl.full([ROUTE_SELECT_T_TILE, TOPK_PAD], dtype=pl.INT32, value=0)
+            values = pl.full([ROUTE_SELECT_T_TILE, TOPK_PAD], dtype=pl.FP32, value=0.0)
+            indices[start : start + ROUTE_SELECT_T_TILE, :] = pl.set_validshape(ids, rows, TOPK)
+            weights[start : start + ROUTE_SELECT_T_TILE, :] = pl.set_validshape(values, rows, TOPK)
+    elif dense and ((small and num_tokens >= PREFILL_SMALL_M_TILE) or
+                    (medium and num_tokens >= PREFILL_GATE_M_TILE) or
+                    (large and num_tokens >= PREFILL_DENSE_MIN_ROWS)):
+        if capacity <= PREFILL_GATE_M_TILE:
+            _gate_panel_from_fp32(
+                xg_buf, gate_w, gate_bias, num_tokens, indices, weights, capacity, decode, True,
+                PREFILL_SMALL_M_TILE, PREFILL_SMALL_N_TILE, PREFILL_COMPACT_K_TILE, ROUTE_SELECT_T_TILE,
+            )
+        elif capacity <= PREFILL_COMPACT_ROWS:
+            _gate_panel_from_fp32(
+                xg_buf, gate_w, gate_bias, num_tokens, indices, weights, capacity, decode, True,
+                PREFILL_GATE_M_TILE, PREFILL_COMPACT_N_TILE, PREFILL_COMPACT_K_TILE, PREFILL_COMPACT_SORT_TILE,
+            )
+        else:
+            _gate_panel_from_fp32(
+                xg_buf, gate_w, gate_bias, num_tokens, indices, weights, capacity, decode, True,
+                PREFILL_GATE_M_TILE, PREFILL_GATE_N_TILE, PREFILL_GATE_K_TILE, ROUTE_SELECT_T_TILE,
+            )
+    else:
+        _gate_panel_from_fp32(
+            xg_buf, gate_w, gate_bias, num_tokens, indices, weights, capacity, decode, False,
+            GATE_M_TILE, GATE_N_TILE, GATE_D_TILE, ROUTE_SELECT_T_TILE,
+        )
+    return weights
+
+
+@pl.jit.inline
+def _gate_panel_from_fp32(
+    xg_buf: pl.Tensor,
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+    indices: pl.Tensor,
+    weights: pl.Tensor,
+    capacity: pl.constexpr,
+    decode: pl.constexpr,
+    dense_prefill: pl.constexpr,
+    m_tile: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+    sort_tile: pl.constexpr,
+):
     padded_rows = (capacity + GATE_M_TILE - 1) // GATE_M_TILE * GATE_M_TILE
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
@@ -194,38 +292,53 @@ def gate_from_fp32(
     task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
     task_gate_tiles = (task_tokens + GATE_M_TILE - 1) // GATE_M_TILE
 
-    biased_scores_buf = pl.create_tensor([padded_rows, SCORE_PAD], dtype=pl.FP32)
+    route_scores_buf = pl.create_tensor([padded_rows, SCORE_PAD], dtype=pl.FP32)
+    biased_scores_buf = route_scores_buf
+    if not dense_prefill:
+        biased_scores_buf = pl.create_tensor([padded_rows, SCORE_PAD], dtype=pl.FP32)
     if active_tokens < capacity:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
-            for zt in pl.range(active_tokens, capacity):
-                for zk in pl.range(TOPK):
-                    zero_index = pl.cast(0, pl.INT32)
-                    pl.write(indices, [zt, zk], zero_index)
-                    zero_weight = pl.cast(0.0, pl.FP32)
-                    pl.write(weights, [zt, zk], zero_weight)
+        if not decode and capacity >= 256 and capacity % ROUTE_SELECT_T_TILE == 0:
+            # The TopK writer fills the active prefix of the first cleared tile.
+            first_tile = active_tokens // ROUTE_SELECT_T_TILE
+            tail_tiles = capacity // ROUTE_SELECT_T_TILE - first_tile
+            workers = pl.min(tail_tiles, ROUTE_SELECT_WORKERS)
+            for worker in pl.spmd(workers, name_hint="gate_clear_tail"):
+                zero_ids = pl.full([ROUTE_SELECT_T_TILE, TOPK_PAD], dtype=pl.INT32, value=0)
+                zero_weights = pl.full([ROUTE_SELECT_T_TILE, TOPK_PAD], dtype=pl.FP32, value=0.0)
+                for tile in pl.range(first_tile + worker, capacity // ROUTE_SELECT_T_TILE, workers):
+                    row = tile * ROUTE_SELECT_T_TILE
+                    indices[row : row + ROUTE_SELECT_T_TILE, :] = pl.set_validshape(zero_ids, ROUTE_SELECT_T_TILE, TOPK)
+                    weights[row : row + ROUTE_SELECT_T_TILE, :] = pl.set_validshape(zero_weights, ROUTE_SELECT_T_TILE, TOPK)
+        else:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
+                for zt in pl.range(active_tokens, capacity):
+                    for zk in pl.range(TOPK):
+                        zero_index = pl.cast(0, pl.INT32)
+                        pl.write(indices, [zt, zk], zero_index)
+                        zero_weight = pl.cast(0.0, pl.FP32)
+                        pl.write(weights, [zt, zk], zero_weight)
     if N_EXPERTS < SCORE_PAD:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_score_pad"):
             biased_pad = pl.full([padded_rows, SCORE_PAD - N_EXPERTS], dtype=pl.FP32, value=FP32_NEG_INF)
             biased_scores_buf[:, N_EXPERTS:SCORE_PAD] = biased_pad
 
-    route_scores_buf = pl.create_tensor([padded_rows, SCORE_PAD], dtype=pl.FP32)
     # Reserve the available clusters before any local Cube-to-Vector transfer.
     gate_bias_matrix = pl.reshape(gate_bias, [1, N_EXPERTS])
     gate_tasks = task_gate_tiles * ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
-    if not decode and capacity == 2048 and N_EXPERTS == SCORE_PAD:
-        token_panels = (task_tokens + PREFILL_GATE_M_TILE - 1) // PREFILL_GATE_M_TILE
-        project_tasks = token_panels * (N_EXPERTS // PREFILL_GATE_N_TILE)
+    if dense_prefill:
+        token_panels = (task_tokens + m_tile - 1) // m_tile
+        project_tasks = token_panels * (N_EXPERTS // n_tile)
         project_workers = pl.min(project_tasks, 512)
         for worker in pl.spmd(project_workers, name_hint="gate_project"):
             for task in pl.range(worker, project_tasks, project_workers):
-                row = task // (N_EXPERTS // PREFILL_GATE_N_TILE) * PREFILL_GATE_M_TILE
-                expert = task % (N_EXPERTS // PREFILL_GATE_N_TILE) * PREFILL_GATE_N_TILE
-                dot = pl.create_tensor([PREFILL_GATE_M_TILE, PREFILL_GATE_N_TILE], dtype=pl.FP32)
-                for inner in pl.pipeline(0, D, PREFILL_GATE_K_TILE, stage=2):
-                    panel = xg_buf[row : row + PREFILL_GATE_M_TILE, inner : inner + PREFILL_GATE_K_TILE]
-                    matrix = gate_w[expert : expert + PREFILL_GATE_N_TILE, inner : inner + PREFILL_GATE_K_TILE]
+                row = task // (N_EXPERTS // n_tile) * m_tile
+                expert = task % (N_EXPERTS // n_tile) * n_tile
+                dot = pl.create_tensor([m_tile, n_tile], dtype=pl.FP32)
+                for inner in pl.pipeline(0, D, k_tile, stage=2):
+                    panel = xg_buf[row : row + m_tile, inner : inner + k_tile]
+                    matrix = gate_w[expert : expert + n_tile, inner : inner + k_tile]
                     dot = pl.matmul_acc(dot, panel, matrix, b_trans=True, init_cond=(inner == 0))
-                route_scores_buf[row : row + PREFILL_GATE_M_TILE, expert : expert + PREFILL_GATE_N_TILE] = dot
+                route_scores_buf[row : row + m_tile, expert : expert + n_tile] = dot
     else:
         gate_workers = pl.min(gate_tasks, pl.min(GATE_WORKERS, pl.system.available_cluster_count()))
         for gate_worker in pl.spmd(gate_workers, name_hint="gate"):
@@ -307,23 +420,23 @@ def gate_from_fp32(
     else:
         # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
         # does not emit an invalid function for a route_hash path that does no work.
-        task_route_tiles = (task_tokens + ROUTE_SELECT_T_TILE - 1) // ROUTE_SELECT_T_TILE
+        task_route_tiles = (task_tokens + sort_tile - 1) // sort_tile
         route_workers = pl.min(task_route_tiles, ROUTE_SELECT_WORKERS)
         for route_worker in pl.spmd(route_workers, name_hint="route_sort"):
             for ts_idx in pl.range(route_worker, task_route_tiles, route_workers):
-                t1 = ts_idx * ROUTE_SELECT_T_TILE
+                t1 = ts_idx * sort_tile
                 # ptoas pto.tmrgsort requires a single source row. Keep the
                 # row-wise sort inside a larger worker tile to amortize launch and
                 # synchronization overhead across the prefill batch.
-                topk_idx_tile = pl.create_tensor([ROUTE_SELECT_T_TILE, TOPK_PAD], dtype=pl.INT32)
-                rows_to_sort = pl.cast(ROUTE_SELECT_T_TILE, pl.INDEX)
+                topk_idx_tile = pl.create_tensor([sort_tile, TOPK_PAD], dtype=pl.INT32)
+                rows_to_sort = pl.cast(sort_tile, pl.INDEX)
                 if decode:
-                    rows_to_sort = pl.max(0, pl.min(ROUTE_SELECT_T_TILE, active_tokens - t1))
-                    topk_idx_tile[:, :] = pl.full([ROUTE_SELECT_T_TILE, TOPK_PAD], dtype=pl.INT32, value=0)
-                dense_scores = pl.create_tensor([ROUTE_SELECT_T_TILE, SCORE_PAD], dtype=pl.FP32)
-                biased_panel = pl.create_tensor([ROUTE_SELECT_T_TILE, SCORE_PAD], dtype=pl.FP32)
-                if not decode and capacity == 2048 and N_EXPERTS == SCORE_PAD:
-                    values = pl.slice(route_scores_buf, [ROUTE_SELECT_T_TILE, SCORE_PAD], [t1, 0])
+                    rows_to_sort = pl.max(0, pl.min(sort_tile, active_tokens - t1))
+                    topk_idx_tile[:, :] = pl.full([sort_tile, TOPK_PAD], dtype=pl.INT32, value=0)
+                dense_scores = pl.create_tensor([sort_tile, SCORE_PAD], dtype=pl.FP32)
+                biased_panel = pl.create_tensor([sort_tile, SCORE_PAD], dtype=pl.FP32)
+                if dense_prefill:
+                    values = pl.slice(route_scores_buf, [sort_tile, SCORE_PAD], [t1, 0])
                     tail = pl.log(pl.add(pl.exp(pl.neg(pl.abs(values))), 1.0))
                     dense_scores[:, :] = pl.sqrt(pl.add(pl.maximum(values, 0.0), tail))
                     biased_panel[:, :] = pl.col_expand_add(dense_scores, gate_bias_matrix)
@@ -331,7 +444,7 @@ def gate_from_fp32(
                 sr_index_range = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
                 sr_idx_init[:, :] = sr_index_range
                 for sr_tt in pl.range(rows_to_sort):
-                    if not decode and capacity == 2048 and N_EXPERTS == SCORE_PAD:
+                    if dense_prefill:
                         sr_row = pl.slice(biased_panel, [1, SCORE_PAD], [sr_tt, 0])
                     else:
                         sr_t = t1 + sr_tt
@@ -339,25 +452,25 @@ def gate_from_fp32(
                     sr_i = route_topk_row(sr_row, sr_idx_init)
                     topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
 
-                local_scores = pl.create_tensor([ROUTE_SELECT_T_TILE, SCORE_PAD], dtype=pl.FP32)
-                if not decode and capacity == 2048 and N_EXPERTS == SCORE_PAD:
+                local_scores = pl.create_tensor([sort_tile, SCORE_PAD], dtype=pl.FP32)
+                if dense_prefill:
                     local_scores[:, :] = dense_scores
                 else:
-                    local_scores[:, :] = route_scores_buf[t1 : t1 + ROUTE_SELECT_T_TILE, :]
+                    local_scores[:, :] = route_scores_buf[t1 : t1 + sort_tile, :]
                 gather_all = pl.gather(local_scores, dim=-1, index=topk_idx_tile)
-                gather_valid = pl.set_validshape(gather_all, ROUTE_SELECT_T_TILE, TOPK)
+                gather_valid = pl.set_validshape(gather_all, sort_tile, TOPK)
                 topk_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
                 topk_sum = pl.row_sum(topk_vals_pad)
-                denom = pl.reshape(topk_sum, [ROUTE_SELECT_T_TILE, 1])
+                denom = pl.reshape(topk_sum, [sort_tile, 1])
                 denom = pl.add(denom, 1e-20)
                 topk_normalized = pl.row_expand_div(topk_vals_pad, denom)
                 normalized_weights = pl.mul(topk_normalized, ROUTE_SCALE)
-                valid_rows = pl.min(ROUTE_SELECT_T_TILE, active_tokens - t1)
+                valid_rows = pl.min(sort_tile, active_tokens - t1)
                 if valid_rows > 0:
-                    indices[t1 : t1 + ROUTE_SELECT_T_TILE, :] = pl.set_validshape(
+                    indices[t1 : t1 + sort_tile, :] = pl.set_validshape(
                         topk_idx_tile, valid_rows, TOPK,
                     )
-                    weights[t1 : t1 + ROUTE_SELECT_T_TILE, :] = pl.set_validshape(
+                    weights[t1 : t1 + sort_tile, :] = pl.set_validshape(
                         normalized_weights, valid_rows, TOPK,
                     )
 

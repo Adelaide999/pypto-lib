@@ -339,7 +339,10 @@ def dispatch(
                     pl.tile.write(metadata, [0, 1], factor)
                     pl.tile.write(metadata, [0, 2], pl.cast(pl.cast(route, pl.INT32), pl.FP32))
                     pl.store(metadata, [row, 0], send_aux)
-                    pl.store(source, [row, 0], recv_x_out)
+                    if prefill:
+                        pl.store(source, [row, 0], recv_x)
+                    else:
+                        pl.store(source, [row, 0], recv_x_out)
 
         # The receiver computes the same expert prefixes from recv_meta.  One
         # transfer per destination therefore replaces one transfer per route.
@@ -349,11 +352,12 @@ def dispatch(
             if total > 0:
                 source_base = pl.cast(dst * (T * TOPK), pl.INDEX)
                 destination_base = pl.cast(my_rank * (T * TOPK), pl.INDEX)
-                pld.tensor.put(
-                    dst=recv_x, peer=dst, src=recv_x_out,
-                    dst_offsets=[destination_base, 0], src_offsets=[source_base, 0],
-                    shape=[total, D], chunk_rows=RECV_TILE,
-                )
+                if not prefill:
+                    pld.tensor.put(
+                        dst=recv_x, peer=dst, src=recv_x_out,
+                        dst_offsets=[destination_base, 0], src_offsets=[source_base, 0],
+                        shape=[total, D], chunk_rows=RECV_TILE,
+                    )
                 pld.tensor.put(
                     dst=recv_weights, peer=dst, src=send_aux,
                     dst_offsets=[destination_base, 0], src_offsets=[source_base, 0],
@@ -414,7 +418,8 @@ def dispatch(
                     source_count = pl.read(recv_meta_local, [src, e])
                     source_rows = pl.cast(source_count, pl.INDEX)
                     source_end = source_begin + source_rows
-                    src_base_row = src * (T * TOPK) + pl.cast(pl.read(recv_starts, [src, e]), pl.INDEX)
+                    expert_start = pl.cast(pl.read(recv_starts, [src, e]), pl.INDEX)
+                    src_base_row = src * (T * TOPK) + expert_start
                     gather_begin = pl.max(tile_row, source_begin)
                     gather_end = pl.min(tile_end, source_end)
                     # Rows for one source/expert lane are contiguous in the
@@ -422,23 +427,19 @@ def dispatch(
                     # panel and keep the route metadata scalar path below.
                     gather_rows = gather_end - gather_begin
                     if gather_rows > 0:
-                        in_row = src_base_row + gather_begin - source_begin
                         out_row = e_base_row + gather_begin
-                        recv_x_raw = pl.load(
-                            recv_x,
-                            [in_row, 0],
-                            [RECV_TILE, D],
-                            valid_shape=[gather_rows, D],
-                        )
-                        # Keep the function argument as the backing tensor.
-                        # Rebinding it here makes the SSA value created by the
-                        # gather launch escape into the earlier bulk-push
-                        # launch, which fails LegalizeSpmdLaunches.
-                        pl.store(
-                            recv_x_raw,
-                            [out_row, 0],
-                            recv_x_out,
-                        )
+                        if prefill and T != 128:
+                            # Each source stages hidden rows by destination and local expert.
+                            source_row = my_rank * (T * TOPK) + expert_start + gather_begin - source_begin
+                            pld.tensor.get(
+                                dst=recv_x_out, peer=src, src=recv_x,
+                                dst_offsets=[out_row, 0], src_offsets=[source_row, 0],
+                                shape=[gather_rows, D], chunk_rows=RECV_TILE,
+                            )
+                        else:
+                            in_row = src_base_row + gather_begin - source_begin
+                            recv_x_raw = pl.load(recv_x, [in_row, 0], [RECV_TILE, D], valid_shape=[gather_rows, D])
+                            pl.store(recv_x_raw, [out_row, 0], recv_x_out)
                     for out_col in pl.range(gather_begin, gather_end):
                         in_row = src_base_row + out_col - source_begin
                         out_row = e_base_row + out_col
