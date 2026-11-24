@@ -76,6 +76,7 @@ DECODE_LINEAR_K_PER_SPLIT = HC_DIM // DECODE_LINEAR_OK
 DECODE_NORM_T_TILE = 8
 DECODE_NORM_D_TILE = 512
 DECODE_POST_STREAM_TILE = 4
+POST_VECTOR_COLUMNS = pl.dynamic("A3_HC_POST_COLUMNS")
 DECODE_POST_D_TILE = 1280
 DECODE_POST_D_TILE_WIDE = 2560
 
@@ -437,6 +438,123 @@ def hc_sinkhorn_decode_token(
 
 
 @pl.jit.inline
+def hc_decode_token_rms(x_hc: pl.Tensor, t_dim: pl.Scalar[pl.INDEX], t_linear: pl.Scalar[pl.INDEX]):
+    """Compute the FP32 residual RMS for the short Decode paths."""
+    inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
+    # Partition each token into vector-length rows and keep its reduction local.
+    rms_view = pl.reshape(x_hc, [t_dim * DECODE_RMS_ROWS, DECODE_RMS_ROW_WIDTH])
+    for token in pl.spmd(t_dim, name_hint="mhc_rms", allow_early_resolve=True):
+        sums = pl.tile.full([1, 8], dtype=pl.FP32, value=0.0)
+        scratch = pl.create_tile([DECODE_RMS_ROWS, DECODE_RMS_ROW_WIDTH], dtype=pl.FP32)
+        values = pl.load(
+            rms_view, [token * DECODE_RMS_ROWS, 0], [DECODE_RMS_ROWS, DECODE_RMS_ROW_WIDTH],
+        )
+        squares = pl.mul(values, values)
+        rms_part = pl.reshape(pl.row_sum(squares, tmp_tile=scratch), [1, 8])
+        sums = pl.add(sums, rms_part)
+        total = pl.tile.read(sums, [0, 0])
+        for lane in pl.unroll(1, 8):
+            total = total + pl.tile.read(sums, [0, lane])
+        padded = pl.add(pl.tile.full([1, 8], dtype=pl.FP32, value=0.0), total)
+        inverse_tmp = pl.create_tile([1, 8], dtype=pl.FP32)
+        inverse = pl.tile.rsqrt(pl.add(pl.mul(padded, HC_DIM_INV), NORM_EPS), inverse_tmp, high_precision=True)
+        inverse = pl.reshape(inverse, [8, 1])
+        pl.store(pl.set_validshape(inverse, 1, 1), [token, 0], inv_rms)
+    return inv_rms
+
+
+@pl.jit.inline
+def hc_short_split_linear(x_hc: pl.Tensor, function: pl.Tensor, first: pl.constexpr, valid_columns: pl.constexpr, splits: pl.constexpr, k_tile: pl.constexpr):
+    t_dim = pl.tensor.dim(x_hc, 0)
+    x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
+    projected = pl.create_tensor([splits, 16], dtype=pl.FP32)
+    with pl.spmd(splits, name_hint="mhc_linear_part", allow_early_resolve=True):
+        worker = pl.tile.get_block_idx()
+        k0 = worker * (HC_DIM // splits)
+        acc = pl.create_tile([LINEAR_T_TILE, 16], dtype=pl.FP32)
+        for chunk in pl.pipeline(HC_DIM // splits // k_tile, stage=2):
+            col = k0 + chunk * k_tile
+            x = pl.load(x_flat, [0, col], [LINEAR_T_TILE, k_tile], valid_shape=[1, k_tile], target_memory=pl.Mem.Mat)
+            w = pl.load(function, [first, col], [16, k_tile], valid_shape=[valid_columns, k_tile], target_memory=pl.Mem.Mat)
+            acc = pl.matmul_acc(acc, x, pl.tile.transpose_view(w), init_cond=(chunk == 0))
+        pl.store(pl.set_validshape(acc, 1, 16), [worker, 0], projected)
+    return projected
+
+
+@pl.jit.inline
+def hc_short_split_coefficients(inv_rms: pl.Tensor, partials: pl.Tensor, scale: pl.Tensor, base: pl.Tensor,
+                               pre_mix: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor,
+                               residual_path: pl.constexpr, first: pl.constexpr, valid_columns: pl.constexpr, splits: pl.constexpr):
+    tokens = pl.tensor.dim(pre_mix, 0)
+    bias_row = pl.reshape(base, [1, MIX_HC])
+    residual_flat = pl.reshape(residual_mix, [tokens, HC_MULT * HC_MULT])
+    with pl.spmd(1, name_hint="mhc_mix_part"):
+        t = pl.tile.get_block_idx()
+        block = pl.load(partials, [0, 0], [splits, 16])
+        total = pl.col_sum(block)
+        inv_group = pl.load(inv_rms, [0, 0], [SINKHORN_LOAD_T_TILE, 1])
+        normalized = pl.mul(total, pl.tile.read(inv_group, [0, 0]))
+        bias = pl.load(bias_row, [0, first], [1, 16], valid_shape=[1, valid_columns])
+        bias = pl.fillpad(bias, pad_value=pl.PadValue.zero)
+        if residual_path:
+            # Four rows are replicated across the eight aligned FP32 lanes.
+            lanes = pl.tile.arange(0, [1, HC_MULT * HC_PAD], dtype=pl.INT32)
+            axis = pl.shrs(lanes, 3)
+            group = pl.shrs(lanes, 2)
+            stream = pl.sub(lanes, pl.shls(group, 2))
+            pack_index = pl.add(pl.shls(stream, 2), axis)
+            transpose_index = pl.add(pl.shls(stream, 3), axis)
+            gather_tmp = pl.create_tile([1, HC_MULT * HC_PAD], dtype=pl.INT32)
+            logits = pl.add(pl.mul(normalized, pl.read(scale, [2])), bias)
+            packed = pl.tile.gather(logits, pack_index, gather_tmp)
+            packed = pl.reshape(packed, [HC_MULT, HC_PAD])
+            maximum = pl.col_max(packed)
+            values = pl.exp(pl.col_expand_sub(packed, maximum))
+            denom = pl.col_sum(values)
+            probability = pl.add(pl.col_expand_div(values, denom), HC_EPS)
+            for _ in pl.unroll(2 * HC_SINKHORN_ITER - 1):
+                flat = pl.reshape(probability, [1, HC_MULT * HC_PAD])
+                swapped = pl.tile.gather(flat, transpose_index, gather_tmp)
+                swapped = pl.reshape(swapped, [HC_MULT, HC_PAD])
+                denom = pl.add(pl.col_sum(swapped), HC_EPS)
+                probability = pl.col_expand_div(swapped, denom)
+            final_values = pl.reshape(probability, [1, HC_MULT * HC_PAD])
+            out_lanes = pl.tile.arange(0, [1, HC_MULT * HC_MULT], dtype=pl.INT32)
+            out_index = pl.add(out_lanes, pl.shls(pl.shrs(out_lanes, 2), 2))
+            out_tmp = pl.create_tile([1, HC_MULT * HC_MULT], dtype=pl.INT32)
+            packed_output = pl.tile.gather(final_values, out_index, out_tmp)
+            pl.store(packed_output, [t, 0], residual_flat)
+        else:
+            coeff_lanes = pl.tile.arange(0, [1, HC_PAD], dtype=pl.INT32)
+            coeff_tmp = pl.create_tile([1, HC_PAD], dtype=pl.INT32)
+            pre_logits = pl.add(pl.mul(normalized, pl.read(scale, [0])), bias)
+            pre_logits = pl.tile.gather(pre_logits, coeff_lanes, coeff_tmp)
+            post_logits = pl.add(pl.mul(normalized, pl.read(scale, [1])), bias)
+            post_logits = pl.tile.gather(post_logits, pl.add(coeff_lanes, HC_MULT), coeff_tmp)
+            pre = pl.add(pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0)), HC_EPS)
+            post = pl.mul(pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0)), 2.0)
+            pl.store(pl.set_validshape(pre, 1, HC_MULT), [t, 0], pre_mix)
+            pl.store(pl.set_validshape(post, 1, HC_MULT), [t, 0], post_mix)
+
+
+@pl.jit.inline
+def hc_decode_mixes_separate_token(x_hc: pl.Tensor, function: pl.Tensor, scale: pl.Tensor, base: pl.Tensor,
+                                   pre_mix: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor):
+    # Residual normalization takes longer than the two sigmoids. Start it
+    # as soon as its own projection completes.
+    tokens = pl.tensor.dim(x_hc, 0)
+    inv = hc_decode_token_rms(x_hc, tokens, LINEAR_T_TILE)
+    residual_projection = hc_short_split_linear(x_hc, function, 8, 16, 10, 512)
+    hc_short_split_coefficients(
+        inv, residual_projection, scale, base, pre_mix, post_mix, residual_mix, True, 8, 16, 10,
+    )
+    sigmoid_projection = hc_short_split_linear(x_hc, function, 0, 8, 5, 512)
+    hc_short_split_coefficients(
+        inv, sigmoid_projection, scale, base, pre_mix, post_mix, residual_mix, False, 0, 8, 5,
+    )
+
+
+@pl.jit.inline
 def hc_decode_mixes(
     x_hc: pl.Tensor,
     function: pl.Tensor,
@@ -445,13 +563,13 @@ def hc_decode_mixes(
     pre_mix: pl.Tensor,
     post_mix: pl.Tensor,
     residual_mix: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
 ):
     """Select the short-slab Decode kernel or the shared multi-token path."""
-    tokens = pl.tensor.dim(x_hc, 0)
-    if tokens <= 1:
-        inv_rms_short, partials_short = hc_project_decode(x_hc, function, short_attention=True)
-        hc_sinkhorn_decode_token(
-            inv_rms_short, partials_short, scale, base, pre_mix, post_mix, residual_mix,
+    if num_tokens == 1:
+        x_active = pl.slice(x_hc, [1, HC_MULT, D], [0, 0, 0])
+        hc_decode_mixes_separate_token(
+            x_active, function, scale, base, pre_mix, post_mix, residual_mix,
         )
     else:
         inv_rms_common, partials_common = hc_project(x_hc, function)
@@ -521,28 +639,10 @@ def hc_project_decode(x_hc: pl.Tensor, function: pl.Tensor, short_attention: pl.
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
 
-    inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     if short_attention:
-        # Partition each token into vector-length rows and keep its reduction local.
-        rms_view = pl.reshape(x_hc, [t_dim * DECODE_RMS_ROWS, DECODE_RMS_ROW_WIDTH])
-        for token in pl.spmd(t_dim, name_hint="mhc_rms", allow_early_resolve=True):
-            sums = pl.tile.full([1, 8], dtype=pl.FP32, value=0.0)
-            scratch = pl.create_tile([DECODE_RMS_ROWS, DECODE_RMS_ROW_WIDTH], dtype=pl.FP32)
-            values = pl.load(
-                rms_view, [token * DECODE_RMS_ROWS, 0], [DECODE_RMS_ROWS, DECODE_RMS_ROW_WIDTH],
-            )
-            squares = pl.mul(values, values)
-            rms_part = pl.reshape(pl.row_sum(squares, tmp_tile=scratch), [1, 8])
-            sums = pl.add(sums, rms_part)
-            total = pl.tile.read(sums, [0, 0])
-            for lane in pl.unroll(1, 8):
-                total = total + pl.tile.read(sums, [0, lane])
-            padded = pl.add(pl.tile.full([1, 8], dtype=pl.FP32, value=0.0), total)
-            inverse_tmp = pl.create_tile([1, 8], dtype=pl.FP32)
-            inverse = pl.tile.rsqrt(pl.add(pl.mul(padded, HC_DIM_INV), NORM_EPS), inverse_tmp, high_precision=True)
-            inverse = pl.reshape(inverse, [8, 1])
-            pl.store(pl.set_validshape(inverse, 1, 1), [token, 0], inv_rms)
+        inv_rms = hc_decode_token_rms(x_hc, t_dim, t_linear)
     else:
+        inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
         for block in pl.spmd((t_dim + T_TILE - 1) // T_TILE, name_hint="mhc_rms"):
             t0 = block * T_TILE
             valid_rows = pl.min(T_TILE, t_dim - t0)
@@ -932,11 +1032,12 @@ def hc_head_norm_adaptive(
     pre_mix: pl.Tensor,
     norm_weight: pl.Tensor[[D], pl.BF16],
     output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
 ):
     """Use the short Decode norm tile only for a single-token slab."""
-    tokens = pl.tensor.dim(x_hc, 0)
-    if tokens <= 1:
-        ready = hc_head_norm_decode(x_hc, pre_mix, norm_weight, output)
+    if num_tokens == 1:
+        x_active = pl.slice(x_hc, [1, HC_MULT, D], [0, 0, 0])
+        ready = hc_head_norm_decode(x_active, pre_mix, norm_weight, output)
     else:
         ready = hc_head_norm(x_hc, pre_mix, norm_weight, output)
     return ready
@@ -1043,21 +1144,48 @@ def hc_post_decode_block(
 
 
 @pl.jit.inline(auto_scope=False)
-def hc_post_collapse_block(
-    sublayer: pl.Tensor,
+def hc_post_token_tile(
+    x_tile: pl.Tile[[1, POST_VECTOR_COLUMNS], pl.FP32],
+    residual_flat: pl.Tensor,
+    post_mix: pl.Tensor,
+    mixes_flat: pl.Tensor,
+    output_flat: pl.Tensor,
+    col: pl.Scalar[pl.INDEX],
+    columns: pl.constexpr,
+):
+    """Mix one FFN Decode token from a BF16-rounded TP tile."""
+    update_tile = pl.reshape(x_tile, [1, columns])
+    r0 = pl.load(residual_flat, [0, col], [1, columns])
+    r1 = pl.load(residual_flat, [0, 1 * D + col], [1, columns])
+    r2 = pl.load(residual_flat, [0, 2 * D + col], [1, columns])
+    r3 = pl.load(residual_flat, [0, 3 * D + col], [1, columns])
+    for stream in pl.unroll(HC_MULT):
+        update = pl.mul(update_tile, pl.read(post_mix, [0, stream]))
+        value = pl.add(
+            pl.mul(r0, pl.read(mixes_flat, [0, stream])),
+            pl.mul(r1, pl.read(mixes_flat, [0, 1 * HC_MULT + stream])),
+        )
+        value = pl.add(value, pl.mul(r2, pl.read(mixes_flat, [0, 2 * HC_MULT + stream])))
+        value = pl.add(value, pl.mul(r3, pl.read(mixes_flat, [0, 3 * HC_MULT + stream])))
+        result = pl.add(value, update)
+        pl.store(result, [0, stream * D + col], output_flat)
+
+
+@pl.jit.inline(auto_scope=False)
+def hc_post_collapse_tile(
+    x_tile: pl.Tile[[1, POST_VECTOR_COLUMNS], pl.FP32],
     residual_flat: pl.Tensor,
     post_mix: pl.Tensor,
     residual_mix_flat: pl.Tensor,
     output_flat: pl.Tensor,
-    block: pl.Scalar[pl.INDEX],
+    t: pl.Scalar[pl.INDEX],
+    d0: pl.Scalar[pl.INDEX],
     incoming: pl.Tensor,
     collapsed: pl.Tensor,
     d_tile: pl.constexpr,
 ):
     """Mix one Decode tile and collapse its four FP32 streams."""
-    t = block // (D // d_tile)
-    d0 = (block % (D // d_tile)) * d_tile
-    x_tile = pl.cast(pl.load(sublayer, [t, d0], [1, d_tile]), pl.FP32)
+    x_tile = pl.reshape(x_tile, [1, d_tile])
     residual0 = pl.load(residual_flat, [t, d0], [1, d_tile])
     residual1 = pl.load(residual_flat, [t, D + d0], [1, d_tile])
     residual2 = pl.load(residual_flat, [t, 2 * D + d0], [1, d_tile])
@@ -1088,6 +1216,28 @@ def hc_post_collapse_block(
     reduced = pl.cast(pl.add(first_pair, second_pair), pl.BF16, mode="rint")
     pl.store(reduced, [t, d0], collapsed)
     return collapsed
+
+
+@pl.jit.inline(auto_scope=False)
+def hc_post_collapse_block(
+    sublayer: pl.Tensor,
+    residual_flat: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix_flat: pl.Tensor,
+    output_flat: pl.Tensor,
+    block: pl.Scalar[pl.INDEX],
+    incoming: pl.Tensor,
+    collapsed: pl.Tensor,
+    d_tile: pl.constexpr,
+):
+    """Mix one Decode tile and collapse its four FP32 streams."""
+    t = block // (D // d_tile)
+    d0 = (block % (D // d_tile)) * d_tile
+    x_tile = pl.cast(pl.load(sublayer, [t, d0], [1, d_tile]), pl.FP32)
+    return hc_post_collapse_tile(
+        x_tile, residual_flat, post_mix, residual_mix_flat, output_flat,
+        t, d0, incoming, collapsed, d_tile,
+    )
 
 
 @pl.jit.inline
@@ -1545,8 +1695,9 @@ def l2_hc_decode_pre(
     pre_mix.bind_dynamic(0, T_DYN)
     post_mix.bind_dynamic(0, T_DYN)
     residual_mix.bind_dynamic(0, T_DYN)
-    hc_decode_mixes(x_hc, function, scale, base, pre_mix, post_mix, residual_mix)
-    hc_head_norm_adaptive(x_hc, incoming_pre_mix, attn_norm_weight, output)
+    num_tokens = pl.cast(pl.tensor.dim(x_hc, 0), pl.INT32)
+    hc_decode_mixes(x_hc, function, scale, base, pre_mix, post_mix, residual_mix, num_tokens)
+    hc_head_norm_adaptive(x_hc, incoming_pre_mix, attn_norm_weight, output, num_tokens)
     return output
 
 

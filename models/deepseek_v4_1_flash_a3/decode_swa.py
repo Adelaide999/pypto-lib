@@ -16,8 +16,8 @@ from .config import TP_SIZE
 from .config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
 from .sparse_attention import publish_window_row, swa_attention_partial
 from .qkv_proj_rope import decode_q_proj_rope as q_proj_rope, decode_kv_proj_rope as kv_proj_rope
-from .o_proj import decode_project_output as project_output, prefill_tp_output_all_reduce
-from .hc import hc_decode_mixes, hc_head_norm_adaptive, zero_bf16_padding, hc_post_collapse
+from .o_proj import decode_project_output as project_output, decode_tp_output_post
+from .hc import hc_decode_mixes, hc_head_norm_adaptive, zero_bf16_padding
 
 
 # model config
@@ -79,7 +79,7 @@ def decode_swa(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_head_norm_adaptive(x_hc, incoming_pre_mix, attn_norm_weight, x_norm)
+    hc_head_norm_adaptive(x_hc, incoming_pre_mix, attn_norm_weight, x_norm, num_tokens)
 
     zero_bf16_padding(x_norm, pl.min(num_tokens, pl.tensor.dim(x_norm, 0)))
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
@@ -108,17 +108,13 @@ def decode_swa(
     hc_decode_mixes(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
         attention_pre_mix, post_mix, residual_mix,
+        num_tokens,
     )
     project_output(
         attended, wo_a, wo_b, rope_cos, rope_sin, attention_output, num_tokens, True,
     )
-    reduced_output = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    prefill_tp_output_all_reduce(
-        attention_output, output_window, output_arrived, reduced_output,
-        group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
-    )
-    hc_post_collapse(
-        reduced_output, x_hc, post_mix, residual_mix, attention_pre_mix,
-        attention_hidden, ffn_input,
+    decode_tp_output_post(
+        attention_output, output_window, output_arrived, group_base, tp_rank, num_tokens, attention_epoch,
+        x_hc, post_mix, residual_mix, attention_pre_mix, attention_hidden, ffn_input,
     )
     return attention_hidden, attention_pre_mix

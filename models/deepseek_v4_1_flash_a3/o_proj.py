@@ -17,6 +17,7 @@ if not __package__:
 
 
 from .gemm import gemm_bf16_to_bf16
+from .hc import hc_post_collapse, hc_post_collapse_tile, hc_post_token_tile
 from .rope import make_pipelined_rope
 from .qkv_proj_rope import _rotate_rope
 
@@ -228,20 +229,17 @@ def prefill_tp_output_all_reduce(
 
 
 @pl.jit.inline(auto_scope=False)
-def _tp_output_all_reduce(
-    output_partial: pl.Tensor[[T_DYN, D], pl.BF16],
+def _tp_output_publish(
+    output_partial: pl.Tensor,
     output_window: pld.DistributedTensor,
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor,
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
-    output_offset: pl.Scalar[pl.INDEX],
     owner_rows: pl.constexpr,
     tile_rows: pl.constexpr,
 ):
-    """Publish TP partials or owned rows and read the destination token range."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_reuse", allow_early_resolve=False) as reuse_tid:
         for peer in pl.range(TP_SIZE):
             previous_epoch = (attention_epoch - 1) * 2
@@ -277,6 +275,29 @@ def _tp_output_all_reduce(
         for peer in pl.range(TP_SIZE):
             ready_epoch = attention_epoch * 2 - 1
             pld.system.wait(output_arrived, offsets=[peer, 0], expected=ready_epoch, cmp=pld.WaitCmp.Ge)
+    return wait_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def _tp_output_all_reduce(
+    output_partial: pl.Tensor[[T_DYN, D], pl.BF16],
+    output_window: pld.DistributedTensor,
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output: pl.Tensor,
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+    output_offset: pl.Scalar[pl.INDEX],
+    owner_rows: pl.constexpr,
+    tile_rows: pl.constexpr,
+):
+    """Publish TP partials or owned rows and read the destination token range."""
+    wait_tid = _tp_output_publish(
+        output_partial, output_window, output_arrived, group_base, tp_rank,
+        num_tokens, attention_epoch, owner_rows, tile_rows,
+    )
+    column_tiles = D // TP_COLUMNS
     with pl.spmd(64, name_hint="prefill_tp_reduce", deps=[wait_tid]) as reduce_tid:
         worker = pl.tile.get_block_idx()
         output_rows = pl.tensor.dim(output, 0)
@@ -323,6 +344,107 @@ def _tp_output_all_reduce(
             pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2, cmp=pld.WaitCmp.Ge)
         anchor = pl.read(output, [0, 0])
         pl.write(output, [0, 0], anchor)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_tp_output_post_token(
+    output_partial: pl.Tensor[[T_DYN, D], pl.BF16],
+    output_window: pld.DistributedTensor,
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
+    incoming: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    output: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    secondary: pl.Tensor[[T_DYN, D], pl.BF16],
+    owner_rows: pl.constexpr,
+):
+    """Fuse the single-token TP read with the Decode mHC Post kernel."""
+    wait_tid = _tp_output_publish(
+        output_partial, output_window, output_arrived, group_base, tp_rank,
+        num_tokens, attention_epoch, owner_rows, 1,
+    )
+    tokens = pl.tensor.dim(output_partial, 0)
+    residual_flat = pl.reshape(residual, [tokens, HC_DIM])
+    residual_mix_flat = pl.reshape(residual_mix, [tokens, HC_MULT * HC_MULT])
+    output_flat = pl.reshape(output, [tokens, HC_DIM])
+    with pl.spmd(D // TP_COLUMNS, name_hint="decode_tp_reduce_post", deps=[wait_tid]) as reduce_tid:
+        col = pl.tile.get_block_idx() * TP_COLUMNS
+        acc = pl.tile.full([1, TP_COLUMNS], dtype=pl.FP32, value=0.0)
+        if num_tokens > 0:
+            if owner_rows:
+                value = pld.tile.remote_load(output_window, peer=group_base, offsets=[0, col], shape=[1, TP_COLUMNS])
+                acc = pl.add(acc, pl.cast(value, pl.FP32))
+            else:
+                for peer in pl.range(TP_SIZE):
+                    value = pld.tile.remote_load(
+                        output_window, peer=group_base + peer, offsets=[0, col], shape=[1, TP_COLUMNS],
+                    )
+                    acc = pl.add(acc, pl.cast(value, pl.FP32))
+        reduced_tile = pl.cast(acc, pl.BF16, mode="rint")
+        reduced_f32 = pl.cast(reduced_tile, pl.FP32)
+        if owner_rows:
+            pl.store(reduced_tile, [0, col], secondary)
+            hc_post_token_tile(
+                reduced_f32, residual_flat, post_mix, residual_mix_flat, output_flat, col, TP_COLUMNS,
+            )
+        else:
+            hc_post_collapse_tile(
+                reduced_f32, residual_flat, post_mix, residual_mix_flat, output_flat,
+                pl.cast(0, pl.INDEX), col, incoming, secondary, TP_COLUMNS,
+            )
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_release", deps=[reduce_tid]) as release_tid:
+        for peer in pl.range(TP_SIZE):
+            pld.system.notify(
+                output_arrived,
+                peer=group_base + peer, offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
+            )
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_consumed", deps=[release_tid],
+               allow_early_resolve=False):
+        for peer in pl.range(TP_SIZE):
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2, cmp=pld.WaitCmp.Ge)
+        output_anchor = pl.read(output, [0, 0, 0])
+        pl.write(output, [0, 0, 0], output_anchor)
+        secondary_anchor = pl.read(secondary, [0, 0])
+        pl.write(secondary, [0, 0], secondary_anchor)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_tp_output_post(
+    output_partial: pl.Tensor[[T_DYN, D], pl.BF16],
+    output_window: pld.DistributedTensor,
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
+    incoming: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    output: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    collapsed: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Fuse one Decode token's local TP reduction and mHC Post."""
+    tokens = pl.tensor.dim(output_partial, 0)
+    if num_tokens == 1:
+        decode_tp_output_post_token(
+            output_partial, output_window, output_arrived, group_base, tp_rank, num_tokens, attention_epoch,
+            residual, post_mix, residual_mix, incoming, output, collapsed, False,
+        )
+    else:
+        reduced = pl.create_tensor([tokens, D], dtype=pl.BF16)
+        prefill_tp_output_all_reduce(
+            output_partial, output_window, output_arrived, reduced,
+            group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
+        )
+        hc_post_collapse(reduced, residual, post_mix, residual_mix, incoming, output, collapsed)
     return output
 
 

@@ -14,7 +14,7 @@ from .gemm import quantize_activation
 import pypto.language.distributed as pld
 from .config import TP_SIZE
 from .qkv_proj_rope import decode_q_proj_rope as q_proj_rope, decode_kv_proj_rope as kv_proj_rope
-from .o_proj import decode_o_proj as o_proj, prefill_tp_output_all_reduce
+from .o_proj import decode_o_proj as o_proj, decode_tp_output_post
 from .decode_indexer import (
     select_candidate_block_pool, c1a_index, score_select_c1a_groups,
     publish_index_rows, c1a_project_index_key, c1a_rotate_index_key,
@@ -23,7 +23,7 @@ from .sparse_attention import (
     attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
     WORKERS as ATTEND_WORKER_TILE,
 )
-from .hc import hc_decode_mixes, hc_head_norm_adaptive, hc_post_collapse
+from .hc import hc_decode_mixes, hc_head_norm_adaptive
 from .config import (
     LOCAL_T_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN,
     CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN,
@@ -111,9 +111,10 @@ def decode_c1a_full(
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     hc_decode_mixes(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix,
+        num_tokens,
     )
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    x_ready = hc_head_norm_adaptive(x_hc, pre_mix, attn_norm_weight, x_norm)
+    x_ready = hc_head_norm_adaptive(x_hc, pre_mix, attn_norm_weight, x_norm, num_tokens)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
@@ -190,13 +191,8 @@ def decode_c1a_full(
     o_proj(
         attended, wo_a, wo_b, rope_cos, rope_sin, attn_out, num_tokens,
     )
-    reduced_output = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    prefill_tp_output_all_reduce(
-        attn_out, output_window, output_arrived, reduced_output,
-        group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
-    )
-    hc_post_collapse(
-        reduced_output, x_hc, post_mix, residual_mix, next_pre_mix,
-        output, ffn_input,
+    decode_tp_output_post(
+        attn_out, output_window, output_arrived, group_base, tp_rank, num_tokens, attention_epoch,
+        x_hc, post_mix, residual_mix, next_pre_mix, output, ffn_input,
     )
     return output

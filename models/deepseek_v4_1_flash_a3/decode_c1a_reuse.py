@@ -16,13 +16,13 @@ from .config import (
     COMPRESSED_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN,
     LOCAL_T_DYN,
 )
-from .hc import hc_decode_mixes, hc_head_norm_adaptive, hc_post_collapse
+from .hc import hc_decode_mixes, hc_head_norm_adaptive
 from .qkv_proj_rope import decode_q_proj_rope as q_proj_rope, decode_kv_proj_rope as kv_proj_rope
 from .sparse_attention import (
     gather_packed, attend_selected, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
     WORKERS as ATTEND_WORKER_TILE,
 )
-from .o_proj import decode_o_proj as o_proj, prefill_tp_output_all_reduce
+from .o_proj import decode_o_proj as o_proj, decode_tp_output_post
 
 
 # model config
@@ -85,7 +85,7 @@ def decode_c1a_reuse(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    x_ready = hc_head_norm_adaptive(x_hc, pre_mix, attn_norm_weight, x_norm)
+    x_ready = hc_head_norm_adaptive(x_hc, pre_mix, attn_norm_weight, x_norm, num_tokens)
 
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
@@ -117,18 +117,14 @@ def decode_c1a_reuse(
     attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64, ATTEND_WORKER_TILE)
     hc_decode_mixes(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix,
+        num_tokens,
     )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     o_proj(
         attended, wo_a, wo_b, rope_cos, rope_sin, attn_out, num_tokens,
     )
-    reduced_output = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    prefill_tp_output_all_reduce(
-        attn_out, output_window, output_arrived, reduced_output,
-        group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
-    )
-    hc_post_collapse(
-        reduced_output, x_hc, post_mix, residual_mix, next_pre_mix,
-        output, ffn_input,
+    decode_tp_output_post(
+        attn_out, output_window, output_arrived, group_base, tp_rank, num_tokens, attention_epoch,
+        x_hc, post_mix, residual_mix, next_pre_mix, output, ffn_input,
     )
     return output
