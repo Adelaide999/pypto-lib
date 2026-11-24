@@ -56,6 +56,11 @@ SIGNAL_PAD = 128  # 512-byte padded monotonic counter lane
 
 # tiling
 RECV_TILE = 16
+DISPATCH_COUNT_TILE = 128
+WIDE_DISPATCH_COUNTS = T >= 512 and T % DISPATCH_COUNT_TILE == 0
+DISPATCH_PEER_TILE = (N_LOCAL + 15) // 16 * 16 if WIDE_DISPATCH_COUNTS else N_LOCAL
+DISPATCH_TOTAL_TILE = 16 if WIDE_DISPATCH_COUNTS else 1
+DISPATCH_SHARDS = T // DISPATCH_COUNT_TILE if WIDE_DISPATCH_COUNTS else 1
 # Local owner rows are interleaved across TP ranks.  Panel copies amortize the
 # wide hidden-vector transfer while keeping the temporary below the A3 vector
 # buffer limit.
@@ -85,6 +90,71 @@ def clear_moe_signals(
 
 
 @pl.jit.inline
+def _publish_wide_route_counts(
+    indices: pl.Tensor,
+    route_slots: pl.Tensor,
+    send_starts: pl.Tensor,
+    send_totals: pl.Tensor,
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, SIGNAL_PAD], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    """Assign stable route slots per token block and publish expert counts by destination."""
+    partial = pl.create_tensor([DISPATCH_SHARDS, N_RANKS * DISPATCH_PEER_TILE], dtype=pl.INT32)
+    with pl.spmd(DISPATCH_SHARDS, name_hint="dispatch_meta_count", deps=[ready], allow_early_resolve=False) as counted:
+        shard = pl.tile.get_block_idx()
+        begin = shard * DISPATCH_COUNT_TILE
+        active = pl.max(0, pl.min(DISPATCH_COUNT_TILE, num_tokens - begin))
+        cursor = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
+        for expert in pl.range(N_RANKS * N_LOCAL):
+            cursor[expert] = 0
+        ids = pl.tile.load(
+            indices, [begin, 0], [DISPATCH_COUNT_TILE, ROUTE_WIDTH], valid_shape=[DISPATCH_COUNT_TILE, TOPK],
+        )
+        slots = pl.tile.full([DISPATCH_COUNT_TILE, ROUTE_WIDTH], dtype=pl.INT32, value=0)
+        for token in pl.range(active):
+            for choice in pl.range(TOPK):
+                expert_id = pl.tile.read(ids, [token, choice])
+                slot = cursor[expert_id]
+                pl.tile.write(slots, [token, choice], slot)
+                cursor[expert_id] = slot + 1
+        pl.store(slots, [begin, 0], route_slots)
+        counts = pl.tile.full([1, N_RANKS * DISPATCH_PEER_TILE], dtype=pl.INT32, value=0)
+        for dst in pl.range(N_RANKS):
+            for local in pl.range(N_LOCAL):
+                pl.tile.write(counts, [0, dst * DISPATCH_PEER_TILE + local], cursor[dst * N_LOCAL + local])
+        pl.store(counts, [shard, 0], partial)
+
+    shard_starts = pl.reshape(send_starts, [DISPATCH_SHARDS, N_RANKS * DISPATCH_PEER_TILE])
+    meta_stage = pl.create_tensor([N_RANKS, DISPATCH_PEER_TILE], dtype=pl.INT32)
+    with pl.spmd(N_RANKS, name_hint="dispatch_meta_publish", deps=[counted], allow_early_resolve=False) as published:
+        peer = pl.tile.get_block_idx()
+        counts = pl.tile.load(partial, [0, peer * DISPATCH_PEER_TILE], [DISPATCH_SHARDS, DISPATCH_PEER_TILE])
+        offsets = pl.tile.full([DISPATCH_SHARDS, DISPATCH_PEER_TILE], dtype=pl.INT32, value=0)
+        meta = pl.tile.full([1, DISPATCH_PEER_TILE], dtype=pl.INT32, value=0)
+        total = pl.const(0, pl.INT32)
+        for local in pl.range(N_LOCAL):
+            first = total
+            for shard in pl.range(DISPATCH_SHARDS):
+                pl.tile.write(offsets, [shard, local], total)
+                total = total + pl.tile.read(counts, [shard, local])
+            pl.tile.write(meta, [0, local], total - first)
+        pl.store(offsets, [0, peer * DISPATCH_PEER_TILE], shard_starts)
+        pl.store(meta, [peer, 0], meta_stage)
+        pl.write(send_totals, [peer * DISPATCH_TOTAL_TILE], total)
+        pld.tensor.put(
+            dst=recv_meta, peer=peer, src=meta_stage,
+            dst_offsets=[my_rank, 0], src_offsets=[peer, 0], shape=[1, N_LOCAL],
+        )
+        if peer != my_rank:
+            pld.system.notify(target=arrived, peer=peer, offsets=[my_rank, 0], value=moe_epoch, op=pld.NotifyOp.Set)
+    return published
+
+
+@pl.jit.inline
 def dispatch(
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     x_norm_mx: pl.Tensor[[T, D], pl.INT8],
@@ -110,57 +180,65 @@ def dispatch(
     x_norm_mx_raw = x_norm_mx
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reuse_wait", deps=[reuse_deps]) as _reuse_tid:
         _anchor = pl.read(indices, [0, 0])
-    send_starts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
+    send_starts = pl.create_tensor([DISPATCH_SHARDS * N_RANKS, DISPATCH_PEER_TILE], dtype=pl.INT32)
     recv_starts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
     route_slots = pl.create_tensor([T, ROUTE_WIDTH], dtype=pl.INT32)
-    # Stage routes in destination-major order so each peer can receive a
-    # contiguous hidden and metadata range.
-    send_aux = pl.create_tensor([ROUTED_RECV_ROWS, AUX_WIDTH], dtype=pl.FP32)
-    send_totals = pl.create_tensor([N_RANKS], dtype=pl.INT32)
-    meta_stage = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    # Publish per-source route counts.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_publish", deps=[_reuse_tid], allow_early_resolve=True) as _meta_push_tid:
-        active_tokens = pl.cast(num_tokens, pl.INDEX)
-        if active_tokens < 0:
-            active_tokens = pl.cast(0, pl.INDEX)
-        if active_tokens > T:
-            active_tokens = pl.cast(T, pl.INDEX)
+    send_totals = pl.create_tensor([N_RANKS * DISPATCH_TOTAL_TILE], dtype=pl.INT32)
+    meta_tids = pl.array.create(1, pl.TASK_ID)
+    if prefill and WIDE_DISPATCH_COUNTS:
+        counted = _publish_wide_route_counts(
+            indices, route_slots, send_starts, send_totals, recv_meta, arrived,
+            num_tokens, my_rank, moe_epoch, _reuse_tid,
+        )
+        meta_tids[0] = counted
+    else:
+        meta_stage = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32)
+        # Publish per-source route counts.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_publish", deps=[_reuse_tid], allow_early_resolve=True) as published:
+            active_tokens = pl.cast(num_tokens, pl.INDEX)
+            if active_tokens < 0:
+                active_tokens = pl.cast(0, pl.INDEX)
+            if active_tokens > T:
+                active_tokens = pl.cast(T, pl.INDEX)
 
-        # Count how many routes land in each (dst, loc_e) lane (no payload move).
-        cursor = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
-        for d in pl.range(N_RANKS):
-            for e in pl.range(N_LOCAL):
-                cursor[d * N_LOCAL + e] = 0
-        indices_tile = pl.tile.load(indices, [0, 0], [T, ROUTE_WIDTH], valid_shape=[T, TOPK])
-        slot_tile = pl.tile.full([T, ROUTE_WIDTH], dtype=pl.INT32, value=0)
-        for t in pl.range(active_tokens):
-            for k in pl.range(TOPK):
-                eid = pl.tile.read(indices_tile, [t, k])
-                slot = cursor[eid]
-                pl.tile.write(slot_tile, [t, k], slot)
-                cursor[eid] = slot + 1
-        pl.store(slot_tile, [0, 0], route_slots)
+            # Count how many routes land in each (dst, loc_e) lane (no payload move).
+            cursor = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
+            for d in pl.range(N_RANKS):
+                for e in pl.range(N_LOCAL):
+                    cursor[d * N_LOCAL + e] = 0
+            indices_tile = pl.tile.load(indices, [0, 0], [T, ROUTE_WIDTH], valid_shape=[T, TOPK])
+            slot_tile = pl.tile.full([T, ROUTE_WIDTH], dtype=pl.INT32, value=0)
+            for t in pl.range(active_tokens):
+                for k in pl.range(TOPK):
+                    eid = pl.tile.read(indices_tile, [t, k])
+                    slot = cursor[eid]
+                    pl.tile.write(slot_tile, [t, k], slot)
+                    cursor[eid] = slot + 1
+            pl.store(slot_tile, [0, 0], route_slots)
 
-        meta_tile = pl.tile.full([1, (N_LOCAL + 7) // 8 * 8], dtype=pl.INT32, value=0)
-        for dst in pl.range(N_RANKS):
-            prefix = pl.const(0, pl.INT32)
-            for e in pl.range(N_LOCAL):
-                count = cursor[dst * N_LOCAL + e]
-                pl.write(send_starts, [dst, e], prefix)
-                pl.tile.write(meta_tile, [0, e], count)
-                prefix = prefix + count
-            meta_valid = pl.tile.set_validshape(meta_tile, 1, N_LOCAL)
-            meta_stage = pl.store(meta_valid, [dst, 0], meta_stage)
-            pld.tensor.put(
-                dst=recv_meta, peer=dst, src=meta_stage,
-                dst_offsets=[my_rank, 0], src_offsets=[dst, 0], shape=[1, N_LOCAL],
-            )
-            pl.write(send_totals, [dst], prefix)
-            if dst != my_rank:
-                pld.system.notify(
-                    target=arrived, peer=dst, offsets=[my_rank, 0],
-                    value=moe_epoch, op=pld.NotifyOp.Set,
+            meta_tile = pl.tile.full([1, (N_LOCAL + 7) // 8 * 8], dtype=pl.INT32, value=0)
+            for dst in pl.range(N_RANKS):
+                prefix = pl.const(0, pl.INT32)
+                for e in pl.range(N_LOCAL):
+                    count = cursor[dst * N_LOCAL + e]
+                    pl.write(send_starts, [dst, e], prefix)
+                    pl.tile.write(meta_tile, [0, e], count)
+                    prefix = prefix + count
+                meta_valid = pl.tile.set_validshape(meta_tile, 1, N_LOCAL)
+                meta_stage = pl.store(meta_valid, [dst, 0], meta_stage)
+                pld.tensor.put(
+                    dst=recv_meta, peer=dst, src=meta_stage,
+                    dst_offsets=[my_rank, 0], src_offsets=[dst, 0], shape=[1, N_LOCAL],
                 )
+                if not prefill or T != 128:
+                    pl.write(send_totals, [dst * DISPATCH_TOTAL_TILE], prefix)
+                if dst != my_rank:
+                    pld.system.notify(
+                        target=arrived, peer=dst, offsets=[my_rank, 0],
+                        value=moe_epoch, op=pld.NotifyOp.Set,
+                    )
+        meta_tids[0] = published
+    _meta_push_tid = meta_tids[0]
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_wait") as _meta_wait_tid:
         for src in pl.range(N_RANKS):
@@ -187,58 +265,96 @@ def dispatch(
             pl.write(recv_count_out, [e, 1], expert_prefix)
             expert_prefix = expert_prefix + pl.cast((acc + 15) // 16 * 16, pl.INT32)
 
-    active_tokens = pl.max(0, pl.min(num_tokens, T))
-    workers = pl.max(1, pl.min(active_tokens, 48))
-    with pl.spmd(workers, name_hint="dispatch_pack", deps=[_meta_push_tid], allow_early_resolve=False) as _pack_tid:
-        worker = pl.tile.get_block_idx()
-        for token in pl.range(worker, active_tokens, workers):
-            # A token has TOPK destinations, but the quantized hidden vector
-            # is shared by all of them. Load it once and reuse the tile for
-            # each destination-major staging row.
-            source = pl.load(x_norm_mx_raw, [token, 0], [1, D])
-            factor = pl.read(x_norm_scale, [0, token])
-            for choice in pl.range(TOPK):
-                route = token * TOPK + choice
+    # For 128-row slabs, scattering directly avoids a second full hidden copy.
+    push_tids = pl.array.create(1, pl.TASK_ID)
+    if prefill and T == 128:
+        aux_stage = pl.create_tensor([T * TOPK, AUX_WIDTH], dtype=pl.FP32)
+        routes = pl.max(0, pl.min(num_tokens, T)) * TOPK
+        workers = pl.max(1, pl.min(routes, 48))
+        with pl.spmd(workers, name_hint="dispatch_push", deps=[_meta_push_tid], allow_early_resolve=False) as direct_tid:
+            worker = pl.tile.get_block_idx()
+            for route in pl.range(worker, routes, workers):
+                token = route // TOPK
+                choice = route % TOPK
                 eid = pl.read(indices, [token, choice])
                 dst = eid // N_LOCAL
                 slot = pl.read(route_slots, [token, choice])
                 start = pl.read(send_starts, [dst, eid % N_LOCAL])
-                row = dst * (T * TOPK) + start + slot
+                row = my_rank * (T * TOPK) + start + slot
                 weight = pl.read(weights, [token, choice])
+                factor = pl.read(x_norm_scale, [0, token])
                 metadata = pl.tile.full([1, AUX_WIDTH], dtype=pl.FP32, value=0.0)
                 pl.tile.write(metadata, [0, 0], weight)
                 pl.tile.write(metadata, [0, 1], factor)
                 pl.tile.write(metadata, [0, 2], pl.cast(pl.cast(route, pl.INT32), pl.FP32))
-                pl.store(metadata, [row, 0], send_aux)
-                pl.store(source, [row, 0], recv_x_out)
-
-    # The receiver computes the same expert prefixes from recv_meta.  One
-    # transfer per destination therefore replaces one transfer per route.
-    with pl.spmd(N_RANKS, name_hint="dispatch_push", deps=[_pack_tid], allow_early_resolve=False) as _push_tid:
-        dst = pl.tile.get_block_idx()
-        total = pl.cast(pl.read(send_totals, [dst]), pl.INDEX)
-        if total > 0:
-            source_base = pl.cast(dst * (T * TOPK), pl.INDEX)
-            destination_base = pl.cast(my_rank * (T * TOPK), pl.INDEX)
-            pld.tensor.put(
-                dst=recv_x, peer=dst, src=recv_x_out,
-                dst_offsets=[destination_base, 0], src_offsets=[source_base, 0],
-                shape=[total, D], chunk_rows=RECV_TILE,
-            )
-            pld.tensor.put(
-                dst=recv_weights, peer=dst, src=send_aux,
-                dst_offsets=[destination_base, 0], src_offsets=[source_base, 0],
-                shape=[total, AUX_WIDTH], chunk_rows=RECV_TILE,
-            )
-
-        # Decode assigns the entire destination payload to this block.
-        # Notify after its puts drain, including when that peer has zero rows.
-        if not prefill:
-            if dst != my_rank:
-                pld.system.notify(
-                    target=data_arrived, peer=dst, offsets=[my_rank, 0, 0],
-                    value=moe_epoch, op=pld.NotifyOp.Set,
+                pl.store(metadata, [route, 0], aux_stage)
+                pld.tensor.put(
+                    dst=recv_x, peer=dst, src=x_norm_mx_raw,
+                    dst_offsets=[row, 0], src_offsets=[token, 0], shape=[1, D],
                 )
+                pld.tensor.put(
+                    dst=recv_weights, peer=dst, src=aux_stage,
+                    dst_offsets=[row, 0], src_offsets=[route, 0], shape=[1, AUX_WIDTH],
+                )
+        push_tids[0] = direct_tid
+    else:
+        send_aux = pl.create_tensor([ROUTED_RECV_ROWS, AUX_WIDTH], dtype=pl.FP32)
+        active_tokens = pl.max(0, pl.min(num_tokens, T))
+        workers = pl.max(1, pl.min(active_tokens, 48))
+        with pl.spmd(workers, name_hint="dispatch_pack", deps=[_meta_push_tid], allow_early_resolve=False) as _pack_tid:
+            worker = pl.tile.get_block_idx()
+            for token in pl.range(worker, active_tokens, workers):
+                # A token has TOPK destinations, but the quantized hidden vector
+                # is shared by all of them. Load it once and reuse the tile for
+                # each destination-major staging row.
+                source = pl.load(x_norm_mx_raw, [token, 0], [1, D])
+                factor = pl.read(x_norm_scale, [0, token])
+                for choice in pl.range(TOPK):
+                    route = token * TOPK + choice
+                    eid = pl.read(indices, [token, choice])
+                    dst = eid // N_LOCAL
+                    slot = pl.read(route_slots, [token, choice])
+                    if prefill and WIDE_DISPATCH_COUNTS:
+                        shard = token // DISPATCH_COUNT_TILE
+                        start = pl.read(send_starts, [shard * N_RANKS + dst, eid % N_LOCAL])
+                    else:
+                        start = pl.read(send_starts, [dst, eid % N_LOCAL])
+                    row = dst * (T * TOPK) + start + slot
+                    weight = pl.read(weights, [token, choice])
+                    metadata = pl.tile.full([1, AUX_WIDTH], dtype=pl.FP32, value=0.0)
+                    pl.tile.write(metadata, [0, 0], weight)
+                    pl.tile.write(metadata, [0, 1], factor)
+                    pl.tile.write(metadata, [0, 2], pl.cast(pl.cast(route, pl.INT32), pl.FP32))
+                    pl.store(metadata, [row, 0], send_aux)
+                    pl.store(source, [row, 0], recv_x_out)
+
+        # The receiver computes the same expert prefixes from recv_meta.  One
+        # transfer per destination therefore replaces one transfer per route.
+        with pl.spmd(N_RANKS, name_hint="dispatch_push", deps=[_pack_tid], allow_early_resolve=False) as bulk_tid:
+            dst = pl.tile.get_block_idx()
+            total = pl.cast(pl.read(send_totals, [dst * DISPATCH_TOTAL_TILE]), pl.INDEX)
+            if total > 0:
+                source_base = pl.cast(dst * (T * TOPK), pl.INDEX)
+                destination_base = pl.cast(my_rank * (T * TOPK), pl.INDEX)
+                pld.tensor.put(
+                    dst=recv_x, peer=dst, src=recv_x_out,
+                    dst_offsets=[destination_base, 0], src_offsets=[source_base, 0],
+                    shape=[total, D], chunk_rows=RECV_TILE,
+                )
+                pld.tensor.put(
+                    dst=recv_weights, peer=dst, src=send_aux,
+                    dst_offsets=[destination_base, 0], src_offsets=[source_base, 0],
+                    shape=[total, AUX_WIDTH], chunk_rows=RECV_TILE,
+                )
+            # Decode publishes from the block that owns this destination.
+            if not prefill:
+                if dst != my_rank:
+                    pld.system.notify(
+                        target=data_arrived, peer=dst, offsets=[my_rank, 0, 0],
+                        value=moe_epoch, op=pld.NotifyOp.Set,
+                    )
+        push_tids[0] = bulk_tid
+    _push_tid = push_tids[0]
 
     publish_deps = pl.array.create(1, pl.TASK_ID)
     if prefill:
@@ -447,6 +563,30 @@ def _compact_local_tokens(
 
 
 @pl.jit.inline
+def prepare_prefill_routes(
+    source: pl.Tensor,
+    norm_weight: pl.Tensor,
+    gate_weight: pl.Tensor,
+    correction_bias: pl.Tensor,
+    normed: pl.Tensor,
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    indices: pl.Tensor,
+    weights: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    capacity: pl.constexpr,
+):
+    """Normalize and route the layer's interleaved TP owner rows."""
+    local_tokens = _local_token_count(num_tokens, tp_rank)
+    if local_tokens > 0:
+        gate_input = pl.create_tensor([capacity, D], dtype=pl.FP32)
+        row_scales = pl.reshape(scales, [capacity, 1])
+        prefill_ffn_norm_quant(source, norm_weight, normed, payload, row_scales, gate_input, local_tokens, tp_rank, capacity)
+        gate_from_fp32(gate_input, gate_weight, correction_bias, local_tokens, indices, weights, capacity, decode=False)
+
+
+@pl.jit.inline
 def _decode_ffn_owner_norm(
     source: pl.Tensor[[T_DYN, D], pl.BF16],
     norm_weight: pl.Tensor[[D], pl.BF16],
@@ -541,7 +681,9 @@ def prefill_moe_sublayer(
     moe_epoch: pl.Scalar[pl.INT32],
     reuse_deps: pl.Array[1, pl.TASK_ID],
     prefill: pl.constexpr,
-    hc_precomputed: pl.constexpr = False,
+    hc_precomputed: pl.constexpr,
+    x_norm_mx: pl.Tensor[[TOKENS, D], pl.INT8],
+    x_norm_scale: pl.Tensor[[1, TOKENS], pl.FP32],
 ):
     """Collapse mHC streams, normalize compact TP owner rows, and run the EP MoE."""
     if not hc_precomputed:
@@ -560,22 +702,9 @@ def prefill_moe_sublayer(
     local_ffn_owned = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
     round_counts = pl.create_tensor([3], dtype=pl.INT32)
     with pl.scope():
-        x_norm_mx = pl.create_tensor([TOKENS, D], dtype=pl.INT8)
-        x_norm_scale = pl.create_tensor([1, TOKENS * 1], dtype=pl.FP32)
         shared_output = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
         if local_num_tokens > 0:
-            if prefill:
-                scale_view = pl.reshape(x_norm_scale, [TOKENS, 1])
-                gate_input = pl.create_tensor([TOKENS, D], dtype=pl.FP32)
-                prefill_ffn_norm_quant(
-                    ffn_input, ffn_norm_weight,
-                    local_ffn_normed, x_norm_mx, scale_view, gate_input,
-                    local_num_tokens, tp_rank, TOKENS,
-                )
-                gate_from_fp32(
-                    gate_input, gate_weight, correction_bias, local_num_tokens, indices, weights, decode=False,
-                )
-            else:
+            if not prefill:
                 _decode_ffn_owner_norm(
                     ffn_input, ffn_norm_weight, local_ffn_normed, num_tokens, tp_rank, local_num_tokens,
                 )

@@ -52,6 +52,9 @@ GATE_WORKERS = 48
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 # The 256-wide K tile halves the number of Cube launches for the 5120-wide gate.
 GATE_D_TILE = 256
+PREFILL_GATE_M_TILE = 128
+PREFILL_GATE_N_TILE = 128
+PREFILL_GATE_K_TILE = 128
 QUANT_TILE = 256
 QUANT_TASK_TILE = QUANT_TILE * 4
 MX_GROUP = 32
@@ -167,32 +170,34 @@ def gate_normalized(
             xg_buf[t0 : t0 + GATE_INPUT_TILE, :] = pl.cast(normalized, pl.FP32)
 
     return gate_from_fp32(
-        xg_buf, gate_w, gate_bias, num_tokens, indices, weights, decode=True,
+        xg_buf, gate_w, gate_bias, num_tokens, indices, weights, T, decode=True,
     )
 
 
 @pl.jit.inline
 def gate_from_fp32(
-    xg_buf: pl.Tensor[[T_PAD, D], pl.FP32],
+    xg_buf: pl.Tensor,
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
-    indices: pl.Tensor[[T, TOPK], pl.INT32],
-    weights: pl.Tensor[[T, TOPK], pl.FP32],
+    indices: pl.Tensor,
+    weights: pl.Tensor,
+    capacity: pl.constexpr,
     decode: pl.constexpr,
 ):
+    padded_rows = (capacity + GATE_M_TILE - 1) // GATE_M_TILE * GATE_M_TILE
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
-    if active_tokens > T:
-        active_tokens = pl.cast(T, pl.INDEX)
+    if active_tokens > capacity:
+        active_tokens = pl.cast(capacity, pl.INDEX)
     task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
     task_gate_tiles = (task_tokens + GATE_M_TILE - 1) // GATE_M_TILE
 
-    biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
-    if active_tokens < T:
+    biased_scores_buf = pl.create_tensor([padded_rows, SCORE_PAD], dtype=pl.FP32)
+    if active_tokens < capacity:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
-            for zt in pl.range(active_tokens, T):
+            for zt in pl.range(active_tokens, capacity):
                 for zk in pl.range(TOPK):
                     zero_index = pl.cast(0, pl.INT32)
                     pl.write(indices, [zt, zk], zero_index)
@@ -200,63 +205,78 @@ def gate_from_fp32(
                     pl.write(weights, [zt, zk], zero_weight)
     if N_EXPERTS < SCORE_PAD:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_score_pad"):
-            biased_pad = pl.full([T_PAD, SCORE_PAD - N_EXPERTS], dtype=pl.FP32, value=FP32_NEG_INF)
+            biased_pad = pl.full([padded_rows, SCORE_PAD - N_EXPERTS], dtype=pl.FP32, value=FP32_NEG_INF)
             biased_scores_buf[:, N_EXPERTS:SCORE_PAD] = biased_pad
 
-    route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
+    route_scores_buf = pl.create_tensor([padded_rows, SCORE_PAD], dtype=pl.FP32)
     # Reserve the available clusters before any local Cube-to-Vector transfer.
     gate_bias_matrix = pl.reshape(gate_bias, [1, N_EXPERTS])
     gate_tasks = task_gate_tiles * ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
-    gate_workers = pl.min(gate_tasks, pl.min(GATE_WORKERS, pl.system.available_cluster_count()))
-    for gate_worker in pl.spmd(gate_workers, name_hint="gate"):
-        # The gate matrix is streamed once per expert tile. Bypassing L2 avoids
-        # evicting the activations and routing buffers used by the following sort.
-        pl.set_cache_policy(gate_w, pl.CachePolicy.BYPASS)
-        for gb_idx in pl.range(gate_worker, gate_tasks, gate_workers):
-            tg = gb_idx // ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
-            nb = gb_idx % ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
-            t1 = tg * GATE_M_TILE
-            n0 = nb * GATE_N_TILE
-            gate_logits_tile = pl.tile.create(
-                [GATE_M_TILE, GATE_N_TILE],
-                dtype=pl.FP32,
-                target_memory=pl.MemorySpace.Acc,
-                compact=True,
-            )
-            for kb in pl.pipeline(0, D // GATE_D_TILE, stage=1):
-                gd_kd = kb * GATE_D_TILE
-                gd_x = pl.tile.load(xg_buf, [t1, gd_kd], [GATE_M_TILE, GATE_D_TILE])
-                valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
-                gd_w = pl.tile.load(
-                    gate_w,
-                    [n0, gd_kd],
-                    [GATE_N_TILE, GATE_D_TILE],
-                    valid_shape=[valid_n, GATE_D_TILE],
-                    target_memory=pl.MemorySpace.Mat,
+    if not decode and capacity == 2048 and N_EXPERTS == SCORE_PAD:
+        token_panels = (task_tokens + PREFILL_GATE_M_TILE - 1) // PREFILL_GATE_M_TILE
+        project_tasks = token_panels * (N_EXPERTS // PREFILL_GATE_N_TILE)
+        project_workers = pl.min(project_tasks, 512)
+        for worker in pl.spmd(project_workers, name_hint="gate_project"):
+            for task in pl.range(worker, project_tasks, project_workers):
+                row = task // (N_EXPERTS // PREFILL_GATE_N_TILE) * PREFILL_GATE_M_TILE
+                expert = task % (N_EXPERTS // PREFILL_GATE_N_TILE) * PREFILL_GATE_N_TILE
+                dot = pl.create_tensor([PREFILL_GATE_M_TILE, PREFILL_GATE_N_TILE], dtype=pl.FP32)
+                for inner in pl.pipeline(0, D, PREFILL_GATE_K_TILE, stage=2):
+                    panel = xg_buf[row : row + PREFILL_GATE_M_TILE, inner : inner + PREFILL_GATE_K_TILE]
+                    matrix = gate_w[expert : expert + PREFILL_GATE_N_TILE, inner : inner + PREFILL_GATE_K_TILE]
+                    dot = pl.matmul_acc(dot, panel, matrix, b_trans=True, init_cond=(inner == 0))
+                route_scores_buf[row : row + PREFILL_GATE_M_TILE, expert : expert + PREFILL_GATE_N_TILE] = dot
+    else:
+        gate_workers = pl.min(gate_tasks, pl.min(GATE_WORKERS, pl.system.available_cluster_count()))
+        for gate_worker in pl.spmd(gate_workers, name_hint="gate"):
+            # The gate matrix is streamed once per expert tile. Bypassing L2 avoids
+            # evicting the activations and routing buffers used by the following sort.
+            pl.set_cache_policy(gate_w, pl.CachePolicy.BYPASS)
+            for gb_idx in pl.range(gate_worker, gate_tasks, gate_workers):
+                tg = gb_idx // ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
+                nb = gb_idx % ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
+                t1 = tg * GATE_M_TILE
+                n0 = nb * GATE_N_TILE
+                gate_logits_tile = pl.tile.create(
+                    [GATE_M_TILE, GATE_N_TILE],
+                    dtype=pl.FP32,
+                    target_memory=pl.MemorySpace.Acc,
+                    compact=True,
                 )
-                gd_w = pl.tile.transpose_view(gd_w)
-                gate_logits_tile = pl.matmul_acc(
-                    gate_logits_tile, gd_x, gd_w, init_cond=(kb == 0),
+                for kb in pl.pipeline(0, D // GATE_D_TILE, stage=1):
+                    gd_kd = kb * GATE_D_TILE
+                    gd_x = pl.tile.load(xg_buf, [t1, gd_kd], [GATE_M_TILE, GATE_D_TILE])
+                    valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
+                    gd_w = pl.tile.load(
+                        gate_w,
+                        [n0, gd_kd],
+                        [GATE_N_TILE, GATE_D_TILE],
+                        valid_shape=[valid_n, GATE_D_TILE],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    gd_w = pl.tile.transpose_view(gd_w)
+                    gate_logits_tile = pl.matmul_acc(
+                        gate_logits_tile, gd_x, gd_w, init_cond=(kb == 0),
+                    )
+                gp_relu = pl.maximum(gate_logits_tile, 0.0)
+                gp_abs = pl.abs(gate_logits_tile)
+                gp_neg_abs = pl.neg(gp_abs)
+                gp_exp_abs = pl.exp(gp_neg_abs)
+                gp_exp_plus = pl.add(gp_exp_abs, 1.0)
+                gp_softplus_tail = pl.log(gp_exp_plus)
+                gp_softplus = pl.add(gp_relu, gp_softplus_tail)
+                gp_score = pl.sqrt(gp_softplus)
+                route_scores_buf = pl.store(gp_score, [t1, n0], route_scores_buf)
+                bias_valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
+                gp_bias_row = pl.tile.load(
+                    gate_bias_matrix,
+                    [0, n0],
+                    [1, GATE_N_TILE],
+                    valid_shape=[1, bias_valid_n],
+                    target_memory=pl.MemorySpace.Vec,
                 )
-            gp_relu = pl.maximum(gate_logits_tile, 0.0)
-            gp_abs = pl.abs(gate_logits_tile)
-            gp_neg_abs = pl.neg(gp_abs)
-            gp_exp_abs = pl.exp(gp_neg_abs)
-            gp_exp_plus = pl.add(gp_exp_abs, 1.0)
-            gp_softplus_tail = pl.log(gp_exp_plus)
-            gp_softplus = pl.add(gp_relu, gp_softplus_tail)
-            gp_score = pl.sqrt(gp_softplus)
-            route_scores_buf = pl.store(gp_score, [t1, n0], route_scores_buf)
-            bias_valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
-            gp_bias_row = pl.tile.load(
-                gate_bias_matrix,
-                [0, n0],
-                [1, GATE_N_TILE],
-                valid_shape=[1, bias_valid_n],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            gp_biased = pl.col_expand_add(gp_score, gp_bias_row)
-            biased_scores_buf = pl.store(gp_biased, [t1, n0], biased_scores_buf)
+                gp_biased = pl.col_expand_add(gp_score, gp_bias_row)
+                biased_scores_buf = pl.store(gp_biased, [t1, n0], biased_scores_buf)
 
     # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
     # does not emit an invalid function for a route_hash path that does no work.
@@ -273,17 +293,30 @@ def gate_from_fp32(
             if decode:
                 rows_to_sort = pl.max(0, pl.min(ROUTE_SELECT_T_TILE, active_tokens - t1))
                 topk_idx_tile[:, :] = pl.full([ROUTE_SELECT_T_TILE, TOPK_PAD], dtype=pl.INT32, value=0)
+            dense_scores = pl.create_tensor([ROUTE_SELECT_T_TILE, SCORE_PAD], dtype=pl.FP32)
+            biased_panel = pl.create_tensor([ROUTE_SELECT_T_TILE, SCORE_PAD], dtype=pl.FP32)
+            if not decode and capacity == 2048 and N_EXPERTS == SCORE_PAD:
+                values = pl.slice(route_scores_buf, [ROUTE_SELECT_T_TILE, SCORE_PAD], [t1, 0])
+                tail = pl.log(pl.add(pl.exp(pl.neg(pl.abs(values))), 1.0))
+                dense_scores[:, :] = pl.sqrt(pl.add(pl.maximum(values, 0.0), tail))
+                biased_panel[:, :] = pl.col_expand_add(dense_scores, gate_bias_matrix)
             sr_idx_init = pl.create_tensor([1, SCORE_PAD], dtype=pl.UINT32)
             sr_index_range = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
             sr_idx_init[:, :] = sr_index_range
             for sr_tt in pl.range(rows_to_sort):
-                sr_t = t1 + sr_tt
-                sr_row = pl.slice(biased_scores_buf, [1, SCORE_PAD], [sr_t, 0])
+                if not decode and capacity == 2048 and N_EXPERTS == SCORE_PAD:
+                    sr_row = pl.slice(biased_panel, [1, SCORE_PAD], [sr_tt, 0])
+                else:
+                    sr_t = t1 + sr_tt
+                    sr_row = pl.slice(biased_scores_buf, [1, SCORE_PAD], [sr_t, 0])
                 sr_i = route_topk_row(sr_row, sr_idx_init)
                 topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
 
             local_scores = pl.create_tensor([ROUTE_SELECT_T_TILE, SCORE_PAD], dtype=pl.FP32)
-            local_scores[:, :] = route_scores_buf[t1 : t1 + ROUTE_SELECT_T_TILE, :]
+            if not decode and capacity == 2048 and N_EXPERTS == SCORE_PAD:
+                local_scores[:, :] = dense_scores
+            else:
+                local_scores[:, :] = route_scores_buf[t1 : t1 + ROUTE_SELECT_T_TILE, :]
             gather_all = pl.gather(local_scores, dim=-1, index=topk_idx_tile)
             gather_valid = pl.set_validshape(gather_all, ROUTE_SELECT_T_TILE, TOPK)
             topk_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)

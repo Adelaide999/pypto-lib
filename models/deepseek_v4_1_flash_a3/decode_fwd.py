@@ -338,6 +338,8 @@ def decode_encoder(
             ffn_shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8] = shared_w3[layer]
             ffn_shared_w3_scale: pl.Tensor[[1, MOE_INTER], pl.FP32, pl.ND] = pl.slice(shared_w3_scale, [1, MOE_INTER], [layer * (1), 0])
             ffn_reuse_deps = pl.array.create(1, pl.TASK_ID)
+            route_payload = pl.create_tensor([MOE_TOKENS, D], dtype=pl.INT8)
+            route_scales = pl.create_tensor([1, MOE_TOKENS], dtype=pl.FP32)
             prefill_moe_sublayer(
                 attention_hidden, attention_pre_mix, ffn_hc_fn, ffn_hc_scale, ffn_hc_base,
                 layer_ffn_norm, ffn_gate_weight, ffn_correction_bias,
@@ -349,6 +351,7 @@ def decode_encoder(
                 routed_output, combine_arrived, ffn_input, ffn_owned, pre_mix, ffn_post, ffn_residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
                 local_moe_tokens, rank, rank % TP_SIZE, layer + 1, ffn_reuse_deps, False, False,
+                route_payload, route_scales,
             )
             prefill_ffn_restore(
                 attention_hidden, ffn_owned, ffn_post, ffn_residual,
@@ -561,6 +564,8 @@ def decode_decoder(
             ffn_shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8] = shared_w3[layer]
             ffn_shared_w3_scale: pl.Tensor[[1, MOE_INTER], pl.FP32, pl.ND] = pl.slice(shared_w3_scale, [1, MOE_INTER], [layer * (1), 0])
             ffn_reuse_deps = pl.array.create(1, pl.TASK_ID)
+            route_payload = pl.create_tensor([MOE_TOKENS, D], dtype=pl.INT8)
+            route_scales = pl.create_tensor([1, MOE_TOKENS], dtype=pl.FP32)
             prefill_moe_sublayer(
                 attention_hidden, attention_pre_mix, ffn_hc_fn, ffn_hc_scale, ffn_hc_base,
                 layer_ffn_norm, ffn_gate_weight, ffn_correction_bias,
@@ -572,6 +577,7 @@ def decode_decoder(
                 routed_output, combine_arrived, ffn_input, ffn_owned, pre_mix, ffn_post, ffn_residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
                 local_moe_tokens, rank, rank % TP_SIZE, layer + 1, ffn_reuse_deps, False, False,
+                route_payload, route_scales,
             )
             prefill_ffn_restore(
                 attention_hidden, ffn_owned, ffn_post, ffn_residual,
