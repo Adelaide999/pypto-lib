@@ -105,6 +105,7 @@ def dispatch(
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
     reuse_deps: pl.Array[1, pl.TASK_ID],
+    prefill: pl.constexpr,
 ):
     x_norm_mx_raw = x_norm_mx
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reuse_wait", deps=[reuse_deps]) as _reuse_tid:
@@ -230,16 +231,30 @@ def dispatch(
                 shape=[total, AUX_WIDTH], chunk_rows=RECV_TILE,
             )
 
-    # Publish one epoch only after every local payload store completes.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_publish_epoch", deps=[_push_tid], allow_early_resolve=False) as _publish_tid:
-        for dst in pl.range(N_RANKS):
+        # Decode assigns the entire destination payload to this block.
+        # Notify after its puts drain, including when that peer has zero rows.
+        if not prefill:
             if dst != my_rank:
                 pld.system.notify(
                     target=data_arrived, peer=dst, offsets=[my_rank, 0, 0],
                     value=moe_epoch, op=pld.NotifyOp.Set,
                 )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[_publish_tid]) as _wait_tid:
+    publish_deps = pl.array.create(1, pl.TASK_ID)
+    if prefill:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_publish_epoch", deps=[_push_tid],
+                   allow_early_resolve=False) as _publish_tid:
+            for dst in pl.range(N_RANKS):
+                if dst != my_rank:
+                    pld.system.notify(
+                        target=data_arrived, peer=dst, offsets=[my_rank, 0, 0],
+                        value=moe_epoch, op=pld.NotifyOp.Set,
+                    )
+        publish_deps[0] = _publish_tid
+    else:
+        publish_deps[0] = _push_tid
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[publish_deps]) as _wait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.defer_wait(
@@ -323,15 +338,29 @@ def combine_scattered(
     moe_epoch: pl.Scalar[pl.INT32],
     prefill: pl.constexpr,
 ):
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_notify", deps=[scatter_done], allow_early_resolve=False) as notify_tid:
-        for peer in pl.range(N_RANKS):
+    notify_deps = pl.array.create(1, pl.TASK_ID)
+    if prefill:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_notify", deps=[scatter_done], allow_early_resolve=False) as serial_notify_tid:
+            for peer in pl.range(N_RANKS):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_arrived, peer=peer, offsets=[my_rank, 0, 0],
+                        value=moe_epoch, op=pld.NotifyOp.Set,
+                    )
+
+        notify_deps[0] = serial_notify_tid
+    else:
+        with pl.spmd(N_RANKS, name_hint="combine_notify_peers", deps=[scatter_done],
+                     allow_early_resolve=False) as parallel_notify_tid:
+            peer = pl.tile.get_block_idx()
             if peer != my_rank:
                 pld.system.notify(
                     target=combine_arrived, peer=peer, offsets=[my_rank, 0, 0],
                     value=moe_epoch, op=pld.NotifyOp.Set,
                 )
+        notify_deps[0] = parallel_notify_tid
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[notify_tid]) as _cwait_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[notify_deps]) as _cwait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.defer_wait(
@@ -586,7 +615,7 @@ def prefill_moe_sublayer(
             recv_x_local, recv_scale_local_backing,
             recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
             recv_meta, recv_x, recv_weights,
-            arrived, data_arrived, local_num_tokens, ep_rank, moe_epoch, reuse_deps,
+            arrived, data_arrived, local_num_tokens, ep_rank, moe_epoch, reuse_deps, prefill,
         )
 
         scatter_done = expert_routed_scatter(
@@ -605,14 +634,27 @@ def prefill_moe_sublayer(
             local_num_tokens, ep_rank, moe_epoch, prefill,
         )
         # Complete all peer readers before reusing the windows.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_release", deps=[output_ready]) as released:
-            for peer in pl.range(EP_SIZE):
+        release_deps = pl.array.create(1, pl.TASK_ID)
+        if prefill:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_release", deps=[output_ready]) as serial_release_tid:
+                for peer in pl.range(EP_SIZE):
+                    if peer != ep_rank:
+                        pld.system.notify(
+                            target=combine_arrived, peer=peer, offsets=[ep_rank, 1, 0],
+                            value=moe_epoch, op=pld.NotifyOp.Set,
+                        )
+            release_deps[0] = serial_release_tid
+        else:
+            with pl.spmd(EP_SIZE, name_hint="moe_round_release_peers", deps=[output_ready],
+                         allow_early_resolve=False) as parallel_release_tid:
+                peer = pl.tile.get_block_idx()
                 if peer != ep_rank:
                     pld.system.notify(
                         target=combine_arrived, peer=peer, offsets=[ep_rank, 1, 0],
                         value=moe_epoch, op=pld.NotifyOp.Set,
                     )
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_released", deps=[released]) as round_ready:
+            release_deps[0] = parallel_release_tid
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_released", deps=[release_deps]) as round_ready:
             for peer in pl.range(EP_SIZE):
                 if peer != ep_rank:
                     pld.system.defer_wait(
