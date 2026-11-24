@@ -176,6 +176,7 @@ def dispatch(
     moe_epoch: pl.Scalar[pl.INT32],
     reuse_deps: pl.Array[1, pl.TASK_ID],
     prefill: pl.constexpr,
+    source_mask: pl.Scalar[pl.INDEX] = 0,
 ):
     x_norm_mx_raw = x_norm_mx
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reuse_wait", deps=[reuse_deps]) as _reuse_tid:
@@ -201,48 +202,55 @@ def dispatch(
             if active_tokens > T:
                 active_tokens = pl.cast(T, pl.INDEX)
 
-            # Count how many routes land in each (dst, loc_e) lane (no payload move).
-            cursor = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
-            for d in pl.range(N_RANKS):
-                for e in pl.range(N_LOCAL):
-                    cursor[d * N_LOCAL + e] = 0
-            indices_tile = pl.tile.load(indices, [0, 0], [T, ROUTE_WIDTH], valid_shape=[T, TOPK])
-            slot_tile = pl.tile.full([T, ROUTE_WIDTH], dtype=pl.INT32, value=0)
-            for t in pl.range(active_tokens):
-                for k in pl.range(TOPK):
-                    eid = pl.tile.read(indices_tile, [t, k])
-                    slot = cursor[eid]
-                    pl.tile.write(slot_tile, [t, k], slot)
-                    cursor[eid] = slot + 1
-            pl.store(slot_tile, [0, 0], route_slots)
+            if prefill or active_tokens > 0:
+                # Count how many routes land in each (dst, loc_e) lane (no payload move).
+                cursor = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
+                for d in pl.range(N_RANKS):
+                    for e in pl.range(N_LOCAL):
+                        cursor[d * N_LOCAL + e] = 0
+                indices_tile = pl.tile.load(indices, [0, 0], [T, ROUTE_WIDTH], valid_shape=[T, TOPK])
+                slot_tile = pl.tile.full([T, ROUTE_WIDTH], dtype=pl.INT32, value=0)
+                for t in pl.range(active_tokens):
+                    for k in pl.range(TOPK):
+                        eid = pl.tile.read(indices_tile, [t, k])
+                        slot = cursor[eid]
+                        pl.tile.write(slot_tile, [t, k], slot)
+                        cursor[eid] = slot + 1
+                pl.store(slot_tile, [0, 0], route_slots)
 
-            meta_tile = pl.tile.full([1, (N_LOCAL + 7) // 8 * 8], dtype=pl.INT32, value=0)
-            for dst in pl.range(N_RANKS):
-                prefix = pl.const(0, pl.INT32)
-                for e in pl.range(N_LOCAL):
-                    count = cursor[dst * N_LOCAL + e]
-                    pl.write(send_starts, [dst, e], prefix)
-                    pl.tile.write(meta_tile, [0, e], count)
-                    prefix = prefix + count
-                meta_valid = pl.tile.set_validshape(meta_tile, 1, N_LOCAL)
-                meta_stage = pl.store(meta_valid, [dst, 0], meta_stage)
-                pld.tensor.put(
-                    dst=recv_meta, peer=dst, src=meta_stage,
-                    dst_offsets=[my_rank, 0], src_offsets=[dst, 0], shape=[1, N_LOCAL],
-                )
-                if not prefill or T != 128:
-                    pl.write(send_totals, [dst * DISPATCH_TOTAL_TILE], prefix)
-                if dst != my_rank:
-                    pld.system.notify(
-                        target=arrived, peer=dst, offsets=[my_rank, 0],
-                        value=moe_epoch, op=pld.NotifyOp.Set,
+                meta_tile = pl.tile.full([1, (N_LOCAL + 7) // 8 * 8], dtype=pl.INT32, value=0)
+                for dst in pl.range(N_RANKS):
+                    prefix = pl.const(0, pl.INT32)
+                    for e in pl.range(N_LOCAL):
+                        count = cursor[dst * N_LOCAL + e]
+                        pl.write(send_starts, [dst, e], prefix)
+                        pl.tile.write(meta_tile, [0, e], count)
+                        prefix = prefix + count
+                    meta_valid = pl.tile.set_validshape(meta_tile, 1, N_LOCAL)
+                    meta_stage = pl.store(meta_valid, [dst, 0], meta_stage)
+                    pld.tensor.put(
+                        dst=recv_meta, peer=dst, src=meta_stage,
+                        dst_offsets=[my_rank, 0], src_offsets=[dst, 0], shape=[1, N_LOCAL],
                     )
+                    if not prefill or T != 128:
+                        pl.write(send_totals, [dst * DISPATCH_TOTAL_TILE], prefix)
+                    if dst != my_rank:
+                        pld.system.notify(
+                            target=arrived, peer=dst, offsets=[my_rank, 0],
+                            value=moe_epoch, op=pld.NotifyOp.Set,
+                        )
+            else:
+                for dst in pl.range(N_RANKS):
+                    pl.write(send_totals, [dst * DISPATCH_TOTAL_TILE], pl.cast(0, pl.INT32))
         meta_tids[0] = published
     _meta_push_tid = meta_tids[0]
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_wait") as _meta_wait_tid:
+        pending_sources = source_mask
         for src in pl.range(N_RANKS):
-            if src != my_rank:
+            has_routes = pending_sources % 2 != 0
+            pending_sources = pending_sources // 2
+            if src != my_rank and (prefill or has_routes):
                 pld.system.defer_wait(
                     signal=arrived, offsets=[src, 0],
                     expected=moe_epoch, cmp=pld.WaitCmp.Ge,
@@ -255,8 +263,13 @@ def dispatch(
         expert_prefix = pl.const(0, pl.INT32)
         for e in pl.range(N_LOCAL):
             acc = pl.const(0, pl.INT32)
+            pending_sources = source_mask
             for src in pl.range(N_RANKS):
-                count = pl.read(recv_meta, [src, e])
+                has_routes = pending_sources % 2 != 0
+                pending_sources = pending_sources // 2
+                count = pl.const(0, pl.INT32)
+                if prefill or has_routes:
+                    count = pl.read(recv_meta, [src, e])
                 pl.write(recv_meta_local, [src, e], count)
                 pl.write(recv_starts, [src, e], source_prefix[src])
                 source_prefix[src] = source_prefix[src] + count
@@ -348,7 +361,7 @@ def dispatch(
                 )
             # Decode publishes from the block that owns this destination.
             if not prefill:
-                if dst != my_rank:
+                if dst != my_rank and active_tokens > 0:
                     pld.system.notify(
                         target=data_arrived, peer=dst, offsets=[my_rank, 0, 0],
                         value=moe_epoch, op=pld.NotifyOp.Set,
@@ -371,8 +384,11 @@ def dispatch(
         publish_deps[0] = _push_tid
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[publish_deps]) as _wait_tid:
+        pending_sources = source_mask
         for src in pl.range(N_RANKS):
-            if src != my_rank:
+            has_routes = pending_sources % 2 != 0
+            pending_sources = pending_sources // 2
+            if src != my_rank and (prefill or has_routes):
                 pld.system.defer_wait(
                     signal=data_arrived, offsets=[src, 0, 0],
                     expected=moe_epoch, cmp=pld.WaitCmp.Ge,
@@ -684,6 +700,7 @@ def prefill_moe_sublayer(
     hc_precomputed: pl.constexpr,
     x_norm_mx: pl.Tensor[[TOKENS, D], pl.INT8],
     x_norm_scale: pl.Tensor[[1, TOKENS], pl.FP32],
+    source_mask: pl.Scalar[pl.INDEX] = 0,
 ):
     """Collapse mHC streams, normalize compact TP owner rows, and run the EP MoE."""
     if not hc_precomputed:
@@ -744,7 +761,7 @@ def prefill_moe_sublayer(
             recv_x_local, recv_scale_local_backing,
             recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
             recv_meta, recv_x, recv_weights,
-            arrived, data_arrived, local_num_tokens, ep_rank, moe_epoch, reuse_deps, prefill,
+            arrived, data_arrived, local_num_tokens, ep_rank, moe_epoch, reuse_deps, prefill, source_mask,
         )
 
         scatter_done = expert_routed_scatter(

@@ -407,7 +407,7 @@ def _prefill_moe(
                 recv_meta, recv_x, recv_weights, arrived, data_arrived,
                 routed_output, combine_arrived, ffn_input, owned, round_next, post, residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
-                active, ep_rank, ep_rank % TP_SIZE, epoch, completion, True, True, local_payload, local_scales,
+                active, ep_rank, ep_rank % TP_SIZE, epoch, completion, True, True, local_payload, local_scales, pl.const(0, pl.INDEX),
             )
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_counts"):
                 for counter in pl.range(3):

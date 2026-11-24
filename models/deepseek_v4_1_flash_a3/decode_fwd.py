@@ -107,6 +107,18 @@ FWD_C2A_TABLE_DYN = pl.dynamic("V41_FWD_C2A_TABLE_DYN")
 FWD_C1A_TABLE_DYN = pl.dynamic("V41_FWD_C1A_TABLE_DYN")
 
 
+@pl.jit.inline
+def _moe_source_mask(moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32]):
+    # TP peers own rows by token index modulo TP_SIZE.
+    mask = pl.const(0, pl.INDEX)
+    for peer_index in pl.range(EP_SIZE):
+        peer = EP_SIZE - 1 - peer_index
+        prefix = pl.read(moe_num_tokens, [peer])
+        active = pl.cast(prefix > peer % TP_SIZE, pl.INDEX)
+        mask = mask * 2 + active
+    return mask
+
+
 @pl.jit.inline(auto_scope=False)
 def decode_encoder(
     engram_lookup: pl.Tensor[[2, LOCAL_T_DYN, ENGRAM_K], pl.BF16],
@@ -255,6 +267,7 @@ def decode_encoder(
     topk_indices = pl.create_tensor([global_tokens, INDEX_TOPK], dtype=pl.INT32)
     x_mixed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
+    source_mask = _moe_source_mask(moe_num_tokens)
     ffn_input = pl.create_tensor([tokens, D], dtype=pl.BF16)
     ffn_owned = pl.create_tensor([tokens, D], dtype=pl.BF16)
     ffn_post = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
@@ -351,7 +364,7 @@ def decode_encoder(
                 routed_output, combine_arrived, ffn_input, ffn_owned, pre_mix, ffn_post, ffn_residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
                 local_moe_tokens, rank, rank % TP_SIZE, layer + 1, ffn_reuse_deps, False, False,
-                route_payload, route_scales,
+                route_payload, route_scales, source_mask,
             )
             prefill_ffn_restore(
                 attention_hidden, ffn_owned, ffn_post, ffn_residual,
@@ -486,6 +499,7 @@ def decode_decoder(
     pool_block_counts = pl.create_tensor([global_tokens], dtype=pl.INT32)
     x_mixed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
+    source_mask = _moe_source_mask(moe_num_tokens)
     ffn_input = pl.create_tensor([tokens, D], dtype=pl.BF16)
     ffn_owned = pl.create_tensor([tokens, D], dtype=pl.BF16)
     ffn_post = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
@@ -577,7 +591,7 @@ def decode_decoder(
                 routed_output, combine_arrived, ffn_input, ffn_owned, pre_mix, ffn_post, ffn_residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
                 local_moe_tokens, rank, rank % TP_SIZE, layer + 1, ffn_reuse_deps, False, False,
-                route_payload, route_scales,
+                route_payload, route_scales, source_mask,
             )
             prefill_ffn_restore(
                 attention_hidden, ffn_owned, ffn_post, ffn_residual,
