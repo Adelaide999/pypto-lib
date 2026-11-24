@@ -418,6 +418,27 @@ def _compact_local_tokens(
 
 
 @pl.jit.inline
+def _decode_ffn_owner_norm(
+    source: pl.Tensor[[T_DYN, D], pl.BF16],
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    output: pl.Tensor[[TOKENS, D], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    local_tokens: pl.Scalar[pl.INDEX],
+):
+    """Normalize the owner rows, reading a lone row directly from mHC output."""
+    if local_tokens == 1:
+        owner_row = pl.slice(source, [1, D], [tp_rank, 0])
+        for block in pl.spmd(1, name_hint="decode_moe_owner_norm"):
+            rms_norm_tiled(owner_row, norm_weight, output, block, 1, output_fp32=False)
+    else:
+        compact = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
+        _compact_local_tokens(source, compact, num_tokens, tp_rank)
+        for block in pl.spmd((TOKENS + 7) // 8, name_hint="rms_norm"):
+            rms_norm_tiled(compact, norm_weight, output, block, TOKENS, output_fp32=False)
+
+
+@pl.jit.inline
 def _scatter_local_tokens(
     compact: pl.Tensor[[T_DYN, D], pl.BF16],
     output: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -510,9 +531,9 @@ def prefill_moe_sublayer(
         x_norm_scale = pl.create_tensor([1, TOKENS * 1], dtype=pl.FP32)
         shared_output = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
         if local_num_tokens > 0:
-            local_ffn_input = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
-            _compact_local_tokens(ffn_input, local_ffn_input, num_tokens, tp_rank)
             if prefill:
+                local_ffn_input = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
+                _compact_local_tokens(ffn_input, local_ffn_input, num_tokens, tp_rank)
                 scale_view = pl.reshape(x_norm_scale, [TOKENS, 1])
                 gate_input = pl.create_tensor([TOKENS, D], dtype=pl.FP32)
                 prefill_ffn_norm_quant(
@@ -522,9 +543,9 @@ def prefill_moe_sublayer(
                 )
                 gate_from_fp32(gate_input, gate_weight, correction_bias, local_num_tokens, indices, weights)
             else:
-                norm_tokens = pl.tensor.dim(local_ffn_input, 0)
-                for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-                    rms_norm_tiled(local_ffn_input, ffn_norm_weight, local_ffn_normed, norm_block, norm_tokens, output_fp32=False)
+                _decode_ffn_owner_norm(
+                    ffn_input, ffn_norm_weight, local_ffn_normed, num_tokens, tp_rank, local_num_tokens,
+                )
                 npu_gate(
                     local_ffn_normed, gate_weight, correction_bias, local_num_tokens,
                     x_norm_mx, x_norm_scale, indices, weights,
