@@ -461,7 +461,6 @@ def dispatch(
 def combine_scattered(
     shared_output: pl.Tensor[[T, D], pl.BF16],
     ffn_out: pl.Tensor[[T, D], pl.BF16],
-    combined_counts: pl.Tensor[[T, 16], pl.INT32],
     routed_output: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32],
     scatter_done: pl.Scalar[pl.TASK_ID],
@@ -529,16 +528,7 @@ def combine_scattered(
                         acc = pl.add(acc, pl.cast(routed_row, target_type=pl.FP32))
                     ffn_row = pl.cast(acc, target_type=pl.BF16, mode="rint")
                     ffn_out = pl.store(ffn_row, [t0 + lane, 0], ffn_out)
-    # Every active row contributes TOPK routed outputs. Keep the count metadata
-    # on one block so the 64-byte rows are written without dynamic-index races.
-    with pl.spmd(1, name_hint="combine_counts", deps=[_reduce_tid]) as _counts_tid:
-        worker = pl.tile.get_block_idx()
-        for t in pl.range(worker, T, 1):
-            combined = pl.cast(0, pl.INT32)
-            if t < num_tokens:
-                combined = pl.cast(TOPK, pl.INT32)
-            pl.write(combined_counts, [t, 0], combined)
-    return _counts_tid
+    return _reduce_tid
 
 
 @pl.jit.inline
@@ -772,9 +762,8 @@ def prefill_moe_sublayer(
             recv_route_local,
             routed_output, input_ready, prefill,
         )
-        combined_counts = pl.create_tensor([TOKENS, 16], dtype=pl.INT32)
         output_ready = combine_scattered(
-            shared_output, local_ffn_owned, combined_counts,
+            shared_output, local_ffn_owned,
             routed_output, combine_arrived,
             scatter_done,
             local_num_tokens, ep_rank, moe_epoch, prefill,
@@ -812,9 +801,9 @@ def prefill_moe_sublayer(
             for expert in pl.range(N_LOCAL_EXPERTS):
                 received = received + pl.read(recv_count_local, [expert, 0])
             sent = pl.cast(local_num_tokens * TOPK, pl.INT32)
-            combined = pl.cast(0, pl.INT32)
-            for token in pl.range(TOKENS):
-                combined = combined + pl.read(combined_counts, [token, 0])
+            # The combine step accounts for TOPK routes per active row.
+            combined_rows = pl.max(0, pl.min(local_num_tokens, TOKENS))
+            combined = pl.cast(combined_rows * TOPK, pl.INT32)
             pl.write(round_counts, [0], sent)
             pl.write(round_counts, [1], received)
             pl.write(round_counts, [2], combined)
