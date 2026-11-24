@@ -39,6 +39,9 @@ EXPERT_ROWS_DYN = pl.dynamic("A3_EXPERT_ROWS_DYN")
 
 # tiling
 VALIDATION_T_TILE = 32
+PREFILL_ROUTED_DOWN_ROW_TILE = 128
+PREFILL_ROUTED_GATE_ROW_TILE = 128
+PREFILL_ROUTED_GATE_N_TILE = 64
 
 
 @pl.jit.inline(auto_scope=False)
@@ -69,8 +72,12 @@ def expert_routed_compute(
         expert_swiglu(
             source, source_scale, w1, scale1, w3, scale3, route_weights, hidden, count,
             D, MOE_INTER, EXPERT_N_TILE, EXPERT_K_TILE, SWIGLU_LIMIT, True, "routed_swiglu", output_major, prefill,
+            PREFILL_ROUTED_GATE_ROW_TILE, PREFILL_ROUTED_GATE_N_TILE,
         )
-        expert_down(hidden, w2, scale2, output, count, MOE_INTER, D, "routed_down", output_major, prefill)
+        expert_down(
+            hidden, w2, scale2, output, count, MOE_INTER, D, "routed_down", output_major, prefill,
+            PREFILL_ROUTED_DOWN_ROW_TILE,
+        )
     return output
 
 

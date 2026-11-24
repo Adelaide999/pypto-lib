@@ -448,13 +448,14 @@ def expert_swiglu(
     count: pl.Scalar[pl.INT32], width: pl.constexpr, intermediate: pl.constexpr,
     n_tile: pl.constexpr, k_tile: pl.constexpr, limit: pl.constexpr,
     weighted: pl.constexpr, hint: pl.constexpr, output_major: pl.constexpr, prefill: pl.constexpr,
+    large_row_tile: pl.constexpr, large_n_tile: pl.constexpr,
 ):
     """Select a row tile for the number of tokens assigned to this expert."""
     if prefill:
         if count > PREFILL_EXPERT_LARGE_M_TILE:
             expert_swiglu_tiled(
                 x, factor, w1, s1, w3, s3, route, hidden, count, width, intermediate,
-                n_tile, k_tile, limit, weighted, hint, output_major, PREFILL_EXPERT_LARGE_M_TILE, 2,
+                large_n_tile, k_tile, limit, weighted, hint, output_major, large_row_tile, 2,
             )
         elif count >= 17:
             expert_swiglu_tiled(
@@ -491,6 +492,7 @@ def expert_down(
     hint: pl.constexpr,
     output_major: pl.constexpr,
     prefill: pl.constexpr,
+    large_row_tile: pl.constexpr,
 ):
     """Quantize the expert activation and project it back to the model width."""
     payload, scale = quantize_projection_activation(hidden, count, width, True, prefill)
@@ -498,7 +500,7 @@ def expert_down(
         if count > PREFILL_EXPERT_LARGE_M_TILE:
             prefill_gemm_int8_tiled(
                 payload, scale, weight, weight_scale, output, count, width, output_width,
-                hint, 128, 256, output_major, PREFILL_EXPERT_LARGE_M_TILE,
+                hint, 128, 256, output_major, large_row_tile,
             )
         elif count > 16:
             prefill_gemm_int8_tiled(
