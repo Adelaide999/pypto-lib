@@ -53,7 +53,8 @@ HC_DIM = M.hc_dim
 O_A_N_TILE = 128
 O_B_N_TILE = 128
 DECODE_B1_O_B_N_TILE = 256
-DECODE_B1_ORDERED_TILE = 64
+DECODE_B1_ORDERED_K_TILE = 64
+DECODE_B1_ORDERED_N_TILE = 128
 K_TILE = 128
 PREFILL_O_M_TILE = 128
 PREFILL_O_N_TILE = 256
@@ -226,11 +227,11 @@ def decode_swa_o_proj(
             _project_ordered_decode_row(
                 rotated, wo_a[group], projected,
                 pl.cast(group * O_GROUP_IN, pl.INT32), pl.cast(group * O_LORA, pl.INT32),
-                O_GROUP_IN, O_LORA, DECODE_B1_ORDERED_TILE, DECODE_B1_ORDERED_TILE, "proj_o_a_ordered_b1",
+                O_GROUP_IN, O_LORA, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE, "proj_o_a_ordered_b1",
             )
         output = _project_ordered_decode_row(
             projected, wo_b, output, 0, 0,
-            LOCAL_O_WIDTH, D, DECODE_B1_ORDERED_TILE, DECODE_B1_ORDERED_TILE, "proj_o_b_ordered_b1",
+            LOCAL_O_WIDTH, D, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE, "proj_o_b_ordered_b1",
         )
     else:
         output = decode_project_output(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens, True)
