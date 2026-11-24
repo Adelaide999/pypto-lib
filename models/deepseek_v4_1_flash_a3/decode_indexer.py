@@ -691,6 +691,99 @@ def publish_index_rows(
     return published
 
 
+@pl.jit.inline(auto_scope=False)
+def _score_single_paged_query(
+    query: pl.Tensor,
+    query_scale: pl.Tensor,
+    weights: pl.Tensor,
+    cache: pl.Tensor,
+    cache_scale: pl.Tensor,
+    block_table: pl.Tensor,
+    request_ids: pl.Tensor,
+    lengths: pl.Tensor,
+    output: pl.Tensor,
+    cache_ready: pl.Scalar[pl.TASK_ID],
+    query_ready: pl.Scalar[pl.TASK_ID],
+    weights_ready: pl.Scalar[pl.TASK_ID],
+    skip_threshold: pl.constexpr,
+    workers: pl.constexpr,
+):
+    """Expand one query and its visible key pages before mixed scoring."""
+    width = pl.tensor.dim(output, 1)
+    pages = (width + 127) // 128
+    table_width = pl.tensor.dim(block_table, 1)
+    request_count = pl.tensor.dim(block_table, 0)
+    cache_pages = pl.tensor.dim(cache, 0)
+    query_values = pl.create_tensor([INDEX_H, INDEX_DIM], dtype=pl.BF16)
+    key_values = pl.create_tensor([pages * 128, INDEX_DIM], dtype=pl.BF16)
+    key_payloads = pl.reshape(cache, [cache_pages * 128, INDEX_DIM // 2])
+    key_scales = pl.reshape(cache_scale, [1, cache_pages * 128 * _SCALE_COUNT])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="idx_expand_query", deps=[query_ready]) as expanded_q:
+        raw_query = pl.tile.load(query, [0, 0], [1, INDEX_H * INDEX_DIM // 2])
+        q_codes = pl.reshape(raw_query, [INDEX_H, INDEX_DIM // 2])
+        q_bytes = pl.tile.load(query_scale, [0, 0], [1, INDEX_H * _SCALE_COUNT])
+        q_decoded = _decode_index_score_tile(q_codes, q_bytes, INDEX_H)
+        pl.tile.store(q_decoded, [0, 0], query_values)
+    unpack_workers = pl.min(48, pages * 4)
+    with pl.spmd(unpack_workers, name_hint="idx_expand_keys", deps=[cache_ready]) as expanded_k:
+        unpack_worker = pl.tile.get_block_idx()
+        unpack_request = pl.read(request_ids, [0])
+        unpack_visible = pl.min(width, pl.read(lengths, [0]))
+        if unpack_visible > skip_threshold and unpack_request >= 0 and unpack_request < request_count:
+            blocks = pl.min(table_width, (unpack_visible + 127) // 128) * 4
+            for block in pl.range(unpack_worker, blocks, unpack_workers):
+                physical_page = pl.read(block_table, [unpack_request, block // 4])
+                if physical_page >= 0 and physical_page < cache_pages:
+                    physical = physical_page * 128 + block % 4 * 32
+                    k_codes = pl.load(key_payloads, [physical, 0], [32, INDEX_DIM // 2], target_memory=pl.MemorySpace.Vec)
+                    k_scales = pl.load(key_scales, [0, physical * _SCALE_COUNT], [1, 32 * _SCALE_COUNT],
+                                       target_memory=pl.MemorySpace.Vec)
+                    k_decoded = _decode_index_score_tile(k_codes, k_scales, 32)
+                    pl.store(k_decoded, [block * 32, 0], key_values)
+    with pl.spmd(
+        workers, name_hint="idx_score_single", sync_start=True,
+        deps=[expanded_q, expanded_k, weights_ready],
+    ) as scored:
+        worker = pl.tile.get_block_idx()
+        request = pl.read(request_ids, [0])
+        visible = pl.min(width, pl.read(lengths, [0]))
+        q_tile = pl.load(query_values, [0, 0], [INDEX_H, INDEX_DIM], target_memory=pl.MemorySpace.Mat)
+        for _ in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
+            weights_fp32 = pl.cast(pl.load(weights, [0, 0], [1, INDEX_H]), pl.FP32)
+            weights_rounded = pl.cast(pl.mul(weights_fp32, 0.015625), pl.BF16, mode="rint")
+            head_weights = pl.reshape(pl.cast(weights_rounded, pl.FP32), [INDEX_H, 1])
+            lanes = pl.cast(pl.tile.arange(0, [1, 64], dtype=pl.INT32), pl.FP32)
+            invalid = pl.reinterpret_view(pl.tile.full([1, 64], dtype=pl.INT32, value=-8388608), pl.FP32)
+        for panel in pl.range(worker, pages, workers):
+            page = pl.cast(-1, pl.INT32)
+            begin = panel * 128
+            if begin < visible and visible > skip_threshold:
+                if request >= 0 and request < request_count and panel < table_width:
+                    page = pl.read(block_table, [request, panel])
+            if page >= 0 and page < cache_pages:
+                k_tile = pl.load(key_values, [begin, 0], [128, INDEX_DIM], target_memory=pl.MemorySpace.Mat)
+                dot = pl.matmul(q_tile, pl.tile.transpose_view(k_tile), out_dtype=pl.FP32)
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
+                    product = pl.aiv_shard(dot)
+                    rounded = pl.cast(product, pl.BF16, mode="rint")
+                    relu = pl.maximum(pl.cast(rounded, pl.FP32), 0.0)
+                    weighted = pl.row_expand_mul(relu, head_weights)
+                    weighted = pl.cast(pl.cast(weighted, pl.BF16, mode="rint"), pl.FP32)
+                    sums = pl.cast(pl.col_sum(weighted), pl.BF16, mode="rint")
+                    position = begin + lane * 64
+                    if position < width:
+                        edge = pl.cast(pl.cast(visible - position, pl.INT32), pl.FP32)
+                        mask = pl.tile.cmps(lanes, edge, cmp_type=2)
+                        scores = pl.tile.select(mask, pl.cast(sums, pl.FP32), invalid)
+                        pl.store(pl.set_validshape(scores, 1, pl.min(64, width - position)), [0, position], output)
+            else:
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
+                    position = begin + lane * 64
+                    if position < width:
+                        pl.store(pl.set_validshape(invalid, 1, pl.min(64, width - position)), [0, position], output)
+    return scored
+
+
 def make_index_scores(skip_short=False, request_workers=32):
     """Score all paged histories with native FP4 request groups."""
     skip_threshold = INDEX_TOPK if skip_short else 0
@@ -722,16 +815,24 @@ def make_index_scores(skip_short=False, request_workers=32):
         scales_flat = pl.reshape(index_cache_scale, [1, cache_rows * 4])
         query_flat = pl.reshape(query, [capacity * INDEX_H, INDEX_DIM // 2])
         query_scales_flat = pl.reshape(query_scale, [1, capacity * INDEX_H * 4])
-        with pl.spmd(
-            launch_workers, name_hint="idx_score_req", sync_start=True,
-            deps=[cache_ready, query_ready, weights_ready],
-        ) as score_tid:
-            _worker = pl.tile.get_block_idx()
-            _index_scores(
-                query_flat, query_scales_flat, weights, payload_flat, scales_flat,
-                block_table, request_ids, lengths, output, unused_valid,
-                width, table_width, pl.cast(skip_threshold, pl.INT32), 0, num_tokens,
+        if num_tokens == 1 and width <= C1A_REQUEST_GROUP_SCORE_WIDTH:
+            score_tid = _score_single_paged_query(
+                query, query_scale, weights, index_cache, index_cache_scale,
+                block_table, request_ids, lengths, output, cache_ready, query_ready, weights_ready,
+                skip_threshold, 16,
             )
+        else:
+            with pl.spmd(
+                launch_workers, name_hint="idx_score_req", sync_start=True,
+                deps=[cache_ready, query_ready, weights_ready],
+            ) as fallback_tid:
+                _worker = pl.tile.get_block_idx()
+                _index_scores(
+                    query_flat, query_scales_flat, weights, payload_flat, scales_flat,
+                    block_table, request_ids, lengths, output, unused_valid,
+                    width, table_width, pl.cast(skip_threshold, pl.INT32), 0, num_tokens,
+                )
+            score_tid = fallback_tid
         return score_tid
 
     return score
