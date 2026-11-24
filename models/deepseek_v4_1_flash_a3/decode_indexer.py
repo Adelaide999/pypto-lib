@@ -1169,7 +1169,7 @@ _TOPK_SORT_FLOOR = -3.4028234663852886e38
 _TOPK_INVALID_SCORE_BITS = -8388608
 
 
-def _make_index_topk_pairs(query_rows=False):
+def _make_index_topk_pairs(query_rows=False, stable_bf16=False):
     """Keep one sort/merge algorithm for flat or query-major pair storage."""
     token_stride = 1 if query_rows else 0
     slot_row_stride = 0 if query_rows else 1
@@ -1190,7 +1190,24 @@ def _make_index_topk_pairs(query_rows=False):
         index_tmp = pl.create_tile([1, 192], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
         lane_indices = pl.tile.arange(0, [1, _TOPK_LEAF_TILE], dtype=pl.INT32, tmp=index_tmp)
         indices = pl.add(lane_indices, pl.cast(logical_begin, pl.INT32))
-        pairs = pl.tile.sort32(values, pl.reinterpret_view(indices, pl.UINT32))
+        # BF16 scores widened to FP32 leave room to encode a deterministic tie break.
+        # The bit pattern stays in the positive normal FP32 range for every finite BF16 score.
+        if stable_bf16 and pl.tensor.dim(scores, 1) <= 16384:
+            upper = pl.tile.shrs(pl.reinterpret_view(padded, pl.INT32), 16)
+            negative = pl.tile.cmps(padded, 0.0, cmp_type=2)
+            zero = pl.tile.cmps(padded, 0.0, cmp_type=0)
+            ascending = pl.tile.select(negative, pl.sub(pl.mul(upper, -1), 1), pl.add(upper, 32768))
+            ascending = pl.tile.select(zero, 32768, ascending)
+            reverse_index = pl.add(pl.mul(indices, -1), 16383)
+            key_bits = pl.add(pl.add(pl.shls(ascending, 14), reverse_index), 8388608)
+            key = pl.reinterpret_view(key_bits, pl.FP32)
+            finite_low = pl.tile.cmps(padded, _TOPK_SORT_FLOOR, cmp_type=4)
+            finite_high = pl.tile.cmps(padded, -_TOPK_SORT_FLOOR, cmp_type=3)
+            keys = pl.tile.select(finite_low, pl.tile.select(finite_high, key, 0.0), 0.0)
+            keys = pl.tile.fillpad(keys, pad_value=pl.PadValue.min)
+            pairs = pl.tile.sort32(keys, pl.reinterpret_view(indices, pl.UINT32))
+        else:
+            pairs = pl.tile.sort32(values, pl.reinterpret_view(indices, pl.UINT32))
         pairs = pl.tile.mrgsort(pairs, block_len=64)
         pairs = pl.tile.mrgsort(pairs, block_len=256)
         pairs = pl.tile.mrgsort(pairs, block_len=1024)
@@ -1700,12 +1717,8 @@ def _write_c2a_short_topk(
 
 
 @pl.jit.inline
-def _sort_c2a_long_topk_physical(
-    output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    token: pl.Scalar[pl.INDEX],
-):
-    """Keep C2A long-history output in ascending physical-row order."""
-    rows = pl.load(output, [token, 0], [1, INDEX_TOPK], target_memory=pl.MemorySpace.Vec)
+def _order_c2a_physical_rows(rows: pl.Tile[[1, INDEX_TOPK], pl.INT32]):
+    """Sort valid physical rows first and keep -1 padding at the end."""
     keys = pl.tile.select(pl.tile.cmps(pl.cast(rows, pl.FP32), pl.cast(pl.cast(-1, pl.INT32), pl.FP32), cmp_type=4), pl.mul(pl.cast(rows, pl.FP32), -1.0), _TOPK_SORT_FLOOR)
     ordered = pl.tile.sort32(keys, pl.reinterpret_view(rows, pl.UINT32))
     ordered = pl.tile.mrgsort(ordered, block_len=64)
@@ -1715,6 +1728,17 @@ def _sort_c2a_long_topk_physical(
         mask_pattern=pl.tile.MaskPattern.P1010,
         output_dtype=pl.INT32,
     )
+    return final
+
+
+@pl.jit.inline
+def _sort_c2a_long_topk_physical(
+    output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    token: pl.Scalar[pl.INDEX],
+):
+    """Keep C2A long-history output in ascending physical-row order."""
+    rows = pl.load(output, [token, 0], [1, INDEX_TOPK], target_memory=pl.MemorySpace.Vec)
+    final = _order_c2a_physical_rows(rows)
     pl.store(final, [token, 0], output)
     return output
 
@@ -1751,7 +1775,8 @@ def _make_c2a_short_topk(row_workers):
     return short_stage
 
 
-def _make_select_c2a_index_topk(leaf_workers=32, row_workers=32, all_long=False):
+def _make_select_c2a_index_topk(leaf_workers=32, row_workers=32, all_long=False, stable_bf16=False):
+    sort_leaf, merge_rows = _make_index_topk_pairs(query_rows=True, stable_bf16=stable_bf16)
     materialize = _make_materialize_index_topk()
     short_stage = _c2a_topk_all_long_ready if all_long else _make_c2a_short_topk(row_workers)
 
@@ -1783,7 +1808,7 @@ def _make_select_c2a_index_topk(leaf_workers=32, row_workers=32, all_long=False)
                     leaf = work - token * leaf_count
                     logical_begin = leaf * _TOPK_LEAF_TILE
                     valid_count = pl.min(_TOPK_LEAF_TILE, width - logical_begin)
-                    _sort_c2a_topk_leaf(index_scores, pair_storage, token, logical_begin, valid_count, leaf)
+                    sort_leaf(index_scores, pair_storage, token, logical_begin, valid_count, leaf)
 
         with pl.spmd(row_workers, name_hint="idx_topk_merge", deps=[short_tid, leaf_tid]) as merge_tid:
             worker = pl.tile.get_block_idx()
@@ -1797,7 +1822,7 @@ def _make_select_c2a_index_topk(leaf_workers=32, row_workers=32, all_long=False)
                                 left = output_slot * 2
                                 right = left + 1
                                 if right < count:
-                                    _merge_c2a_topk_rows(pair_storage, left, right, output_slot, token)
+                                    merge_rows(pair_storage, left, right, output_slot, token)
                                 else:
                                     forwarded = pl.load(
                                         pair_storage, [token, left * _TOPK_PAIR_WIDTH], [1, _TOPK_PAIR_WIDTH]
@@ -1806,31 +1831,54 @@ def _make_select_c2a_index_topk(leaf_workers=32, row_workers=32, all_long=False)
                             count = output_count
                     root = pl.load(pair_storage, [token, 0], [1, _TOPK_PAIR_WIDTH])
                     root_scores = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P0101)
-                    cutoff = pl.tile.read(root_scores, [0, INDEX_TOPK - 1])
-                    root_ones = pl.tile.full([1, INDEX_TOPK], dtype=pl.FP32, value=1.0)
-                    above_flags = pl.tile.select(pl.tile.cmps(root_scores, cutoff, cmp_type=4), root_ones, 0.0)
-                    sums64 = pl.col_sum(pl.reshape(above_flags, [8, 64]))
-                    sums8 = pl.col_sum(pl.reshape(sums64, [8, 8]))
-                    above = pl.cast(0, pl.INDEX)
-                    for lane in pl.unroll(8):
-                        above = above + pl.cast(pl.tile.read(sums8, [0, lane]), pl.INT32)
-                    materialize(
-                        index_scores, block_table, request_ids, output,
-                        token, width, cutoff, INDEX_TOPK - above,
-                    )
+                    if stable_bf16 and width <= 16384:
+                        valid = pl.tile.cmps(root_scores, 0.0, cmp_type=4)
+                        root_ids = pl.tile.gather_mask(
+                            root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32,
+                        )
+                        logical = pl.tile.select(valid, root_ids, 0)
+                        request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
+                        page_count = pl.min(pl.tensor.dim(block_table, 1), 128)
+                        raw_pages = pl.load(block_table, [request, 0], [1, 128], valid_shape=[1, page_count])
+                        pages = pl.tile.fillpad(raw_pages, pad_value=pl.PadValue.zero)
+                        page_offsets = pl.tile.shrs(logical, 7)
+                        scratch = pl.tile.create([1, INDEX_TOPK], dtype=pl.INT32)
+                        page_ids = pl.tile.gather(pages, page_offsets, scratch)
+                        physical = pl.add(pl.mul(page_ids, 128), pl.sub(logical, pl.mul(page_offsets, 128)))
+                        ordered = _order_c2a_physical_rows(pl.tile.select(valid, physical, -1))
+                        pl.store(ordered, [token, 0], output)
+                    else:
+                        cutoff = pl.tile.read(root_scores, [0, INDEX_TOPK - 1])
+                        root_ones = pl.tile.full([1, INDEX_TOPK], dtype=pl.FP32, value=1.0)
+                        above_flags = pl.tile.select(pl.tile.cmps(root_scores, cutoff, cmp_type=4), root_ones, 0.0)
+                        sums64 = pl.col_sum(pl.reshape(above_flags, [8, 64]))
+                        sums8 = pl.col_sum(pl.reshape(sums64, [8, 8]))
+                        above = pl.cast(0, pl.INDEX)
+                        for lane in pl.unroll(8):
+                            above = above + pl.cast(pl.tile.read(sums8, [0, lane]), pl.INT32)
+                        materialize(
+                            index_scores, block_table, request_ids, output,
+                            token, width, cutoff, INDEX_TOPK - above,
+                        )
 
-        with pl.spmd(row_workers, name_hint="idx_topk_order", deps=[merge_tid]) as order_tid:
-            worker = pl.tile.get_block_idx()
-            for token in pl.range(worker, num_tokens, row_workers):
-                if pl.read(lengths, [token]) > INDEX_TOPK:
-                    _sort_c2a_long_topk_physical(output, token)
-        return order_tid
+        if stable_bf16 and width <= 16384:
+            result = pl.yield_(merge_tid)
+        else:
+            with pl.spmd(row_workers, name_hint="idx_topk_order", deps=[merge_tid]) as order_tid:
+                order_worker = pl.tile.get_block_idx()
+                for token in pl.range(order_worker, num_tokens, row_workers):
+                    if pl.read(lengths, [token]) > INDEX_TOPK:
+                        _sort_c2a_long_topk_physical(output, token)
+            result = pl.yield_(order_tid)
+        return result
 
     return select_c2a_index_topk
 
 
 select_c2a_index_topk = _make_select_c2a_index_topk()
-_select_c2a_request_group_topk = _make_select_c2a_index_topk(leaf_workers=16, row_workers=16, all_long=True)
+_select_c2a_request_group_topk = _make_select_c2a_index_topk(leaf_workers=16, row_workers=16, all_long=True, stable_bf16=True)
+
+select_c2a_stable_bf16_topk = _make_select_c2a_index_topk(stable_bf16=True)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1882,7 +1930,7 @@ def _score_select_c2a_groups(
             block_table, request_ids, lengths, scores,
             num_tokens, cache_ready, query_ready, weights_ready,
         )
-        result = select_c2a_index_topk(
+        result = select_c2a_stable_bf16_topk(
             scores, block_table, request_ids, lengths, output, num_tokens, scores_tid,
         )
     return result
