@@ -194,13 +194,14 @@ def _project_ordered_decode_row(
         for panel in pl.range(worker, panels, workers):
             col = panel * n_tile
             total = pl.tile.full([1, n_tile], dtype=pl.FP32, value=0.0)
-            for first in pl.range(0, width, k_tile):
+            for first in pl.pipeline(0, width, k_tile, stage=2):
                 value = pl.cast(pl.load(source, [0, source_col + first], [1, k_tile]), pl.FP32)
                 matrix = pl.cast(pl.load(weight, [first, col], [k_tile, n_tile]), pl.FP32)
-                columns = pl.tile.transpose(matrix, 0, 1)
-                products = pl.tile.transpose(pl.col_expand_mul(columns, value), 0, 1)
+                column = pl.reshape(value, [k_tile, 1])
+                products = pl.row_expand_mul(matrix, column)
                 for inner in pl.range(k_tile):
-                    total = pl.add(total, pl.tile.slice(products, [1, n_tile], [inner, 0]))
+                    product = pl.tile.slice(products, [1, n_tile], [inner, 0])
+                    total = pl.add(total, product)
             pl.store(pl.cast(total, pl.BF16, mode="rint"), [0, output_col + col], output)
     return output
 
