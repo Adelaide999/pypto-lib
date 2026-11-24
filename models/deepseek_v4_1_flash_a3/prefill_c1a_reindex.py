@@ -122,7 +122,7 @@ def prefill_c1a_reindex_attention(
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
         query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         proj_payload, proj_scales = quantize_projection_activation(x, num_tokens, D, True, True)
-        q_proj_rope(
+        _, query, qb_payload, qb_scales = q_proj_rope(
             proj_payload, proj_scales,
             wq_a, wq_a_scale, q_norm_weight,
             wq_b, wq_b_scale,
@@ -132,7 +132,8 @@ def prefill_c1a_reindex_attention(
         )
         cache_ready = pl.system.task_dummy(deps=[])
         indexer_completion = prefill_indexer(
-            x, query_latent, request_ids, compressed_lens, index_cache, index_cache_scale, index_block_table,
+            x, qb_payload, qb_scales, request_ids, compressed_lens,
+            index_cache, index_cache_scale, index_block_table,
             rope_cos, rope_sin, index_wq_b, index_wq_b_scale, index_weights_proj,
             pool_block_ids, pool_block_counts, topk_indices, num_tokens, cache_ready, pool=use_candidates, c2a=False,
         )

@@ -28,7 +28,7 @@ from .o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_
 from .qkv_proj_rope import q_proj_rope, kv_proj_rope
 from .compressor import c1a_compressor_project, compressor_rope, c1a_compressor_publish
 from .prefill_indexer import (
-    prefill_indexer, publish_c1a_index_key,
+    clear_inactive_index_pool, prefill_indexer, publish_c1a_index_key,
 )
 
 
@@ -137,18 +137,16 @@ def prefill_c1a_full_attention(
     """Publish ratio-1 caches, select sparse rows, and compute packed C1A."""
     tokens = pl.tensor.dim(x, 0)
     partial = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales = quantize_projection_activation(x, num_tokens, D, True, True)
-    publication = pl.array.create(1, pl.TASK_ID)
-    publication[0] = pl.system.task_dummy(deps=[])
     if num_tokens > 0:
+        proj_payload, proj_scales = quantize_projection_activation(x, num_tokens, D, True, True)
         published = prefill_publish_decoder(
             x, compressor_wkv, compressor_norm_weight, index_wk, index_norm_weight,
             compressed_rope_cos, compressed_rope_sin, compressed_slots,
             compressed_cache, compressed_cache_scale, index_cache, index_cache_scale, num_tokens,
         )
-        q_proj_rope(
+        query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+        query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        _, query, qb_payload, qb_scales = q_proj_rope(
             proj_payload, proj_scales,
             wq_a, wq_a_scale, q_norm_weight,
             wq_b, wq_b_scale,
@@ -156,15 +154,13 @@ def prefill_c1a_full_attention(
             query_latent, query,
             num_tokens,
         )
-        publication[0] = published
-    publication_ready = publication[0]
-    indexer_completion = prefill_indexer(
-        x, query_latent, request_ids, compressed_lens, index_cache, index_cache_scale, index_block_table,
-        rope_cos, rope_sin, index_wq_b, index_wq_b_scale, index_weights_proj,
-        pool_block_ids, pool_block_counts, topk_indices, num_tokens, publication_ready, pool=False, c2a=False,
-    )
-    if num_tokens > 0:
-        source_ready = pl.system.task_dummy(deps=[publication_ready, indexer_completion])
+        indexer_completion = prefill_indexer(
+            x, qb_payload, qb_scales, request_ids, compressed_lens,
+            index_cache, index_cache_scale, index_block_table,
+            rope_cos, rope_sin, index_wq_b, index_wq_b_scale, index_weights_proj,
+            pool_block_ids, pool_block_counts, topk_indices, num_tokens, published, pool=False, c2a=False,
+        )
+        source_ready = pl.system.task_dummy(deps=[published, indexer_completion])
         window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         kv_proj_rope(
@@ -187,6 +183,8 @@ def prefill_c1a_full_attention(
         o_proj(
             attended, wo_a, wo_b, rope_cos, rope_sin, partial, num_tokens,
         )
+    elif tokens > 0:
+        clear_inactive_index_pool(pool_block_ids, pool_block_counts, num_tokens, pl.system.task_dummy(deps=[]))
     if scatter_output:
         prefill_sp_output_reduce_scatter(
             partial, output_window, output_arrived, output,

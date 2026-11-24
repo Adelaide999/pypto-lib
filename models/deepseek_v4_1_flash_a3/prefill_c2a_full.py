@@ -131,7 +131,7 @@ def prefill_c2a_full_attention(
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_activation(x, num_tokens, D, True, True)
-    q_proj_rope(
+    _, query, qb_payload, qb_scales = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
@@ -168,7 +168,8 @@ def prefill_c2a_full_attention(
     )
 
     select_tid = prefill_indexer(
-        x, qr, token_to_req_indices, compressed_lens, index_cache, index_cache_scale, index_block_table,
+        x, qb_payload, qb_scales, token_to_req_indices, compressed_lens,
+        index_cache, index_cache_scale, index_block_table,
         rope_cos, rope_sin, index_wq_b, index_wq_b_scale, index_weights_proj,
         topk_indices, compressed_lens, topk_indices, num_tokens, index_publish_tid, pool=False, c2a=True,
     )

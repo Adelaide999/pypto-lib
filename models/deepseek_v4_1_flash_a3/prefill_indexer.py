@@ -15,7 +15,8 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "models.deepseek_v4_1_flash_a3"
 
-from .gemm import gemm_bf16_to_bf16, gemm_dynamic_int8, prefill_gemm_int8_tiled, quantize_projection_activation
+from .activation_quant import quantize_projection_activation
+from .gemm import gemm_bf16_to_bf16, gemm_int8, prefill_gemm_int8_tiled
 
 import torch
 import torch.nn.functional as F
@@ -44,6 +45,7 @@ INDEX_TOPK = M.index_topk
 INDEX_QUERY_WIDTH = M.index_n_heads * INDEX_DIM
 INDEX_QUERY_SCALE_WIDTH = INDEX_QUERY_WIDTH // 32
 CANDIDATE_BLOCK_SIZE = M.candidate_block_size
+CANDIDATE_BLOCK_SHIFT = CANDIDATE_BLOCK_SIZE.bit_length() - 1
 CANDIDATE_TOPK_BLOCKS = M.candidate_topk_blocks
 CANDIDATE_PAIR_WIDTH = 2 * CANDIDATE_TOPK_BLOCKS
 TOPK_CACHED_PAGES = (M.max_position_embeddings + 127) // 128
@@ -75,6 +77,7 @@ INDEX_SCORE_QUERY_TILE = 2
 
 
 CANDIDATE_SCORE_TILE = 1024
+CANDIDATE_DIRECT_ROWS_TILE = 8
 CANDIDATE_LEAF_TILE = 8192
 CANDIDATE_SHORT_LEAF_TILE = 2048
 CANDIDATE_MAX_LEAVES = (M.max_position_embeddings // CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_LEAF_TILE + 1
@@ -408,32 +411,43 @@ def _sort_candidate_short_leaf(
 
 
 @pl.jit.inline(auto_scope=False)
-def _publish_all_candidate_blocks(lengths: pl.Tensor, block_ids: pl.Tensor, counts: pl.Tensor,
-                                  num_tokens: pl.Scalar[pl.INT32], positions: pl.Scalar[pl.INDEX],
-                                  ready: pl.Scalar[pl.TASK_ID]):
+def _publish_all_candidate_blocks(
+    lengths: pl.Tensor,
+    block_ids: pl.Tensor,
+    counts: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    positions: pl.Scalar[pl.INDEX],
+    ready: pl.Scalar[pl.TASK_ID],
+):
     """Publish a contiguous logical pool when every visible block fits."""
     tokens = pl.tensor.dim(lengths, 0)
     capacity = pl.tensor.dim(block_ids, 1)
-    workers = pl.min(32, tokens)
-    with pl.spmd(workers, name_hint="c1a_pool_all_blocks", deps=[ready]) as pool_ready:
+    blocks = (tokens + CANDIDATE_DIRECT_ROWS_TILE - 1) // CANDIDATE_DIRECT_ROWS_TILE
+    workers = pl.min(48, blocks)
+    length_rows = pl.reshape(lengths, [1, tokens])
+    count_rows = pl.reshape(counts, [1, tokens])
+    entry_deps = pl.array.create(1, pl.TASK_ID)
+    entry_deps[0] = ready
+    with pl.spmd(workers, name_hint="c1a_pool_all_blocks", deps=[entry_deps[0]]) as pool_ready:
         worker = pl.tile.get_block_idx()
         lanes = pl.tile.arange(0, [1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32)
-        for token in pl.range(worker, tokens, workers):
-            count = pl.cast(0, pl.INT32)
-            if token < num_tokens:
-                visible = pl.min(pl.max(pl.read(lengths, [token]), 0), positions)
-                count = pl.cast((visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE, pl.INT32)
-            keep = pl.tile.cmps(pl.cast(lanes, pl.FP32), pl.cast(count, pl.FP32), cmp_type=2)
-            selected = pl.tile.select(keep, lanes, -1)
-            pl.store(pl.set_validshape(selected, 1, capacity), [token, 0], block_ids)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_pool_counts", deps=[pool_ready]) as done:
-        for token in pl.range(tokens):
-            count = pl.cast(0, pl.INT32)
-            if token < num_tokens:
-                visible = pl.min(pl.max(pl.read(lengths, [token]), 0), positions)
-                count = pl.cast((visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE, pl.INT32)
-            pl.write(counts, [token], count)
-    return done
+        float_lanes = pl.cast(lanes, pl.FP32)
+        for block in pl.range(worker, blocks, workers):
+            begin = block * CANDIDATE_DIRECT_ROWS_TILE
+            rows = pl.min(CANDIDATE_DIRECT_ROWS_TILE, tokens - begin)
+            active = pl.min(rows, pl.max(0, num_tokens - begin))
+            raw = pl.load(length_rows, [0, begin], [1, CANDIDATE_DIRECT_ROWS_TILE], valid_shape=[1, active])
+            padded = pl.fillpad(raw, pad_value=pl.PadValue.zero)
+            padded = pl.set_validshape(padded, 1, CANDIDATE_DIRECT_ROWS_TILE)
+            visible = pl.minimum(pl.maximum(padded, 0), pl.cast(positions, pl.INT32))
+            sizes = pl.shrs(pl.add(visible, CANDIDATE_BLOCK_SIZE - 1), CANDIDATE_BLOCK_SHIFT)
+            for row in pl.range(rows):
+                count = pl.tile.read(sizes, [0, row])
+                keep = pl.tile.cmps(float_lanes, pl.cast(count, pl.FP32), cmp_type=2)
+                selected = pl.tile.select(keep, lanes, -1)
+                pl.store(pl.set_validshape(selected, 1, capacity), [begin + row, 0], block_ids)
+            pl.store(pl.set_validshape(sizes, 1, rows), [0, begin], count_rows)
+    return pool_ready
 
 
 @pl.jit.inline(auto_scope=False)
@@ -613,7 +627,8 @@ def _scale_index_weights(projected: pl.Tile[[INDEX_WEIGHT_ROWS_DYN, INDEX_H], pl
 @pl.jit.inline(auto_scope=False)
 def prepare_prefill_index_query(
     x: pl.Tensor,
-    latent: pl.Tensor,
+    latent_payload: pl.Tensor,
+    latent_scales: pl.Tensor,
     query_weight: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.INT8],
     query_weight_scale: pl.Tensor,
     weight_projection: pl.Tensor[[D, INDEX_H], pl.BF16, pl.ND],
@@ -624,19 +639,18 @@ def prepare_prefill_index_query(
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
-    """Project, rotate, and quantize query rows with group-32 scales."""
+    """Project shared W8A8 activations, rotate the query, and quantize it to FP4."""
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
     if num_tokens >= 128:
-        payload, factor = quantize_projection_activation(latent, num_tokens, Q_LORA, True, True)
         prefill_gemm_int8_tiled(
-            payload, factor, query_weight, query_weight_scale, projected, num_tokens,
+            latent_payload, latent_scales, query_weight, query_weight_scale, projected, num_tokens,
             Q_LORA, INDEX_QUERY_WIDTH, "c1a_mx_projection", 128, 256, False, 64,
         )
     else:
-        gemm_dynamic_int8(
-            latent, query_weight, query_weight_scale, projected, num_tokens,
-            Q_LORA, INDEX_QUERY_WIDTH, "c1a_mx_projection", False, True,
+        gemm_int8(
+            latent_payload, latent_scales, query_weight, query_weight_scale, projected, num_tokens,
+            Q_LORA, INDEX_QUERY_WIDTH, "c1a_mx_projection", 128, 256, False,
         )
     if num_tokens >= 64:
         rotated = rotate_index_query(projected, cos, sin, projected, num_tokens)
@@ -1317,12 +1331,13 @@ def publish_c2a_index_key(
 
 
 @pl.jit.inline(auto_scope=False)
-def _clear_inactive_pool(
+def clear_inactive_index_pool(
     ids: pl.Tensor,
     counts: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
+    """Clear candidate IDs and counts beyond the active token rows."""
     rows = pl.tensor.dim(ids, 0)
     width = pl.tensor.dim(ids, 1)
     first = pl.cast(pl.max(num_tokens, 0), pl.INDEX)
@@ -1343,7 +1358,8 @@ def _clear_inactive_pool(
 @pl.jit.inline(auto_scope=False)
 def prefill_indexer(
     x: pl.Tensor,
-    latent: pl.Tensor,
+    latent_payload: pl.Tensor,
+    latent_scales: pl.Tensor,
     request_ids: pl.Tensor,
     lengths: pl.Tensor,
     cache: pl.Tensor,
@@ -1369,9 +1385,15 @@ def prefill_indexer(
     width = (width + 127) // 128 * 128
     completion = pl.array.create(1, pl.TASK_ID)
     completion[0] = ready
+    direct_pool = pl.array.create(1, pl.TASK_ID)
+    direct_pool[0] = ready
+    candidate_capacity = pl.min(pl.tensor.dim(pool_ids, 1), CANDIDATE_TOPK_BLOCKS)
+    all_blocks_fit = width <= candidate_capacity * CANDIDATE_BLOCK_SIZE
     if not pool and not c2a:
-        if num_tokens < pl.tensor.dim(x, 0):
-            cleared = _clear_inactive_pool(pool_ids, pool_counts, num_tokens, ready)
+        if num_tokens > 0 and all_blocks_fit:
+            direct_pool[0] = _publish_all_candidate_blocks(lengths, pool_ids, pool_counts, num_tokens, width, ready)
+        elif num_tokens < pl.tensor.dim(x, 0):
+            cleared = clear_inactive_index_pool(pool_ids, pool_counts, num_tokens, ready)
             completion[0] = cleared
     if num_tokens > 0:
         linear_available = pl.cast(0, pl.INT32)
@@ -1392,7 +1414,6 @@ def prefill_indexer(
                 rows = pl.min(chunk, active - begin)
                 count = pl.cast(rows, pl.INT32)
                 chunk_x = pl.slice(x, [rows, D], [begin, 0])
-                chunk_latent = pl.slice(latent, [rows, Q_LORA], [begin, 0])
                 chunk_requests = pl.slice(request_ids, [rows], [begin])
                 chunk_lengths = pl.slice(lengths, [rows], [begin])
                 chunk_cos = pl.slice(cos, [rows, ROPE_DIM // 2], [begin, 0])
@@ -1413,8 +1434,10 @@ def prefill_indexer(
                 scoring = pl.array.create(1, pl.TASK_ID)
                 scoring[0] = chunk_ready
                 if not c2a or maximum_visible > INDEX_TOPK:
+                    chunk_payload = pl.slice(latent_payload, [rows, Q_LORA], [begin, 0])
+                    chunk_scales = pl.slice(latent_scales, [rows, 1], [begin, 0])
                     query_tid, weights_tid = prepare_prefill_index_query(
-                        chunk_x, chunk_latent, query_weight, query_weight_scale, weight_projection,
+                        chunk_x, chunk_payload, chunk_scales, query_weight, query_weight_scale, weight_projection,
                         chunk_cos, chunk_sin, query, weights, count, ready,
                     )
                     prepared = pl.system.task_dummy(deps=[query_tid, weights_tid, chunk_ready])
@@ -1488,14 +1511,13 @@ def prefill_indexer(
                 topk_ready = selection[0]
                 completion[0] = topk_ready
                 if not pool and not c2a:
-                    if width <= capacity * CANDIDATE_BLOCK_SIZE and width <= CANDIDATE_TOPK_BLOCKS * CANDIDATE_BLOCK_SIZE:
-                        pool_ready = _publish_all_candidate_blocks(chunk_lengths, chunk_pool, chunk_counts,
-                                                                   count, width, score_ready)
-                        completion[0] = pl.system.task_dummy(deps=[topk_ready, pool_ready])
-                    else:
+                    if not all_blocks_fit:
                         sorted_pool = select_candidate_block_pool(chunk_scores, chunk_lengths, chunk_pool,
                                                                   chunk_counts, count, score_ready)
                         completion[0] = pl.system.task_dummy(deps=[topk_ready, sorted_pool])
+        if not pool and not c2a:
+            if all_blocks_fit:
+                completion[0] = pl.system.task_dummy(deps=[completion[0], direct_pool[0]])
     return completion[0]
 
 
@@ -1671,8 +1693,9 @@ def l2_prefill_indexer_validation(
 ):
     entry = pl.system.task_dummy(deps=[])
     raw_weights = pl.create_tensor([pl.tensor.dim(weights, 0), INDEX_H], dtype=pl.BF16)
+    latent_payload, latent_scales = quantize_projection_activation(latent, num_tokens, Q_LORA, True, True)
     query_tid, weight_tid = prepare_prefill_index_query(
-        x, latent, query_weight, query_weight_scale, weight_projection,
+        x, latent_payload, latent_scales, query_weight, query_weight_scale, weight_projection,
         cos, sin, query, raw_weights, num_tokens, entry,
     )
     with pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="index_weights_validation", deps=[weight_tid]):
