@@ -203,6 +203,36 @@ def _prefill_down_proj_tile(
 
 
 @pl.jit.inline(auto_scope=False)
+def _prefill_expert_single_tile(
+    source: pl.Tensor,
+    source_scale: pl.Tensor,
+    route_weights: pl.Tensor,
+    w1: pl.Tensor,
+    scale1: pl.Tensor,
+    w3: pl.Tensor,
+    scale3: pl.Tensor,
+    w2: pl.Tensor,
+    scale2: pl.Tensor,
+    output: pl.Tensor,
+    valid_rows: pl.Scalar[pl.INDEX],
+    row_tile: pl.constexpr,
+    weighted: pl.constexpr,
+):
+    """Project and quantize a Prefill expert with one aligned row tile."""
+    hidden = pl.create_tensor([row_tile, MOE_INTER], dtype=pl.INT8)
+    # The payload and the scale are written by the same tile task.
+    hidden_scale = pl.create_tensor([row_tile, 1], dtype=pl.FP32, manual_dep=True)
+    _prefill_gate_up_quant_tile(
+        source, source_scale, route_weights,
+        w1, scale1, w3, scale3,
+        hidden, hidden_scale,
+        0, valid_rows, row_tile, weighted,
+    )
+    _prefill_down_proj_tile(hidden, hidden_scale, w2, scale2, output, 0, valid_rows, row_tile)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
 def prefill_expert_compute(
     source: pl.Tensor,
     source_scale: pl.Tensor,
@@ -217,69 +247,54 @@ def prefill_expert_compute(
     count: pl.Scalar[pl.INT32],
     weighted: pl.constexpr,
 ):
-    """Project and quantize row tiles of a nonempty Prefill expert."""
-    capacity = pl.max(PREFILL_ROW_TILE, (count + PREFILL_ROW_TILE - 1) // PREFILL_ROW_TILE * PREFILL_ROW_TILE)
-    hidden = pl.create_tensor([capacity, MOE_INTER], dtype=pl.INT8)
-    # The payload and the scale are written by the same tile task.
-    hidden_scale = pl.create_tensor([capacity, 1], dtype=pl.FP32, manual_dep=True)
-    tiles128 = capacity // 128
-    tail = capacity - tiles128 * 128
-    tiles64 = tail // 64
-    tail = tail - tiles64 * 64
-    tiles32 = tail // 32
-    tiles16 = (tail - tiles32 * 32) // PREFILL_ROW_TILE
-
-    for tile in pl.parallel(tiles128):
-        tile_row_start = tile * 128
-        valid_rows = pl.min(128, count - tile_row_start)
-        _prefill_gate_up_quant_tile(
-            source, source_scale, route_weights, w1, scale1, w3, scale3,
-            hidden, hidden_scale, tile_row_start, valid_rows, 128, weighted,
+    """Dispatch a nonempty Prefill expert of at most 128 rows."""
+    valid_rows = pl.cast(count, pl.INDEX)
+    if count <= PREFILL_ROW_TILE:
+        _prefill_expert_single_tile(
+            source, source_scale, route_weights,
+            w1, scale1, w3, scale3, w2, scale2,
+            output, valid_rows, PREFILL_ROW_TILE, weighted,
         )
-    for tile in pl.parallel(tiles64):
-        tile_row_start = tiles128 * 128 + tile * 64
-        valid_rows = pl.min(64, count - tile_row_start)
-        _prefill_gate_up_quant_tile(
-            source, source_scale, route_weights, w1, scale1, w3, scale3,
-            hidden, hidden_scale, tile_row_start, valid_rows, 64, weighted,
+    elif count <= 32:
+        _prefill_expert_single_tile(
+            source, source_scale, route_weights,
+            w1, scale1, w3, scale3, w2, scale2,
+            output, valid_rows, 32, weighted,
         )
-    for tile in pl.parallel(tiles32):
-        tile_row_start = tiles128 * 128 + tiles64 * 64 + tile * 32
-        valid_rows = pl.min(32, count - tile_row_start)
-        _prefill_gate_up_quant_tile(
-            source, source_scale, route_weights, w1, scale1, w3, scale3,
-            hidden, hidden_scale, tile_row_start, valid_rows, 32, weighted,
+    elif count <= 48:
+        _prefill_expert_single_tile(
+            source, source_scale, route_weights,
+            w1, scale1, w3, scale3, w2, scale2,
+            output, valid_rows, 48, weighted,
         )
-    for tile in pl.parallel(tiles16):
-        tile_row_start = tiles128 * 128 + tiles64 * 64 + tiles32 * 32 + tile * PREFILL_ROW_TILE
-        valid_rows = pl.min(PREFILL_ROW_TILE, count - tile_row_start)
-        _prefill_gate_up_quant_tile(
-            source, source_scale, route_weights, w1, scale1, w3, scale3,
-            hidden, hidden_scale, tile_row_start, valid_rows, PREFILL_ROW_TILE, weighted,
+    elif count <= 64:
+        _prefill_expert_single_tile(
+            source, source_scale, route_weights,
+            w1, scale1, w3, scale3, w2, scale2,
+            output, valid_rows, 64, weighted,
         )
-
-    for tile in pl.parallel(tiles128):
-        tile_row_start = tile * 128
-        valid_rows = pl.min(128, count - tile_row_start)
-        _prefill_down_proj_tile(
-            hidden, hidden_scale, w2, scale2, output, tile_row_start, valid_rows, 128,
+    elif count <= 80:
+        _prefill_expert_single_tile(
+            source, source_scale, route_weights,
+            w1, scale1, w3, scale3, w2, scale2,
+            output, valid_rows, 80, weighted,
         )
-    for tile in pl.parallel(tiles64):
-        tile_row_start = tiles128 * 128 + tile * 64
-        valid_rows = pl.min(64, count - tile_row_start)
-        _prefill_down_proj_tile(
-            hidden, hidden_scale, w2, scale2, output, tile_row_start, valid_rows, 64,
+    elif count <= 96:
+        _prefill_expert_single_tile(
+            source, source_scale, route_weights,
+            w1, scale1, w3, scale3, w2, scale2,
+            output, valid_rows, 96, weighted,
         )
-    for tile in pl.parallel(tiles32):
-        tile_row_start = tiles128 * 128 + tiles64 * 64 + tile * 32
-        valid_rows = pl.min(32, count - tile_row_start)
-        _prefill_down_proj_tile(
-            hidden, hidden_scale, w2, scale2, output, tile_row_start, valid_rows, 32,
+    elif count <= 112:
+        _prefill_expert_single_tile(
+            source, source_scale, route_weights,
+            w1, scale1, w3, scale3, w2, scale2,
+            output, valid_rows, 112, weighted,
         )
-    for tile in pl.parallel(tiles16):
-        tile_row_start = tiles128 * 128 + tiles64 * 64 + tiles32 * 32 + tile * PREFILL_ROW_TILE
-        valid_rows = pl.min(PREFILL_ROW_TILE, count - tile_row_start)
-        _prefill_down_proj_tile(
-            hidden, hidden_scale, w2, scale2, output, tile_row_start, valid_rows, PREFILL_ROW_TILE,
+    else:
+        _prefill_expert_single_tile(
+            source, source_scale, route_weights,
+            w1, scale1, w3, scale3, w2, scale2,
+            output, valid_rows, PREFILL_FUSED_MAX_ROWS, weighted,
         )
     return output
