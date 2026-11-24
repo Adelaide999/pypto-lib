@@ -109,13 +109,14 @@ def _index_scores(
     key_flat = index_cache
     scale_flat = index_cache_scale
     panels = (width + 63) // 64
+    pair_table = _index_fp4_pairs()
     for token in pl.range(num_tokens):
         # Match the previous flattened (token, panel) assignment to each worker.
         start = (worker + workers - token * panels % workers) % workers
         length = pl.max(0, pl.min(width, pl.read(lengths, [token])))
         q_codes = pl.load(q_flat, [token * INDEX_H, 0], [INDEX_H, INDEX_DIM // 2])
         q_codes_scale = pl.load(qs_flat, [0, token * INDEX_H * 4], [1, INDEX_H * 4])
-        q_value = _decode_index_score_tile(q_codes, q_codes_scale, INDEX_H)
+        q_value = _index_key_score_tile(q_codes, q_codes_scale, pair_table, INDEX_H)
         raw_weight = pl.cast(pl.load(weights, [token, 0], [1, INDEX_H]), pl.FP32)
         scaled_weight = pl.mul(raw_weight, 0.015625)
         head_weight = pl.cast(pl.cast(scaled_weight, pl.BF16, mode="rint"), pl.FP32)
@@ -139,7 +140,7 @@ def _index_scores(
                     key_row = pl.cast(page, pl.INDEX) * 128 + begin % 128
                 k_codes = pl.load(key_flat, [key_row, 0], [64, INDEX_DIM // 2])
                 k_codes_scale = pl.load(scale_flat, [0, key_row * 4], [1, 64 * 4])
-                k_value = _decode_index_score_tile(k_codes, k_codes_scale, 64)
+                k_value = _index_key_score_tile(k_codes, k_codes_scale, pair_table, 64)
                 dot = pl.matmul(q_value, pl.tile.transpose(k_value, 0, 1), out_dtype=pl.FP32)
                 rounded = pl.cast(dot, pl.BF16, mode="rint")
                 relu = pl.maximum(pl.cast(rounded, pl.FP32), 0.0)
@@ -702,22 +703,23 @@ def _index_fp4_pairs():
 
 @pl.jit.inline(auto_scope=False)
 def _index_key_score_tile(
-    payload: pl.Tile[[32, INDEX_DIM // 2], pl.UINT8],
-    scale_codes: pl.Tile[[1, 32 * _SCALE_COUNT], pl.UINT8],
+    payload: pl.Tile[[CODE_ROWS_DYN, INDEX_DIM // 2], pl.UINT8],
+    scale_codes: pl.Tile[[1, SCORE_SCALE_COLS_DYN], pl.UINT8],
     pair_table: pl.Tile[[1, 256], pl.INT32],
+    rows: pl.constexpr,
 ):
     packed = pl.reinterpret_view(payload, pl.INT8)
     fp16 = pl.cast(packed, pl.FP16)
     byte_ids = pl.ands(pl.cast(fp16, pl.INT16, mode="rint"), 255)
     indices = pl.cast(pl.cast(byte_ids, pl.FP32), pl.INT32, mode="rint")
-    flat_indices = pl.reshape(indices, [1, 16 * INDEX_DIM])
-    scratch = pl.tile.create([1, 16 * INDEX_DIM], dtype=pl.INT32)
+    flat_indices = pl.reshape(indices, [1, rows * INDEX_DIM // 2])
+    scratch = pl.tile.create([1, rows * INDEX_DIM // 2], dtype=pl.INT32)
     pairs = pl.tile.gather(pair_table, flat_indices, scratch)
-    values = pl.reinterpret_view(pairs, pl.BF16, shape=[1, 32 * INDEX_DIM])
-    factors = pl.reshape(decode_scale(scale_codes, 1, 32 * _SCALE_COUNT), [32 * _SCALE_COUNT, 1])
-    groups = pl.reshape(pl.cast(values, pl.FP32), [32 * _SCALE_COUNT, INDEX_CACHE_GROUP])
+    values = pl.reinterpret_view(pairs, pl.BF16, shape=[1, rows * INDEX_DIM])
+    factors = pl.reshape(decode_scale(scale_codes, 1, rows * _SCALE_COUNT), [rows * _SCALE_COUNT, 1])
+    groups = pl.reshape(pl.cast(values, pl.FP32), [rows * _SCALE_COUNT, INDEX_CACHE_GROUP])
     scaled = pl.cast(pl.row_expand_mul(groups, factors), pl.BF16, mode="rint")
-    return pl.reshape(scaled, [32, INDEX_DIM])
+    return pl.reshape(scaled, [rows, INDEX_DIM])
 
 
 @pl.jit.inline(auto_scope=False)
@@ -768,7 +770,7 @@ def _score_single_paged_query(
                     k_codes = pl.load(key_payloads, [physical, 0], [32, INDEX_DIM // 2], target_memory=pl.MemorySpace.Vec)
                     k_scales = pl.load(key_scales, [0, physical * _SCALE_COUNT], [1, 32 * _SCALE_COUNT],
                                        target_memory=pl.MemorySpace.Vec)
-                    k_decoded = _index_key_score_tile(k_codes, k_scales, pair_table)
+                    k_decoded = _index_key_score_tile(k_codes, k_scales, pair_table, 32)
                     pl.store(k_decoded, [block * 32, 0], key_values)
     with pl.spmd(
         workers, name_hint="idx_score_single", sync_start=True,
