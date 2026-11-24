@@ -22,7 +22,7 @@ from .compressor import (
     c2a_compressor_publish, STATE_WIDTH, c2a_compressor_project, c2a_compressor_pool_state,
 )
 from .hc import hc_decode_mixes, hc_head_norm_adaptive
-from .qkv_proj_rope import decode_q_proj_rope as q_proj_rope, decode_kv_proj_rope as kv_proj_rope
+from .qkv_proj_rope import decode_qkv_proj_rope
 from .sparse_attention import (
     gather_packed, attend_selected, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
     WORKERS as ATTEND_WORKER_TILE,
@@ -121,22 +121,12 @@ def decode_c2a_full(
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_activation(x_norm, num_tokens, D)
-    qr, query, qb_payload, qb_scales = q_proj_rope(
+    qr, query, qb_payload, qb_scales = decode_qkv_proj_rope(
         proj_payload, proj_scales,
-        wq_a, wq_a_scale, q_norm_weight,
-        wq_b, wq_b_scale,
-        rope_cos, rope_sin,
-        qr, query,
-        num_tokens,
-    )
-    kv_proj_rope(
-        proj_payload, proj_scales,
+        wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight,
-        rope_cos, rope_sin,
-        kv_projection, window_kv,
-        num_tokens,
+        rope_cos, rope_sin, qr, query, window_kv, num_tokens,
     )
     publish_window_row(window_kv, window_slots, window_cache, window_cache_scale, num_tokens)
 

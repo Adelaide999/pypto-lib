@@ -215,6 +215,7 @@ def l2_pair_columns(
     return gemm_int8_pair_columns(
         payload, activation_scale, weight, weight_scale, output, count,
         WIDTH, OUTPUT_WIDTH, "decode_int8_pair_columns", N_TILE, K_TILE, False, 16,
+        activation_scale, activation_scale, False, 0, 0, 16,
     )
 
 

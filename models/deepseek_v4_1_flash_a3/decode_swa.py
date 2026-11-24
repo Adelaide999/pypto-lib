@@ -15,8 +15,8 @@ import pypto.language.distributed as pld
 from .config import TP_SIZE
 from .config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
 from .sparse_attention import publish_window_row, swa_attention_partial
-from .qkv_proj_rope import decode_q_proj_rope as q_proj_rope, decode_kv_proj_rope as kv_proj_rope
-from .o_proj import decode_project_output as project_output, decode_tp_output_post
+from .qkv_proj_rope import decode_qkv_proj_rope
+from .o_proj import decode_swa_o_proj, decode_tp_output_post
 from .hc import hc_decode_mixes, hc_head_norm_adaptive, zero_bf16_padding
 
 
@@ -85,22 +85,12 @@ def decode_swa(
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_activation(x_norm, num_tokens, D)
-    q_proj_rope(
+    decode_qkv_proj_rope(
         proj_payload, proj_scales,
-        wq_a, wq_a_scale, q_norm_weight,
-        wq_b, wq_b_scale,
-        rope_cos, rope_sin,
-        qr, q,
-        num_tokens,
-    )
-    kv_proj_rope(
-        proj_payload, proj_scales,
+        wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight,
-        rope_cos, rope_sin,
-        kv_projection, kv,
-        num_tokens,
+        rope_cos, rope_sin, qr, q, kv, num_tokens,
     )
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
@@ -110,9 +100,7 @@ def decode_swa(
         attention_pre_mix, post_mix, residual_mix,
         num_tokens,
     )
-    project_output(
-        attended, wo_a, wo_b, rope_cos, rope_sin, attention_output, num_tokens, True,
-    )
+    attention_output = decode_swa_o_proj(attended, wo_a, wo_b, rope_cos, rope_sin, attention_output, num_tokens)
     decode_tp_output_post(
         attention_output, output_window, output_arrived, group_base, tp_rank, num_tokens, attention_epoch,
         x_hc, post_mix, residual_mix, attention_pre_mix, attention_hidden, ffn_input,

@@ -205,6 +205,7 @@ def gemm_int8_pair_columns(
     fuse_rope: pl.constexpr,
     rope_dim: pl.constexpr,
     rope_offset: pl.constexpr,
+    rope_rows: pl.constexpr,
 ):
     """Compute two adjacent output panels while reusing each activation tile.
 
@@ -213,7 +214,8 @@ def gemm_int8_pair_columns(
     reducing repeated activation loads and the number of SPMD blocks. The
     weight ABI remains the canonical [K, N] layout used by the existing
     projections. Q-B can optionally apply RoPE to its second output panel
-    before the result is stored.
+    before the result is stored. A single-token caller can use one
+    vector row for RoPE while retaining the Cube tile dimensions.
     """
     panels = output_width // n_tile
     pairs = panels // 2
@@ -287,36 +289,36 @@ def gemm_int8_pair_columns(
             second_value = pl.col_expand_mul(second_value, second_scale)
             second_value = pl.cast(second_value, pl.BF16, mode="rint")
             if fuse_rope:
-                rope_value = pl.set_validshape(second_value, row_tile, n_tile)
+                rope_value = pl.set_validshape(second_value, rope_rows, n_tile)
                 tail_bf16 = pl.tile.slice(
-                    rope_value, [row_tile, rope_dim], [0, rope_offset],
+                    rope_value, [rope_rows, rope_dim], [0, rope_offset],
                 )
                 tail = pl.cast(tail_bf16, pl.FP32)
                 even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
                 odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
                 cosine = pl.load(
-                    rope_cos, [row, 0], [row_tile, rope_dim // 2],
+                    rope_cos, [row, 0], [rope_rows, rope_dim // 2],
                     valid_shape=[valid_rows, rope_dim // 2],
                 )
                 sine = pl.load(
-                    rope_sin, [row, 0], [row_tile, rope_dim // 2],
+                    rope_sin, [row, 0], [rope_rows, rope_dim // 2],
                     valid_shape=[valid_rows, rope_dim // 2],
                 )
                 cosine = pl.set_validshape(
                     pl.fillpad(cosine, pad_value=pl.PadValue.zero),
-                    row_tile, rope_dim // 2,
+                    rope_rows, rope_dim // 2,
                 )
                 sine = pl.set_validshape(
                     pl.fillpad(sine, pad_value=pl.PadValue.zero),
-                    row_tile, rope_dim // 2,
+                    rope_rows, rope_dim // 2,
                 )
                 real = pl.sub(pl.mul(even, cosine), pl.mul(odd, sine))
                 imag = pl.add(pl.mul(even, sine), pl.mul(odd, cosine))
-                real_lanes = pl.tile.full([row_tile, rope_dim], dtype=pl.FP32, value=0.0)
+                real_lanes = pl.tile.full([rope_rows, rope_dim], dtype=pl.FP32, value=0.0)
                 real_lanes = pl.tile.scatter_mask(
                     real_lanes, real, mask_pattern=pl.tile.MaskPattern.P0101,
                 )
-                imag_lanes = pl.tile.full([row_tile, rope_dim], dtype=pl.FP32, value=0.0)
+                imag_lanes = pl.tile.full([rope_rows, rope_dim], dtype=pl.FP32, value=0.0)
                 imag_lanes = pl.tile.scatter_mask(
                     imag_lanes, imag, mask_pattern=pl.tile.MaskPattern.P1010,
                 )
@@ -325,11 +327,11 @@ def gemm_int8_pair_columns(
                 rotated = pl.reinterpret_view(pl.or_(real_bits, imag_bits), pl.FP32)
                 rotated = pl.cast(rotated, pl.BF16, mode="rint")
                 prefix = pl.tile.slice(
-                    rope_value, [row_tile, rope_offset], [0, 0],
+                    rope_value, [rope_rows, rope_offset], [0, 0],
                     valid_shape=[valid_rows, rope_offset],
                 )
                 rotated = pl.tile.slice(
-                    rotated, [row_tile, rope_dim], [0, 0],
+                    rotated, [rope_rows, rope_dim], [0, 0],
                     valid_shape=[valid_rows, rope_dim],
                 )
                 output = pl.store(
@@ -508,6 +510,11 @@ def expert_down(
                 payload, scale, weight, weight_scale, output, count, width, output_width,
                 hint, PREFILL_EXPERT_DOWN_N_TILE, 256, output_major, 16,
             )
+    elif width == 2304 and output_width == 5120 and count == 1:
+        prefill_gemm_int8_tiled(
+            payload, scale, weight, weight_scale, output, count, width, output_width,
+            hint, 256, 256, output_major, 16,
+        )
     else:
         gemm_int8(payload, scale, weight, weight_scale, output, count, width, output_width, hint, 128, 256, output_major)
     return output

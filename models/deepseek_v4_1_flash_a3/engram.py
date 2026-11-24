@@ -221,12 +221,17 @@ def make_engram_from_rows(*, prefill):
             pl.dump_tag(original_query)
             engram_gate(kv, weight, original_query, x, out, output_fp32=True, kv_bf16=True)
         else:
-            kv_fp32 = pl.create_tensor([tokens, KV_OUT], dtype=pl.FP32)
-            engram_cast_to_fp32(kv, kv_fp32)
             original_query = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
-            engram_unrotate(x, rotation, original_query)
-            pl.dump_tag(original_query)
-            engram_gate(kv_fp32, weight, original_query, x, out, output_fp32=True, kv_bf16=False)
+            if tokens == 1:
+                engram_unrotate(x, rotation, original_query)
+                pl.dump_tag(original_query)
+                engram_gate(kv, weight, original_query, x, out, output_fp32=True, kv_bf16=True)
+            else:
+                kv_fp32 = pl.create_tensor([tokens, KV_OUT], dtype=pl.FP32)
+                engram_cast_to_fp32(kv, kv_fp32)
+                engram_unrotate(x, rotation, original_query)
+                pl.dump_tag(original_query)
+                engram_gate(kv_fp32, weight, original_query, x, out, output_fp32=True, kv_bf16=False)
         return out
 
     return engram_from_rows
