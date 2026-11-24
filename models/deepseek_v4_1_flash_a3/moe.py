@@ -321,6 +321,7 @@ def combine_scattered(
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
+    prefill: pl.constexpr,
 ):
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_notify", deps=[scatter_done], allow_early_resolve=False) as notify_tid:
         for peer in pl.range(N_RANKS):
@@ -341,6 +342,9 @@ def combine_scattered(
     # Wait for local and peer routed-output stores. A two-token panel keeps the
     # token-major routed rows contiguous while amortizing the 5120-wide loads.
     combine_blocks = (T + COMBINE_TOKEN_TILE - 1) // COMBINE_TOKEN_TILE
+    if not prefill:
+        active_blocks = (num_tokens + COMBINE_TOKEN_TILE - 1) // COMBINE_TOKEN_TILE
+        combine_blocks = pl.max(1, pl.min(combine_blocks, active_blocks))
     with pl.spmd(combine_blocks, name_hint="combine_reduce", deps=[_cwait_tid]) as _reduce_tid:
         block = pl.tile.get_block_idx()
         t0 = block * COMBINE_TOKEN_TILE
@@ -573,7 +577,7 @@ def prefill_moe_sublayer(
             shared_output, local_ffn_owned, combined_counts,
             routed_output, combine_arrived,
             scatter_done,
-            local_num_tokens, ep_rank, moe_epoch,
+            local_num_tokens, ep_rank, moe_epoch, prefill,
         )
         # Complete all peer readers before reusing the windows.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_release", deps=[output_ready]) as released:

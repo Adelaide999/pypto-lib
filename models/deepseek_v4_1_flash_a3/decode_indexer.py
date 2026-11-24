@@ -94,75 +94,77 @@ def _index_scores(
     key_flat = index_cache
     scale_flat = index_cache_scale
     panels = (width + 63) // 64
-    for work in pl.range(worker, num_tokens * panels, workers):
-        token = work // panels
-        begin = work % panels * 64
+    for token in pl.range(num_tokens):
+        # Match the previous flattened (token, panel) assignment to each worker.
+        start = (worker + workers - token * panels % workers) % workers
         length = pl.max(0, pl.min(width, pl.read(lengths, [token])))
-        page = pl.cast(-1, pl.INT32)
-        if gathered_rows > 0:
-            length = width
-            page = pl.cast(0, pl.INT32)
-        elif length > skip_threshold and begin < length:
-            request = pl.read(request_ids, [token])
-            if request >= 0 and begin // 128 < table_width:
-                page = pl.read(block_table, [pl.cast(request, pl.INDEX), begin // 128])
-        score = pl.reinterpret_view(pl.tile.full([1, 64], dtype=pl.INT32, value=-8388608), pl.FP32)
-        if page >= 0:
+        q_codes = pl.load(q_flat, [token * INDEX_H, 0], [INDEX_H, INDEX_DIM // 2])
+        q_value = decode_fp4(q_codes, INDEX_H, INDEX_DIM)
+        q_codes_scale = pl.load(qs_flat, [0, token * INDEX_H * 4], [1, INDEX_H * 4])
+        q_scale = decode_scale(q_codes_scale, 1, INDEX_H * 4)
+        q_scale_lanes = pl.tile.arange(0, [1, INDEX_H], dtype=pl.INT32)
+        raw_weight = pl.cast(pl.load(weights, [token, 0], [1, INDEX_H]), pl.FP32)
+        scaled_weight = pl.mul(raw_weight, 0.015625)
+        head_weight = pl.cast(pl.cast(scaled_weight, pl.BF16, mode="rint"), pl.FP32)
+        head_weight = pl.reshape(head_weight, [INDEX_H, 1])
+        for panel in pl.range(start, panels, workers):
+            begin = panel * 64
+            page = pl.cast(-1, pl.INT32)
             if gathered_rows > 0:
-                key_row = token * gathered_rows + begin
+                length = width
+                page = pl.cast(0, pl.INT32)
+            elif length > skip_threshold and begin < length:
+                request = pl.read(request_ids, [token])
+                if request >= 0 and begin // 128 < table_width:
+                    page = pl.read(block_table, [pl.cast(request, pl.INDEX), begin // 128])
+            score = pl.reinterpret_view(pl.tile.full([1, 64], dtype=pl.INT32, value=-8388608), pl.FP32)
+            if page >= 0:
+                if gathered_rows > 0:
+                    key_row = token * gathered_rows + begin
+                else:
+                    key_row = pl.cast(page, pl.INDEX) * 128 + begin % 128
+                k_codes = pl.load(key_flat, [key_row, 0], [64, INDEX_DIM // 2])
+                k_value = decode_fp4(k_codes, 64, INDEX_DIM)
+                k_codes_scale = pl.load(scale_flat, [0, key_row * 4], [1, 64 * 4])
+                k_scale = decode_scale(k_codes_scale, 1, 64 * 4)
+                k_scale_lanes = pl.tile.arange(0, [1, 64], dtype=pl.INT32)
+                q_scale_tmp = pl.create_tile([1, INDEX_H], dtype=pl.INT32)
+                k_scale_tmp = pl.create_tile([1, 64], dtype=pl.INT32)
+                dot = pl.tile.full([INDEX_H, 64], dtype=pl.FP32, value=0.0)
+                for group in pl.range(4):
+                    q = pl.tile.slice(q_value, [INDEX_H, 32], [0, group * 32])
+                    k = pl.tile.slice(k_value, [64, 32], [0, group * 32])
+                    k_fp32 = pl.cast(k, pl.FP32)
+                    k_compact = pl.cast(k_fp32, pl.BF16, mode="rint")
+                    part = pl.matmul(q, pl.tile.transpose(k_compact, 0, 1))
+                    q_scale_indices = pl.add(pl.mul(q_scale_lanes, 4), pl.cast(group, pl.INT32))
+                    k_scale_indices = pl.add(pl.mul(k_scale_lanes, 4), pl.cast(group, pl.INT32))
+                    sq = pl.tile.gather(q_scale, q_scale_indices, q_scale_tmp)
+                    sq = pl.reshape(sq, [INDEX_H, 1])
+                    sk = pl.tile.gather(k_scale, k_scale_indices, k_scale_tmp)
+                    part = pl.row_expand_mul(part, sq)
+                    part = pl.col_expand_mul(part, sk)
+                    dot = pl.add(dot, part)
+                rounded = pl.cast(dot, pl.BF16, mode="rint")
+                relu = pl.maximum(pl.cast(rounded, pl.FP32), 0.0)
+                weighted = pl.row_expand_mul(relu, head_weight)
+                weighted = pl.cast(pl.cast(weighted, pl.BF16, mode="rint"), pl.FP32)
+                score = pl.tile.slice(weighted, [1, 64], [0, 0])
+                for pair in pl.unroll(15):
+                    left = pl.tile.slice(weighted, [1, 64], [1 + 2 * pair, 0])
+                    right = pl.tile.slice(weighted, [1, 64], [2 + 2 * pair, 0])
+                    score = pl.add(score, pl.add(left, right))
+                score = pl.add(score, pl.tile.slice(weighted, [1, 64], [31, 0]))
+                score = pl.cast(pl.cast(score, pl.BF16, mode="rint"), pl.FP32)
+            lanes = pl.add(pl.tile.arange(0, [1, 64], dtype=pl.INT32), pl.cast(begin, pl.INT32))
+            if gathered_rows > 0:
+                mask_values = pl.load(valid, [0, token * gathered_rows + begin], [1, 64])
+                mask = pl.tile.cmps(mask_values, 1, cmp_type=0)
             else:
-                key_row = pl.cast(page, pl.INDEX) * 128 + begin % 128
-            q_codes = pl.load(q_flat, [token * INDEX_H, 0], [INDEX_H, INDEX_DIM // 2])
-            k_codes = pl.load(key_flat, [key_row, 0], [64, INDEX_DIM // 2])
-            q_value = decode_fp4(q_codes, INDEX_H, INDEX_DIM)
-            k_value = decode_fp4(k_codes, 64, INDEX_DIM)
-            q_codes_scale = pl.load(qs_flat, [0, token * INDEX_H * 4], [1, INDEX_H * 4])
-            k_codes_scale = pl.load(scale_flat, [0, key_row * 4], [1, 64 * 4])
-            q_scale = decode_scale(q_codes_scale, 1, INDEX_H * 4)
-            k_scale = decode_scale(k_codes_scale, 1, 64 * 4)
-            q_scale_lanes = pl.tile.arange(0, [1, INDEX_H], dtype=pl.INT32)
-            k_scale_lanes = pl.tile.arange(0, [1, 64], dtype=pl.INT32)
-            q_scale_tmp = pl.create_tile([1, INDEX_H], dtype=pl.INT32)
-            k_scale_tmp = pl.create_tile([1, 64], dtype=pl.INT32)
-            dot = pl.tile.full([INDEX_H, 64], dtype=pl.FP32, value=0.0)
-            for group in pl.range(4):
-                q = pl.tile.slice(q_value, [INDEX_H, 32], [0, group * 32])
-                k = pl.tile.slice(k_value, [64, 32], [0, group * 32])
-                k_fp32 = pl.cast(k, pl.FP32)
-                k_compact = pl.cast(k_fp32, pl.BF16, mode="rint")
-                part = pl.matmul(q, pl.tile.transpose(k_compact, 0, 1))
-                q_scale_indices = pl.add(pl.mul(q_scale_lanes, 4), pl.cast(group, pl.INT32))
-                k_scale_indices = pl.add(pl.mul(k_scale_lanes, 4), pl.cast(group, pl.INT32))
-                sq = pl.tile.gather(q_scale, q_scale_indices, q_scale_tmp)
-                sq = pl.reshape(sq, [INDEX_H, 1])
-                sk = pl.tile.gather(k_scale, k_scale_indices, k_scale_tmp)
-                part = pl.row_expand_mul(part, sq)
-                part = pl.col_expand_mul(part, sk)
-                dot = pl.add(dot, part)
-            rounded = pl.cast(dot, pl.BF16, mode="rint")
-            relu = pl.maximum(pl.cast(rounded, pl.FP32), 0.0)
-            raw_weight = pl.cast(pl.load(weights, [token, 0], [1, INDEX_H]), pl.FP32)
-            scaled_weight = pl.mul(raw_weight, 0.015625)
-            head_weight = pl.cast(pl.cast(scaled_weight, pl.BF16, mode="rint"), pl.FP32)
-            head_weight = pl.reshape(head_weight, [INDEX_H, 1])
-            weighted = pl.row_expand_mul(relu, head_weight)
-            weighted = pl.cast(pl.cast(weighted, pl.BF16, mode="rint"), pl.FP32)
-            score = pl.tile.slice(weighted, [1, 64], [0, 0])
-            for pair in pl.unroll(15):
-                left = pl.tile.slice(weighted, [1, 64], [1 + 2 * pair, 0])
-                right = pl.tile.slice(weighted, [1, 64], [2 + 2 * pair, 0])
-                score = pl.add(score, pl.add(left, right))
-            score = pl.add(score, pl.tile.slice(weighted, [1, 64], [31, 0]))
-            score = pl.cast(pl.cast(score, pl.BF16, mode="rint"), pl.FP32)
-        lanes = pl.add(pl.tile.arange(0, [1, 64], dtype=pl.INT32), pl.cast(begin, pl.INT32))
-        if gathered_rows > 0:
-            mask_values = pl.load(valid, [0, token * gathered_rows + begin], [1, 64])
-            mask = pl.tile.cmps(mask_values, 1, cmp_type=0)
-        else:
-            mask = pl.tile.cmps(pl.cast(lanes, pl.FP32), pl.cast(pl.cast(length, pl.INT32), pl.FP32), cmp_type=2)
-        negative = pl.reinterpret_view(pl.tile.full([1, 64], dtype=pl.INT32, value=-8388608), pl.FP32)
-        score = pl.tile.select(mask, score, negative)
-        pl.store(pl.set_validshape(score, 1, pl.min(64, width - begin)), [token, begin], output)
+                mask = pl.tile.cmps(pl.cast(lanes, pl.FP32), pl.cast(pl.cast(length, pl.INT32), pl.FP32), cmp_type=2)
+            negative = pl.reinterpret_view(pl.tile.full([1, 64], dtype=pl.INT32, value=-8388608), pl.FP32)
+            score = pl.tile.select(mask, score, negative)
+            pl.store(pl.set_validshape(score, 1, pl.min(64, width - begin)), [token, begin], output)
     return output
 
 
