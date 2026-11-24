@@ -167,7 +167,7 @@ def gate_normalized(
             xg_buf[t0 : t0 + GATE_INPUT_TILE, :] = pl.cast(normalized, pl.FP32)
 
     return gate_from_fp32(
-        xg_buf, gate_w, gate_bias, num_tokens, indices, weights,
+        xg_buf, gate_w, gate_bias, num_tokens, indices, weights, decode=True,
     )
 
 
@@ -179,6 +179,7 @@ def gate_from_fp32(
     num_tokens: pl.Scalar[pl.INT32],
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
+    decode: pl.constexpr,
 ):
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
@@ -268,10 +269,14 @@ def gate_from_fp32(
             # row-wise sort inside a larger worker tile to amortize launch and
             # synchronization overhead across the prefill batch.
             topk_idx_tile = pl.create_tensor([ROUTE_SELECT_T_TILE, TOPK_PAD], dtype=pl.INT32)
+            rows_to_sort = pl.cast(ROUTE_SELECT_T_TILE, pl.INDEX)
+            if decode:
+                rows_to_sort = pl.max(0, pl.min(ROUTE_SELECT_T_TILE, active_tokens - t1))
+                topk_idx_tile[:, :] = pl.full([ROUTE_SELECT_T_TILE, TOPK_PAD], dtype=pl.INT32, value=0)
             sr_idx_init = pl.create_tensor([1, SCORE_PAD], dtype=pl.UINT32)
             sr_index_range = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
             sr_idx_init[:, :] = sr_index_range
-            for sr_tt in pl.range(ROUTE_SELECT_T_TILE):
+            for sr_tt in pl.range(rows_to_sort):
                 sr_t = t1 + sr_tt
                 sr_row = pl.slice(biased_scores_buf, [1, SCORE_PAD], [sr_t, 0])
                 sr_i = route_topk_row(sr_row, sr_idx_init)

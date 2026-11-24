@@ -18,7 +18,7 @@ if not __package__:
 
 from .gemm import gemm_bf16_to_bf16, gemm_dynamic_int8, gemm_int8
 import pypto.language as pl
-from .quant import decode_fp4, decode_scale
+from .quant import CODE_ROWS_DYN, decode_fp4, decode_scale
 from .rmsnorm import make_norm_with_deps
 from .config import (
     B_DYN, CMP_POSITIONS_DYN, FLASH, INDEX_BLOCKS_DYN, INDEX_CACHE_GROUP, INDEX_POOL_BLOCKS_DYN,
@@ -61,13 +61,28 @@ CANDIDATE_MAX_LEAVES = (FLASH.max_position_embeddings // CANDIDATE_BLOCK_SIZE - 
 INDEX_SCORE_POSITIONS_DYN = pl.dynamic("V41_INDEX_SCORE_POSITIONS_DYN")
 VALID_ROWS_DYN = pl.dynamic("A3_VALID_ROWS_DYN")
 VALID_COLS_DYN = pl.dynamic("A3_VALID_COLS_DYN")
+SCORE_SCALE_COLS_DYN = pl.dynamic("A3_SCORE_SCALE_COLS_DYN")
 
 # Request-group score capacities for the 8192-start-position workloads.
 C1A_REQUEST_GROUP_SCORE_WIDTH = 8320
 C2A_REQUEST_GROUP_SCORE_WIDTH = 4224
 
 
-# Paged and gathered tensors need independent extern shape bindings.
+@pl.jit.inline(auto_scope=False)
+def _decode_index_score_tile(
+    codes: pl.Tile[[CODE_ROWS_DYN, INDEX_DIM // 2], pl.UINT8],
+    scale_codes: pl.Tile[[1, SCORE_SCALE_COLS_DYN], pl.UINT8],
+    rows: pl.constexpr,
+):
+    """Expand FP4 values and apply each shared scale to its group of 32."""
+    magnitudes = decode_fp4(codes, rows, INDEX_DIM)
+    scales = decode_scale(scale_codes, 1, rows * _SCALE_COUNT)
+    groups = pl.reshape(pl.cast(magnitudes, pl.FP32), [rows * _SCALE_COUNT, INDEX_CACHE_GROUP])
+    factors = pl.reshape(scales, [rows * _SCALE_COUNT, 1])
+    values = pl.row_expand_mul(groups, factors)
+    return pl.reshape(pl.cast(values, pl.BF16, mode="rint"), [rows, INDEX_DIM])
+
+
 @pl.jit.inline(auto_scope=False)
 def _index_scores(
     query: pl.Tensor,
@@ -99,10 +114,8 @@ def _index_scores(
         start = (worker + workers - token * panels % workers) % workers
         length = pl.max(0, pl.min(width, pl.read(lengths, [token])))
         q_codes = pl.load(q_flat, [token * INDEX_H, 0], [INDEX_H, INDEX_DIM // 2])
-        q_value = decode_fp4(q_codes, INDEX_H, INDEX_DIM)
         q_codes_scale = pl.load(qs_flat, [0, token * INDEX_H * 4], [1, INDEX_H * 4])
-        q_scale = decode_scale(q_codes_scale, 1, INDEX_H * 4)
-        q_scale_lanes = pl.tile.arange(0, [1, INDEX_H], dtype=pl.INT32)
+        q_value = _decode_index_score_tile(q_codes, q_codes_scale, INDEX_H)
         raw_weight = pl.cast(pl.load(weights, [token, 0], [1, INDEX_H]), pl.FP32)
         scaled_weight = pl.mul(raw_weight, 0.015625)
         head_weight = pl.cast(pl.cast(scaled_weight, pl.BF16, mode="rint"), pl.FP32)
@@ -117,34 +130,17 @@ def _index_scores(
                 request = pl.read(request_ids, [token])
                 if request >= 0 and begin // 128 < table_width:
                     page = pl.read(block_table, [pl.cast(request, pl.INDEX), begin // 128])
-            score = pl.reinterpret_view(pl.tile.full([1, 64], dtype=pl.INT32, value=-8388608), pl.FP32)
+            negative = pl.reinterpret_view(pl.tile.full([1, 64], dtype=pl.INT32, value=-8388608), pl.FP32)
+            valid_cols = pl.min(64, width - begin)
             if page >= 0:
                 if gathered_rows > 0:
                     key_row = token * gathered_rows + begin
                 else:
                     key_row = pl.cast(page, pl.INDEX) * 128 + begin % 128
                 k_codes = pl.load(key_flat, [key_row, 0], [64, INDEX_DIM // 2])
-                k_value = decode_fp4(k_codes, 64, INDEX_DIM)
                 k_codes_scale = pl.load(scale_flat, [0, key_row * 4], [1, 64 * 4])
-                k_scale = decode_scale(k_codes_scale, 1, 64 * 4)
-                k_scale_lanes = pl.tile.arange(0, [1, 64], dtype=pl.INT32)
-                q_scale_tmp = pl.create_tile([1, INDEX_H], dtype=pl.INT32)
-                k_scale_tmp = pl.create_tile([1, 64], dtype=pl.INT32)
-                dot = pl.tile.full([INDEX_H, 64], dtype=pl.FP32, value=0.0)
-                for group in pl.range(4):
-                    q = pl.tile.slice(q_value, [INDEX_H, 32], [0, group * 32])
-                    k = pl.tile.slice(k_value, [64, 32], [0, group * 32])
-                    k_fp32 = pl.cast(k, pl.FP32)
-                    k_compact = pl.cast(k_fp32, pl.BF16, mode="rint")
-                    part = pl.matmul(q, pl.tile.transpose(k_compact, 0, 1))
-                    q_scale_indices = pl.add(pl.mul(q_scale_lanes, 4), pl.cast(group, pl.INT32))
-                    k_scale_indices = pl.add(pl.mul(k_scale_lanes, 4), pl.cast(group, pl.INT32))
-                    sq = pl.tile.gather(q_scale, q_scale_indices, q_scale_tmp)
-                    sq = pl.reshape(sq, [INDEX_H, 1])
-                    sk = pl.tile.gather(k_scale, k_scale_indices, k_scale_tmp)
-                    part = pl.row_expand_mul(part, sq)
-                    part = pl.col_expand_mul(part, sk)
-                    dot = pl.add(dot, part)
+                k_value = _decode_index_score_tile(k_codes, k_codes_scale, 64)
+                dot = pl.matmul(q_value, pl.tile.transpose(k_value, 0, 1), out_dtype=pl.FP32)
                 rounded = pl.cast(dot, pl.BF16, mode="rint")
                 relu = pl.maximum(pl.cast(rounded, pl.FP32), 0.0)
                 weighted = pl.row_expand_mul(relu, head_weight)
@@ -156,15 +152,16 @@ def _index_scores(
                     score = pl.add(score, pl.add(left, right))
                 score = pl.add(score, pl.tile.slice(weighted, [1, 64], [31, 0]))
                 score = pl.cast(pl.cast(score, pl.BF16, mode="rint"), pl.FP32)
-            lanes = pl.add(pl.tile.arange(0, [1, 64], dtype=pl.INT32), pl.cast(begin, pl.INT32))
-            if gathered_rows > 0:
-                mask_values = pl.load(valid, [0, token * gathered_rows + begin], [1, 64])
-                mask = pl.tile.cmps(mask_values, 1, cmp_type=0)
+                lanes = pl.add(pl.tile.arange(0, [1, 64], dtype=pl.INT32), pl.cast(begin, pl.INT32))
+                if gathered_rows > 0:
+                    mask_values = pl.load(valid, [0, token * gathered_rows + begin], [1, 64])
+                    mask = pl.tile.cmps(mask_values, 1, cmp_type=0)
+                else:
+                    mask = pl.tile.cmps(pl.cast(lanes, pl.FP32), pl.cast(pl.cast(length, pl.INT32), pl.FP32), cmp_type=2)
+                masked = pl.tile.select(mask, score, negative)
+                pl.store(pl.set_validshape(masked, 1, valid_cols), [token, begin], output)
             else:
-                mask = pl.tile.cmps(pl.cast(lanes, pl.FP32), pl.cast(pl.cast(length, pl.INT32), pl.FP32), cmp_type=2)
-            negative = pl.reinterpret_view(pl.tile.full([1, 64], dtype=pl.INT32, value=-8388608), pl.FP32)
-            score = pl.tile.select(mask, score, negative)
-            pl.store(pl.set_validshape(score, 1, pl.min(64, width - begin)), [token, begin], output)
+                pl.store(pl.set_validshape(negative, 1, valid_cols), [token, begin], output)
     return output
 
 

@@ -572,7 +572,9 @@ def prefill_moe_sublayer(
                     local_ffn_normed, x_norm_mx, scale_view, gate_input,
                     local_num_tokens, tp_rank, TOKENS,
                 )
-                gate_from_fp32(gate_input, gate_weight, correction_bias, local_num_tokens, indices, weights)
+                gate_from_fp32(
+                    gate_input, gate_weight, correction_bias, local_num_tokens, indices, weights, decode=False,
+                )
             else:
                 _decode_ffn_owner_norm(
                     ffn_input, ffn_norm_weight, local_ffn_normed, num_tokens, tp_rank, local_num_tokens,
