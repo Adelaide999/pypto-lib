@@ -258,81 +258,108 @@ def gate_from_fp32(
                     gate_logits_tile = pl.matmul_acc(
                         gate_logits_tile, gd_x, gd_w, init_cond=(kb == 0),
                     )
-                gp_relu = pl.maximum(gate_logits_tile, 0.0)
-                gp_abs = pl.abs(gate_logits_tile)
-                gp_neg_abs = pl.neg(gp_abs)
-                gp_exp_abs = pl.exp(gp_neg_abs)
-                gp_exp_plus = pl.add(gp_exp_abs, 1.0)
-                gp_softplus_tail = pl.log(gp_exp_plus)
-                gp_softplus = pl.add(gp_relu, gp_softplus_tail)
-                gp_score = pl.sqrt(gp_softplus)
-                route_scores_buf = pl.store(gp_score, [t1, n0], route_scores_buf)
-                bias_valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
-                gp_bias_row = pl.tile.load(
-                    gate_bias_matrix,
-                    [0, n0],
-                    [1, GATE_N_TILE],
-                    valid_shape=[1, bias_valid_n],
-                    target_memory=pl.MemorySpace.Vec,
-                )
-                gp_biased = pl.col_expand_add(gp_score, gp_bias_row)
-                biased_scores_buf = pl.store(gp_biased, [t1, n0], biased_scores_buf)
-
-    # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
-    # does not emit an invalid function for a route_hash path that does no work.
-    task_route_tiles = (task_tokens + ROUTE_SELECT_T_TILE - 1) // ROUTE_SELECT_T_TILE
-    route_workers = pl.min(task_route_tiles, ROUTE_SELECT_WORKERS)
-    for route_worker in pl.spmd(route_workers, name_hint="route_sort"):
-        for ts_idx in pl.range(route_worker, task_route_tiles, route_workers):
-            t1 = ts_idx * ROUTE_SELECT_T_TILE
-            # ptoas pto.tmrgsort requires a single source row. Keep the
-            # row-wise sort inside a larger worker tile to amortize launch and
-            # synchronization overhead across the prefill batch.
-            topk_idx_tile = pl.create_tensor([ROUTE_SELECT_T_TILE, TOPK_PAD], dtype=pl.INT32)
-            rows_to_sort = pl.cast(ROUTE_SELECT_T_TILE, pl.INDEX)
-            if decode:
-                rows_to_sort = pl.max(0, pl.min(ROUTE_SELECT_T_TILE, active_tokens - t1))
-                topk_idx_tile[:, :] = pl.full([ROUTE_SELECT_T_TILE, TOPK_PAD], dtype=pl.INT32, value=0)
-            dense_scores = pl.create_tensor([ROUTE_SELECT_T_TILE, SCORE_PAD], dtype=pl.FP32)
-            biased_panel = pl.create_tensor([ROUTE_SELECT_T_TILE, SCORE_PAD], dtype=pl.FP32)
-            if not decode and capacity == 2048 and N_EXPERTS == SCORE_PAD:
-                values = pl.slice(route_scores_buf, [ROUTE_SELECT_T_TILE, SCORE_PAD], [t1, 0])
-                tail = pl.log(pl.add(pl.exp(pl.neg(pl.abs(values))), 1.0))
-                dense_scores[:, :] = pl.sqrt(pl.add(pl.maximum(values, 0.0), tail))
-                biased_panel[:, :] = pl.col_expand_add(dense_scores, gate_bias_matrix)
-            sr_idx_init = pl.create_tensor([1, SCORE_PAD], dtype=pl.UINT32)
-            sr_index_range = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
-            sr_idx_init[:, :] = sr_index_range
-            for sr_tt in pl.range(rows_to_sort):
-                if not decode and capacity == 2048 and N_EXPERTS == SCORE_PAD:
-                    sr_row = pl.slice(biased_panel, [1, SCORE_PAD], [sr_tt, 0])
+                if decode and capacity == 16 and N_EXPERTS == SCORE_PAD:
+                    route_scores_buf = pl.store(gate_logits_tile, [t1, n0], route_scores_buf)
                 else:
-                    sr_t = t1 + sr_tt
-                    sr_row = pl.slice(biased_scores_buf, [1, SCORE_PAD], [sr_t, 0])
-                sr_i = route_topk_row(sr_row, sr_idx_init)
-                topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
+                    gp_relu = pl.maximum(gate_logits_tile, 0.0)
+                    gp_abs = pl.abs(gate_logits_tile)
+                    gp_neg_abs = pl.neg(gp_abs)
+                    gp_exp_abs = pl.exp(gp_neg_abs)
+                    gp_exp_plus = pl.add(gp_exp_abs, 1.0)
+                    gp_softplus_tail = pl.log(gp_exp_plus)
+                    gp_softplus = pl.add(gp_relu, gp_softplus_tail)
+                    gp_score = pl.sqrt(gp_softplus)
+                    route_scores_buf = pl.store(gp_score, [t1, n0], route_scores_buf)
+                    bias_valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
+                    gp_bias_row = pl.tile.load(
+                        gate_bias_matrix,
+                        [0, n0],
+                        [1, GATE_N_TILE],
+                        valid_shape=[1, bias_valid_n],
+                        target_memory=pl.MemorySpace.Vec,
+                    )
+                    gp_biased = pl.col_expand_add(gp_score, gp_bias_row)
+                    biased_scores_buf = pl.store(gp_biased, [t1, n0], biased_scores_buf)
 
-            local_scores = pl.create_tensor([ROUTE_SELECT_T_TILE, SCORE_PAD], dtype=pl.FP32)
-            if not decode and capacity == 2048 and N_EXPERTS == SCORE_PAD:
-                local_scores[:, :] = dense_scores
-            else:
-                local_scores[:, :] = route_scores_buf[t1 : t1 + ROUTE_SELECT_T_TILE, :]
-            gather_all = pl.gather(local_scores, dim=-1, index=topk_idx_tile)
-            gather_valid = pl.set_validshape(gather_all, ROUTE_SELECT_T_TILE, TOPK)
-            topk_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
-            topk_sum = pl.row_sum(topk_vals_pad)
-            denom = pl.reshape(topk_sum, [ROUTE_SELECT_T_TILE, 1])
-            denom = pl.add(denom, 1e-20)
-            topk_normalized = pl.row_expand_div(topk_vals_pad, denom)
-            normalized_weights = pl.mul(topk_normalized, ROUTE_SCALE)
-            valid_rows = pl.min(ROUTE_SELECT_T_TILE, active_tokens - t1)
-            if valid_rows > 0:
-                indices[t1 : t1 + ROUTE_SELECT_T_TILE, :] = pl.set_validshape(
-                    topk_idx_tile, valid_rows, TOPK,
-                )
-                weights[t1 : t1 + ROUTE_SELECT_T_TILE, :] = pl.set_validshape(
-                    normalized_weights, valid_rows, TOPK,
-                )
+    if decode and capacity == 16 and N_EXPERTS == SCORE_PAD:
+        if active_tokens > 0:
+            decode_route_workers = pl.min(active_tokens, ROUTE_SELECT_WORKERS)
+            for decode_worker in pl.spmd(decode_route_workers, name_hint="decode_gate_topk"):
+                expert_ids = pl.create_tensor([1, SCORE_PAD], dtype=pl.UINT32)
+                expert_ids[:, :] = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
+                for decode_row in pl.range(decode_worker, active_tokens, decode_route_workers):
+                    decode_logits = pl.slice(route_scores_buf, [1, SCORE_PAD], [decode_row, 0])
+                    decode_tail = pl.log(pl.add(pl.exp(pl.neg(pl.abs(decode_logits))), 1.0))
+                    decode_scores = pl.sqrt(pl.add(pl.maximum(decode_logits, 0.0), decode_tail))
+                    biased = pl.create_tensor([1, SCORE_PAD], dtype=pl.FP32)
+                    biased[:, :] = pl.add(decode_scores, gate_bias_matrix)
+                    decode_chosen = route_topk_row(biased, expert_ids)
+                    decode_selected = pl.gather(decode_scores, dim=-1, index=decode_chosen)
+                    decode_padded = pl.create_tensor([8, TOPK_PAD], dtype=pl.FP32)
+                    decode_padded[:, :] = pl.full([8, TOPK_PAD], dtype=pl.FP32, value=0.0)
+                    decode_padded[0:1, :] = decode_selected
+                    decode_padded = pl.fillpad(pl.set_validshape(decode_padded, 8, TOPK), pad_value=pl.PadValue.zero)
+                    decode_denom = pl.add(pl.row_sum(decode_padded), 1e-20)
+                    decode_all_weights = pl.mul(pl.row_expand_div(decode_padded, decode_denom), ROUTE_SCALE)
+                    decode_normalized = pl.slice(decode_all_weights, [1, TOPK_PAD], [0, 0], valid_shape=[1, TOPK])
+                    indices[decode_row : decode_row + 1, :] = pl.set_validshape(decode_chosen, 1, TOPK)
+                    weights[decode_row : decode_row + 1, :] = decode_normalized
+    else:
+        # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
+        # does not emit an invalid function for a route_hash path that does no work.
+        task_route_tiles = (task_tokens + ROUTE_SELECT_T_TILE - 1) // ROUTE_SELECT_T_TILE
+        route_workers = pl.min(task_route_tiles, ROUTE_SELECT_WORKERS)
+        for route_worker in pl.spmd(route_workers, name_hint="route_sort"):
+            for ts_idx in pl.range(route_worker, task_route_tiles, route_workers):
+                t1 = ts_idx * ROUTE_SELECT_T_TILE
+                # ptoas pto.tmrgsort requires a single source row. Keep the
+                # row-wise sort inside a larger worker tile to amortize launch and
+                # synchronization overhead across the prefill batch.
+                topk_idx_tile = pl.create_tensor([ROUTE_SELECT_T_TILE, TOPK_PAD], dtype=pl.INT32)
+                rows_to_sort = pl.cast(ROUTE_SELECT_T_TILE, pl.INDEX)
+                if decode:
+                    rows_to_sort = pl.max(0, pl.min(ROUTE_SELECT_T_TILE, active_tokens - t1))
+                    topk_idx_tile[:, :] = pl.full([ROUTE_SELECT_T_TILE, TOPK_PAD], dtype=pl.INT32, value=0)
+                dense_scores = pl.create_tensor([ROUTE_SELECT_T_TILE, SCORE_PAD], dtype=pl.FP32)
+                biased_panel = pl.create_tensor([ROUTE_SELECT_T_TILE, SCORE_PAD], dtype=pl.FP32)
+                if not decode and capacity == 2048 and N_EXPERTS == SCORE_PAD:
+                    values = pl.slice(route_scores_buf, [ROUTE_SELECT_T_TILE, SCORE_PAD], [t1, 0])
+                    tail = pl.log(pl.add(pl.exp(pl.neg(pl.abs(values))), 1.0))
+                    dense_scores[:, :] = pl.sqrt(pl.add(pl.maximum(values, 0.0), tail))
+                    biased_panel[:, :] = pl.col_expand_add(dense_scores, gate_bias_matrix)
+                sr_idx_init = pl.create_tensor([1, SCORE_PAD], dtype=pl.UINT32)
+                sr_index_range = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
+                sr_idx_init[:, :] = sr_index_range
+                for sr_tt in pl.range(rows_to_sort):
+                    if not decode and capacity == 2048 and N_EXPERTS == SCORE_PAD:
+                        sr_row = pl.slice(biased_panel, [1, SCORE_PAD], [sr_tt, 0])
+                    else:
+                        sr_t = t1 + sr_tt
+                        sr_row = pl.slice(biased_scores_buf, [1, SCORE_PAD], [sr_t, 0])
+                    sr_i = route_topk_row(sr_row, sr_idx_init)
+                    topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
+
+                local_scores = pl.create_tensor([ROUTE_SELECT_T_TILE, SCORE_PAD], dtype=pl.FP32)
+                if not decode and capacity == 2048 and N_EXPERTS == SCORE_PAD:
+                    local_scores[:, :] = dense_scores
+                else:
+                    local_scores[:, :] = route_scores_buf[t1 : t1 + ROUTE_SELECT_T_TILE, :]
+                gather_all = pl.gather(local_scores, dim=-1, index=topk_idx_tile)
+                gather_valid = pl.set_validshape(gather_all, ROUTE_SELECT_T_TILE, TOPK)
+                topk_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
+                topk_sum = pl.row_sum(topk_vals_pad)
+                denom = pl.reshape(topk_sum, [ROUTE_SELECT_T_TILE, 1])
+                denom = pl.add(denom, 1e-20)
+                topk_normalized = pl.row_expand_div(topk_vals_pad, denom)
+                normalized_weights = pl.mul(topk_normalized, ROUTE_SCALE)
+                valid_rows = pl.min(ROUTE_SELECT_T_TILE, active_tokens - t1)
+                if valid_rows > 0:
+                    indices[t1 : t1 + ROUTE_SELECT_T_TILE, :] = pl.set_validshape(
+                        topk_idx_tile, valid_rows, TOPK,
+                    )
+                    weights[t1 : t1 + ROUTE_SELECT_T_TILE, :] = pl.set_validshape(
+                        normalized_weights, valid_rows, TOPK,
+                    )
 
     return weights
 
