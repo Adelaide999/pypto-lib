@@ -24,11 +24,12 @@ from tokenizers import Tokenizer
 from pypto.backend import BackendType
 from pypto.ir import DistributedConfig
 from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
-from pypto.runtime import DeviceTensor, ExecutionMode, RunConfig, StackedDeviceTensor
+from pypto.runtime import DeviceTensor, ExecutionMode, RunConfig
 from pypto.runtime.distributed_runner import DistributedWorker
 
 from . import config as C
 from .config import FLASH as M
+from .device_views import resident_graph_argument
 from .engram import HostEngram
 from .host import prepare_resident_inputs
 from .utils import DECODE_CACHE_NAMES, decode_cache_views, prepare_decode_inputs
@@ -290,14 +291,20 @@ def generate(args, devices, *, manifests):
                     if name in DECODE_CACHE_NAMES:
                         source = ranks[0][rank][DECODE_CACHE_NAMES[name]]
                         handle = DeviceTensor(source.data_ptr, views[name].shape, source.dtype, buffer=source.buffer)
+                    elif name in weights.tensor_layouts and name not in ranks[0][rank]:
+                        shape, dtype = weights.tensor_layouts[name]
+                        handle = runtime.alloc_tensor(shape, dtype, worker_id=rank)
                     elif name in constants or name in ("logits", "sampled_ids"):
                         handle = ranks[0][rank][name]
                     else:
                         handle = input_views[name]
                     ranks[1][rank][name] = handle
             with ThreadPoolExecutor(max_workers=8) as uploaders:
-                uploads = {uploaders.submit(weights.upload, runtime, rank, ranks[0][rank], layers=selected_layers): rank
-                           for rank in range(16)}
+                uploads = {
+                    uploaders.submit(weights.upload, runtime, rank, ranks[0][rank] | ranks[1][rank],
+                                     layers=selected_layers): rank
+                    for rank in range(16)
+                }
                 for uploaded in as_completed(uploads):
                     uploaded.result()
                     print(f"A3_RANK_WEIGHTS_READY {uploads[uploaded]}", flush=True)
@@ -306,16 +313,20 @@ def generate(args, devices, *, manifests):
             memory.sample()
             report["weight_load_seconds"] = time.monotonic() - load_start
             report["resident_weights_shared"] = all(ranks[0][rank][name] is ranks[1][rank][name]
-                                                     for rank in range(16) for name in weights.tensor_layouts)
+                                                     for rank in range(16) for name in weights.tensor_layouts.keys() & ranks[0][rank].keys())
             report["resident_caches_shared"] = all(
                 ranks[0][rank][source].data_ptr == ranks[1][rank][target].data_ptr
                 for rank in range(16) for target, source in DECODE_CACHE_NAMES.items()
             )
             arguments = []
             for index in range(2):
-                stacked = {name: StackedDeviceTensor([rank[name] for rank in ranks[index]],
-                           (16, *ranks[index][0][name].shape), tuple(range(16)))
-                           for name in names[index] if name not in counts}
+                parameters = programs[index]._get_metadata()[0]
+                if prepare_windows[index]:
+                    parameters = parameters[:-1]
+                stacked = {
+                    name: resident_graph_argument([rank[name] for rank in ranks[index]], tuple(range(16)), param)
+                    for name, param in zip(names[index], parameters, strict=True) if name not in counts
+                }
                 stacked.update(counts if index == 1 else {})
                 arguments.append(stacked)
             reserve_times = {}

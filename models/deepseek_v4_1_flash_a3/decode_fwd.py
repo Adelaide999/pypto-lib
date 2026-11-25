@@ -19,7 +19,7 @@ if not __package__:
 
 import argparse
 import pypto.language as pl
-from .config import TP_SIZE
+from .config import SWA_LAYER_COUNT, TP_SIZE
 import pypto.language.distributed as pld
 from . import config as C
 
@@ -139,6 +139,8 @@ def decode_encoder(
     attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
     wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
+    swa_wo_a: pl.Tensor[[SWA_LAYER_COUNT * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
+    swa_wo_b: pl.Tensor[[SWA_LAYER_COUNT, LOCAL_O_WIDTH, D], pl.BF16],
     freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     freqs_sin: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     token_rope_cos: pl.Out[pl.Tensor[[DECODE_CAPACITY, ROPE_DIM // 2], pl.FP32]],
@@ -298,10 +300,12 @@ def decode_encoder(
             layer_sink: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(attn_sink, [LOCAL_H], [layer * LOCAL_H])
             layer_wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16, pl.NZ] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [layer * LOCAL_O_GROUPS, 0, 0])
             layer_wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16, pl.NZ] = wo_b[layer]
-            if layer < 2:
+            if layer < SWA_LAYER_COUNT:
+                layer_swa_wo_a = pl.slice(swa_wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [layer * LOCAL_O_GROUPS, 0, 0])
+                layer_swa_wo_b = swa_wo_b[layer]
                 swa_attention_output = pl.create_tensor([tokens, D], dtype=pl.BF16)
                 decode_swa(
-                    x_hc, pre_mix, layer_hc_fn, layer_hc_scale, layer_hc_base, layer_norm_weight, layer_wq_a, layer_wq_a_scale, layer_q_norm, layer_wq_b, layer_wq_b_scale, layer_wkv, layer_wkv_scale, layer_kv_norm, layer_sink, layer_wo_a, layer_wo_b, base_rope_cos, base_rope_sin, window_slots, window_indices, layer_window_cache, layer_window_cache_scale, swa_attention_output, attention_hidden, attention_pre_mix, ffn_input, attention_count, output_window, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, layer + 1,
+                    x_hc, pre_mix, layer_hc_fn, layer_hc_scale, layer_hc_base, layer_norm_weight, layer_wq_a, layer_wq_a_scale, layer_q_norm, layer_wq_b, layer_wq_b_scale, layer_wkv, layer_wkv_scale, layer_kv_norm, layer_sink, layer_wo_a, layer_wo_b, layer_swa_wo_a, layer_swa_wo_b, base_rope_cos, base_rope_sin, window_slots, window_indices, layer_window_cache, layer_window_cache_scale, swa_attention_output, attention_hidden, attention_pre_mix, ffn_input, attention_count, output_window, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, layer + 1,
                 )
             elif (layer - 2) % 6 == 0:
                 full_source_id = (layer - 2) // 6
@@ -619,6 +623,8 @@ def l2_decode_fwd(
     attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
     wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
+    swa_wo_a: pl.Tensor[[SWA_LAYER_COUNT * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
+    swa_wo_b: pl.Tensor[[SWA_LAYER_COUNT, LOCAL_O_WIDTH, D], pl.BF16],
     freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     freqs_sin: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
@@ -705,7 +711,7 @@ def l2_decode_fwd(
     compressed_token_rope_cos = pl.create_tensor([DECODE_CAPACITY, ROPE_DIM // 2], dtype=pl.FP32)
     compressed_token_rope_sin = pl.create_tensor([DECODE_CAPACITY, ROPE_DIM // 2], dtype=pl.FP32)
     encoder_hidden, encoder_pre_mix, token_cos, token_sin = decode_encoder(
-                                                                engram_lookup, engram_wkv, engram_weight, engram_rotation, x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a, q_norm_weight, wq_b, wkv, kv_norm_weight, attn_sink, wo_a, wo_b, freqs_cos, freqs_sin, compressed_token_rope_cos, compressed_token_rope_sin, window_slots, window_indices, window_cache_pool, window_cache_scale_pool, compressed_cache_pool, compressed_cache_scale_pool, token_to_req_indices, position_ids, index_cache_pool, index_cache_scale_pool, c2a_index_block_table, c2a_compressor_wkv, c2a_compressor_wgate, c1a_compressor_wkv, query_start_loc, state_block_table, state_cache_pool, compressor_norm_weight, c2a_compressed_slots, index_wk, index_norm_weight, index_wq_b, index_weights_proj, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_weight, gate_weight, correction_bias, routed_w1, routed_w2, routed_w3,  shared_w13, shared_w2, recv_meta, recv_x, recv_weights, arrived, data_arrived, routed_output, combine_arrived, moe_num_tokens, attention_num_tokens, rank, wq_a_scale, wq_b_scale, wkv_scale, index_wq_b_scale, routed_w1_scale, routed_w2_scale, routed_w3_scale, shared_w1_scale, shared_w2_scale, shared_w3_scale, output_window, output_arrived, ffn_window, ffn_arrived,
+                                                                engram_lookup, engram_wkv, engram_weight, engram_rotation, x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a, q_norm_weight, wq_b, wkv, kv_norm_weight, attn_sink, wo_a, wo_b, swa_wo_a, swa_wo_b, freqs_cos, freqs_sin, compressed_token_rope_cos, compressed_token_rope_sin, window_slots, window_indices, window_cache_pool, window_cache_scale_pool, compressed_cache_pool, compressed_cache_scale_pool, token_to_req_indices, position_ids, index_cache_pool, index_cache_scale_pool, c2a_index_block_table, c2a_compressor_wkv, c2a_compressor_wgate, c1a_compressor_wkv, query_start_loc, state_block_table, state_cache_pool, compressor_norm_weight, c2a_compressed_slots, index_wk, index_norm_weight, index_wq_b, index_weights_proj, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_weight, gate_weight, correction_bias, routed_w1, routed_w2, routed_w3,  shared_w13, shared_w2, recv_meta, recv_x, recv_weights, arrived, data_arrived, routed_output, combine_arrived, moe_num_tokens, attention_num_tokens, rank, wq_a_scale, wq_b_scale, wkv_scale, index_wq_b_scale, routed_w1_scale, routed_w2_scale, routed_w3_scale, shared_w1_scale, shared_w2_scale, shared_w3_scale, output_window, output_arrived, ffn_window, ffn_arrived,
                                                             )
     result = decode_decoder(
                  encoder_hidden, encoder_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a, q_norm_weight, wq_b, wkv, kv_norm_weight, attn_sink, wo_a, wo_b, token_cos, token_sin, window_slots, window_indices, window_cache_pool, window_cache_scale_pool, compressed_cache_pool, compressed_cache_scale_pool, token_to_req_indices, position_ids, index_cache_pool, index_cache_scale_pool, c1a_index_block_table, c2a_compressor_wkv, c2a_compressor_wgate, c1a_compressor_wkv, query_start_loc, state_block_table, state_cache_pool, compressor_norm_weight, c1a_compressed_slots, index_wk, index_norm_weight, index_wq_b, index_weights_proj, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm_weight, gate_weight, correction_bias, routed_w1, routed_w2, routed_w3,  shared_w13, shared_w2, recv_meta, recv_x, recv_weights, arrived, data_arrived, routed_output, combine_arrived, moe_num_tokens, attention_num_tokens, rank, wq_a_scale, wq_b_scale, wkv_scale, index_wq_b_scale, routed_w1_scale, routed_w2_scale, routed_w3_scale, shared_w1_scale, shared_w2_scale, shared_w3_scale, output_window, output_arrived, ffn_window, ffn_arrived,
@@ -744,6 +750,8 @@ def l3_decode_fwd(
     attn_sink: pl.Tensor[[EP_SIZE, N_LAYERS * LOCAL_H], pl.FP32],
     wo_a: pl.Tensor[[EP_SIZE, N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[EP_SIZE, N_LAYERS, LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
+    swa_wo_a: pl.Tensor[[EP_SIZE, SWA_LAYER_COUNT * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
+    swa_wo_b: pl.Tensor[[EP_SIZE, SWA_LAYER_COUNT, LOCAL_O_WIDTH, D], pl.BF16],
     freqs_cos: pl.Tensor[[EP_SIZE, 2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     freqs_sin: pl.Tensor[[EP_SIZE, 2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[EP_SIZE, T_DYN], pl.INT64],
@@ -942,7 +950,7 @@ def l3_decode_fwd(
         head_logits_done = pld.window(head_logits_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         if execute_layers != 0:
             l2_decode_fwd(
-                engram_lookup[rank], engram_wkv[rank], engram_weight[rank], engram_rotation[rank], x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank], attn_norm_weight[rank], wq_a[rank], q_norm_weight[rank], wq_b[rank], wkv[rank], kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank], freqs_cos[rank], freqs_sin[rank], window_slots[rank], window_indices[rank], window_cache_pool[rank], window_cache_scale_pool[rank], compressed_cache_pool[rank], compressed_cache_scale_pool[rank], token_to_req_indices[rank], position_ids[rank], index_cache_pool[rank], index_cache_scale_pool[rank], c2a_index_block_table[rank], c1a_index_block_table[rank], c2a_compressor_wkv[rank], c2a_compressor_wgate[rank], c1a_compressor_wkv[rank], query_start_loc[rank], state_block_table[rank], state_cache_pool[rank], compressor_norm_weight[rank], c2a_compressed_slots[rank], c1a_compressed_slots[rank], index_wk[rank], index_norm_weight[rank], index_wq_b[rank], index_weights_proj[rank], hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank], ffn_norm_weight[rank], gate_weight[rank], correction_bias[rank], routed_w1[rank], routed_w2[rank], routed_w3[rank],  shared_w13[rank], shared_w2[rank], recv_meta, recv_x, recv_weights, arrived, data_arrived, routed_output, combine_arrived, moe_num_tokens, attention_num_tokens, rank, wq_a_scale[rank], wq_b_scale[rank], wkv_scale[rank], index_wq_b_scale[rank], routed_w1_scale[rank], routed_w2_scale[rank], routed_w3_scale[rank], shared_w1_scale[rank], shared_w2_scale[rank], shared_w3_scale[rank], final_norm_weight[rank], lm_head_weight[rank], logit_row_indices[rank], logits[rank], sampled_ids[rank], head_hidden, head_hidden_done, head_logits, head_logits_done, output_window, output_arrived, ffn_window, ffn_arrived, device=rank,
+                engram_lookup[rank], engram_wkv[rank], engram_weight[rank], engram_rotation[rank], x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank], attn_norm_weight[rank], wq_a[rank], q_norm_weight[rank], wq_b[rank], wkv[rank], kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank], swa_wo_a[rank], swa_wo_b[rank], freqs_cos[rank], freqs_sin[rank], window_slots[rank], window_indices[rank], window_cache_pool[rank], window_cache_scale_pool[rank], compressed_cache_pool[rank], compressed_cache_scale_pool[rank], token_to_req_indices[rank], position_ids[rank], index_cache_pool[rank], index_cache_scale_pool[rank], c2a_index_block_table[rank], c1a_index_block_table[rank], c2a_compressor_wkv[rank], c2a_compressor_wgate[rank], c1a_compressor_wkv[rank], query_start_loc[rank], state_block_table[rank], state_cache_pool[rank], compressor_norm_weight[rank], c2a_compressed_slots[rank], c1a_compressed_slots[rank], index_wk[rank], index_norm_weight[rank], index_wq_b[rank], index_weights_proj[rank], hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank], ffn_norm_weight[rank], gate_weight[rank], correction_bias[rank], routed_w1[rank], routed_w2[rank], routed_w3[rank],  shared_w13[rank], shared_w2[rank], recv_meta, recv_x, recv_weights, arrived, data_arrived, routed_output, combine_arrived, moe_num_tokens, attention_num_tokens, rank, wq_a_scale[rank], wq_b_scale[rank], wkv_scale[rank], index_wq_b_scale[rank], routed_w1_scale[rank], routed_w2_scale[rank], routed_w3_scale[rank], shared_w1_scale[rank], shared_w2_scale[rank], shared_w3_scale[rank], final_norm_weight[rank], lm_head_weight[rank], logit_row_indices[rank], logits[rank], sampled_ids[rank], head_hidden, head_hidden_done, head_logits, head_logits_done, output_window, output_arrived, ffn_window, ffn_arrived, device=rank,
             )
     return logits, sampled_ids
 

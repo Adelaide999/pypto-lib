@@ -23,7 +23,7 @@ import struct
 import torch
 
 from .config import FLASH as M, EP_SIZE, N_LOCAL_EXPERTS, TP_SIZE, WEIGHT_LAYOUT_VERSION
-from .config import SHARED_NZ_PANEL
+from .config import SHARED_NZ_PANEL, SWA_LAYER_COUNT
 
 ENGRAM_K = (M.engram_max_ngram_size - 1) * M.engram_n_heads * M.engram_head_dim
 KV_OUT = (M.hc_mult + 1) * M.hidden_size
@@ -229,6 +229,8 @@ def forward_weight_layouts(local_experts=N_LOCAL_EXPERTS):
         "attn_sink": ((layers * heads,), torch.float32),
         "wo_a": (bf16_nz_shape(layers * groups, M.num_attention_heads * M.head_dim // M.o_groups, M.o_lora_rank), torch.bfloat16),
         "wo_b": (bf16_nz_shape(layers, groups * M.o_lora_rank, d), torch.bfloat16),
+        "swa_wo_a": ((SWA_LAYER_COUNT * groups, M.num_attention_heads * M.head_dim // M.o_groups, M.o_lora_rank), torch.bfloat16),
+        "swa_wo_b": ((SWA_LAYER_COUNT, groups * M.o_lora_rank, d), torch.bfloat16),
         "c2a_compressor_wkv": ((c2a_sources, d, M.head_dim), torch.bfloat16),
         "c2a_compressor_wgate": ((c2a_sources, d, M.head_dim), torch.bfloat16),
         "c1a_compressor_wkv": ((d, M.head_dim), torch.bfloat16),
@@ -312,7 +314,7 @@ class ResidentWeights:
                 category = "routed_experts"
             elif name.startswith("shared_"):
                 category = "shared_expert"
-            elif name.startswith(("wq_b", "wo_a", "wo_b", "attn_sink")):
+            elif name.startswith(("wq_b", "wo_a", "wo_b", "swa_wo_", "attn_sink")):
                 category = "attention_tp"
             elif name == "lm_head_weight":
                 category = "lm_head"
@@ -389,10 +391,15 @@ class ResidentWeights:
                 copy(target, value, layer, total_layers)
             wo_a = checkpoint.tensor(f"layers.{layer}.attn.wo_a.weight")
             wo_a = wo_a.reshape(M.o_groups, M.o_lora_rank, -1)[lane * groups:(lane + 1) * groups]
-            copy("wo_a", pack_bf16_nz(wo_a.transpose(-1, -2)), layer, total_layers)
+            wo_a = wo_a.transpose(-1, -2)
+            copy("wo_a", pack_bf16_nz(wo_a), layer, total_layers)
             wo_b = checkpoint.tensor(f"layers.{layer}.attn.wo_b.weight")
             width = groups * M.o_lora_rank
-            copy("wo_b", pack_bf16_nz(wo_b[:, lane * width:(lane + 1) * width].t()), layer, total_layers)
+            wo_b = wo_b[:, lane * width:(lane + 1) * width].t()
+            copy("wo_b", pack_bf16_nz(wo_b), layer, total_layers)
+            if layer < SWA_LAYER_COUNT and "swa_wo_a" in handles:
+                copy("swa_wo_a", wo_a, layer, SWA_LAYER_COUNT)
+                copy("swa_wo_b", wo_b, layer, SWA_LAYER_COUNT)
             for local in range(self.local_experts):
                 expert = rank * self.local_experts + local
                 for projection in ("w1", "w2", "w3"):

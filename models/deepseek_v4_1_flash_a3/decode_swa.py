@@ -13,9 +13,9 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from .config import TP_SIZE
 from .config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
-from .sparse_attention import publish_window_row, swa_attention_partial, swa_attention_partial_b1_rotated
+from .sparse_attention import publish_window_row, swa_attention_partial
 from .qkv_proj_rope import decode_qkv_proj_rope
-from .o_proj import decode_o_proj_nz_from_attention, decode_tp_output_post
+from .o_proj import decode_o_proj_nz, decode_swa_o_proj_ordered, decode_tp_output_post
 from .hc import hc_decode_mixes, hc_head_norm_quantize_decode
 
 
@@ -56,6 +56,8 @@ def decode_swa(
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16, pl.NZ],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
+    swa_wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
+    swa_wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
@@ -92,20 +94,20 @@ def decode_swa(
     )
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    if num_tokens == 1:
-        swa_attention_partial_b1_rotated(
-            q, window_cache, window_cache_scale, window_indices, attn_sink, attended, rope_cos, rope_sin,
-        )
-    else:
-        swa_attention_partial(q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens)
+    swa_attention_partial(q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens)
     hc_decode_mixes(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
         attention_pre_mix, post_mix, residual_mix,
         num_tokens,
     )
-    attention_output = decode_o_proj_nz_from_attention(
-        attended, wo_a, wo_b, rope_cos, rope_sin, attention_output, num_tokens,
-    )
+    if num_tokens == 1:
+        decode_swa_o_proj_ordered(
+            attended, swa_wo_a, swa_wo_b, rope_cos, rope_sin, attention_output, num_tokens,
+        )
+    else:
+        decode_o_proj_nz(
+            attended, wo_a, wo_b, rope_cos, rope_sin, attention_output, num_tokens,
+        )
     decode_tp_output_post(
         attention_output, output_window, output_arrived, group_base, tp_rank, num_tokens, attention_epoch,
         x_hc, post_mix, residual_mix, attention_pre_mix, attention_hidden, ffn_input,
