@@ -302,9 +302,10 @@ SCALE_DTYPE = pl.UINT8
 MX_A_LAYOUT = pl.ND
 MX_B_LAYOUT = pl.ND
 PROJECTION_LAYOUT = pl.ND
+SHARED_NZ_PANEL = 64
 EXPERT_N_TILE = 128
 EXPERT_K_TILE = 512
-WEIGHT_LAYOUT_VERSION = "v41-a3-w8a8-dynamic-expert-nk-engram-qakv-wo-nz-v7"
+WEIGHT_LAYOUT_VERSION = "v41-a3-w8a8-dynamic-expert-nk-engram-qakv-wo-shared-nz-v8"
 CACHE_LAYOUT_VERSION = "v41-a3-u8-paged128-v1"
 
 TP_SIZE = _parse_parallel_size("tp", 4)

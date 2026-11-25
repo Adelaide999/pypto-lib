@@ -19,7 +19,7 @@ from .config import MOE_TOKENS, N_LOCAL_EXPERTS, ROUTE_T_DYN
 from .config import T_DYN
 from .gate import gate_from_fp32
 from .gate import gate_normalized as npu_gate
-from .expert_shared import expert_shared
+from .expert_shared import expert_shared_nz
 from .expert_routed import (
     expert_routed_scatter,
 )
@@ -659,11 +659,10 @@ def prefill_moe_sublayer(
     routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (1), MOE_INTER], pl.FP32, pl.ND],
 
-    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w13: pl.Tensor[[D, 2 * MOE_INTER], pl.INT8, pl.NZ],
     shared_w1_scale: pl.Tensor[[1, MOE_INTER], pl.FP32, pl.ND],
-    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w2_scale: pl.Tensor[[1, D], pl.FP32, pl.ND],
-    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[1, MOE_INTER], pl.FP32, pl.ND],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[ROUTED_RECV_ROWS, D], pl.INT8],
@@ -721,12 +720,12 @@ def prefill_moe_sublayer(
                     x_norm_mx, x_norm_scale, indices, weights,
                 )
 
-            expert_shared(
+            expert_shared_nz(
                 x_norm_mx, x_norm_scale,
-                shared_w1, shared_w1_scale,
-                shared_w3, shared_w3_scale,
+                shared_w13, shared_w1_scale,
+                shared_w3_scale,
                 shared_w2, shared_w2_scale,
-                shared_output, local_num_tokens, True, prefill,
+                shared_output, local_num_tokens, prefill,
             )
         else:
             workers = pl.min(48, TOKENS // 4)

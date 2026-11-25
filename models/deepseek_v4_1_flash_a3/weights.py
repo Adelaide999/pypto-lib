@@ -23,6 +23,7 @@ import struct
 import torch
 
 from .config import FLASH as M, EP_SIZE, N_LOCAL_EXPERTS, TP_SIZE, WEIGHT_LAYOUT_VERSION
+from .config import SHARED_NZ_PANEL
 
 ENGRAM_K = (M.engram_max_ngram_size - 1) * M.engram_n_heads * M.engram_head_dim
 KV_OUT = (M.hc_mult + 1) * M.hidden_size
@@ -249,23 +250,25 @@ def forward_weight_layouts(local_experts=N_LOCAL_EXPERTS):
         "wq_b": (layers, M.q_lora_rank, heads * M.head_dim),
         "wkv": (layers, d, M.head_dim),
         "index_wq_b": (index_sources, M.q_lora_rank, M.index_n_heads * M.index_head_dim),
-        "shared_w1": (layers, d, inter),
         "shared_w2": (layers, inter, d),
-        "shared_w3": (layers, d, inter),
         "routed_w1": (layers * local_experts, d, inter),
         "routed_w2": (layers * local_experts, inter, d),
         "routed_w3": (layers * local_experts, d, inter),
     }
     for name, shape in projections.items():
         matrices, input_width, output_width = shape
-        if name in ("wq_a", "wkv"):
+        if name in ("wq_a", "wkv", "shared_w2"):
             bank_shape = projection_int8_nz_shape(matrices, input_width, output_width)
-        elif name.startswith(("routed_", "shared_")):
+        elif name.startswith("routed_"):
             bank_shape = (matrices, output_width, input_width)
         else:
             bank_shape = shape
         result[name] = (bank_shape, torch.int8)
         result[name + "_scale"] = ((matrices, output_width), torch.float32)
+
+    result["shared_w13"] = (projection_int8_nz_shape(layers, d, 2 * inter), torch.int8)
+    result["shared_w1_scale"] = ((layers, inter), torch.float32)
+    result["shared_w3_scale"] = ((layers, inter), torch.float32)
     return result
 
 
@@ -283,8 +286,7 @@ class ResidentWeights:
     )
     int8_projections = (
         ("wq_a", "attn.wq_a"), ("wq_b", "attn.wq_b"), ("wkv", "attn.wkv"),
-        ("shared_w1", "ffn.shared_experts.w1"), ("shared_w2", "ffn.shared_experts.w2"),
-        ("shared_w3", "ffn.shared_experts.w3"),
+        ("shared_w2", "ffn.shared_experts.w2"),
     )
 
     def __init__(self, checkpoint, *, ep_size=EP_SIZE):
@@ -364,12 +366,20 @@ class ResidentWeights:
         for layer in selected_layers:
             for target, suffix in self.int8_projections:
                 output_slice = slice(lane * heads * M.head_dim, (lane + 1) * heads * M.head_dim) if target == "wq_b" else None
-                weight, scale = self.projection(f"layers.{layer}.{suffix}", output_slice=output_slice,
-                                                output_major=target.startswith("shared_"))
-                if target in ("wq_a", "wkv"):
+                weight, scale = self.projection(f"layers.{layer}.{suffix}", output_slice=output_slice)
+                if target in ("wq_a", "wkv", "shared_w2"):
                     weight = pack_projection_int8_nz(weight)
                 copy(target, weight, layer, total_layers)
                 copy(target + "_scale", scale, layer, total_layers)
+            shared = f"layers.{layer}.ffn.shared_experts"
+            gate, gate_scale = self.projection(shared + ".w1", output_major=True)
+            up, up_scale = self.projection(shared + ".w3", output_major=True)
+            gate = gate.reshape(-1, SHARED_NZ_PANEL, M.hidden_size)
+            up = up.reshape_as(gate)
+            paired = torch.stack((gate, up), dim=1).reshape(-1, M.hidden_size).t()
+            copy("shared_w13", pack_projection_int8_nz(paired), layer, total_layers)
+            copy("shared_w1_scale", gate_scale, layer, total_layers)
+            copy("shared_w3_scale", up_scale, layer, total_layers)
             for target, suffix in self.layer_projections:
                 value = checkpoint.tensor(f"layers.{layer}.{suffix}")
                 if target == "attn_sink":
