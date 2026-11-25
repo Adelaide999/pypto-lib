@@ -10,14 +10,13 @@
 
 
 import pypto.language as pl
-from .gemm import quantize_activation
 import pypto.language.distributed as pld
 from .config import TP_SIZE
 from .config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
 from .sparse_attention import publish_window_row, swa_attention_partial, swa_attention_partial_b1_rotated
 from .qkv_proj_rope import decode_qkv_proj_rope
 from .o_proj import decode_swa_o_proj_from_attention, decode_tp_output_post
-from .hc import hc_decode_mixes, hc_head_norm_adaptive, zero_bf16_padding
+from .hc import hc_decode_mixes, hc_head_norm_quantize_decode
 
 
 # model config
@@ -79,13 +78,12 @@ def decode_swa(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_head_norm_adaptive(x_hc, incoming_pre_mix, attn_norm_weight, x_norm, num_tokens)
-
-    zero_bf16_padding(x_norm, pl.min(num_tokens, pl.tensor.dim(x_norm, 0)))
+    proj_payload, proj_scales, _ = hc_head_norm_quantize_decode(
+        x_hc, incoming_pre_mix, attn_norm_weight, x_norm, num_tokens, zero_padding=True,
+    )
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales = quantize_activation(x_norm, num_tokens, D)
     decode_qkv_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,

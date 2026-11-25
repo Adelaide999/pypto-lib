@@ -345,6 +345,16 @@ def quantize_projection_activation(
     padded_rows = (capacity + 15) // 16 * 16
     payload = pl.create_tensor([padded_rows, width], dtype=pl.INT8)
     scale = pl.create_tensor([padded_rows, 1], dtype=pl.FP32)
+    _quantize_projection_activation_into(source, payload, scale, num_tokens, padded_rows, width, dense_query, prefill)
+    return payload, scale
+
+
+@pl.jit.inline(auto_scope=False)
+def _quantize_projection_activation_into(
+    source: pl.Tensor, payload: pl.Tensor, scale: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32], padded_rows: pl.Scalar[pl.INT32],
+    width: pl.constexpr, dense_query: pl.constexpr, prefill: pl.constexpr,
+):
     if not prefill and num_tokens == 1:
         if width == 5120:
             _quantize_decode_wide_row(source, payload, scale, width)

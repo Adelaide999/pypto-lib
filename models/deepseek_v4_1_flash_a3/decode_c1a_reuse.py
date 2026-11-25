@@ -9,14 +9,13 @@
 """C1A reuse decode attention with mHC."""
 
 import pypto.language as pl
-from .gemm import quantize_activation
 import pypto.language.distributed as pld
 from .config import TP_SIZE
 from .config import (
     COMPRESSED_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN,
     LOCAL_T_DYN,
 )
-from .hc import hc_decode_mixes, hc_head_norm_adaptive
+from .hc import hc_decode_mixes, hc_head_norm_quantize_decode
 from .qkv_proj_rope import decode_qkv_proj_rope
 from .sparse_attention import (
     gather_packed, attend_decode_selected, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
@@ -85,12 +84,13 @@ def decode_c1a_reuse(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    x_ready = hc_head_norm_adaptive(x_hc, pre_mix, attn_norm_weight, x_norm, num_tokens)
+    proj_payload, proj_scales, x_ready = hc_head_norm_quantize_decode(
+        x_hc, pre_mix, attn_norm_weight, x_norm, num_tokens, zero_padding=False,
+    )
 
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales = quantize_activation(x_norm, num_tokens, D)
     decode_qkv_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
