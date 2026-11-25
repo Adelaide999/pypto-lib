@@ -20,12 +20,10 @@ from .activation_quant import (
 )
 from .config import FLASH as M, T_DYN, TP_SIZE
 from .gemm import (
-    gemm_int8,
     gemm_int8_pair_columns,
-    gemm_int8_tiled,
+    gemm_int8_tiled_nz,
     golden_dynamic_int8,
     prefill_gemm_int8_reuse_weight,
-    prefill_gemm_int8_tiled,
 )
 from .rmsnorm import golden_rms_norm, rms_norm
 from .rope import make_pipelined_rope, make_prefill_kv_norm_rope
@@ -43,8 +41,8 @@ EPS = M.rms_norm_eps
 Q_A_N_TILE = 128
 Q_B_N_TILE = 256
 KV_N_TILE = 64
-DECODE_QA_KV_N_TILE = 256
-DECODE_QA_KV_K_TILE = 256
+DECODE_QA_KV_N_TILE = 128
+DECODE_QA_KV_K_TILE = 512
 PREFILL_QKV_MIN_ROWS = 512
 PREFILL_Q_B_MIN_ROWS = 1024
 PREFILL_Q_A_M_TILE = 128
@@ -269,6 +267,12 @@ def _finish_decode_q(
             256, False, 16, rope_cos, rope_sin, True,
             ROPE_DIM, HEAD_DIM - ROPE_DIM - Q_B_N_TILE, 1,
         )
+    elif num_tokens > 16:
+        gemm_int8_tiled_nz(
+            qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
+            Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b_decode_wide", 512, 128, 32,
+        )
+        rotate_prefill_q(query, rope_cos, rope_sin, query, num_tokens)
     else:
         gemm_int8_pair_columns(
             qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
@@ -299,14 +303,14 @@ def make_q_proj_rope(*, prefill):
             tokens = pl.tensor.dim(query_latent, 0)
             projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
             if num_tokens >= PREFILL_QKV_MIN_ROWS:
-                prefill_gemm_int8_tiled(
+                gemm_int8_tiled_nz(
                     payload, scales, wq_a, wq_a_scale, projected, num_tokens, D, Q_LORA, "proj_q_a",
-                    Q_A_N_TILE, PREFILL_Q_A_K_TILE, False, PREFILL_Q_A_M_TILE,
+                    Q_A_N_TILE, PREFILL_Q_A_K_TILE, PREFILL_Q_A_M_TILE,
                 )
             else:
-                gemm_int8(
+                gemm_int8_tiled_nz(
                     payload, scales, wq_a, wq_a_scale, projected, num_tokens,
-                    D, Q_LORA, "proj_q_a", Q_A_N_TILE, 256, False,
+                    D, Q_LORA, "proj_q_a", Q_A_N_TILE, 256, 16,
                 )
             padded_rows = (tokens + 15) // 16 * 16
             qb_payload = pl.create_tensor([padded_rows, Q_LORA], dtype=pl.INT8)
@@ -329,15 +333,20 @@ def make_q_proj_rope(*, prefill):
                     PREFILL_Q_B_KV_N_TILE, PREFILL_Q_B_K_TILE, PREFILL_Q_B_KV_M_TILE,
                 )
             elif num_tokens >= PREFILL_QKV_MIN_ROWS:
-                prefill_gemm_int8_tiled(
+                gemm_int8_tiled_nz(
                     qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
                     Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b",
-                    PREFILL_Q_B_KV_N_TILE, PREFILL_Q_B_KV_K_TILE, False, PREFILL_Q_B_KV_M_TILE,
+                    PREFILL_Q_B_KV_N_TILE, PREFILL_Q_B_KV_K_TILE, PREFILL_Q_B_KV_M_TILE,
+                )
+            elif num_tokens >= 64:
+                gemm_int8_tiled_nz(
+                    qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
+                    Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", 512, 128, 32,
                 )
             else:
-                gemm_int8(
+                gemm_int8_tiled_nz(
                     qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
-                    Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", Q_B_N_TILE, 256, False,
+                    Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", Q_B_N_TILE, 256, 16,
                 )
             if num_tokens >= 64:
                 query = rotate_prefill_q(query, rope_cos, rope_sin, query, num_tokens)
@@ -365,10 +374,9 @@ def make_q_proj_rope(*, prefill):
         ):
             tokens = pl.tensor.dim(query_latent, 0)
             projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-            gemm_int8_pair_columns(
+            gemm_int8_tiled_nz(
                 payload, scales, wq_a, wq_a_scale, projected, num_tokens,
-                D, Q_LORA, "proj_q_a_decode_pair_k512", 128, 512, False, 16,
-                rope_cos, rope_sin, False, ROPE_DIM, ROPE_DIM, 16,
+                D, Q_LORA, "proj_q_a_decode_k512_n128", 128, 512, 16,
             )
             return _finish_decode_q(
                 projected, q_norm_weight, wq_b, wq_b_scale, rope_cos, rope_sin,
@@ -398,14 +406,14 @@ def make_kv_proj_rope(*, prefill):
             num_tokens: pl.Scalar[pl.INT32],
         ):
             if num_tokens >= PREFILL_QKV_MIN_ROWS:
-                prefill_gemm_int8_tiled(
+                gemm_int8_tiled_nz(
                     payload, scales, wkv, wkv_scale, kv_projection, num_tokens, D, HEAD_DIM, "proj_kv",
-                    PREFILL_Q_B_KV_N_TILE, PREFILL_Q_B_KV_K_TILE, False, PREFILL_Q_B_KV_M_TILE,
+                    PREFILL_Q_B_KV_N_TILE, PREFILL_Q_B_KV_K_TILE, PREFILL_Q_B_KV_M_TILE,
                 )
             else:
-                gemm_int8(
+                gemm_int8_tiled_nz(
                     payload, scales, wkv, wkv_scale, kv_projection, num_tokens,
-                    D, HEAD_DIM, "proj_kv", KV_N_TILE, 256, False,
+                    D, HEAD_DIM, "proj_kv", KV_N_TILE, 256, 16,
                 )
             if num_tokens >= 64:
                 window_kv = normalize_rotate_prefill_kv(
@@ -434,9 +442,9 @@ def make_kv_proj_rope(*, prefill):
             window_kv: pl.Tensor,
             num_tokens: pl.Scalar[pl.INT32],
         ):
-            gemm_int8_tiled(
+            gemm_int8_tiled_nz(
                 payload, scales, wkv, wkv_scale, kv_projection, num_tokens,
-                D, HEAD_DIM, "proj_kv_decode_k512_n128", 128, 512, False, 16,
+                D, HEAD_DIM, "proj_kv_decode_k512_n128", 128, 512, 16,
             )
             normalize_rope_kv(
                 kv_projection, kv_norm_weight, rope_cos, rope_sin, window_kv, num_tokens,
@@ -454,54 +462,43 @@ decode_kv_proj_rope = make_kv_proj_rope(prefill=False)
 def _project_decode_qa_kv_one_row(
     payload: pl.Tensor,
     scales: pl.Tensor,
-    wq_a: pl.Tensor,
-    wq_a_scale: pl.Tensor,
-    wkv: pl.Tensor,
-    wkv_scale: pl.Tensor,
-    projected_q: pl.Tensor,
-    projected_kv: pl.Tensor,
+    qw: pl.Tensor[[D, Q_LORA], pl.INT8, pl.NZ],
+    kvw: pl.Tensor[[D, HEAD_DIM], pl.INT8, pl.NZ],
+    qw_scale: pl.Tensor,
+    kvw_scale: pl.Tensor,
+    qo: pl.Tensor,
+    kvo: pl.Tensor,
     n_tile: pl.constexpr,
     k_tile: pl.constexpr,
 ):
-    # Use twice as many Cube workers while retaining the checkpoint layout.
-    panels = (Q_LORA + HEAD_DIM) // n_tile
-    half_width = D // 2
-    partials = pl.create_tensor([2, Q_LORA + HEAD_DIM], dtype=pl.INT32)
-    for worker in pl.spmd(2 * panels, name_hint="proj_qa_kv_split_k"):
-        shard = worker // panels
-        panel = worker % panels
+    """Run full K accumulation for each Q-A or KV panel within one Cube launch."""
+    q_panels = Q_LORA // n_tile
+    workers = (Q_LORA + HEAD_DIM) // n_tile
+    for panel in pl.spmd(
+        workers, name_hint="proj_qa_kv_nz_b1", optimizations=[pl.cross_core_slot(slot_num=1)],
+    ):
         col = panel * n_tile
-        is_query = panel < Q_LORA // n_tile
-        acc = pl.tile.create([16, n_tile], dtype=pl.INT32, target_memory=pl.Mem.Acc, compact=True)
-        acc = pl.set_validshape(acc, 1, n_tile)
-        for offset in pl.pipeline(0, half_width, k_tile, stage=2):
-            k = shard * half_width + offset
-            source = pl.load(payload, [0, k], [16, k_tile], valid_shape=[1, k_tile])
-            if is_query:
-                weight = pl.load(wq_a, [k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
-                acc = pl.matmul_acc(acc, source, weight, init_cond=(offset == 0))
+        seed = pl.tile.create([16, n_tile], dtype=pl.INT32, target_memory=pl.Mem.Acc, compact=True)
+        acc = pl.set_validshape(seed, 1, n_tile)
+        for k in pl.pipeline(0, D, k_tile, stage=2):
+            a = pl.load(payload, [0, k], [16, k_tile], valid_shape=[1, k_tile])
+            if panel < q_panels:
+                bq = pl.load(qw, [k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                acc = pl.matmul_acc(acc, a, bq, init_cond=(k == 0))
             else:
-                weight_kv = pl.load(wkv, [k, col - Q_LORA], [k_tile, n_tile], target_memory=pl.Mem.Mat)
-                acc = pl.matmul_acc(acc, source, weight_kv, init_cond=(offset == 0))
-        pl.store(pl.set_validshape(acc, 1, n_tile), [shard, col], partials)
-
-    # D * 128 * 128 fits in INT32, so partitioning preserves the accumulator exactly.
-    for panel in pl.spmd(panels, name_hint="proj_qa_kv_reduce_k"):
-        col = panel * n_tile
-        first = pl.load(partials, [0, col], [1, n_tile])
-        second = pl.load(partials, [1, col], [1, n_tile])
-        total = pl.add(first, second)
-        scaled = pl.mul(pl.cast(total, pl.FP32), pl.read(scales, [0, 0]))
-        if panel < Q_LORA // n_tile:
-            weight_scale = pl.load(wq_a_scale, [0, col], [1, n_tile])
-            rounded = pl.cast(pl.mul(scaled, weight_scale), pl.BF16, mode="rint")
-            pl.store(rounded, [0, col], projected_q)
+                bk = pl.load(kvw, [k, (panel % q_panels) * n_tile], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                acc = pl.matmul_acc(acc, a, bk, init_cond=(k == 0))
+        value = pl.cast(acc, pl.FP32)
+        active = pl.tile.slice(value, [1, n_tile], [0, 0], valid_shape=[1, n_tile])
+        scaled = pl.mul(active, pl.read(scales, [0, 0]))
+        if panel < q_panels:
+            w_scale = pl.load(qw_scale, [0, col], [1, n_tile])
+            pl.store(pl.cast(pl.mul(scaled, w_scale), pl.BF16, mode="rint"), [0, col], qo)
         else:
-            col_kv = col - Q_LORA
-            weight_scale_kv = pl.load(wkv_scale, [0, col_kv], [1, n_tile])
-            rounded_kv = pl.cast(pl.mul(scaled, weight_scale_kv), pl.BF16, mode="rint")
-            pl.store(rounded_kv, [0, col_kv], projected_kv)
-    return projected_q, projected_kv
+            kv_col = (panel % q_panels) * n_tile
+            w_scale = pl.load(kvw_scale, [0, kv_col], [1, n_tile])
+            pl.store(pl.cast(pl.mul(scaled, w_scale), pl.BF16, mode="rint"), [0, kv_col], kvo)
+    return qo, kvo
 
 
 @pl.jit.inline(auto_scope=False)
@@ -528,18 +525,17 @@ def decode_qkv_proj_rope(
     projected_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     if num_tokens == 1:
         _project_decode_qa_kv_one_row(
-            payload, scales, wq_a, wq_a_scale, wkv, wkv_scale, projected_q, projected_kv,
+            payload, scales, wq_a, wkv, wq_a_scale, wkv_scale, projected_q, projected_kv,
             DECODE_QA_KV_N_TILE, DECODE_QA_KV_K_TILE,
         )
     else:
-        gemm_int8_pair_columns(
+        gemm_int8_tiled_nz(
             payload, scales, wq_a, wq_a_scale, projected_q, num_tokens,
-            D, Q_LORA, "proj_q_a_decode_pair_k512", 128, 512, False, 16,
-            rope_cos, rope_sin, False, ROPE_DIM, ROPE_DIM, 16,
+            D, Q_LORA, "proj_q_a_decode_k512_n128", 128, 512, 16,
         )
-        gemm_int8_tiled(
+        gemm_int8_tiled_nz(
             payload, scales, wkv, wkv_scale, projected_kv, num_tokens,
-            D, HEAD_DIM, "proj_kv_decode_k512_n128", 128, 512, False, 16,
+            D, HEAD_DIM, "proj_kv_decode_k512_n128", 128, 512, 16,
         )
     query_latent, query, qb_payload, qb_scales = _finish_decode_q(
         projected_q, q_norm_weight, wq_b, wq_b_scale, rope_cos, rope_sin,

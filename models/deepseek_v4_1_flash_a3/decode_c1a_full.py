@@ -10,20 +10,19 @@
 
 
 import pypto.language as pl
-from .gemm import quantize_activation
 import pypto.language.distributed as pld
 from .config import TP_SIZE
 from .qkv_proj_rope import decode_qkv_proj_rope
-from .o_proj import decode_o_proj as o_proj, decode_tp_output_post
+from .o_proj import decode_o_proj_nz_from_attention as o_proj, decode_tp_output_post
 from .decode_indexer import (
     select_candidate_block_pool, c1a_index, score_select_c1a_groups,
     publish_index_rows, c1a_project_index_key, c1a_norm_rotate_index_key,
 )
 from .sparse_attention import (
-    attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
+    attend_decode_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
     WORKERS as ATTEND_WORKER_TILE,
 )
-from .hc import hc_decode_mixes, hc_head_norm_adaptive
+from .hc import hc_decode_mixes, hc_head_norm_quantize_decode
 from .config import (
     LOCAL_T_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN,
     CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN,
@@ -56,17 +55,17 @@ def decode_c1a_full(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_weight: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.INT8, pl.NZ],
     wq_a_scale: pl.Tensor[[1, Q_LORA], pl.FP32, pl.ND],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[1, LOCAL_H * HEAD_DIM], pl.FP32, pl.ND],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.INT8],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.INT8, pl.NZ],
     wkv_scale: pl.Tensor[[1, HEAD_DIM], pl.FP32, pl.ND],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
@@ -113,11 +112,12 @@ def decode_c1a_full(
         num_tokens,
     )
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    x_ready = hc_head_norm_adaptive(x_hc, pre_mix, attn_norm_weight, x_norm, num_tokens)
+    proj_payload, proj_scales, x_ready = hc_head_norm_quantize_decode(
+        x_hc, pre_mix, attn_norm_weight, x_norm, num_tokens, zero_padding=False,
+    )
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales = quantize_activation(x_norm, num_tokens, D)
     qr, query, qb_payload, qb_scales = decode_qkv_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
@@ -172,7 +172,9 @@ def decode_c1a_full(
         window_indices, topk_indices, selected, indices, num_tokens, selection_ready,
         max_workers=GATHER_WORKER_TILE, name_hint="c1a_gather", gather_keys=640, decode=True,
     )
-    attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64, ATTEND_WORKER_TILE)
+    attend_decode_selected(
+        query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64, ATTEND_WORKER_TILE, rope_cos, rope_sin,
+    )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     o_proj(
         attended, wo_a, wo_b, rope_cos, rope_sin, attn_out, num_tokens,

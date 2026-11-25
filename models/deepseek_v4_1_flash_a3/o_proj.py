@@ -16,7 +16,7 @@ if not __package__:
     __package__ = "models.deepseek_v4_1_flash_a3"
 
 
-from .gemm import gemm_bf16_to_bf16, prefill_gemm_bf16_to_bf16
+from .gemm import PREFILL_BF16_K_SUBTILE, gemm_bf16_to_bf16, prefill_gemm_bf16_to_bf16
 from .hc import hc_post_collapse, hc_post_collapse_tile, hc_post_token_tile
 from .rope import make_pipelined_rope
 from .qkv_proj_rope import _rotate_rope
@@ -53,8 +53,7 @@ HC_DIM = M.hc_dim
 O_A_N_TILE = 128
 O_B_N_TILE = 128
 DECODE_B1_O_B_N_TILE = 256
-DECODE_B1_ORDERED_K_TILE = 64
-DECODE_B1_ORDERED_N_TILE = 128
+DECODE_B1_O_A_K_TILE = 256
 K_TILE = 128
 PREFILL_O_M_TILE = 128
 PREFILL_O_N_TILE = 256
@@ -69,7 +68,30 @@ rotate_decode_b1 = make_pipelined_rope(
 )
 
 
-def make_project_output(*, prefill):
+@pl.jit.inline(auto_scope=False)
+def _project_decode_o_a_one_row(
+    source: pl.Tensor,
+    weight: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
+    projected: pl.Tensor,
+    n: pl.constexpr,
+    k_tile: pl.constexpr,
+):
+    """Put both O-A groups in one launch and assign one channel panel per Cube worker."""
+    panels = O_LORA // n
+    rhs = pl.reshape(weight, [LOCAL_O_GROUPS * O_GROUP_IN, O_LORA])
+    for worker in pl.spmd(LOCAL_O_GROUPS * panels, name_hint="proj_o_a_nd_grouped"):
+        group = worker // panels
+        column = (worker % panels) * n
+        seed = pl.tile.create([16, n], dtype=pl.FP32, target_memory=pl.Mem.Acc, compact=True)
+        acc = pl.set_validshape(seed, 1, n)
+        for k in pl.pipeline(0, O_GROUP_IN, k_tile, stage=2):
+            lhs = pl.load(source, [0, group * O_GROUP_IN + k], [16, k_tile], valid_shape=[1, k_tile])
+            rhs_tile = pl.load(rhs, [group * O_GROUP_IN + k, column], [k_tile, n], target_memory=pl.Mem.Mat)
+            acc = pl.matmul_acc(acc, lhs, rhs_tile, init_cond=(k == 0))
+        pl.store(acc, [0, group * O_LORA + column], projected)
+    return projected
+
+def make_project_output(*, prefill, b1_rotated=False):
     @pl.jit.inline(auto_scope=False)
     def project_output(
         attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -85,6 +107,220 @@ def make_project_output(*, prefill):
         tokens = pl.tensor.dim(output, 0)
         if prefill:
             rotated = rotate_output(attended, rope_cos, rope_sin, attended, num_tokens)
+        elif b1_rotated:
+            rotated = attended
+        else:
+            rotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+            if num_tokens == 1:
+                rotated = rotate_decode_b1(attended, rope_cos, rope_sin, rotated, num_tokens)
+            else:
+                rotated = _rotate_rope(
+                    attended, rotated, rope_cos, rope_sin, 0, num_tokens,
+                    LOCAL_H, HEAD_DIM, "inverse_rope_o", True, True,
+                )
+        projected = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
+        ready = pl.system.task_dummy(deps=[])
+        if not prefill and not sequential and num_tokens == 1:
+            _project_decode_o_a_one_row(rotated, wo_a, projected, O_A_N_TILE, DECODE_B1_O_A_K_TILE)
+            gemm_bf16_to_bf16(
+                projected, wo_b, output, num_tokens, ready,
+                LOCAL_O_WIDTH, D, DECODE_B1_O_B_N_TILE, K_TILE, 24, "proj_o_b_b1",
+                0, 0, False, 16, stages=2,
+            )
+        else:
+            for group in pl.parallel(LOCAL_O_GROUPS):
+                source_col = pl.cast(group * O_GROUP_IN, pl.INT32)
+                output_col = pl.cast(group * O_LORA, pl.INT32)
+                if prefill and not sequential and num_tokens >= PREFILL_O_M_TILE:
+                    prefill_gemm_bf16_to_bf16(
+                        rotated, wo_a[group], projected, num_tokens, ready,
+                        O_GROUP_IN, O_LORA, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_a",
+                        source_col, output_col, False, PREFILL_O_M_TILE, stages=2,
+                    )
+                elif not sequential and num_tokens >= 64:
+                    gemm_bf16_to_bf16(
+                        rotated, wo_a[group], projected, num_tokens, ready,
+                        O_GROUP_IN, O_LORA, 256, K_TILE, 24, "proj_o_a",
+                        source_col, output_col, False, 64, stages=1,
+                    )
+                else:
+                    gemm_bf16_to_bf16(
+                        rotated, wo_a[group], projected, num_tokens, ready,
+                        O_GROUP_IN, O_LORA, O_A_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_a",
+                        source_col, output_col, sequential, 16, stages=1,
+                    )
+            if prefill and not sequential and num_tokens >= PREFILL_O_M_TILE:
+                prefill_gemm_bf16_to_bf16(
+                    projected, wo_b, output, num_tokens, ready,
+                    LOCAL_O_WIDTH, D, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_b",
+                    0, 0, False, PREFILL_O_M_TILE, stages=2,
+                )
+            elif not sequential and num_tokens >= 64:
+                gemm_bf16_to_bf16(
+                    projected, wo_b, output, num_tokens, ready,
+                    LOCAL_O_WIDTH, D, 256, K_TILE, 24, "proj_o_b", 0, 0, False, 64, stages=1,
+                )
+            else:
+                gemm_bf16_to_bf16(
+                    projected, wo_b, output, num_tokens, ready,
+                    LOCAL_O_WIDTH, D, O_B_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_b",
+                    0, 0, sequential, 16, stages=1,
+                )
+        return output
+
+    return project_output
+
+
+project_output = make_project_output(prefill=True)
+decode_project_output = make_project_output(prefill=False)
+_project_decode_attention = make_project_output(prefill=False, b1_rotated=True)
+
+
+def make_o_proj(project, *, b1_rotated=False):
+    @pl.jit.inline(auto_scope=False)
+    def o_proj(
+        attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
+        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16],
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        output: pl.Tensor[[T_DYN, D], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        """Apply the Cube output projections."""
+        if b1_rotated and num_tokens == 1:
+            output = _project_decode_attention(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens, False)
+        else:
+            output = project(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens, False)
+        return output
+
+    return o_proj
+
+
+o_proj = make_o_proj(project_output)
+decode_o_proj = make_o_proj(decode_project_output)
+decode_o_proj_from_attention = make_o_proj(decode_project_output, b1_rotated=True)
+
+
+def make_decode_swa_o_proj(*, b1_rotated):
+    @pl.jit.inline(auto_scope=False)
+    def decode_swa_o_proj(
+        attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
+        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16],
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        output: pl.Tensor[[T_DYN, D], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        """Project SWA output with the active-row Cube path for one Decode token."""
+        if b1_rotated and num_tokens == 1:
+            output = _project_decode_attention(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens, False)
+        elif num_tokens == 1:
+            output = decode_project_output(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens, False)
+        else:
+            output = decode_project_output(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens, True)
+        return output
+
+
+    return decode_swa_o_proj
+
+
+decode_swa_o_proj = make_decode_swa_o_proj(b1_rotated=False)
+decode_swa_o_proj_from_attention = make_decode_swa_o_proj(b1_rotated=True)
+
+
+NZ_WEIGHT_K = pl.dynamic("NZ_WEIGHT_K")
+NZ_WEIGHT_N = pl.dynamic("NZ_WEIGHT_N")
+
+
+def make_gemm_bf16_native(*, k_subtile):
+    @pl.jit.inline(auto_scope=False)
+    def gemm_bf16_native(
+        source: pl.Tensor,
+        weight: pl.Tensor[[NZ_WEIGHT_K, NZ_WEIGHT_N], pl.BF16, pl.NZ],
+        output: pl.Tensor,
+        num_tokens: pl.Scalar[pl.INT32],
+        ready: pl.Scalar[pl.TASK_ID],
+        width: pl.constexpr,
+        output_width: pl.constexpr,
+        n_tile: pl.constexpr,
+        k_tile: pl.constexpr,
+        workers: pl.constexpr,
+        name_hint: pl.constexpr,
+        source_col: pl.Scalar[pl.INT32],
+        output_col: pl.Scalar[pl.INT32],
+        row_tile: pl.constexpr,
+        stages: pl.constexpr,
+    ):
+        """Project BF16 activations against packed Cube weights."""
+        col_blocks = output_width // n_tile
+        row_blocks = (num_tokens + row_tile - 1) // row_tile
+        task_workers = pl.max(1, pl.min(row_blocks * col_blocks, workers))
+        entry_deps = pl.array.create(1, pl.TASK_ID)
+        entry_deps[0] = ready
+        with pl.spmd(task_workers, name_hint=name_hint, deps=[entry_deps[0]]):
+            worker = pl.tile.get_block_idx()
+            if col_blocks == 4:
+                inverse = 1
+            else:
+                inverse = 5
+            for panel in pl.range(0, col_blocks):
+                col = panel * n_tile
+                first_row = (worker + task_workers - (panel * row_blocks) % task_workers) % task_workers
+                row_step = task_workers
+                if k_subtile > 0 and num_tokens >= 768:
+                    # With 24 workers, the 4 or 20 output panels recur every six row tiles.
+                    first_row = row_blocks
+                    if worker % 4 == panel % 4:
+                        first_row = (((worker + 24 - panel) % 24) // 4 * inverse) % 6
+                    row_step = 6
+                for block in pl.range(first_row, row_blocks, row_step):
+                    row = block * row_tile
+                    rows = pl.max(0, pl.min(row_tile, num_tokens - row))
+                    cube_seed = pl.tile.create([row_tile, n_tile], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc, compact=True)
+                    cube_acc = pl.set_validshape(cube_seed, rows, n_tile)
+                    for k in pl.pipeline(0, width, k_tile, stage=stages):
+                        if k_subtile > 0:
+                            a = pl.load(source, [row, source_col + k], [row_tile, k_tile],
+                                        valid_shape=[rows, k_tile], target_memory=pl.Mem.Mat)
+                            b = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                            for inner in pl.pipeline(0, k_tile, k_subtile, stage=2):
+                                af = pl.tile.slice(a, [row_tile, k_subtile], [0, inner])
+                                bf = pl.tile.slice(b, [k_subtile, n_tile], [inner, 0])
+                                cube_acc = pl.matmul_acc(cube_acc, af, bf, init_cond=(k + inner == 0))
+                        else:
+                            cube_a = pl.load(source, [row, source_col + k], [row_tile, k_tile], valid_shape=[rows, k_tile])
+                            cube_w = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
+                            cube_acc = pl.matmul_acc(cube_acc, cube_a, cube_w, init_cond=(k == 0))
+                    cube_value = pl.set_validshape(cube_acc, rows, n_tile)
+                    output = pl.store(cube_value, [row, output_col + col], output)
+        return output
+
+    return gemm_bf16_native
+
+
+gemm_bf16_native = make_gemm_bf16_native(k_subtile=0)
+prefill_bf16_native = make_gemm_bf16_native(k_subtile=PREFILL_BF16_K_SUBTILE)
+
+
+def make_native_project_output(*, prefill, b1_rotated):
+    @pl.jit.inline(auto_scope=False)
+    def project_output(
+        attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16, pl.NZ],
+        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        output: pl.Tensor[[T_DYN, D], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        """Apply inverse RoPE and grouped BF16 O-A/O-B projections. Prefill consumes attention scratch."""
+        tokens = pl.tensor.dim(output, 0)
+        if prefill:
+            rotated = rotate_output(attended, rope_cos, rope_sin, attended, num_tokens)
+        elif b1_rotated:
+            rotated = attended
         else:
             rotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             if num_tokens == 1:
@@ -99,143 +335,76 @@ def make_project_output(*, prefill):
         for group in pl.parallel(LOCAL_O_GROUPS):
             source_col = pl.cast(group * O_GROUP_IN, pl.INT32)
             output_col = pl.cast(group * O_LORA, pl.INT32)
-            if prefill and not sequential and num_tokens >= PREFILL_O_M_TILE:
-                prefill_gemm_bf16_to_bf16(
+            if prefill and num_tokens >= PREFILL_O_M_TILE:
+                prefill_bf16_native(
                     rotated, wo_a[group], projected, num_tokens, ready,
                     O_GROUP_IN, O_LORA, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_a",
-                    source_col, output_col, False, PREFILL_O_M_TILE, stages=2,
+                    source_col, output_col, PREFILL_O_M_TILE, stages=2,
                 )
-            elif not prefill and not sequential and num_tokens == 1:
-                gemm_bf16_to_bf16(
+            elif not prefill and num_tokens == 1:
+                gemm_bf16_native(
                     rotated, wo_a[group], projected, num_tokens, ready,
-                    O_GROUP_IN, O_LORA, O_A_N_TILE, K_TILE, 24, "proj_o_a",
-                    source_col, output_col, False, 16, stages=2,
+                    O_GROUP_IN, O_LORA, O_A_N_TILE, DECODE_B1_O_A_K_TILE, 24, "proj_o_a",
+                    source_col, output_col, 16, stages=2,
                 )
-            elif not sequential and num_tokens >= 64:
-                gemm_bf16_to_bf16(
+            elif num_tokens >= 64:
+                gemm_bf16_native(
                     rotated, wo_a[group], projected, num_tokens, ready,
                     O_GROUP_IN, O_LORA, 256, K_TILE, 24, "proj_o_a",
-                    source_col, output_col, False, 64, stages=1,
+                    source_col, output_col, 64, stages=1,
                 )
             else:
-                gemm_bf16_to_bf16(
+                gemm_bf16_native(
                     rotated, wo_a[group], projected, num_tokens, ready,
-                    O_GROUP_IN, O_LORA, O_A_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_a",
-                    source_col, output_col, sequential, 16, stages=1,
+                    O_GROUP_IN, O_LORA, O_A_N_TILE, K_TILE, 24, "proj_o_a",
+                    source_col, output_col, 16, stages=1,
                 )
-        if not prefill and not sequential and num_tokens == 1:
-            gemm_bf16_to_bf16(
+        if not prefill and num_tokens == 1:
+            gemm_bf16_native(
                 projected, wo_b, output, num_tokens, ready,
                 LOCAL_O_WIDTH, D, DECODE_B1_O_B_N_TILE, K_TILE, 24, "proj_o_b_b1",
-                0, 0, False, 16, stages=1,
+                0, 0, 16, stages=2,
             )
-        elif prefill and not sequential and num_tokens >= PREFILL_O_M_TILE:
-            prefill_gemm_bf16_to_bf16(
+        elif prefill and num_tokens >= PREFILL_O_M_TILE:
+            prefill_bf16_native(
                 projected, wo_b, output, num_tokens, ready,
-                LOCAL_O_WIDTH, D, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_b",
-                0, 0, False, PREFILL_O_M_TILE, stages=2,
+                LOCAL_O_WIDTH, D, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_b", 0, 0, PREFILL_O_M_TILE, stages=2,
             )
-        elif not sequential and num_tokens >= 64:
-            gemm_bf16_to_bf16(
+        elif num_tokens >= 64:
+            gemm_bf16_native(
                 projected, wo_b, output, num_tokens, ready,
-                LOCAL_O_WIDTH, D, 256, K_TILE, 24, "proj_o_b", 0, 0, False, 64, stages=1,
+                LOCAL_O_WIDTH, D, 256, K_TILE, 24, "proj_o_b", 0, 0, 64, stages=1,
             )
         else:
-            gemm_bf16_to_bf16(
+            gemm_bf16_native(
                 projected, wo_b, output, num_tokens, ready,
-                LOCAL_O_WIDTH, D, O_B_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_b",
-                0, 0, sequential, 16, stages=1,
+                LOCAL_O_WIDTH, D, O_B_N_TILE, K_TILE, 24, "proj_o_b",
+                0, 0, 16, stages=1,
             )
         return output
 
     return project_output
 
 
-project_output = make_project_output(prefill=True)
-decode_project_output = make_project_output(prefill=False)
-
-
-def make_o_proj(project):
-    @pl.jit.inline(auto_scope=False)
-    def o_proj(
-        attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
-        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16],
-        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        output: pl.Tensor[[T_DYN, D], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        """Apply the Cube output projections."""
-        return project(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens, False)
-
-    return o_proj
-
-
-o_proj = make_o_proj(project_output)
-decode_o_proj = make_o_proj(decode_project_output)
+prefill_o_proj_nz = make_native_project_output(prefill=True, b1_rotated=False)
+_decode_o_proj_nz_rotated = make_native_project_output(prefill=False, b1_rotated=True)
+_decode_o_proj_nz = make_native_project_output(prefill=False, b1_rotated=False)
 
 
 @pl.jit.inline(auto_scope=False)
-def _project_ordered_decode_row(
-    source: pl.Tensor,
-    weight: pl.Tensor,
-    output: pl.Tensor,
-    source_col: pl.Scalar[pl.INT32],
-    output_col: pl.Scalar[pl.INT32],
-    width: pl.constexpr,
-    output_width: pl.constexpr,
-    k_tile: pl.constexpr,
-    n_tile: pl.constexpr,
-    name_hint: pl.constexpr,
-):
-    """Multiply a panel at once and sum in the original FP32 reduction order."""
-    panels = output_width // n_tile
-    workers = pl.min(panels, pl.system.available_cluster_count())
-    for worker in pl.spmd(workers, name_hint=name_hint):
-        for panel in pl.range(worker, panels, workers):
-            col = panel * n_tile
-            total = pl.tile.full([1, n_tile], dtype=pl.FP32, value=0.0)
-            for first in pl.pipeline(0, width, k_tile, stage=2):
-                value = pl.cast(pl.load(source, [0, source_col + first], [1, k_tile]), pl.FP32)
-                matrix = pl.cast(pl.load(weight, [first, col], [k_tile, n_tile]), pl.FP32)
-                column = pl.reshape(value, [k_tile, 1])
-                products = pl.row_expand_mul(matrix, column)
-                for inner in pl.range(k_tile):
-                    product = pl.tile.slice(products, [1, n_tile], [inner, 0])
-                    total = pl.add(total, product)
-            pl.store(pl.cast(total, pl.BF16, mode="rint"), [0, output_col + col], output)
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
-def decode_swa_o_proj(
+def decode_o_proj_nz_from_attention(
     attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     output: pl.Tensor[[T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Apply the ordered SWA projections to the active Decode token."""
     if num_tokens == 1:
-        tokens = pl.tensor.dim(attended, 0)
-        rotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        rotated = rotate_decode_b1(attended, rope_cos, rope_sin, rotated, num_tokens)
-        projected = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
-        for group in pl.parallel(LOCAL_O_GROUPS):
-            _project_ordered_decode_row(
-                rotated, wo_a[group], projected,
-                pl.cast(group * O_GROUP_IN, pl.INT32), pl.cast(group * O_LORA, pl.INT32),
-                O_GROUP_IN, O_LORA, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE, "proj_o_a_ordered_b1",
-            )
-        output = _project_ordered_decode_row(
-            projected, wo_b, output, 0, 0,
-            LOCAL_O_WIDTH, D, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE, "proj_o_b_ordered_b1",
-        )
+        _decode_o_proj_nz_rotated(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens)
     else:
-        output = decode_project_output(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens, True)
+        _decode_o_proj_nz(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens)
     return output
 
 

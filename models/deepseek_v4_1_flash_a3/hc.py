@@ -21,6 +21,9 @@ import pypto.language as pl
 import torch
 import torch.nn.functional as F
 
+from .activation_quant import (
+    DECODE_QUANT_REDUCE_TILE, _decode_checkpoint_codes, _quantize_projection_activation_into,
+)
 from .config import FLASH as M, SP_T_DYN, T_DYN
 
 
@@ -1087,6 +1090,87 @@ def hc_head_norm_adaptive(
     else:
         ready = hc_head_norm(x_hc, pre_mix, norm_weight, output, one_token=False)
     return ready
+
+
+@pl.jit.inline(auto_scope=False)
+def hc_head_norm_quantize_decode(
+    x_hc: pl.Tensor,
+    pre_mix: pl.Tensor,
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    zero_padding: pl.constexpr,
+):
+    """Prepare the shared BF16 and W8A8 attention inputs for a Decode slab."""
+    padded_rows = (pl.tensor.dim(output, 0) + 15) // 16 * 16
+    payload = pl.create_tensor([padded_rows, D], dtype=pl.INT8)
+    scale = pl.create_tensor([padded_rows, 1], dtype=pl.FP32)
+    if num_tokens == 1:
+        tokens = pl.tensor.dim(x_hc, 0)
+        x_flat = pl.reshape(x_hc, [tokens, HC_DIM])
+        gamma_flat = pl.reshape(norm_weight, [1, D])
+        with pl.spmd(1 + D // DECODE_QUANT_REDUCE_TILE, name_hint="hc_decode_collapse_norm_quant") as ready:
+            worker = pl.tile.get_block_idx()
+            if worker == 0:
+                weights = pl.load(pre_mix, [0, 0], [1, HC_PAD], valid_shape=[1, HC_MULT])
+                p0 = pl.mul(pl.load(x_flat, [0, 0], [1, D]), pl.tile.read(weights, [0, 0]))
+                p1 = pl.mul(pl.load(x_flat, [0, D], [1, D]), pl.tile.read(weights, [0, 1]))
+                p01 = pl.add(p0, p1)
+                p2 = pl.mul(pl.load(x_flat, [0, 2 * D], [1, D]), pl.tile.read(weights, [0, 2]))
+                p3 = pl.mul(pl.load(x_flat, [0, 3 * D], [1, D]), pl.tile.read(weights, [0, 3]))
+                p23 = pl.add(p2, p3)
+                rounded = pl.cast(pl.add(p01, p23), pl.BF16, mode="rint")
+                values = pl.cast(rounded, pl.FP32)
+                # Match hc_head_norm: one hardware row sum per 256 channels, then left-to-right addition.
+                lanes = pl.reshape(values, [D // PRE_NORM_D_TILE, PRE_NORM_D_TILE])
+                squares = pl.mul(lanes, lanes)
+                scratch = pl.create_tile([8, PRE_NORM_D_TILE], dtype=pl.FP32)
+                first = pl.row_sum(pl.tile.slice(squares, [8, PRE_NORM_D_TILE], [0, 0]), tmp_tile=scratch)
+                middle = pl.row_sum(pl.tile.slice(squares, [8, PRE_NORM_D_TILE], [8, 0]), tmp_tile=scratch)
+                last = pl.row_sum(pl.tile.slice(squares, [8, PRE_NORM_D_TILE], [12, 0]), tmp_tile=scratch)
+                square_sum = pl.tile.read(first, [0, 0])
+                for lane in pl.unroll(1, 8):
+                    square_sum = square_sum + pl.tile.read(first, [lane, 0])
+                for lane in pl.unroll(0, 8):
+                    square_sum = square_sum + pl.tile.read(middle, [lane, 0])
+                for lane in pl.unroll(4, 8):
+                    square_sum = square_sum + pl.tile.read(last, [lane, 0])
+                rms_arg = pl.mul(pl.tile.full([1, 8], dtype=pl.FP32, value=1.0 / D), square_sum)
+                rsqrt_tmp = pl.create_tile([1, 8], dtype=pl.FP32)
+                inverse = pl.tile.rsqrt(pl.add(rms_arg, NORM_EPS), rsqrt_tmp, high_precision=True)
+                scaled = pl.mul(values, pl.tile.read(inverse, [0, 0]))
+                gamma = pl.cast(pl.load(gamma_flat, [0, 0], [1, D]), pl.FP32)
+                result = pl.cast(pl.mul(scaled, gamma), pl.BF16, mode="rint")
+
+                grouped = pl.reshape(result, [8, D // 8])
+                fp32 = pl.cast(grouped, pl.FP32)
+                peak_scratch = pl.create_tile([8, D // 8], dtype=pl.FP32)
+                peaks = pl.reshape(pl.row_max(pl.abs(fp32), tmp_tile=peak_scratch), [1, 8])
+                peak_zero = pl.tile.full([8, 8], dtype=pl.FP32, value=0.0)
+                maximum = pl.row_max(pl.col_expand_add(peak_zero, peaks), tmp_tile=peak_zero)
+                pl.store(result, [0, 0], output)
+                live_scale = pl.maximum(pl.mul(maximum, 1.0 / 127.0), 1e-30)
+                inactive = pl.tile.full([1, 8], dtype=pl.FP32, value=1e-30)
+                scale_lanes = pl.cast(pl.tile.arange(0, [1, 8], dtype=pl.INT32), pl.FP32)
+                active_lane = pl.tile.cmps(scale_lanes, 0.0, cmp_type=0)
+                scales = pl.tile.select(active_lane, pl.reshape(live_scale, [1, 8]), inactive)
+                pl.store(pl.reshape(scales, [8, 1]), [0, 0], scale)
+                pl.store(pl.reshape(inactive, [8, 1]), [8, 0], scale)
+                denominator = pl.mul(pl.maximum(maximum, 127e-30), 1.0 / 128.0)
+                reciprocal = pl.recip(denominator)
+                codes = _decode_checkpoint_codes(fp32, denominator, reciprocal)
+                pl.store(pl.reshape(codes, [1, D]), [0, 0], payload)
+            else:
+                col = (worker - 1) * DECODE_QUANT_REDUCE_TILE
+                pad = pl.cast(pl.tile.full([8, DECODE_QUANT_REDUCE_TILE], dtype=pl.FP32, value=0.0), pl.INT8, mode="rint")
+                pl.store(pl.set_validshape(pad, 7, DECODE_QUANT_REDUCE_TILE), [1, col], payload)
+                pl.store(pad, [8, col], payload)
+    else:
+        ready = hc_head_norm_adaptive(x_hc, pre_mix, norm_weight, output, num_tokens)
+        if zero_padding:
+            zero_bf16_padding(output, pl.min(num_tokens, pl.tensor.dim(output, 0)))
+        _quantize_projection_activation_into(output, payload, scale, num_tokens, padded_rows, D, True, False)
+    return payload, scale, ready
 
 
 @pl.jit.inline

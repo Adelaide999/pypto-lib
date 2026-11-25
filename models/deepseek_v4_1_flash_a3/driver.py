@@ -22,6 +22,7 @@ from golden import ScalarSpec, TensorSpec, run
 from pypto.ir import DistributedConfig
 
 from . import config as C
+from .weights import bf16_nz_shape, engram_wkv_nz_shape, projection_int8_nz_shape
 
 
 TOPOLOGY = {"world": 16, "dp": 4, "tp": 4, "ep": 16, "local_experts": 24}
@@ -64,6 +65,16 @@ def build_specs(function, *, mode, capacity, history_capacity=HISTORY_CAPACITY, 
         if dtype_name not in dtype_map:
             raise ValueError(f"unsupported A3 dtype {annotation.dtype} for {name}")
         shape = [extent(dim) for dim in annotation.shape]
+        if name == "engram_wkv":
+            # The host orchestration slices rank-local matrices from a flat batch of NZ blocks.
+            ranks, layers, _, _ = shape
+            shape = list(engram_wkv_nz_shape(ranks * layers))
+        elif name in ("wq_a", "wq_b", "wkv", "shared_w13", "shared_w2"):
+            ranks, layers, rows, columns = shape
+            shape = list(projection_int8_nz_shape(ranks * layers, rows, columns))
+        elif name in ('wo_a', 'wo_b'):
+            ranks, matrices, rows, columns = shape
+            shape = list(bf16_nz_shape(ranks * matrices, rows, columns))
         specs.append(TensorSpec(name, shape, dtype_map[dtype_name]))
     return specs
 

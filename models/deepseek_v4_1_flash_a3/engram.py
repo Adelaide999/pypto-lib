@@ -21,7 +21,8 @@ import pypto.language as pl
 import torch
 
 from .config import FLASH as M, T_DYN
-from .gemm import gemm_bf16_to_bf16, prefill_gemm_bf16_to_bf16_columns_first
+from .gemm import PREFILL_BF16_K_SUBTILE
+from .weights import unpack_bf16_nz
 
 
 # model config
@@ -45,6 +46,8 @@ DOT_SCALE = D**-0.5
 T_TILE = 16
 K_TILE = 128
 N_TILE = 256
+DECODE_ENGRAM_K_TILE = 256
+DECODE_ENGRAM_N_TILE = 128
 PREFILL_M_TILE = 128
 PREFILL_MIN_ROWS = 1024
 D_TILE = 512
@@ -186,11 +189,63 @@ def engram_gate(
     return out
 
 
+@pl.jit.inline(auto_scope=False)
+def engram_project_nz(
+    lookup: pl.Tensor,
+    weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
+    output: pl.Tensor,
+    tokens: pl.Scalar[pl.INT32],
+    row_tile: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+    columns_first: pl.constexpr,
+    k_subtile: pl.constexpr,
+):
+    """Project token tiles from a resident BF16 NZ matrix."""
+    for worker in pl.spmd(24, name_hint="engram_projection"):
+        row_blocks = (tokens + row_tile - 1) // row_tile
+        if columns_first:
+            panel_start = 0
+            panel_step = 1
+        else:
+            panel_start = worker
+            panel_step = 24
+        for panel in pl.range(panel_start, KV_OUT // n_tile, panel_step):
+            col = panel * n_tile
+            if columns_first:
+                # Distribute consecutive row tiles of the same weight panel across workers.
+                first_row_tile = (worker + 24 - (panel * row_blocks) % 24) % 24
+                row_step = 24
+            else:
+                first_row_tile = 0
+                row_step = 1
+            for row_block in pl.range(first_row_tile, row_blocks, row_step):
+                row = row_block * row_tile
+                rows = pl.min(row_tile, tokens - row)
+                seed = pl.tile.create([row_tile, n_tile], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc, compact=True)
+                acc = pl.set_validshape(seed, rows, n_tile)
+                for k in pl.pipeline(0, ENGRAM_K, k_tile, stage=2):
+                    if k_subtile > 0:
+                        a_panel = pl.load(lookup, [row, k], [row_tile, k_tile], valid_shape=[rows, k_tile],
+                                          target_memory=pl.MemorySpace.Mat)
+                        b_panel = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
+                        for inner_k in pl.pipeline(0, k_tile, k_subtile, stage=2):
+                            a = pl.tile.slice(a_panel, [row_tile, k_subtile], [0, inner_k])
+                            b = pl.tile.slice(b_panel, [k_subtile, n_tile], [inner_k, 0])
+                            acc = pl.matmul_acc(acc, a, b, init_cond=(k + inner_k == 0))
+                    else:
+                        source = pl.load(lookup, [row, k], [row_tile, k_tile], valid_shape=[rows, k_tile])
+                        weights = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
+                        acc = pl.matmul_acc(acc, source, weights, init_cond=(k == 0))
+                pl.store(pl.set_validshape(acc, rows, n_tile), [row, col], output)
+    return output
+
+
 def make_engram_from_rows(*, prefill):
     @pl.jit.inline(auto_scope=False)
     def engram_from_rows(
         lookup: pl.Tensor,
-        wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16],
+        wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
         weight: pl.Tensor[[HC_MULT, D], pl.FP32],
         rotation: pl.Tensor[[D // 32, 32, 32], pl.FP32],
         x: pl.Tensor,
@@ -199,19 +254,12 @@ def make_engram_from_rows(*, prefill):
         """Project host-gathered BF16 rows and gate the FP32 residual stream."""
         tokens = pl.tensor.dim(x, 0)
         kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
-        ready = pl.system.task_dummy(deps=[])
         if prefill and tokens >= PREFILL_MIN_ROWS:
-            # Visit multiple rows while the same weight columns are in cache.
-            prefill_gemm_bf16_to_bf16_columns_first(
-                lookup, wkv_weight, kv, tokens, ready,
-                ENGRAM_K, KV_OUT, N_TILE, K_TILE, 24, "engram_projection",
-                0, 0, False, PREFILL_M_TILE, stages=2,
-            )
+            engram_project_nz(lookup, wkv_weight, kv, tokens, PREFILL_M_TILE, N_TILE, K_TILE, True, PREFILL_BF16_K_SUBTILE)
+        elif not prefill and tokens == 1:
+            engram_project_nz(lookup, wkv_weight, kv, tokens, T_TILE, DECODE_ENGRAM_N_TILE, DECODE_ENGRAM_K_TILE, False, 0)
         else:
-            gemm_bf16_to_bf16(
-                lookup, wkv_weight, kv, tokens, ready,
-                ENGRAM_K, KV_OUT, N_TILE, K_TILE, 24, "engram_projection", 0, 0, False, 64, stages=2,
-            )
+            engram_project_nz(lookup, wkv_weight, kv, tokens, 64, N_TILE, K_TILE, False, 0)
         pl.dump_tag(kv)
         if prefill:
             original_query = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
@@ -245,7 +293,7 @@ prefill_engram_from_rows = make_engram_from_rows(prefill=True)
 @pl.jit(auto_scope=False)
 def l2_engram(
     lookup: pl.Tensor[[T_DYN, ENGRAM_K], pl.BF16],
-    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16],
+    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
     rotation: pl.Tensor[[D // 32, 32, 32], pl.FP32],
     source: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
@@ -255,11 +303,14 @@ def l2_engram(
     return output
 
 
-def golden_engram(tensors):
+def golden_engram(tensors, *, packed_weight=False):
     """Project real host rows, unrotate queries and gate the rotated value residual."""
     source = tensors["source"].float()
     tokens = source.shape[0]
-    projection = (tensors["lookup"].float() @ tensors["wkv_weight"].float()).bfloat16().float()
+    weight = tensors["wkv_weight"]
+    if packed_weight:
+        weight = unpack_bf16_nz(weight)
+    projection = (tensors["lookup"].float() @ weight.float()).bfloat16().float()
     key = projection[:, :HC_MULT * D].reshape(tokens, HC_MULT, D)
     value = projection[:, HC_MULT * D:]
     original = torch.einsum("thbi,boi->thbo", source.reshape(tokens, HC_MULT, D // 32, 32),
@@ -407,7 +458,7 @@ if __name__ == "__main__":
 
     from golden import TensorSpec, ratio_allclose, run
     from tokenizers import Tokenizer
-    from .weights import Checkpoint
+    from .weights import Checkpoint, pack_bf16_nz
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
@@ -415,7 +466,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--mode", choices=["rotation", "full", "all"], default="all")
-    parser.add_argument("--tokens", type=int, choices=[33, 8192], default=33)
+    parser.add_argument("--tokens", type=int, choices=[1, 2, 33, 8192], default=33)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
     torch.set_num_threads(8)
@@ -460,7 +511,7 @@ if __name__ == "__main__":
             weight = checkpoint.tensor(prefix + "q_weight").float() * checkpoint.tensor(prefix + "k_weight").float()
             projection = checkpoint.tensor(prefix + "wkv.weight").t().contiguous()
             specs = [TensorSpec("lookup", [tokens, ENGRAM_K], torch.bfloat16, init_value=lookups[slot]),
-                     TensorSpec("wkv_weight", [ENGRAM_K, KV_OUT], torch.bfloat16, init_value=projection),
+                     TensorSpec("wkv_weight", [ENGRAM_K, KV_OUT], torch.bfloat16, init_value=pack_bf16_nz(projection)),
                      TensorSpec("weight", [HC_MULT, D], torch.float32, init_value=weight),
                      TensorSpec("rotation", [D // 32, 32, 32], torch.float32, init_value=blocks),
                      TensorSpec("source", [tokens, HC_MULT, D], torch.float32, init_value=source),
@@ -468,7 +519,7 @@ if __name__ == "__main__":
             result = run(
                 l2_engram,
                 specs,
-                golden_fn=golden_engram,
+                golden_fn=lambda tensors: golden_engram(tensors, packed_weight=True),
                 compare_fn={"output": ratio_allclose(atol=0.003, rtol=0.03, max_error_ratio=0.005)},
                 config=dict(backend_type=args.platform, execution_mode=False, device_id=args.device,
                             ring_heap=(2 * 1024**3, 1024**3, 1024**3, 1024**3)),
