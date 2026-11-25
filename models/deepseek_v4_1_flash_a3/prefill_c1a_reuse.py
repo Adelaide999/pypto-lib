@@ -85,6 +85,7 @@ def prefill_c1a_reuse_attention(
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
     scatter_output: pl.constexpr = False,
+    shared_prefix: pl.Scalar[pl.INT32] = -1,
 ):
     """Read published ratio-1 Top-K rows and compute packed-prefill C1A."""
     tokens = pl.tensor.dim(x, 0)
@@ -119,7 +120,7 @@ def prefill_c1a_reuse_attention(
             window_indices, window_cache, window_cache_scale,
             compressed_indices, compressed_cache, compressed_cache_scale,
             attn_sink, attended,
-            num_tokens, window_ready, KEY_TILE, TOKEN_TILE,
+            num_tokens, window_ready, KEY_TILE, TOKEN_TILE, shared_prefix=shared_prefix,
         )
         o_proj(
             attended, wo_a, wo_b, rope_cos, rope_sin, partial, num_tokens,

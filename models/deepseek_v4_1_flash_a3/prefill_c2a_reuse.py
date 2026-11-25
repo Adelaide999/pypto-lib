@@ -77,6 +77,7 @@ def prefill_c2a_reuse_attention(
     partial: pl.Tensor[[T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
+    shared_prefix: pl.Scalar[pl.INT32] = -1,
 ):
     """Return replicated output for standalone C2A attention callers."""
     with pl.at(
@@ -115,7 +116,7 @@ def prefill_c2a_reuse_attention(
     attended = attend_packed(
         query, window_indices, window_cache, window_cache_scale, compressed_indices,
         compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, window_publish_tid,
-        key_tile=PACKED_KEY_TILE, token_tile=128,
+        key_tile=PACKED_KEY_TILE, token_tile=128, shared_prefix=shared_prefix,
     )
 
     o_proj(

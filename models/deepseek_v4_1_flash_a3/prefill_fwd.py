@@ -23,6 +23,7 @@ import argparse
 import pypto.language as pl
 import pypto.language.distributed as pld
 
+from .sparse_attention import CACHE_MAX_ROWS, SELECTED_KEYS
 from . import config as C
 
 _shape_parser = argparse.ArgumentParser(add_help=False)
@@ -119,6 +120,24 @@ ROPE_DIM = M.qk_rope_head_dim
 
 
 @pl.jit.inline(auto_scope=False)
+def _shared_prefill_prefix(starts: pl.Tensor[[Q_START_DYN], pl.INT32],
+                           logical_rows: pl.Scalar[pl.INDEX], pool_rows: pl.Scalar[pl.INDEX]):
+    # Single-slot callers retain the original whole-batch path. Packed request
+    # chunks arrive in decreasing length, so the streaming rows form one prefix.
+    slots = pl.tensor.dim(starts, 0) - 1
+    prefix = pl.cast(-1, pl.INT32)
+    if slots > 1:
+        prefix = pl.cast(0, pl.INT32)
+        if pool_rows <= CACHE_MAX_ROWS:
+            for slot in pl.range(slots):
+                start = pl.read(starts, [slot])
+                end = pl.read(starts, [slot + 1])
+                if logical_rows < (end - start) * SELECTED_KEYS:
+                    prefix = end
+    return prefix
+
+
+@pl.jit.inline(auto_scope=False)
 def prefill_attention(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.INT8, pl.NZ],
@@ -177,6 +196,7 @@ def prefill_attention(
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
     mode: pl.Scalar[pl.INT32],
+    shared_prefix: pl.Scalar[pl.INT32],
 ):
     if mode == 0:
         tokens = pl.tensor.dim(x, 0)
@@ -191,7 +211,7 @@ def prefill_attention(
         attention_tokens = pl.tensor.dim(x, 0)
         attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.BF16)
         prefill_c2a_full_attention(
-            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, token_to_req_indices, c2a_compressed_lens, index_cache, index_cache_scale, c2a_index_block_table, position_ids, compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_wgate, query_start_loc, state_block_table, state_cache, compressor_norm_weight, c2a_compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices, output_arrived, attention_partial, num_tokens, attention_epoch,
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, token_to_req_indices, c2a_compressed_lens, index_cache, index_cache_scale, c2a_index_block_table, position_ids, compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_wgate, query_start_loc, state_block_table, state_cache, compressor_norm_weight, c2a_compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices, output_arrived, attention_partial, num_tokens, attention_epoch, shared_prefix=shared_prefix,
         )
         prefill_tp_output_all_reduce(
             attention_partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
@@ -200,22 +220,22 @@ def prefill_attention(
         attention_tokens = pl.tensor.dim(x, 0)
         attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.BF16)
         prefill_c2a_reuse_attention(
-            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, topk_indices, output_arrived, attention_partial, num_tokens, attention_epoch,
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, topk_indices, output_arrived, attention_partial, num_tokens, attention_epoch, shared_prefix=shared_prefix,
         )
         prefill_tp_output_all_reduce(
             attention_partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch, owner_rows=False,
         )
     elif mode == 3:
         prefill_c1a_reindex_attention(
-            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, token_to_req_indices, c1a_compressed_lens, index_cache, index_cache_scale, c1a_index_block_table, pool_block_ids, pool_block_counts, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch, use_candidates=False, scatter_output=False,
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, token_to_req_indices, c1a_compressed_lens, index_cache, index_cache_scale, c1a_index_block_table, pool_block_ids, pool_block_counts, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch, use_candidates=False, scatter_output=False, shared_prefix=shared_prefix,
         )
     elif mode == 4:
         prefill_c1a_reindex_attention(
-            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, token_to_req_indices, c1a_compressed_lens, index_cache, index_cache_scale, c1a_index_block_table, pool_block_ids, pool_block_counts, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch, scatter_output=False, use_candidates=True,
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, token_to_req_indices, c1a_compressed_lens, index_cache, index_cache_scale, c1a_index_block_table, pool_block_ids, pool_block_counts, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch, scatter_output=False, use_candidates=True, shared_prefix=shared_prefix,
         )
     elif mode == 5:
         prefill_c1a_reuse_attention(
-            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, topk_indices, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch, scatter_output=False,
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, topk_indices, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch, scatter_output=False, shared_prefix=shared_prefix,
         )
     return output
 
@@ -558,6 +578,10 @@ def l2_prefill_fwd(
     compressed_sin = pl.create_tensor([CAPACITY, 32], dtype=pl.FP32)
     encoder_count = pl.read(counts, [0])
     decoder_count = pl.read(counts, [1])
+    logical_cache_rows = (pl.tensor.dim(c1a_index_block_table, 1) + 1) * 2 * 128
+    pool_cache_rows = pl.tensor.dim(window_cache, 1) * 2 * 128
+    encoder_shared = _shared_prefill_prefix(query_start_loc[0], logical_cache_rows, pool_cache_rows)
+    decoder_shared = _shared_prefill_prefix(query_start_loc[1], logical_cache_rows, pool_cache_rows)
     materialize_rope_rows(
         freqs_cos[0], freqs_sin[0], position_ids[0], encoder_count, rope_cos[0], rope_sin[0], False,
     )
@@ -603,6 +627,9 @@ def l2_prefill_fwd(
     for layer in pl.range(first_layer, last_layer):
         stage = layer // 20
         active = pl.read(counts, [stage])
+        shared_prefix = encoder_shared
+        if stage == 1:
+            shared_prefix = decoder_shared
         current_slot = (2 * (stage - first_layer // 20) + (layer - first_layer) % 2) * CAPACITY
         next_slot = (2 * (stage - first_layer // 20) + (layer - first_layer + 1) % 2) * CAPACITY
         if current_slot == 3 * CAPACITY:
@@ -725,7 +752,7 @@ def l2_prefill_fwd(
                 state_slot = pl.min(cache_slot, 2)
                 if active > 0:
                     prefill_attention(
-                        normalized, layer_wq_a, layer_wq_a_scale, layer_q_norm, layer_wq_b, layer_wq_b_scale, layer_wkv, layer_wkv_scale, layer_kv_norm, layer_attn_sink, layer_wo_a, layer_wo_b, rope_cos[rope_slot], rope_sin[rope_slot], window_slots[stage], window_indices[stage], window_cache[layer], window_scales[layer], compressed_cache[cache_slot], compressed_scales[cache_slot], token_to_req_indices[stage], c2a_compressed_lens, c1a_compressed_lens, index_cache[cache_slot], index_scales[cache_slot], c2a_index_block_table, c1a_index_block_table, position_ids[stage], compressed_cos, compressed_sin, layer_compressor_wkv, layer_compressor_wgate, query_start_loc[stage], state_block_table, state_cache[state_slot], layer_compressor_norm, c2a_compressed_slots, layer_index_wk, layer_index_norm, layer_index_wq_b, layer_index_wq_b_scale, layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived, attn_output, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, layer - first_layer + 1, mode,
+                        normalized, layer_wq_a, layer_wq_a_scale, layer_q_norm, layer_wq_b, layer_wq_b_scale, layer_wkv, layer_wkv_scale, layer_kv_norm, layer_attn_sink, layer_wo_a, layer_wo_b, rope_cos[rope_slot], rope_sin[rope_slot], window_slots[stage], window_indices[stage], window_cache[layer], window_scales[layer], compressed_cache[cache_slot], compressed_scales[cache_slot], token_to_req_indices[stage], c2a_compressed_lens, c1a_compressed_lens, index_cache[cache_slot], index_scales[cache_slot], c2a_index_block_table, c1a_index_block_table, position_ids[stage], compressed_cos, compressed_sin, layer_compressor_wkv, layer_compressor_wgate, query_start_loc[stage], state_block_table, state_cache[state_slot], layer_compressor_norm, c2a_compressed_slots, layer_index_wk, layer_index_norm, layer_index_wq_b, layer_index_wq_b_scale, layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived, attn_output, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, layer - first_layer + 1, mode, shared_prefix,
                     )
                 else:
                     zero_bf16_padding(attn_output, pl.cast(0, pl.INT32))

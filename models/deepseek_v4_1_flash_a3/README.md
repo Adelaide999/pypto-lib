@@ -72,3 +72,33 @@ The accuracy collector uses the same Prefill and Decode entry points as generati
 It feeds the prepared trace token into each Decode step and records full-vocabulary
 FP32 logits. See the [fixed-trace comparison](../../docs/models/deepseek_v4_1_flash_a3/accuracy.md)
 and the [module map](MODULE_ALIGNMENT.md).
+
+## Packed request execution
+
+Compile both phases with the same `--request-slots-per-dp` and `--context-capacity`.
+Eight slots per DP owner accommodate 32 live requests across DP4. The token
+capacity bounds each dispatch on each owner. Cache allocations reserve the
+configured context for every slot. Choose a context and slot count that fit
+on every rank.
+
+Use `packed.open_packed_session` with a matched graph pair, the resident
+checkpoint weights and HostEngram. One worker thread owns the session.
+The caller chooses the phase, DP owners and request set for each dispatch.
+
+```python
+a = session.admit("a", dp=0, prompt_length=3)
+b = session.admit("b", dp=0, prompt_length=2)
+first = session.advance_batch("prefill", [(a, [11, 12]), (b, [21, 22])])
+tail = session.advance_batch("prefill", [(a, [13])])
+next_rows = session.advance_batch("decode", [
+    (b, [int(first[b].argmax())]), (a, [int(tail[a].argmax())]),
+])
+session.release(a)
+session.release(b)
+```
+
+Outputs are full-vocabulary logits keyed by the original session-local handle.
+An intermediate prompt chunk yields no logits for that request. Omitted
+requests retain their pages and history. Release a finished or cancelled
+request after its dispatch returns. Reusing its ID creates a new handle.
+After a device or reset failure, close the session.

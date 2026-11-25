@@ -28,6 +28,7 @@ def prepare_prefill_inputs(
     start_pos: int = 0,
     max_seq_len: int | None = None,
     cache_state: Mapping[str, torch.Tensor] | None = None,
+    request_slots: int = 1,
     rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Prepare one TP group member's next embedding chunk and native cache metadata.
@@ -58,21 +59,28 @@ def prepare_prefill_inputs(
         raise ValueError("continuation requires the preceding call's retained cache state")
 
     data_pages = (max_seq_len + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE
-    pages = data_pages + 1
+    pages = data_pages * request_slots + 1
     table = torch.arange(data_pages, dtype=torch.int32).reshape(1, -1)
     c2a_pages = max(1, (max_seq_len // 2 + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE)
     c2a_table = torch.arange(c2a_pages, dtype=torch.int32).reshape(1, -1)
+    table = table.expand(request_slots, -1).contiguous()
+    c2a_table = c2a_table.expand(request_slots, -1).contiguous()
+    if request_slots > 1:
+        if count:
+            raise ValueError("Use packed metadata for multi-slot inputs")
+        table.fill_(-1)
+        c2a_table.fill_(-1)
     compressed_tables = {
         source: c2a_table if M.compress_ratios[source] == 2 else table
         for source in M.kv_source_layer_ids
     }
-    state_table = torch.zeros((1, 1), dtype=torch.int32)
+    state_table = torch.arange(request_slots, dtype=torch.int32).reshape(-1, 1)
     state_tables = {
         source: state_table
         for source in M.kv_source_layer_ids
         if M.compress_ratios[source] == 2
     }
-    query_starts = torch.tensor([0, count], dtype=torch.int32)
+    query_starts = torch.tensor([0] + [count] * request_slots, dtype=torch.int32)
     request_ids = torch.zeros(count, dtype=torch.int32)
     positions = torch.arange(start_pos, start_pos + count, dtype=torch.int32)
     window_slots, window_indices, _ = window_metadata(positions, request_ids, table)
@@ -110,7 +118,7 @@ def prepare_prefill_inputs(
     values = {
         "layer_range": torch.tensor([0, M.num_hidden_layers], dtype=torch.int32),
         "topk_indices": torch.full((capacity, M.index_topk), -1, dtype=torch.int32),
-        "pool_block_ids": torch.full((capacity, min(M.candidate_topk_blocks, (pages * 16 + 31) // 32 * 32)), -1, dtype=torch.int32),
+        "pool_block_ids": torch.full((capacity, min(M.candidate_topk_blocks, ((data_pages + 1) * 16 + 31) // 32 * 32)), -1, dtype=torch.int32),
         "pool_block_counts": torch.zeros(capacity, dtype=torch.int32),
         "moe_statistics": torch.zeros((M.num_hidden_layers, rounds, 3), dtype=torch.int32),
         "moe_gate_inputs": torch.zeros((local_moe_rows, M.hidden_size), dtype=torch.bfloat16),
@@ -148,7 +156,7 @@ def prepare_prefill_inputs(
             "index_scales", (*source_shape, M.index_head_dim // C.INDEX_CACHE_GROUP), torch.uint8, 127,
         ),
         "state_cache": native_cache(
-            "state_cache", (len(state_tables), 1, C.STATE_CAPACITY, 2 * M.head_dim), torch.float32,
+            "state_cache", (len(state_tables), request_slots, C.STATE_CAPACITY, 2 * M.head_dim), torch.float32,
         ),
         "logit_rows": logit_rows,
     }
@@ -163,6 +171,7 @@ def prepare_resident_inputs(
     start_pos: int = 0,
     max_seq_len: int | None = None,
     cache_state: Mapping[str, torch.Tensor] | None = None,
+    request_slots: int = 1,
     rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
     engram: HostEngram,
     request_id: int = 0,
@@ -183,7 +192,7 @@ def prepare_resident_inputs(
 
     values = prepare_prefill_inputs(
         embedding, capacity, start_pos=start_pos, max_seq_len=max_seq_len,
-        cache_state=cache_state, rope_tables=rope_tables,
+        cache_state=cache_state, rope_tables=rope_tables, request_slots=request_slots,
     )
     values["engram_lookup"] = engram.lookup(ids, capacity, start_pos, request_id=request_id)
     return values

@@ -2109,6 +2109,7 @@ def attend_packed(
     source_ready: pl.Scalar[pl.TASK_ID],
     key_tile: pl.constexpr,
     token_tile: pl.constexpr,
+    shared_prefix: pl.Scalar[pl.INT32] = -1,
 ):
     marker = pl.create_tensor([1, 16], dtype=pl.FP32)
     with pl.spmd(1, name_hint="sparse_query_ready", deps=[source_ready]) as ready:
@@ -2116,27 +2117,33 @@ def attend_packed(
         marker[block:block + 1, :] = pl.cast(query[0:1, 0:16], pl.FP32)
 
     cache_rows = (pl.tensor.dim(window, 0) + pl.tensor.dim(compressed, 0)) * 128
-    use_shared = pl.cast(0, pl.INT32)
-    if cache_rows <= CACHE_MAX_ROWS:
-        if cache_rows < num_tokens * SELECTED_KEYS:
-            use_shared = pl.cast(1, pl.INT32)
-    if use_shared == 1:
-        output = _attend_cache_shared(
+    # The packed host groups longer chunks first. Only those rows use the
+    # cache-streaming reduction selected for the equivalent single request.
+    shared = pl.cast(pl.max(shared_prefix, 0), pl.INT32)
+    if shared_prefix < 0:
+        if cache_rows <= CACHE_MAX_ROWS and cache_rows < num_tokens * SELECTED_KEYS:
+            shared = num_tokens
+    if shared > 0:
+        _attend_cache_shared(
             query, window_indices, window, window_scale, compressed_indices,
-            compressed, compressed_scale, sink, output, num_tokens, ready,
+            compressed, compressed_scale, sink, output, shared, ready,
         )
-    else:
-        if TP_SIZE == 1 and num_tokens <= 12:
+    if shared < num_tokens:
+        remaining = num_tokens - shared
+        if TP_SIZE == 1 and remaining <= 12:
+            cohort_q = pl.slice(query, [remaining, LOCAL_H * HEAD_DIM], [shared, 0])
+            cohort_wi = pl.slice(window_indices, [remaining, 128], [shared, 0])
+            cohort_ci = pl.slice(compressed_indices, [remaining, INDEX_TOPK], [shared, 0])
+            cohort_out = pl.slice(output, [remaining, LOCAL_H * HEAD_DIM], [shared, 0])
             ready = attend_packed_cohorts(
-                query, window_indices, window, window_scale, compressed_indices,
-                compressed, compressed_scale, sink, output, num_tokens, ready,
-                gather_name="c2a_gather", attn_name="c2a_sparse_attn",
+                cohort_q, cohort_wi, window, window_scale, cohort_ci, compressed, compressed_scale,
+                sink, cohort_out, remaining, ready, gather_name="c2a_gather", attn_name="c2a_sparse_attn",
             )
         else:
-            capacity = pl.max(1, pl.min(token_tile, num_tokens))
+            capacity = pl.max(1, pl.min(token_tile, remaining))
             selected = pl.create_tensor([capacity, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
             indices = pl.create_tensor([capacity, SELECTED_KEYS], dtype=pl.INT32)
-            for offset in pl.range(0, num_tokens, token_tile):
+            for offset in pl.range(shared, num_tokens, token_tile):
                 count = pl.min(token_tile, num_tokens - offset)
                 q = pl.slice(query, [count, LOCAL_H * HEAD_DIM], [offset, 0])
                 wi = pl.slice(window_indices, [count, 128], [offset, 0])

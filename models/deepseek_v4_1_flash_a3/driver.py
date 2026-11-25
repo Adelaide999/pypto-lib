@@ -29,20 +29,23 @@ TOPOLOGY = {"world": 16, "dp": 4, "tp": 4, "ep": 16, "local_experts": 24}
 HISTORY_CAPACITY = 8200
 
 
-def build_specs(function, *, mode, capacity, history_capacity=HISTORY_CAPACITY, prepare_windows=False):
+def build_specs(function, *, mode, capacity, history_capacity=HISTORY_CAPACITY, prepare_windows=False, request_slots=1):
     """Construct compile shapes without allocating the model's weight tensors."""
     dtype_map = {"FP32": torch.float32, "BF16": torch.bfloat16, "INT8": torch.int8,
                  "UINT8": torch.uint8, "INT32": torch.int32, "INT64": torch.int64}
-    pages = (history_capacity + 127) // 128 + 1
+    if type(request_slots) is not int or not 1 <= request_slots <= C.MAX_BATCH_PER_DP:
+        raise ValueError("Invalid per-DP request capacity")
+    table_pages = (history_capacity + 127) // 128
+    pages = table_pages * request_slots + 1
     c2a_pages = max(1, (history_capacity // 2 + 127) // 128)
     dimensions = {
         "FWD_ORI_BLOCKS_DYN": 40 * pages, "FWD_CMP_BLOCKS_DYN": 4 * pages,
-        "FWD_INDEX_BLOCKS_DYN": 4 * pages, "FWD_STATE_BLOCKS_DYN": 3,
-        "FWD_C2A_TABLE_DYN": c2a_pages, "FWD_C1A_TABLE_DYN": pages - 1,
-        "PREFILL_HISTORY_PAGES": pages, "PREFILL_C2A_TABLE": c2a_pages, "PREFILL_C1A_TABLE": pages - 1,
+        "FWD_INDEX_BLOCKS_DYN": 4 * pages, "FWD_STATE_BLOCKS_DYN": 3 * request_slots,
+        "FWD_C2A_TABLE_DYN": c2a_pages, "FWD_C1A_TABLE_DYN": table_pages,
+        "PREFILL_HISTORY_PAGES": pages, "PREFILL_C2A_TABLE": c2a_pages, "PREFILL_C1A_TABLE": table_pages,
         "ROPE_ROWS_DYN": history_capacity, "LOCAL_T_DYN": capacity, "T_DYN": capacity,
-        "Q_START_DYN": 2, "STATE_BLOCKS_DYN": 1, "B_DYN": 1,
-        "INDEX_POOL_BLOCKS_DYN": min(C.FLASH.candidate_topk_blocks, (pages * 16 + 31) // 32 * 32),
+        "Q_START_DYN": request_slots + 1, "STATE_BLOCKS_DYN": request_slots, "B_DYN": request_slots,
+        "INDEX_POOL_BLOCKS_DYN": min(C.FLASH.candidate_topk_blocks, ((table_pages + 1) * 16 + 31) // 32 * 32),
     }
 
     def extent(dim):
@@ -79,7 +82,7 @@ def build_specs(function, *, mode, capacity, history_capacity=HISTORY_CAPACITY, 
     return specs
 
 
-def manifest(mode, capacity, history_capacity=HISTORY_CAPACITY, *, slab_rows=64):
+def manifest(mode, capacity, history_capacity=HISTORY_CAPACITY, *, slab_rows=64, request_slots=1):
     """Version the shared weight, cache and quantization ABI."""
     root = Path(__file__).parent
     pending = ["prefill_fwd", "decode_fwd", "driver"]
@@ -99,11 +102,11 @@ def manifest(mode, capacity, history_capacity=HISTORY_CAPACITY, *, slab_rows=64)
                     pending.extend(alias.name for alias in node.names)
     return {"format": "deepseek-v41-a3-artifact-v1", "platform": "a2a3", "mode": mode,
             "topology": TOPOLOGY, "moe_slab_rows": slab_rows, "capacity": capacity, "history_capacity": history_capacity,
-            "weight_layout": C.WEIGHT_LAYOUT_VERSION, "cache_layout": C.CACHE_LAYOUT_VERSION,
+            "request_slots_per_dp": request_slots, "weight_layout": C.WEIGHT_LAYOUT_VERSION, "cache_layout": C.CACHE_LAYOUT_VERSION,
             "quantization": "W8A8_DYNAMIC", "sources": sources}
 
 
-def load_manifest(directory, *, mode, capacity=None):
+def load_manifest(directory, *, mode, capacity=None, request_slots=1):
     """Reject artifacts from a different topology, dtype ABI or source snapshot."""
     path = Path(directory) / "a3_manifest.json"
     if not path.is_file():
@@ -116,11 +119,25 @@ def load_manifest(directory, *, mode, capacity=None):
     if slab_rows not in supported_slabs:
         raise ValueError(f"artifact {path} has incompatible MoE slab geometry")
     expected = manifest(mode, actual["capacity"] if capacity is None else capacity, actual["history_capacity"],
-                        slab_rows=slab_rows)
+                        slab_rows=slab_rows, request_slots=request_slots)
     for key, value in expected.items():
         if actual.get(key) != value:
             raise ValueError(f"artifact {path} has incompatible {key}")
     return actual
+
+
+def compile_generation_graphs(prefill_dir, decode_dir, *, devices, context, prefill_capacity,
+                              prefill_slab_rows, decode_capacity=16, request_slots=1):
+    """Compile each phase in its own process with the matching runtime ABI."""
+    for phase, directory in (("prefill", prefill_dir), ("decode", decode_dir)):
+        cmd = [sys.executable, str(Path(__file__).with_name(f"{phase}_fwd.py")), "--compile-only", "--prepare-windows",
+               "--output", str(directory), "--context-capacity", str(context), "--devices", devices,
+               "--request-slots-per-dp", str(request_slots)]
+        if phase == "prefill":
+            cmd.extend(("--capacity", str(prefill_capacity), "--prefill-moe-slab-rows", str(prefill_slab_rows)))
+        else:
+            cmd.extend(("--decode-capacity", str(decode_capacity)))
+        subprocess.run(cmd, check=True)
 
 
 def main(function, *, mode, capacity, argv=None):
@@ -172,7 +189,10 @@ def main(function, *, mode, capacity, argv=None):
                            help="capture Level 1 swimlanes for prefill and all seven decode steps in a new directory")
     parser.add_argument("--execution-log", type=Path)
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--request-slots-per-dp", type=int, choices=range(1, C.MAX_BATCH_PER_DP + 1), default=1)
     args = parser.parse_args(argv)
+    if args.request_slots_per_dp != 1 and not args.compile_only:
+        parser.error("Use the packed session API to execute multi-slot artifacts")
     app_request = args.prompt is not None or args.tokens is not None or args.tokens_file is not None
     if args.max_new_tokens is None:
         args.max_new_tokens = 3 if app_request else 8
@@ -208,13 +228,13 @@ def main(function, *, mode, capacity, argv=None):
         slab_rows = C.MOE_TOKENS
         if args.prefill_moe_slab_rows is not None and (mode != "prefill" or args.prefill_moe_slab_rows != slab_rows):
             parser.error("MoE slab size must match the imported Prefill entry")
-        snapshot = manifest(mode, capacity, context, slab_rows=slab_rows)
+        snapshot = manifest(mode, capacity, context, slab_rows=slab_rows, request_slots=args.request_slots_per_dp)
         specs = build_specs(function, mode=mode, capacity=capacity, history_capacity=context,
-                            prepare_windows=args.prepare_windows)
+                            prepare_windows=args.prepare_windows, request_slots=args.request_slots_per_dp)
         result = run(fn=function, specs=specs, config=config, compile_only=True)
         if not result.passed:
             raise SystemExit(result.error or 1)
-        if manifest(mode, capacity, context, slab_rows=slab_rows) != snapshot:
+        if manifest(mode, capacity, context, slab_rows=slab_rows, request_slots=args.request_slots_per_dp) != snapshot:
             raise RuntimeError("Model sources changed during compilation")
         path = Path(result.work_dir) / "a3_manifest.json"
         path.write_text(json.dumps(snapshot, indent=2) + "\n")
@@ -236,16 +256,11 @@ def main(function, *, mode, capacity, argv=None):
         args.runtime_dir, args.decode_runtime_dir = args.output / "prefill", args.output / "decode"
         context = args.context_capacity or (16384 if app_request else HISTORY_CAPACITY)
         prefill_capacity = args.capacity or ((args.chunk_size + 15) // 16 * 16)
-        for phase, directory in (("prefill", args.runtime_dir), ("decode", args.decode_runtime_dir)):
-            cmd = [sys.executable, str(Path(__file__).with_name(f"{phase}_fwd.py")), "--compile-only", "--prepare-windows",
-                   "--output", str(directory), "--context-capacity", str(context), "--devices", args.devices]
-            if phase == "prefill":
-                cmd.extend(("--capacity", str(prefill_capacity), "--prefill-moe-slab-rows",
-                            str(args.prefill_moe_slab_rows or C.default_prefill_slab_rows(prefill_capacity))))
-            else:
-                cmd.extend(("--decode-capacity", str(args.decode_capacity or 16)))
-            # Each phase has its own compile-time shapes.
-            subprocess.run(cmd, check=True)
+        compile_generation_graphs(
+            args.runtime_dir, args.decode_runtime_dir, devices=args.devices, context=context,
+            prefill_capacity=prefill_capacity, decode_capacity=args.decode_capacity or 16,
+            prefill_slab_rows=args.prefill_moe_slab_rows or C.default_prefill_slab_rows(prefill_capacity),
+        )
     manifests = (load_manifest(args.runtime_dir, mode="prefill"),
                  load_manifest(args.decode_runtime_dir, mode="decode", capacity=args.decode_capacity))
     if args.capacity is not None and function is None and args.capacity != manifests[0]["capacity"]:
