@@ -124,7 +124,7 @@ def prefill_attention(
     wq_a: pl.Tensor[[D, Q_LORA], pl.INT8, pl.NZ],
     wq_a_scale: pl.Tensor[[1, Q_LORA], pl.FP32, pl.ND],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[1, LOCAL_H * HEAD_DIM], pl.FP32, pl.ND],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.INT8, pl.NZ],
     wkv_scale: pl.Tensor[[1, HEAD_DIM], pl.FP32, pl.ND],
@@ -461,7 +461,7 @@ def l2_prefill_fwd(
     wq_a: pl.Tensor[[N_LAYERS, D, Q_LORA], pl.INT8, pl.NZ],
     wq_a_scale: pl.Tensor[[N_LAYERS * (1), Q_LORA], pl.FP32],
     q_norm_weight: pl.Tensor[[N_LAYERS * Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[N_LAYERS * (1), LOCAL_H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.INT8, pl.NZ],
     wkv_scale: pl.Tensor[[N_LAYERS * (1), HEAD_DIM], pl.FP32],
@@ -639,7 +639,7 @@ def l2_prefill_fwd(
         layer_kv_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(kv_norm_weight, [HEAD_DIM], [layer * HEAD_DIM])
         layer_wq_a: pl.Tensor[[D, Q_LORA], pl.INT8, pl.NZ] = wq_a[layer]
         layer_wq_a_scale: pl.Tensor[[1, Q_LORA], pl.FP32, pl.ND] = pl.slice(wq_a_scale, [1, Q_LORA], [layer * (1), 0])
-        layer_wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8] = wq_b[layer]
+        layer_wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8, pl.NZ] = wq_b[layer]
         layer_wq_b_scale: pl.Tensor[[1, LOCAL_H * HEAD_DIM], pl.FP32, pl.ND] = pl.slice(wq_b_scale, [1, LOCAL_H * HEAD_DIM], [layer * (1), 0])
         layer_wkv: pl.Tensor[[D, HEAD_DIM], pl.INT8, pl.NZ] = wkv[layer]
         layer_wkv_scale: pl.Tensor[[1, HEAD_DIM], pl.FP32, pl.ND] = pl.slice(wkv_scale, [1, HEAD_DIM], [layer * (1), 0])
@@ -790,7 +790,7 @@ def l3_prefill_fwd(
     wq_a: pl.Tensor[[RANKS, N_LAYERS, D, Q_LORA], pl.INT8, pl.NZ],
     wq_a_scale: pl.Tensor[[RANKS, N_LAYERS * (1), Q_LORA], pl.FP32],
     q_norm_weight: pl.Tensor[[RANKS, N_LAYERS * Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[RANKS, N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[RANKS, N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[RANKS, N_LAYERS * (1), LOCAL_H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[RANKS, N_LAYERS, D, HEAD_DIM], pl.INT8, pl.NZ],
     wkv_scale: pl.Tensor[[RANKS, N_LAYERS * (1), HEAD_DIM], pl.FP32],

@@ -257,7 +257,7 @@ def forward_weight_layouts(local_experts=N_LOCAL_EXPERTS):
     }
     for name, shape in projections.items():
         matrices, input_width, output_width = shape
-        if name in ("wq_a", "wkv", "shared_w2"):
+        if name in ("wq_a", "wq_b", "wkv", "shared_w2"):
             bank_shape = projection_int8_nz_shape(matrices, input_width, output_width)
         elif name.startswith("routed_"):
             bank_shape = (matrices, output_width, input_width)
@@ -367,7 +367,7 @@ class ResidentWeights:
             for target, suffix in self.int8_projections:
                 output_slice = slice(lane * heads * M.head_dim, (lane + 1) * heads * M.head_dim) if target == "wq_b" else None
                 weight, scale = self.projection(f"layers.{layer}.{suffix}", output_slice=output_slice)
-                if target in ("wq_a", "wkv", "shared_w2"):
+                if target in ("wq_a", "wq_b", "wkv", "shared_w2"):
                     weight = pack_projection_int8_nz(weight)
                 copy(target, weight, layer, total_layers)
                 copy(target + "_scale", scale, layer, total_layers)

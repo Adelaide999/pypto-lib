@@ -52,7 +52,7 @@ def decode_c2a_reuse(
     wq_a: pl.Tensor[[D, Q_LORA], pl.INT8, pl.NZ],
     wq_a_scale: pl.Tensor[[1, Q_LORA], pl.FP32, pl.ND],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[1, LOCAL_H * HEAD_DIM], pl.FP32, pl.ND],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.INT8, pl.NZ],
     wkv_scale: pl.Tensor[[1, HEAD_DIM], pl.FP32, pl.ND],

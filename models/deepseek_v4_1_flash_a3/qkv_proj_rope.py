@@ -20,12 +20,10 @@ from .activation_quant import (
 )
 from .config import FLASH as M, T_DYN, TP_SIZE
 from .gemm import (
-    gemm_int8,
     gemm_int8_pair_columns,
     gemm_int8_tiled_nz,
     golden_dynamic_int8,
     prefill_gemm_int8_reuse_weight,
-    prefill_gemm_int8_tiled,
 )
 from .rmsnorm import golden_rms_norm, rms_norm
 from .rope import make_pipelined_rope, make_prefill_kv_norm_rope
@@ -269,6 +267,12 @@ def _finish_decode_q(
             256, False, 16, rope_cos, rope_sin, True,
             ROPE_DIM, HEAD_DIM - ROPE_DIM - Q_B_N_TILE, 1,
         )
+    elif num_tokens > 16:
+        gemm_int8_tiled_nz(
+            qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
+            Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b_decode_wide", 512, 128, 32,
+        )
+        rotate_prefill_q(query, rope_cos, rope_sin, query, num_tokens)
     else:
         gemm_int8_pair_columns(
             qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
@@ -329,15 +333,20 @@ def make_q_proj_rope(*, prefill):
                     PREFILL_Q_B_KV_N_TILE, PREFILL_Q_B_K_TILE, PREFILL_Q_B_KV_M_TILE,
                 )
             elif num_tokens >= PREFILL_QKV_MIN_ROWS:
-                prefill_gemm_int8_tiled(
+                gemm_int8_tiled_nz(
                     qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
                     Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b",
-                    PREFILL_Q_B_KV_N_TILE, PREFILL_Q_B_KV_K_TILE, False, PREFILL_Q_B_KV_M_TILE,
+                    PREFILL_Q_B_KV_N_TILE, PREFILL_Q_B_KV_K_TILE, PREFILL_Q_B_KV_M_TILE,
+                )
+            elif num_tokens >= 64:
+                gemm_int8_tiled_nz(
+                    qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
+                    Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", 512, 128, 32,
                 )
             else:
-                gemm_int8(
+                gemm_int8_tiled_nz(
                     qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
-                    Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", Q_B_N_TILE, 256, False,
+                    Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", Q_B_N_TILE, 256, 16,
                 )
             if num_tokens >= 64:
                 query = rotate_prefill_q(query, rope_cos, rope_sin, query, num_tokens)

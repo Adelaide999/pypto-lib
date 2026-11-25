@@ -255,29 +255,32 @@ def prefill_gemm_int8_reuse_weight(
     row_tiles_per_group = pl.min(24, pl.max(8, num_tokens // (2 * row_tile)))
     group_rows = row_tile * row_tiles_per_group
     col_blocks = output_width // n_tile
-    blocks = (num_tokens + group_rows - 1) // group_rows * col_blocks
-    workers = pl.max(1, pl.min(blocks, pl.system.available_cluster_count()))
-    for worker in pl.spmd(workers, name_hint=name_hint, optimizations=[pl.cross_core_slot(slot_num=1)]):
-        for block in pl.range(worker, blocks, workers):
-            first_row = block // col_blocks * group_rows
-            last_row = pl.min(first_row + group_rows, num_tokens)
-            col = block % col_blocks * n_tile
-            weight_panel = pl.load(weight, [0, col], [width, n_tile], target_memory=pl.MemorySpace.Mat)
-            for row in pl.range(first_row, last_row, row_tile):
-                rows = pl.min(row_tile, num_tokens - row)
-                seed = pl.tile.create([row_tile, n_tile], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc, compact=True)
-                acc = pl.set_validshape(seed, rows, n_tile)
-                for k in pl.pipeline(0, width, k_tile, stage=2):
-                    a = pl.load(payload, [row, k], [row_tile, k_tile], valid_shape=[rows, k_tile])
-                    b = pl.tile.slice(weight_panel, [k_tile, n_tile], [k, 0])
-                    acc = pl.matmul_acc(acc, a, b, init_cond=(k == 0))
-                value = pl.cast(acc, pl.FP32)
-                a_scale = pl.load(activation_scale, [row, 0], [row_tile, 1], valid_shape=[rows, 1])
-                b_scale = pl.load(weight_scale, [0, col], [1, n_tile])
-                scaled = pl.row_expand_mul(value, a_scale)
-                scaled = pl.col_expand_mul(scaled, b_scale)
-                rounded = pl.cast(scaled, pl.BF16, mode="rint")
-                output = pl.store(pl.set_validshape(rounded, rows, n_tile), [row, col], output)
+    groups = (num_tokens + group_rows - 1) // group_rows
+    workers = pl.max(1, pl.min(groups * col_blocks, pl.system.available_cluster_count()))
+    with pl.spmd(workers, name_hint=name_hint, optimizations=[pl.cross_core_slot(slot_num=1)]):
+        worker = pl.tile.get_block_idx()
+        for panel in pl.range(0, col_blocks):
+            col = panel * n_tile
+            for group in pl.range(0, groups):
+                if (group * col_blocks + panel) % workers == worker:
+                    first_row = group * group_rows
+                    last_row = pl.min(first_row + group_rows, num_tokens)
+                    weight_panel = pl.load(weight, [0, col], [width, n_tile], target_memory=pl.MemorySpace.Mat)
+                    for row in pl.range(first_row, last_row, row_tile):
+                        rows = pl.min(row_tile, num_tokens - row)
+                        seed = pl.tile.create([row_tile, n_tile], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc, compact=True)
+                        acc = pl.set_validshape(seed, rows, n_tile)
+                        for k in pl.pipeline(0, width, k_tile, stage=2):
+                            a = pl.load(payload, [row, k], [row_tile, k_tile], valid_shape=[rows, k_tile])
+                            b = pl.tile.slice(weight_panel, [k_tile, n_tile], [k, 0])
+                            acc = pl.matmul_acc(acc, a, b, init_cond=(k == 0))
+                        value = pl.cast(acc, pl.FP32)
+                        a_scale = pl.load(activation_scale, [row, 0], [row_tile, 1], valid_shape=[rows, 1])
+                        b_scale = pl.load(weight_scale, [0, col], [1, n_tile])
+                        scaled = pl.row_expand_mul(value, a_scale)
+                        scaled = pl.col_expand_mul(scaled, b_scale)
+                        rounded = pl.cast(scaled, pl.BF16, mode="rint")
+                        output = pl.store(pl.set_validshape(rounded, rows, n_tile), [row, col], output)
     return output
 
 
@@ -308,139 +311,137 @@ def gemm_int8_pair_columns(
     Decode Q-A and Q-B use an even number of output panels. The paired
     schedule keeps one activation tile live while it feeds two Cube products,
     reducing repeated activation loads and the number of SPMD blocks. The
-    weight ABI remains the canonical [K, N] layout used by the existing
-    projections. Q-B can optionally apply RoPE to its second output panel
+    weight can be packed for direct Cube loads. Q-B can apply RoPE to its second output panel
     before the result is stored. A single-token caller can use one
     vector row for RoPE while retaining the Cube tile dimensions.
     """
     panels = output_width // n_tile
     pairs = panels // 2
-    blocks = (num_tokens + row_tile - 1) // row_tile * pairs
-    workers = pl.max(1, pl.min(blocks, pl.system.available_cluster_count()))
-    for worker in pl.spmd(workers, name_hint=name_hint):
-        for block in pl.range(worker, blocks, workers):
-            row = block // pairs * row_tile
-            first_panel = block % pairs * 2
-            first_col = first_panel * n_tile
-            second_col = first_col + n_tile
-            valid_rows = pl.max(0, pl.min(row_tile, num_tokens - row))
-            first_seed = pl.tile.create(
-                [row_tile, n_tile], dtype=pl.INT32,
-                target_memory=pl.MemorySpace.Acc, compact=True,
+    row_blocks = (num_tokens + row_tile - 1) // row_tile
+    blocks = row_blocks * pairs
+    with pl.spmd(blocks, name_hint=name_hint):
+        block = pl.tile.get_block_idx()
+        row = block // pairs * row_tile
+        first_col = (block % pairs) * (2 * n_tile)
+        second_col = first_col + n_tile
+        valid_rows = pl.max(0, pl.min(row_tile, num_tokens - row))
+        first_seed = pl.tile.create(
+            [row_tile, n_tile], dtype=pl.INT32,
+            target_memory=pl.MemorySpace.Acc, compact=True,
+        )
+        second_seed = pl.tile.create(
+            [row_tile, n_tile], dtype=pl.INT32,
+            target_memory=pl.MemorySpace.Acc, compact=True,
+        )
+        first_acc = pl.set_validshape(first_seed, valid_rows, n_tile)
+        second_acc = pl.set_validshape(second_seed, valid_rows, n_tile)
+        for k0 in pl.range(0, width, k_tile):
+            source = pl.load(
+                payload, [row, k0], [row_tile, k_tile],
+                valid_shape=[valid_rows, k_tile],
             )
-            second_seed = pl.tile.create(
-                [row_tile, n_tile], dtype=pl.INT32,
-                target_memory=pl.MemorySpace.Acc, compact=True,
-            )
-            first_acc = pl.set_validshape(first_seed, valid_rows, n_tile)
-            second_acc = pl.set_validshape(second_seed, valid_rows, n_tile)
-            for k0 in pl.range(0, width, k_tile):
-                source = pl.load(
-                    payload, [row, k0], [row_tile, k_tile],
-                    valid_shape=[valid_rows, k_tile],
+            if output_major:
+                first_nk = pl.load(
+                    weight, [first_col, k0], [n_tile, k_tile],
+                    target_memory=pl.MemorySpace.Mat,
                 )
-                if output_major:
-                    first_nk = pl.load(
-                        weight, [first_col, k0], [n_tile, k_tile],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    second_nk = pl.load(
-                        weight, [second_col, k0], [n_tile, k_tile],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    first_weight_mat = pl.tile.transpose_view(first_nk)
-                    second_weight_mat = pl.tile.transpose_view(second_nk)
-                    first_acc = pl.matmul_acc(
-                        first_acc, source, first_weight_mat, init_cond=(k0 == 0),
-                    )
-                    second_acc = pl.matmul_acc(
-                        second_acc, source, second_weight_mat, init_cond=(k0 == 0),
-                    )
-                else:
-                    first_weight_mat = pl.load(weight, [k0, first_col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
-                    second_weight_mat = pl.load(weight, [k0, second_col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
-                    first_acc = pl.matmul_acc(
-                        first_acc, source, first_weight_mat, init_cond=(k0 == 0),
-                    )
-                    second_acc = pl.matmul_acc(
-                        second_acc, source, second_weight_mat, init_cond=(k0 == 0),
-                    )
-
-            a_scale = pl.load(
-                activation_scale, [row, 0], [row_tile, 1],
-                valid_shape=[valid_rows, 1],
-            )
-            first_scale = pl.load(weight_scale, [0, first_col], [1, n_tile])
-            second_scale = pl.load(weight_scale, [0, second_col], [1, n_tile])
-
-            first_value = pl.row_expand_mul(pl.cast(first_acc, pl.FP32), a_scale)
-            first_value = pl.col_expand_mul(first_value, first_scale)
-            first_value = pl.cast(first_value, pl.BF16, mode="rint")
-            output = pl.store(
-                pl.set_validshape(first_value, valid_rows, n_tile),
-                [row, first_col], output,
-            )
-
-            second_value = pl.row_expand_mul(pl.cast(second_acc, pl.FP32), a_scale)
-            second_value = pl.col_expand_mul(second_value, second_scale)
-            second_value = pl.cast(second_value, pl.BF16, mode="rint")
-            if fuse_rope:
-                rope_value = pl.set_validshape(second_value, rope_rows, n_tile)
-                tail_bf16 = pl.tile.slice(
-                    rope_value, [rope_rows, rope_dim], [0, rope_offset],
+                second_nk = pl.load(
+                    weight, [second_col, k0], [n_tile, k_tile],
+                    target_memory=pl.MemorySpace.Mat,
                 )
-                tail = pl.cast(tail_bf16, pl.FP32)
-                even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-                odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-                cosine = pl.load(
-                    rope_cos, [row, 0], [rope_rows, rope_dim // 2],
-                    valid_shape=[valid_rows, rope_dim // 2],
+                first_weight_mat = pl.tile.transpose_view(first_nk)
+                second_weight_mat = pl.tile.transpose_view(second_nk)
+                first_acc = pl.matmul_acc(
+                    first_acc, source, first_weight_mat, init_cond=(k0 == 0),
                 )
-                sine = pl.load(
-                    rope_sin, [row, 0], [rope_rows, rope_dim // 2],
-                    valid_shape=[valid_rows, rope_dim // 2],
-                )
-                cosine = pl.set_validshape(
-                    pl.fillpad(cosine, pad_value=pl.PadValue.zero),
-                    rope_rows, rope_dim // 2,
-                )
-                sine = pl.set_validshape(
-                    pl.fillpad(sine, pad_value=pl.PadValue.zero),
-                    rope_rows, rope_dim // 2,
-                )
-                real = pl.sub(pl.mul(even, cosine), pl.mul(odd, sine))
-                imag = pl.add(pl.mul(even, sine), pl.mul(odd, cosine))
-                real_lanes = pl.tile.full([rope_rows, rope_dim], dtype=pl.FP32, value=0.0)
-                real_lanes = pl.tile.scatter_mask(
-                    real_lanes, real, mask_pattern=pl.tile.MaskPattern.P0101,
-                )
-                imag_lanes = pl.tile.full([rope_rows, rope_dim], dtype=pl.FP32, value=0.0)
-                imag_lanes = pl.tile.scatter_mask(
-                    imag_lanes, imag, mask_pattern=pl.tile.MaskPattern.P1010,
-                )
-                real_bits = pl.reinterpret_view(real_lanes, pl.INT16)
-                imag_bits = pl.reinterpret_view(imag_lanes, pl.INT16)
-                rotated = pl.reinterpret_view(pl.or_(real_bits, imag_bits), pl.FP32)
-                rotated = pl.cast(rotated, pl.BF16, mode="rint")
-                prefix = pl.tile.slice(
-                    rope_value, [rope_rows, rope_offset], [0, 0],
-                    valid_shape=[valid_rows, rope_offset],
-                )
-                rotated = pl.tile.slice(
-                    rotated, [rope_rows, rope_dim], [0, 0],
-                    valid_shape=[valid_rows, rope_dim],
-                )
-                output = pl.store(
-                    prefix, [row, second_col], output,
-                )
-                output = pl.store(
-                    rotated, [row, second_col + rope_offset], output,
+                second_acc = pl.matmul_acc(
+                    second_acc, source, second_weight_mat, init_cond=(k0 == 0),
                 )
             else:
-                output = pl.store(
-                    pl.set_validshape(second_value, valid_rows, n_tile),
-                    [row, second_col], output,
+                first_weight_mat = pl.load(weight, [k0, first_col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                second_weight_mat = pl.load(weight, [k0, second_col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                first_acc = pl.matmul_acc(
+                    first_acc, source, first_weight_mat, init_cond=(k0 == 0),
                 )
+                second_acc = pl.matmul_acc(
+                    second_acc, source, second_weight_mat, init_cond=(k0 == 0),
+                )
+
+        a_scale = pl.load(
+            activation_scale, [row, 0], [row_tile, 1],
+            valid_shape=[valid_rows, 1],
+        )
+        first_scale = pl.load(weight_scale, [0, first_col], [1, n_tile])
+        second_scale = pl.load(weight_scale, [0, second_col], [1, n_tile])
+
+        first_value = pl.row_expand_mul(pl.cast(first_acc, pl.FP32), a_scale)
+        first_value = pl.col_expand_mul(first_value, first_scale)
+        first_value = pl.cast(first_value, pl.BF16, mode="rint")
+        output = pl.store(
+            pl.set_validshape(first_value, valid_rows, n_tile),
+            [row, first_col], output,
+        )
+
+        second_value = pl.row_expand_mul(pl.cast(second_acc, pl.FP32), a_scale)
+        second_value = pl.col_expand_mul(second_value, second_scale)
+        second_value = pl.cast(second_value, pl.BF16, mode="rint")
+        if fuse_rope:
+            rope_value = pl.set_validshape(second_value, rope_rows, n_tile)
+            tail_bf16 = pl.tile.slice(
+                rope_value, [rope_rows, rope_dim], [0, rope_offset],
+            )
+            tail = pl.cast(tail_bf16, pl.FP32)
+            even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+            odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+            cosine = pl.load(
+                rope_cos, [row, 0], [rope_rows, rope_dim // 2],
+                valid_shape=[valid_rows, rope_dim // 2],
+            )
+            sine = pl.load(
+                rope_sin, [row, 0], [rope_rows, rope_dim // 2],
+                valid_shape=[valid_rows, rope_dim // 2],
+            )
+            cosine = pl.set_validshape(
+                pl.fillpad(cosine, pad_value=pl.PadValue.zero),
+                rope_rows, rope_dim // 2,
+            )
+            sine = pl.set_validshape(
+                pl.fillpad(sine, pad_value=pl.PadValue.zero),
+                rope_rows, rope_dim // 2,
+            )
+            real = pl.sub(pl.mul(even, cosine), pl.mul(odd, sine))
+            imag = pl.add(pl.mul(even, sine), pl.mul(odd, cosine))
+            real_lanes = pl.tile.full([rope_rows, rope_dim], dtype=pl.FP32, value=0.0)
+            real_lanes = pl.tile.scatter_mask(
+                real_lanes, real, mask_pattern=pl.tile.MaskPattern.P0101,
+            )
+            imag_lanes = pl.tile.full([rope_rows, rope_dim], dtype=pl.FP32, value=0.0)
+            imag_lanes = pl.tile.scatter_mask(
+                imag_lanes, imag, mask_pattern=pl.tile.MaskPattern.P1010,
+            )
+            real_bits = pl.reinterpret_view(real_lanes, pl.INT16)
+            imag_bits = pl.reinterpret_view(imag_lanes, pl.INT16)
+            rotated = pl.reinterpret_view(pl.or_(real_bits, imag_bits), pl.FP32)
+            rotated = pl.cast(rotated, pl.BF16, mode="rint")
+            prefix = pl.tile.slice(
+                rope_value, [rope_rows, rope_offset], [0, 0],
+                valid_shape=[valid_rows, rope_offset],
+            )
+            rotated = pl.tile.slice(
+                rotated, [rope_rows, rope_dim], [0, 0],
+                valid_shape=[valid_rows, rope_dim],
+            )
+            output = pl.store(
+                prefix, [row, second_col], output,
+            )
+            output = pl.store(
+                rotated, [row, second_col + rope_offset], output,
+            )
+        else:
+            output = pl.store(
+                pl.set_validshape(second_value, valid_rows, n_tile),
+                [row, second_col], output,
+            )
     return output
 
 

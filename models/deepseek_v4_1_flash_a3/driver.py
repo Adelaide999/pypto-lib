@@ -69,7 +69,7 @@ def build_specs(function, *, mode, capacity, history_capacity=HISTORY_CAPACITY, 
             # The host orchestration slices rank-local matrices from a flat batch of NZ blocks.
             ranks, layers, _, _ = shape
             shape = list(engram_wkv_nz_shape(ranks * layers))
-        elif name in ("wq_a", "wkv", "shared_w13", "shared_w2"):
+        elif name in ("wq_a", "wq_b", "wkv", "shared_w13", "shared_w2"):
             ranks, layers, rows, columns = shape
             shape = list(projection_int8_nz_shape(ranks * layers, rows, columns))
         elif name in ('wo_a', 'wo_b'):
