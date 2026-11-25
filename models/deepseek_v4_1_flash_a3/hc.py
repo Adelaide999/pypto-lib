@@ -1408,7 +1408,9 @@ def hc_post(
         workers = pl.min(tiles, PREFILL_POST_WORKERS)
         with pl.spmd(workers, name_hint="hc_post_prefill", deps=[deps]):
             worker = pl.tile.get_block_idx()
-            for block in pl.pipeline(worker, tiles, PREFILL_POST_WORKERS, stage=2):
+            begin = worker * tiles // workers
+            end = (worker + 1) * tiles // workers
+            for block in pl.pipeline(begin, end, stage=2):
                 token = block // (D // PREFILL_POST_D_TILE)
                 d0 = (block % (D // PREFILL_POST_D_TILE)) * PREFILL_POST_D_TILE
                 hidden = pl.load(sublayer, [token, d0], [1, PREFILL_POST_D_TILE])
