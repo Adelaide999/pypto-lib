@@ -487,7 +487,7 @@ def _swa_attention_tile(
 
 
 @pl.jit.inline(auto_scope=False)
-def _attention_tile(
+def attention_tile(
     query: pl.Tensor,
     keys: pl.Tensor,
     indices: pl.Tensor,
@@ -501,9 +501,6 @@ def _attention_tile(
     key_rows: pl.constexpr,
     key_tile: pl.constexpr,
     window_only: pl.constexpr,
-    rope_cos: pl.Tensor,
-    rope_sin: pl.Tensor,
-    inverse_rope: pl.constexpr,
 ):
     """Evaluate BF16 QK and PV products with FP32 online softmax."""
     sinks = pl.load(sink, [0, head_offset], [1, heads])
@@ -568,52 +565,7 @@ def _attention_tile(
     denominator_column = pl.reshape(denominator, [heads, 1])
     normalized = pl.row_expand_div(numerator, denominator_column)
     result = pl.cast(normalized, pl.BF16, mode="rint")
-    if inverse_rope:
-        # Preserve the BF16 attention boundary before rotating the last 64 features.
-        lanes = pl.cast(pl.tile.arange(0, [1, heads * 64], dtype=pl.INT32), pl.FP32)
-        pairs = pl.cast(pl.mul(lanes, 0.5), pl.INT32, mode="trunc")
-        parity = pl.sub(lanes, pl.mul(pl.cast(pairs, pl.FP32), 2.0))
-        swap = pl.cast(pl.sub(pl.add(lanes, 1.0), pl.mul(parity, 2.0)), pl.INT32)
-        pair_index = pl.tile.slice(pairs, [1, 64], [0, 0])
-        head_parity = pl.tile.slice(parity, [1, 64], [0, 0])
-        sign = pl.mul(pl.sub(pl.mul(head_parity, 2.0), 1.0), -1.0)
-        tail = pl.cast(pl.tile.slice(result, [heads, 64], [0, 448]), pl.FP32)
-        swap_tmp = pl.create_tile([1, heads * 64], dtype=pl.INT32, target_memory=pl.Mem.Vec)
-        swapped = pl.tile.gather(pl.reshape(tail, [1, heads * 64]), swap, swap_tmp)
-        coeff_tmp = pl.create_tile([1, 64], dtype=pl.INT32, target_memory=pl.Mem.Vec)
-        cos = pl.tile.gather(pl.load(rope_cos, [0, 0], [1, 32]), pair_index, coeff_tmp)
-        sin = pl.mul(pl.tile.gather(pl.load(rope_sin, [0, 0], [1, 32]), pair_index, coeff_tmp), sign)
-        direct = pl.col_expand_mul(tail, cos)
-        cross = pl.col_expand_mul(pl.reshape(swapped, [heads, 64]), sin)
-        rotated = pl.cast(pl.add(direct, cross), pl.BF16, mode="rint")
-        prefix = pl.tile.slice(result, [heads, 448], [0, 0])
-        pl.store(prefix, [query_offset, 0], output)
-        pl.store(rotated, [query_offset, 448], output)
-    else:
-        pl.store(result, [query_offset, 0], output)
-
-
-@pl.jit.inline(auto_scope=False)
-def attention_tile(
-    query: pl.Tensor,
-    keys: pl.Tensor,
-    indices: pl.Tensor,
-    sink: pl.Tensor,
-    output: pl.Tensor,
-    query_offset: pl.Scalar[pl.INDEX],
-    key_offset: pl.Scalar[pl.INDEX],
-    index_row: pl.Scalar[pl.INDEX],
-    head_offset: pl.Scalar[pl.INDEX],
-    heads: pl.constexpr,
-    key_rows: pl.constexpr,
-    key_tile: pl.constexpr,
-    window_only: pl.constexpr,
-):
-    """Evaluate unrotated BF16 attention."""
-    _attention_tile(
-        query, keys, indices, sink, output, query_offset, key_offset, index_row,
-        head_offset, heads, key_rows, key_tile, window_only, sink, sink, False,
-    )
+    pl.store(result, [query_offset, 0], output)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -910,35 +862,6 @@ def swa_attention_partial(
             )
         cache_consumed = attention_done
     return cache_consumed
-
-
-@pl.jit.inline(auto_scope=False)
-def swa_attention_partial_b1_rotated(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.UINT8],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_GROUPS], pl.BF16],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
-    sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    rope_cos: pl.Tensor[[T_DYN, 32], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, 32], pl.FP32],
-):
-    """Gather the live SWA row, then write the inverse-rotated attention output."""
-    tokens = pl.tensor.dim(query, 0)
-    selected = pl.create_tensor([tokens, SWA_WINDOW, HEAD_DIM], dtype=pl.BF16)
-    gathered = gather_window_batched(cache, scales, indices, selected, 1)
-    qflat = pl.reshape(query, [tokens * LOCAL_H, HEAD_DIM])
-    kflat = pl.reshape(selected, [tokens * SWA_WINDOW, HEAD_DIM])
-    oflat = pl.reshape(output, [tokens * LOCAL_H, HEAD_DIM])
-    sink_row = pl.reshape(sink, [1, LOCAL_H])
-    with pl.spmd(LOCAL_H // SWA_HEAD_TILE, name_hint="swa_attn", deps=[gathered],
-                 optimizations=[pl.cross_core_slot(slot_num=1)]) as attention_done:
-        head = pl.tile.get_block_idx() * SWA_HEAD_TILE
-        _attention_tile(
-            qflat, kflat, indices, sink_row, oflat, head, 0, 0, head,
-            SWA_HEAD_TILE, SWA_WINDOW, SWA_WINDOW, True, rope_cos, rope_sin, True,
-        )
-    return attention_done
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1606,42 +1529,6 @@ def attend_selected(
             q0 = token * LOCAL_H + head
             k0 = token * SELECTED_KEYS
             attention_tile(qflat, kflat, indices, sink_row, oflat, q0, k0, token, head, HEAD_TILE, SELECTED_KEYS, key_tile, False)
-    return attended
-
-
-@pl.jit.inline(auto_scope=False)
-def attend_decode_selected(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
-    indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
-    sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    selected_ready: pl.Scalar[pl.TASK_ID],
-    key_tile: pl.constexpr,
-    worker_limit: pl.constexpr,
-    rope_cos: pl.Tensor[[T_DYN, 32], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, 32], pl.FP32],
-):
-    """Apply inverse RoPE during the final write of single-token sparse attention."""
-    if num_tokens == 1:
-        tokens = pl.tensor.dim(query, 0)
-        cache_rows = pl.tensor.dim(selected, 0) * SELECTED_KEYS
-        qflat = pl.reshape(query, [tokens * LOCAL_H, HEAD_DIM])
-        kflat = pl.reshape(selected, [cache_rows, HEAD_DIM])
-        oflat = pl.reshape(output, [tokens * LOCAL_H, HEAD_DIM])
-        sink_row = pl.reshape(sink, [1, LOCAL_H])
-        with pl.spmd(LOCAL_H // HEAD_TILE, name_hint="sparse_online", deps=[selected_ready],
-                     optimizations=[pl.cross_core_slot(slot_num=1)]) as attended:
-            head = pl.tile.get_block_idx() * HEAD_TILE
-            _attention_tile(
-                qflat, kflat, indices, sink_row, oflat, head, 0, 0, head,
-                HEAD_TILE, SELECTED_KEYS, key_tile, False, rope_cos, rope_sin, True,
-            )
-    else:
-        attended = attend_selected(
-            query, selected, indices, sink, output, num_tokens, selected_ready, key_tile, worker_limit,
-        )
     return attended
 
 

@@ -23,46 +23,10 @@ import struct
 import torch
 
 from .config import FLASH as M, EP_SIZE, N_LOCAL_EXPERTS, TP_SIZE, WEIGHT_LAYOUT_VERSION
-from .config import SHARED_NZ_PANEL
 
 ENGRAM_K = (M.engram_max_ngram_size - 1) * M.engram_n_heads * M.engram_head_dim
 KV_OUT = (M.hc_mult + 1) * M.hidden_size
 _DTYPES = {"F32": torch.float32, "BF16": torch.bfloat16, "I8": torch.int8}
-
-
-def bf16_nz_shape(matrix_count, rows, columns):
-    """Return the physical shape of BF16 Cube weights."""
-    return matrix_count, columns // 16, rows // 16, 16, 16
-
-
-def engram_wkv_nz_shape(matrix_count):
-    """Describe the packed BF16 Engram projection buffer for runtime allocation."""
-    return matrix_count, KV_OUT // 16, ENGRAM_K // 16, 16, 16
-
-
-def pack_bf16_nz(weight):
-    """Pack the final BF16 matrix dimensions into 16 by 16 Cube fractals."""
-    rows, columns = weight.shape[-2:]
-    blocks = weight.reshape(-1, rows // 16, 16, columns // 16, 16)
-    return blocks.permute(0, 3, 1, 2, 4).contiguous().reshape(weight.shape)
-
-
-def unpack_bf16_nz(weight):
-    """Recover the logical BF16 matrix for a CPU reference."""
-    rows, columns = weight.shape[-2:]
-    blocks = weight.reshape(-1, columns // 16, rows // 16, 16, 16)
-    return blocks.permute(0, 2, 3, 1, 4).contiguous().reshape(weight.shape)
-
-
-def projection_int8_nz_shape(matrix_count, rows, columns):
-    """Return the physical shape of INT8 Cube weights with C0=32."""
-    return matrix_count, columns // 32, rows // 16, 16, 32
-
-
-def pack_projection_int8_nz(weight):
-    """Reorder the resident bytes without changing any quantized value."""
-    rows, columns = weight.shape
-    return weight.reshape(rows // 16, 16, columns // 32, 32).permute(2, 0, 1, 3).contiguous()
 
 
 class Checkpoint:
@@ -217,7 +181,7 @@ def forward_weight_layouts(local_experts=N_LOCAL_EXPERTS):
     kv_sources, index_sources = len(M.kv_source_layer_ids), len(M.index_source_layer_ids)
     c2a_sources = sum(M.compress_ratios[source] == 2 for source in M.kv_source_layer_ids)
     result = {
-        "engram_wkv": (engram_wkv_nz_shape(len(M.engram_layer_ids)), torch.bfloat16),
+        "engram_wkv": ((2, ENGRAM_K, KV_OUT), torch.bfloat16),
         "engram_weight": ((2, M.hc_mult, d), torch.float32),
         "engram_rotation": ((d // 32, 32, 32), torch.float32),
         "hc_attn_fn": ((layers * M.mix_hc, M.hc_dim), torch.float32),
@@ -227,8 +191,8 @@ def forward_weight_layouts(local_experts=N_LOCAL_EXPERTS):
         "q_norm_weight": ((layers * M.q_lora_rank,), torch.bfloat16),
         "kv_norm_weight": ((layers * M.head_dim,), torch.bfloat16),
         "attn_sink": ((layers * heads,), torch.float32),
-        "wo_a": (bf16_nz_shape(layers * groups, M.num_attention_heads * M.head_dim // M.o_groups, M.o_lora_rank), torch.bfloat16),
-        "wo_b": (bf16_nz_shape(layers, groups * M.o_lora_rank, d), torch.bfloat16),
+        "wo_a": ((layers * groups, M.num_attention_heads * M.head_dim // M.o_groups, M.o_lora_rank), torch.bfloat16),
+        "wo_b": ((layers, groups * M.o_lora_rank, d), torch.bfloat16),
         "c2a_compressor_wkv": ((c2a_sources, d, M.head_dim), torch.bfloat16),
         "c2a_compressor_wgate": ((c2a_sources, d, M.head_dim), torch.bfloat16),
         "c1a_compressor_wkv": ((d, M.head_dim), torch.bfloat16),
@@ -250,25 +214,17 @@ def forward_weight_layouts(local_experts=N_LOCAL_EXPERTS):
         "wq_b": (layers, M.q_lora_rank, heads * M.head_dim),
         "wkv": (layers, d, M.head_dim),
         "index_wq_b": (index_sources, M.q_lora_rank, M.index_n_heads * M.index_head_dim),
+        "shared_w1": (layers, d, inter),
         "shared_w2": (layers, inter, d),
+        "shared_w3": (layers, d, inter),
         "routed_w1": (layers * local_experts, d, inter),
         "routed_w2": (layers * local_experts, inter, d),
         "routed_w3": (layers * local_experts, d, inter),
     }
     for name, shape in projections.items():
-        matrices, input_width, output_width = shape
-        if name in ("wq_a", "wq_b", "wkv", "shared_w2"):
-            bank_shape = projection_int8_nz_shape(matrices, input_width, output_width)
-        elif name.startswith("routed_"):
-            bank_shape = (matrices, output_width, input_width)
-        else:
-            bank_shape = shape
+        bank_shape = (shape[0], shape[2], shape[1]) if name.startswith(("routed_", "shared_")) else shape
         result[name] = (bank_shape, torch.int8)
-        result[name + "_scale"] = ((matrices, output_width), torch.float32)
-
-    result["shared_w13"] = (projection_int8_nz_shape(layers, d, 2 * inter), torch.int8)
-    result["shared_w1_scale"] = ((layers, inter), torch.float32)
-    result["shared_w3_scale"] = ((layers, inter), torch.float32)
+        result[name + "_scale"] = ((shape[0], shape[-1]), torch.float32)
     return result
 
 
@@ -286,7 +242,8 @@ class ResidentWeights:
     )
     int8_projections = (
         ("wq_a", "attn.wq_a"), ("wq_b", "attn.wq_b"), ("wkv", "attn.wkv"),
-        ("shared_w2", "ffn.shared_experts.w2"),
+        ("shared_w1", "ffn.shared_experts.w1"), ("shared_w2", "ffn.shared_experts.w2"),
+        ("shared_w3", "ffn.shared_experts.w3"),
     )
 
     def __init__(self, checkpoint, *, ep_size=EP_SIZE):
@@ -366,20 +323,10 @@ class ResidentWeights:
         for layer in selected_layers:
             for target, suffix in self.int8_projections:
                 output_slice = slice(lane * heads * M.head_dim, (lane + 1) * heads * M.head_dim) if target == "wq_b" else None
-                weight, scale = self.projection(f"layers.{layer}.{suffix}", output_slice=output_slice)
-                if target in ("wq_a", "wq_b", "wkv", "shared_w2"):
-                    weight = pack_projection_int8_nz(weight)
+                weight, scale = self.projection(f"layers.{layer}.{suffix}", output_slice=output_slice,
+                                                output_major=target.startswith("shared_"))
                 copy(target, weight, layer, total_layers)
                 copy(target + "_scale", scale, layer, total_layers)
-            shared = f"layers.{layer}.ffn.shared_experts"
-            gate, gate_scale = self.projection(shared + ".w1", output_major=True)
-            up, up_scale = self.projection(shared + ".w3", output_major=True)
-            gate = gate.reshape(-1, SHARED_NZ_PANEL, M.hidden_size)
-            up = up.reshape_as(gate)
-            paired = torch.stack((gate, up), dim=1).reshape(-1, M.hidden_size).t()
-            copy("shared_w13", pack_projection_int8_nz(paired), layer, total_layers)
-            copy("shared_w1_scale", gate_scale, layer, total_layers)
-            copy("shared_w3_scale", up_scale, layer, total_layers)
             for target, suffix in self.layer_projections:
                 value = checkpoint.tensor(f"layers.{layer}.{suffix}")
                 if target == "attn_sink":
@@ -389,10 +336,10 @@ class ResidentWeights:
                 copy(target, value, layer, total_layers)
             wo_a = checkpoint.tensor(f"layers.{layer}.attn.wo_a.weight")
             wo_a = wo_a.reshape(M.o_groups, M.o_lora_rank, -1)[lane * groups:(lane + 1) * groups]
-            copy("wo_a", pack_bf16_nz(wo_a.transpose(-1, -2)), layer, total_layers)
+            copy("wo_a", wo_a.transpose(-1, -2), layer, total_layers)
             wo_b = checkpoint.tensor(f"layers.{layer}.attn.wo_b.weight")
             width = groups * M.o_lora_rank
-            copy("wo_b", pack_bf16_nz(wo_b[:, lane * width:(lane + 1) * width].t()), layer, total_layers)
+            copy("wo_b", wo_b[:, lane * width:(lane + 1) * width].t(), layer, total_layers)
             for local in range(self.local_experts):
                 expert = rank * self.local_experts + local
                 for projection in ("w1", "w2", "w3"):
@@ -429,8 +376,7 @@ class ResidentWeights:
                 copy(target, value, slot, len(M.index_source_layer_ids))
         for slot, layer in enumerate(M.engram_layer_ids):
             prefix = f"layers.{layer}.engram."
-            engram_wkv = checkpoint.tensor(prefix + "wkv.weight").t()
-            copy("engram_wkv", pack_bf16_nz(engram_wkv), slot, 2)
+            copy("engram_wkv", checkpoint.tensor(prefix + "wkv.weight").t(), slot, 2)
             gate = checkpoint.tensor(prefix + "q_weight").float() * checkpoint.tensor(prefix + "k_weight").float()
             copy("engram_weight", gate, slot, 2)
         copy("final_norm_weight", checkpoint.tensor("norm.weight"))

@@ -22,9 +22,8 @@ import pypto.language as pl
 import torch
 import torch.nn.functional as F
 
-from .activation_quant import quantize_projection_activation
-from .config import EXPERT_N_TILE, EXPERT_K_TILE, FLASH as M, MOE_TOKENS, SHARED_NZ_PANEL
-from .gemm import PREFILL_EXPERT_LARGE_M_TILE, expert_down, expert_swiglu, gemm_int8_tiled_nz
+from .config import EXPERT_N_TILE, EXPERT_K_TILE, FLASH as M, MOE_TOKENS
+from .gemm import PREFILL_EXPERT_LARGE_M_TILE, expert_down, expert_swiglu
 
 
 # model config
@@ -36,7 +35,6 @@ SWIGLU_LIMIT = M.swiglu_limit
 # tiling
 SH_M_TILE = 16
 T_PAD = (T + SH_M_TILE - 1) // SH_M_TILE * SH_M_TILE
-SHARED_ROWS = pl.dynamic("SHARED_ROWS")
 
 
 @pl.jit.inline(auto_scope=False)
@@ -67,94 +65,6 @@ def expert_shared(
         hidden, shared_w2, shared_w2_scale, sh, num_tokens, MOE_INTER, D, "shared_down", output_major, prefill,
         PREFILL_EXPERT_LARGE_M_TILE,
     )
-
-
-@pl.jit.inline(auto_scope=False)
-def _shared_swiglu_nz(
-    source: pl.Tensor[[T_PAD, D], pl.INT8],
-    activation_scale: pl.Tensor[[1, T_PAD], pl.FP32],
-    paired: pl.Tensor[[D, 2 * MOE_INTER], pl.INT8, pl.NZ],
-    s1: pl.Tensor[[1, MOE_INTER], pl.FP32],
-    s3: pl.Tensor[[1, MOE_INTER], pl.FP32],
-    output: pl.Tensor[[SHARED_ROWS, MOE_INTER], pl.BF16],
-    count: pl.Scalar[pl.INT32], row_tile: pl.constexpr,
-):
-    """Share each input tile across paired gate and up panels."""
-    panels = MOE_INTER // SHARED_NZ_PANEL
-    row_blocks = (count + row_tile - 1) // row_tile
-    workers = pl.min(pl.system.available_cluster_count(), panels * row_blocks)
-    for worker in pl.spmd(workers, name_hint="shared_swiglu_nz", optimizations=[pl.cross_core_slot(slot_num=1)]):
-        for panel in pl.range(0, panels):
-            first_row = (worker + workers - (panel * row_blocks) % workers) % workers
-            for row_index in pl.range(first_row, row_blocks, workers):
-                row = row_index * row_tile
-                valid_rows = pl.min(row_tile, count - row)
-                col = panel * SHARED_NZ_PANEL
-                acc_seed = pl.tile.create([row_tile, 2 * SHARED_NZ_PANEL], dtype=pl.INT32, target_memory=pl.Mem.Acc, compact=True)
-                acc = pl.set_validshape(acc_seed, valid_rows, 2 * SHARED_NZ_PANEL)
-                for k in pl.pipeline(0, D, EXPERT_K_TILE, stage=2):
-                    x = pl.load(source, [row, k], [row_tile, EXPERT_K_TILE], valid_shape=[valid_rows, EXPERT_K_TILE])
-                    matrix = pl.load(paired, [k, panel * (2 * SHARED_NZ_PANEL)], [EXPERT_K_TILE, 2 * SHARED_NZ_PANEL], target_memory=pl.Mem.Mat)
-                    acc = pl.matmul_acc(acc, x, matrix, init_cond=(k == 0))
-                value = pl.cast(acc, pl.FP32)
-                gate_product = pl.tile.slice(value, [row_tile, SHARED_NZ_PANEL], [0, 0], valid_shape=[valid_rows, SHARED_NZ_PANEL])
-                up_product = pl.tile.slice(value, [row_tile, SHARED_NZ_PANEL], [0, SHARED_NZ_PANEL], valid_shape=[valid_rows, SHARED_NZ_PANEL])
-                scale_row = pl.load(activation_scale, [0, row], [1, row_tile], valid_shape=[1, valid_rows])
-                scale = pl.reshape(scale_row, [row_tile, 1])
-                g_scale = pl.load(s1, [0, col], [1, SHARED_NZ_PANEL])
-                u_scale = pl.load(s3, [0, col], [1, SHARED_NZ_PANEL])
-                gate_fp = pl.col_expand_mul(pl.row_expand_mul(gate_product, scale), g_scale)
-                up_fp = pl.col_expand_mul(pl.row_expand_mul(up_product, scale), u_scale)
-                gate = pl.minimum(pl.cast(pl.cast(gate_fp, pl.BF16, mode="rint"), pl.FP32), SWIGLU_LIMIT)
-                up = pl.cast(pl.cast(up_fp, pl.BF16, mode="rint"), pl.FP32)
-                up = pl.minimum(pl.maximum(up, -SWIGLU_LIMIT), SWIGLU_LIMIT)
-                sigma = pl.recip(pl.add(pl.exp(pl.neg(gate)), 1.0))
-                value = pl.mul(pl.mul(gate, sigma), up)
-                result = pl.cast(value, pl.BF16, mode="rint")
-                pl.store(pl.set_validshape(result, valid_rows, SHARED_NZ_PANEL), [row, col], output)
-    return output
-
-
-
-@pl.jit.inline(auto_scope=False)
-def _run_shared_nz(
-    x_local: pl.Tensor[[T_PAD, D], pl.INT8],
-    source_scales: pl.Tensor[[1, T_PAD], pl.FP32],
-    gate_up: pl.Tensor[[D, 2 * MOE_INTER], pl.INT8, pl.NZ],
-    gate_scale: pl.Tensor[[1, MOE_INTER], pl.FP32],
-    up_scale: pl.Tensor[[1, MOE_INTER], pl.FP32],
-    down: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
-    down_scale: pl.Tensor[[1, D], pl.FP32],
-    output: pl.Tensor[[SHARED_ROWS, D], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32], prefill: pl.constexpr,
-    row_tile: pl.constexpr, down_tile: pl.constexpr,
-):
-    padded_rows = pl.max(16, (num_tokens + 15) // 16 * 16)
-    hidden = pl.create_tensor([padded_rows, MOE_INTER], dtype=pl.BF16)
-    _shared_swiglu_nz(x_local, source_scales, gate_up, gate_scale, up_scale, hidden, num_tokens, row_tile)
-    payload, scales = quantize_projection_activation(hidden, num_tokens, MOE_INTER, True, prefill)
-    return gemm_int8_tiled_nz(payload, scales, down, down_scale, output, num_tokens,
-                             MOE_INTER, D, "shared_down_nz", down_tile, 256, row_tile)
-
-
-@pl.jit.inline(auto_scope=False)
-def expert_shared_nz(
-    x_local: pl.Tensor, x_local_scale: pl.Tensor,
-    gate_up: pl.Tensor, gate_scale: pl.Tensor, up_scale: pl.Tensor,
-    down: pl.Tensor, down_scale: pl.Tensor, output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32], prefill: pl.constexpr,
-):
-    """Run the shared expert against the two resident Cube weight banks."""
-    if prefill and num_tokens > PREFILL_EXPERT_LARGE_M_TILE:
-        output = _run_shared_nz(x_local, x_local_scale, gate_up, gate_scale, up_scale,
-                                down, down_scale, output, num_tokens, prefill, 64, 128)
-    elif prefill and num_tokens > 16:
-        output = _run_shared_nz(x_local, x_local_scale, gate_up, gate_scale, up_scale,
-                                down, down_scale, output, num_tokens, prefill, 32, 256)
-    else:
-        output = _run_shared_nz(x_local, x_local_scale, gate_up, gate_scale, up_scale,
-                                down, down_scale, output, num_tokens, prefill, 16, 256)
-    return output
 
 
 def golden_expert_shared(payload, activation_scale, w1, scale1, w3, scale3, w2, scale2):

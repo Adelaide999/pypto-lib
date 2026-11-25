@@ -121,17 +121,17 @@ ROPE_DIM = M.qk_rope_head_dim
 @pl.jit.inline(auto_scope=False)
 def prefill_attention(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.INT8, pl.NZ],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.INT8],
     wq_a_scale: pl.Tensor[[1, Q_LORA], pl.FP32, pl.ND],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[1, LOCAL_H * HEAD_DIM], pl.FP32, pl.ND],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.INT8, pl.NZ],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.INT8],
     wkv_scale: pl.Tensor[[1, HEAD_DIM], pl.FP32, pl.ND],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16, pl.NZ],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
@@ -293,14 +293,15 @@ def _prefill_moe(
         pl.ND,
     ],
 
-    shared_w13: pl.Tensor[[D, 2 * MOE_INTER], pl.INT8, pl.NZ],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[
         [1, MOE_INTER], pl.FP32, pl.ND
     ],
-    shared_w2: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[
         [1, D], pl.FP32, pl.ND
     ],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[
         [1, MOE_INTER], pl.FP32, pl.ND
     ],
@@ -403,7 +404,7 @@ def _prefill_moe(
                 round_hidden, round_pre, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_weight,
                 gate_weight, correction_bias,
                 routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
-                 shared_w13, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3_scale,
+                 shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
                 recv_meta, recv_x, recv_weights, arrived, data_arrived,
                 routed_output, combine_arrived, ffn_input, owned, round_next, post, residual,
                 local_gate_inputs, local_gate_indices, local_gate_weights,
@@ -448,7 +449,7 @@ def _prefill_moe(
 def l2_prefill_fwd(
     embedding: pl.Tensor[[CAPACITY, D], pl.BF16],
     engram_lookup: pl.Tensor[[2, CAPACITY, ENGRAM_K], pl.BF16],
-    engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
+    engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.BF16],
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
     engram_rotation: pl.Tensor[[D // 32, 32, 32], pl.FP32],
     embedding_ids: pl.Tensor[[CAPACITY], pl.INT64],
@@ -458,17 +459,17 @@ def l2_prefill_fwd(
     hc_attn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
     attn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[N_LAYERS, D, Q_LORA], pl.INT8, pl.NZ],
+    wq_a: pl.Tensor[[N_LAYERS, D, Q_LORA], pl.INT8],
     wq_a_scale: pl.Tensor[[N_LAYERS * (1), Q_LORA], pl.FP32],
     q_norm_weight: pl.Tensor[[N_LAYERS * Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_b: pl.Tensor[[N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[N_LAYERS * (1), LOCAL_H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.INT8, pl.NZ],
+    wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.INT8],
     wkv_scale: pl.Tensor[[N_LAYERS * (1), HEAD_DIM], pl.FP32],
     kv_norm_weight: pl.Tensor[[N_LAYERS * HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16, pl.NZ],
-    wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
+    wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
+    wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.BF16],
     c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.ND],
     c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.ND],
     c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.ND],
@@ -490,10 +491,11 @@ def l2_prefill_fwd(
     routed_w2_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (1)), D], pl.FP32],
     routed_w3: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w3_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (1)), MOE_INTER], pl.FP32],
-    shared_w13: pl.Tensor[[N_LAYERS, D, 2 * MOE_INTER], pl.INT8, pl.NZ],
+    shared_w1: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[N_LAYERS * (1), MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.INT8, pl.NZ],
+    shared_w2: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_LAYERS * (1), D], pl.FP32],
+    shared_w3: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[N_LAYERS * (1), MOE_INTER], pl.FP32],
 
     layer_range: pl.Tensor[[2], pl.INT32],
@@ -637,20 +639,21 @@ def l2_prefill_fwd(
         layer_ffn_norm: pl.Tensor[[D], pl.BF16] = pl.slice(ffn_norm_weight, [D], [layer * D])
         layer_q_norm: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(q_norm_weight, [Q_LORA], [layer * Q_LORA])
         layer_kv_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(kv_norm_weight, [HEAD_DIM], [layer * HEAD_DIM])
-        layer_wq_a: pl.Tensor[[D, Q_LORA], pl.INT8, pl.NZ] = wq_a[layer]
+        layer_wq_a: pl.Tensor[[D, Q_LORA], pl.INT8] = wq_a[layer]
         layer_wq_a_scale: pl.Tensor[[1, Q_LORA], pl.FP32, pl.ND] = pl.slice(wq_a_scale, [1, Q_LORA], [layer * (1), 0])
-        layer_wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8, pl.NZ] = wq_b[layer]
+        layer_wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8] = wq_b[layer]
         layer_wq_b_scale: pl.Tensor[[1, LOCAL_H * HEAD_DIM], pl.FP32, pl.ND] = pl.slice(wq_b_scale, [1, LOCAL_H * HEAD_DIM], [layer * (1), 0])
-        layer_wkv: pl.Tensor[[D, HEAD_DIM], pl.INT8, pl.NZ] = wkv[layer]
+        layer_wkv: pl.Tensor[[D, HEAD_DIM], pl.INT8] = wkv[layer]
         layer_wkv_scale: pl.Tensor[[1, HEAD_DIM], pl.FP32, pl.ND] = pl.slice(wkv_scale, [1, HEAD_DIM], [layer * (1), 0])
-        layer_wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16, pl.NZ] = wo_b[layer]
-        layer_shared_w13: pl.Tensor[[D, 2 * MOE_INTER], pl.INT8, pl.NZ] = shared_w13[layer]
+        layer_wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16] = wo_b[layer]
+        layer_shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8] = shared_w1[layer]
         layer_shared_w1_scale: pl.Tensor[[1, MOE_INTER], pl.FP32, pl.ND] = pl.slice(shared_w1_scale, [1, MOE_INTER], [layer * (1), 0])
-        layer_shared_w2: pl.Tensor[[MOE_INTER, D], pl.INT8, pl.NZ] = shared_w2[layer]
+        layer_shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8] = shared_w2[layer]
         layer_shared_w2_scale: pl.Tensor[[1, D], pl.FP32, pl.ND] = pl.slice(shared_w2_scale, [1, D], [layer * (1), 0])
+        layer_shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8] = shared_w3[layer]
         layer_shared_w3_scale: pl.Tensor[[1, MOE_INTER], pl.FP32, pl.ND] = pl.slice(shared_w3_scale, [1, MOE_INTER], [layer * (1), 0])
         layer_attn_sink: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(attn_sink, [LOCAL_H], [layer * LOCAL_H])
-        layer_wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16, pl.NZ] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [layer * LOCAL_O_GROUPS, 0, 0])
+        layer_wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [layer * LOCAL_O_GROUPS, 0, 0])
         layer_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.ND] = c2a_compressor_wkv[c2a_source]
         layer_compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.ND] = c2a_compressor_wgate[c2a_source]
         layer_compressor_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(compressor_norm_weight, [HEAD_DIM], [kv_source * HEAD_DIM])
@@ -745,8 +748,8 @@ def l2_prefill_fwd(
         moe_ready = _prefill_moe(
             attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
             layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
-             layer_shared_w13, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
-            layer_shared_w3_scale, next_pre, next_hidden,
+             layer_shared_w1, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
+            layer_shared_w3, layer_shared_w3_scale, next_pre, next_hidden,
             recv_meta, recv_x, recv_weights, arrived, data_arrived,
             routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, moe_statistics[layer],
             moe_gate_inputs, owner_payload, owner_scales, moe_route_indices[layer], moe_route_weights[layer],
@@ -777,7 +780,7 @@ def l2_prefill_fwd(
 def l3_prefill_fwd(
     embedding: pl.Tensor[[RANKS, CAPACITY, D], pl.BF16],
     engram_lookup: pl.Tensor[[RANKS, 2, CAPACITY, ENGRAM_K], pl.BF16],
-    engram_wkv: pl.Tensor[[RANKS, 2, ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
+    engram_wkv: pl.Tensor[[RANKS, 2, ENGRAM_K, KV_OUT], pl.BF16],
     engram_weight: pl.Tensor[[RANKS, 2, HC_MULT, D], pl.FP32],
     engram_rotation: pl.Tensor[[RANKS, D // 32, 32, 32], pl.FP32],
     embedding_ids: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
@@ -787,17 +790,17 @@ def l3_prefill_fwd(
     hc_attn_scale: pl.Tensor[[RANKS, N_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[RANKS, N_LAYERS * MIX_HC], pl.FP32],
     attn_norm_weight: pl.Tensor[[RANKS, N_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[RANKS, N_LAYERS, D, Q_LORA], pl.INT8, pl.NZ],
+    wq_a: pl.Tensor[[RANKS, N_LAYERS, D, Q_LORA], pl.INT8],
     wq_a_scale: pl.Tensor[[RANKS, N_LAYERS * (1), Q_LORA], pl.FP32],
     q_norm_weight: pl.Tensor[[RANKS, N_LAYERS * Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[RANKS, N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_b: pl.Tensor[[RANKS, N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[RANKS, N_LAYERS * (1), LOCAL_H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[RANKS, N_LAYERS, D, HEAD_DIM], pl.INT8, pl.NZ],
+    wkv: pl.Tensor[[RANKS, N_LAYERS, D, HEAD_DIM], pl.INT8],
     wkv_scale: pl.Tensor[[RANKS, N_LAYERS * (1), HEAD_DIM], pl.FP32],
     kv_norm_weight: pl.Tensor[[RANKS, N_LAYERS * HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[RANKS, N_LAYERS * LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[RANKS, N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16, pl.NZ],
-    wo_b: pl.Tensor[[RANKS, N_LAYERS, LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
+    wo_a: pl.Tensor[[RANKS, N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
+    wo_b: pl.Tensor[[RANKS, N_LAYERS, LOCAL_O_WIDTH, D], pl.BF16],
     c2a_compressor_wkv: pl.Tensor[[RANKS, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16],
     c2a_compressor_wgate: pl.Tensor[[RANKS, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16],
     c1a_compressor_wkv: pl.Tensor[[RANKS, D, HEAD_DIM], pl.BF16],
@@ -819,10 +822,11 @@ def l3_prefill_fwd(
     routed_w2_scale: pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (1)), D], pl.FP32],
     routed_w3: pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w3_scale: pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (1)), MOE_INTER], pl.FP32],
-    shared_w13: pl.Tensor[[RANKS, N_LAYERS, D, 2 * MOE_INTER], pl.INT8, pl.NZ],
+    shared_w1: pl.Tensor[[RANKS, N_LAYERS, MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[RANKS, N_LAYERS * (1), MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[RANKS, N_LAYERS, MOE_INTER, D], pl.INT8, pl.NZ],
+    shared_w2: pl.Tensor[[RANKS, N_LAYERS, D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[RANKS, N_LAYERS * (1), D], pl.FP32],
+    shared_w3: pl.Tensor[[RANKS, N_LAYERS, MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[RANKS, N_LAYERS * (1), MOE_INTER], pl.FP32],
 
     layer_range: pl.Tensor[[RANKS, 2], pl.INT32],
@@ -955,7 +959,7 @@ def l3_prefill_fwd(
         head_logits_done = pld.window(head_logits_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         if execute_layers != 0:
             l2_prefill_fwd(
-                embedding[rank], engram_lookup[rank], engram_wkv[rank], engram_weight[rank], engram_rotation[rank], embedding_ids[rank], initial_pre[rank], identity_rows[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank], attn_norm_weight[rank], wq_a[rank], wq_a_scale[rank], q_norm_weight[rank], wq_b[rank], wq_b_scale[rank], wkv[rank], wkv_scale[rank], kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank], c2a_compressor_wkv[rank], c2a_compressor_wgate[rank], c1a_compressor_wkv[rank], compressor_norm_weight[rank], index_wk[rank], index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale[rank], index_weights_proj[rank], hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank], ffn_norm_weight[rank], gate_weight[rank], correction_bias[rank], routed_w1[rank], routed_w1_scale[rank], routed_w2[rank], routed_w2_scale[rank], routed_w3[rank], routed_w3_scale[rank], shared_w13[rank], shared_w1_scale[rank], shared_w2[rank], shared_w2_scale[rank], shared_w3_scale[rank], layer_range[rank], topk_indices[rank], pool_block_ids[rank], pool_block_counts[rank], moe_statistics[rank], moe_gate_inputs[rank], moe_route_indices[rank], moe_route_weights[rank], counts[rank], replay_rows[rank], position_ids[rank], freqs_cos[rank], freqs_sin[rank], window_slots[rank], window_indices[rank], c2a_compressed_slots[rank], c1a_compressed_slots[rank], token_to_req_indices[rank], query_start_loc[rank], c2a_index_block_table[rank], c1a_index_block_table[rank], state_block_table[rank], window_cache[rank], window_scales[rank], compressed_cache[rank], compressed_scales[rank], index_cache[rank], index_scales[rank], state_cache[rank], final_norm_weight[rank], lm_head_weight[rank], logit_rows[rank], x_hc_out[rank], attn_hc_out[rank], pre_mix_out[rank], logits[rank], sampled_ids[rank], recv_meta, recv_x, recv_weights, arrived, data_arrived, routed_output, combine_arrived, attention_window, attention_arrived, head_hidden, head_hidden_done, head_logits, head_logits_done, ffn_window, ffn_arrived, rank, device=rank,
+                embedding[rank], engram_lookup[rank], engram_wkv[rank], engram_weight[rank], engram_rotation[rank], embedding_ids[rank], initial_pre[rank], identity_rows[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank], attn_norm_weight[rank], wq_a[rank], wq_a_scale[rank], q_norm_weight[rank], wq_b[rank], wq_b_scale[rank], wkv[rank], wkv_scale[rank], kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_b[rank], c2a_compressor_wkv[rank], c2a_compressor_wgate[rank], c1a_compressor_wkv[rank], compressor_norm_weight[rank], index_wk[rank], index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale[rank], index_weights_proj[rank], hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank], ffn_norm_weight[rank], gate_weight[rank], correction_bias[rank], routed_w1[rank], routed_w1_scale[rank], routed_w2[rank], routed_w2_scale[rank], routed_w3[rank], routed_w3_scale[rank], shared_w1[rank], shared_w1_scale[rank], shared_w2[rank], shared_w2_scale[rank], shared_w3[rank], shared_w3_scale[rank], layer_range[rank], topk_indices[rank], pool_block_ids[rank], pool_block_counts[rank], moe_statistics[rank], moe_gate_inputs[rank], moe_route_indices[rank], moe_route_weights[rank], counts[rank], replay_rows[rank], position_ids[rank], freqs_cos[rank], freqs_sin[rank], window_slots[rank], window_indices[rank], c2a_compressed_slots[rank], c1a_compressed_slots[rank], token_to_req_indices[rank], query_start_loc[rank], c2a_index_block_table[rank], c1a_index_block_table[rank], state_block_table[rank], window_cache[rank], window_scales[rank], compressed_cache[rank], compressed_scales[rank], index_cache[rank], index_scales[rank], state_cache[rank], final_norm_weight[rank], lm_head_weight[rank], logit_rows[rank], x_hc_out[rank], attn_hc_out[rank], pre_mix_out[rank], logits[rank], sampled_ids[rank], recv_meta, recv_x, recv_weights, arrived, data_arrived, routed_output, combine_arrived, attention_window, attention_arrived, head_hidden, head_hidden_done, head_logits, head_logits_done, ffn_window, ffn_arrived, rank, device=rank,
             )
 
 
