@@ -287,6 +287,82 @@ def _quantize_decode_active_row(
     return payload, scale
 
 
+
+@pl.jit.inline(auto_scope=False)
+def _quantize_decode_active_row_dedup(
+    source: pl.Tensor,
+    payload: pl.Tensor,
+    scale: pl.Tensor,
+    width: pl.constexpr,
+):
+    """Reduce the live Decode row once before encoding its output panels."""
+    maxima = pl.create_tensor([8, 1], dtype=pl.FP32)
+    with pl.spmd(1, name_hint="quant_decode_reduce") as reduce_ready:
+        worker = pl.tile.get_block_idx()
+        whole = pl.reshape(pl.load(source, [0, 0], [1, width]), [8, width // 8])
+        fp32 = pl.cast(whole, pl.FP32)
+        scratch = pl.create_tile([8, width // 8], dtype=pl.FP32)
+        slice_peaks = pl.row_max(pl.abs(fp32), tmp_tile=scratch)
+        zeros = pl.tile.full([8, 8], dtype=pl.FP32, value=0.0)
+        maximum = pl.row_max(
+            pl.col_expand_add(zeros, pl.reshape(slice_peaks, [1, 8])),
+            tmp_tile=zeros,
+        )
+        pl.store(pl.reshape(maximum, [8, 1]), [0, 0], maxima)
+        active_scale = pl.reshape(
+            pl.maximum(pl.mul(maximum, 1.0 / 127.0), 1e-30),
+            [1, 8],
+        )
+        padding_scale = pl.tile.full([1, 8], dtype=pl.FP32, value=1e-30)
+        lanes = pl.cast(pl.tile.arange(0, [1, 8], dtype=pl.INT32), pl.FP32)
+        row_scales = pl.tile.select(
+            pl.tile.cmps(lanes, 0.0, cmp_type=0),
+            active_scale,
+            padding_scale,
+        )
+        pl.store(pl.reshape(row_scales, [8, 1]), [0, 0], scale)
+        pl.store(pl.reshape(padding_scale, [8, 1]), [8, 0], scale)
+    with pl.spmd(
+        width // DECODE_QUANT_ENCODE_TILE,
+        name_hint="quant_decode_encode",
+        deps=[reduce_ready],
+    ):
+        panel = pl.tile.get_block_idx()
+        col = panel * DECODE_QUANT_ENCODE_TILE
+        maximum = pl.load(maxima, [0, 0], [8, 1])
+        denominator = pl.mul(pl.maximum(maximum, 127e-30), 1.0 / 128.0)
+        inverse = pl.recip(denominator)
+        value = pl.cast(
+            pl.reshape(
+                pl.load(source, [0, col], [1, DECODE_QUANT_ENCODE_TILE]),
+                [8, DECODE_QUANT_ENCODE_TILE // 8],
+            ),
+            pl.FP32,
+        )
+        codes = _decode_checkpoint_codes_8x32(value, denominator, inverse)
+        pl.store(
+            pl.reshape(codes, [1, DECODE_QUANT_ENCODE_TILE]),
+            [0, col],
+            payload,
+        )
+        padding = pl.cast(
+            pl.tile.full(
+                [8, DECODE_QUANT_ENCODE_TILE],
+                dtype=pl.FP32,
+                value=0.0,
+            ),
+            pl.INT8,
+            mode="rint",
+        )
+        pl.store(
+            pl.set_validshape(padding, 7, DECODE_QUANT_ENCODE_TILE),
+            [1, col],
+            payload,
+        )
+        pl.store(padding, [8, col], payload)
+    return payload, scale
+
+
 @pl.jit.inline(auto_scope=False)
 def quantize_projection_activation(
     source: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], width: pl.constexpr, dense_query: pl.constexpr,
@@ -298,7 +374,10 @@ def quantize_projection_activation(
     payload = pl.create_tensor([padded_rows, width], dtype=pl.INT8)
     scale = pl.create_tensor([padded_rows, 1], dtype=pl.FP32)
     if not prefill and num_tokens == 1:
-        _quantize_decode_active_row(source, payload, scale, width)
+        if width == 5120:
+            _quantize_decode_active_row_dedup(source, payload, scale, width)
+        else:
+            _quantize_decode_active_row(source, payload, scale, width)
     elif prefill:
         if width == 2304:
             _quantize_prefill_rows(source, payload, scale, num_tokens, padded_rows, width, width)
