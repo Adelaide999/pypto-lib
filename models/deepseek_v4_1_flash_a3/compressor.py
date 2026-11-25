@@ -108,7 +108,7 @@ def _decode_norm_rope_block(
     scratch = pl.create_tile([8, HEAD_DIM], dtype=pl.FP32)
     row_sum = pl.row_sum(square, tmp_tile=scratch)
     mean = pl.add(pl.mul(row_sum, 1.0 / HEAD_DIM), EPS)
-    inverse = pl.tile.rsqrt(mean, pl.create_tile([8, 1], dtype=pl.FP32))
+    inverse = pl.tile.rsqrt(mean, pl.create_tile([8, 1], dtype=pl.FP32), high_precision=True)
     gamma = pl.reshape(
         pl.cast(pl.load(norm_weight, [0], [HEAD_DIM]), pl.FP32),
         [1, HEAD_DIM],

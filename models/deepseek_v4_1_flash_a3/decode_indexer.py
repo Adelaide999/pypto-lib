@@ -199,7 +199,7 @@ def _predecode_index_queries(
             raw_weight = pl.cast(pl.load(weights, [token, 0], [1, INDEX_H]), pl.FP32)
             scaled_weight = pl.mul(raw_weight, 0.015625)
             rounded_weight = pl.cast(scaled_weight, pl.BF16, mode="rint")
-            pl.store(rounded_weight, [token, 0], head_weights)
+            pl.store(rounded_weight, [0, token * INDEX_H], head_weights)
     return decoded
 
 
@@ -232,7 +232,7 @@ def _index_scores_predecoded(
         length = pl.max(0, pl.min(width, pl.read(lengths, [token])))
         q_value = pl.load(query_values, [token * INDEX_H, 0], [INDEX_H, INDEX_DIM])
         head_weight = pl.reshape(
-            pl.cast(pl.load(head_weights, [token, 0], [1, INDEX_H]), pl.FP32),
+            pl.cast(pl.load(head_weights, [0, token * INDEX_H], [1, INDEX_H]), pl.FP32),
             [INDEX_H, 1],
         )
         request = pl.read(request_ids, [token])
@@ -747,7 +747,7 @@ def c1a_norm_rotate_index_key(
             scratch = pl.create_tile([8, INDEX_DIM], dtype=pl.FP32)
             row_sum = pl.row_sum(pl.mul(value, value), tmp_tile=scratch)
             mean = pl.add(pl.mul(row_sum, 1.0 / INDEX_DIM), EPS)
-            inverse = pl.tile.rsqrt(mean, pl.create_tile([8, 1], dtype=pl.FP32))
+            inverse = pl.tile.rsqrt(mean, pl.create_tile([8, 1], dtype=pl.FP32), high_precision=True)
             gamma = pl.reshape(
                 pl.cast(pl.load(norm_weight, [0], [INDEX_DIM]), pl.FP32),
                 [1, INDEX_DIM],
@@ -1064,7 +1064,8 @@ def make_index_scores(skip_short=False, request_workers=32):
         else:
             if request_workers <= 16:
                 query_values = pl.create_tensor([capacity * INDEX_H, INDEX_DIM], dtype=pl.BF16)
-                head_weights = pl.create_tensor([capacity, INDEX_H], dtype=pl.BF16)
+                # A flat scratch view leaves the score arena's dynamic row dimension independent.
+                head_weights = pl.create_tensor([1, capacity * INDEX_H], dtype=pl.BF16)
                 query_decode_tid = _predecode_index_queries(
                     query, query_scale, weights, query_values, head_weights,
                     num_tokens, query_ready, weights_ready,
