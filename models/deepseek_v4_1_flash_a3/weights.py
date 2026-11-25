@@ -29,6 +29,25 @@ KV_OUT = (M.hc_mult + 1) * M.hidden_size
 _DTYPES = {"F32": torch.float32, "BF16": torch.bfloat16, "I8": torch.int8}
 
 
+def engram_wkv_nz_shape(matrix_count):
+    """Describe the packed BF16 Engram projection buffer for runtime allocation."""
+    return matrix_count, KV_OUT // 16, ENGRAM_K // 16, 16, 16
+
+
+def pack_bf16_nz(weight):
+    """Pack the final BF16 matrix dimensions into 16 by 16 Cube fractals."""
+    rows, columns = weight.shape[-2:]
+    blocks = weight.reshape(-1, rows // 16, 16, columns // 16, 16)
+    return blocks.permute(0, 3, 1, 2, 4).contiguous().reshape(weight.shape)
+
+
+def unpack_bf16_nz(weight):
+    """Recover the logical BF16 matrix for a CPU reference."""
+    rows, columns = weight.shape[-2:]
+    blocks = weight.reshape(-1, columns // 16, rows // 16, 16, 16)
+    return blocks.permute(0, 2, 3, 1, 4).contiguous().reshape(weight.shape)
+
+
 class Checkpoint:
     """Read requested original checkpoint tensors and selected embedding rows."""
 
@@ -181,7 +200,7 @@ def forward_weight_layouts(local_experts=N_LOCAL_EXPERTS):
     kv_sources, index_sources = len(M.kv_source_layer_ids), len(M.index_source_layer_ids)
     c2a_sources = sum(M.compress_ratios[source] == 2 for source in M.kv_source_layer_ids)
     result = {
-        "engram_wkv": ((2, ENGRAM_K, KV_OUT), torch.bfloat16),
+        "engram_wkv": (engram_wkv_nz_shape(len(M.engram_layer_ids)), torch.bfloat16),
         "engram_weight": ((2, M.hc_mult, d), torch.float32),
         "engram_rotation": ((d // 32, 32, 32), torch.float32),
         "hc_attn_fn": ((layers * M.mix_hc, M.hc_dim), torch.float32),
@@ -376,7 +395,8 @@ class ResidentWeights:
                 copy(target, value, slot, len(M.index_source_layer_ids))
         for slot, layer in enumerate(M.engram_layer_ids):
             prefix = f"layers.{layer}.engram."
-            copy("engram_wkv", checkpoint.tensor(prefix + "wkv.weight").t(), slot, 2)
+            engram_wkv = checkpoint.tensor(prefix + "wkv.weight").t()
+            copy("engram_wkv", pack_bf16_nz(engram_wkv), slot, 2)
             gate = checkpoint.tensor(prefix + "q_weight").float() * checkpoint.tensor(prefix + "k_weight").float()
             copy("engram_weight", gate, slot, 2)
         copy("final_norm_weight", checkpoint.tensor("norm.weight"))

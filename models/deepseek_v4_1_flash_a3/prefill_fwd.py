@@ -449,7 +449,7 @@ def _prefill_moe(
 def l2_prefill_fwd(
     embedding: pl.Tensor[[CAPACITY, D], pl.BF16],
     engram_lookup: pl.Tensor[[2, CAPACITY, ENGRAM_K], pl.BF16],
-    engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.BF16],
+    engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
     engram_rotation: pl.Tensor[[D // 32, 32, 32], pl.FP32],
     embedding_ids: pl.Tensor[[CAPACITY], pl.INT64],
@@ -780,7 +780,7 @@ def l2_prefill_fwd(
 def l3_prefill_fwd(
     embedding: pl.Tensor[[RANKS, CAPACITY, D], pl.BF16],
     engram_lookup: pl.Tensor[[RANKS, 2, CAPACITY, ENGRAM_K], pl.BF16],
-    engram_wkv: pl.Tensor[[RANKS, 2, ENGRAM_K, KV_OUT], pl.BF16],
+    engram_wkv: pl.Tensor[[RANKS, 2, ENGRAM_K, KV_OUT], pl.BF16, pl.NZ],
     engram_weight: pl.Tensor[[RANKS, 2, HC_MULT, D], pl.FP32],
     engram_rotation: pl.Tensor[[RANKS, D // 32, 32, 32], pl.FP32],
     embedding_ids: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
