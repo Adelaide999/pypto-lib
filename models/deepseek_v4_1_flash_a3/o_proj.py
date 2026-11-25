@@ -202,25 +202,32 @@ decode_o_proj = make_o_proj(decode_project_output)
 decode_o_proj_from_attention = make_o_proj(decode_project_output, b1_rotated=True)
 
 
-@pl.jit.inline(auto_scope=False)
-def decode_swa_o_proj(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    b1_rotated: pl.constexpr = False,
-):
-    """Project SWA output with the active-row Cube path for one Decode token."""
-    if b1_rotated and num_tokens == 1:
-        output = _project_decode_attention(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens, False)
-    elif num_tokens == 1:
-        output = decode_project_output(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens, False)
-    else:
-        output = decode_project_output(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens, True)
-    return output
+def make_decode_swa_o_proj(*, b1_rotated):
+    @pl.jit.inline(auto_scope=False)
+    def decode_swa_o_proj(
+        attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
+        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16],
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        output: pl.Tensor[[T_DYN, D], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        """Project SWA output with the active-row Cube path for one Decode token."""
+        if b1_rotated and num_tokens == 1:
+            output = _project_decode_attention(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens, False)
+        elif num_tokens == 1:
+            output = decode_project_output(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens, False)
+        else:
+            output = decode_project_output(attended, wo_a, wo_b, rope_cos, rope_sin, output, num_tokens, True)
+        return output
+
+
+    return decode_swa_o_proj
+
+
+decode_swa_o_proj = make_decode_swa_o_proj(b1_rotated=False)
+decode_swa_o_proj_from_attention = make_decode_swa_o_proj(b1_rotated=True)
 
 
 def golden_grouped_output(grouped, wo_a, *, output_dtype=None):
