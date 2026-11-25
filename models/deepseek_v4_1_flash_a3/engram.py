@@ -21,7 +21,7 @@ import pypto.language as pl
 import torch
 
 from .config import FLASH as M, T_DYN
-from .gemm import gemm_bf16_to_bf16, gemm_bf16_to_bf16_columns_first
+from .gemm import gemm_bf16_to_bf16, prefill_gemm_bf16_to_bf16_columns_first
 
 
 # model config
@@ -202,9 +202,10 @@ def make_engram_from_rows(*, prefill):
         ready = pl.system.task_dummy(deps=[])
         if prefill and tokens >= PREFILL_MIN_ROWS:
             # Visit multiple rows while the same weight columns are in cache.
-            gemm_bf16_to_bf16_columns_first(
+            prefill_gemm_bf16_to_bf16_columns_first(
                 lookup, wkv_weight, kv, tokens, ready,
-                ENGRAM_K, KV_OUT, N_TILE, K_TILE, 24, "engram_projection", 0, 0, False, PREFILL_M_TILE, stages=2,
+                ENGRAM_K, KV_OUT, N_TILE, K_TILE, 24, "engram_projection",
+                0, 0, False, PREFILL_M_TILE, stages=2,
             )
         else:
             gemm_bf16_to_bf16(

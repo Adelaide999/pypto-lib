@@ -24,6 +24,7 @@ from .gemm import (
     gemm_int8_pair_columns,
     gemm_int8_tiled,
     golden_dynamic_int8,
+    prefill_gemm_int8_reuse_weight,
     prefill_gemm_int8_tiled,
 )
 from .rmsnorm import golden_rms_norm, rms_norm
@@ -322,10 +323,10 @@ def make_q_proj_rope(*, prefill):
                     query_latent, qb_payload, qb_scales, num_tokens, padded_rows, Q_LORA, Q_LORA,
                 )
             if num_tokens >= PREFILL_Q_B_MIN_ROWS:
-                prefill_gemm_int8_tiled(
+                prefill_gemm_int8_reuse_weight(
                     qb_payload, qb_scales, wq_b, wq_b_scale, query, num_tokens,
                     Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b",
-                    PREFILL_Q_B_KV_N_TILE, PREFILL_Q_B_K_TILE, False, PREFILL_Q_B_KV_M_TILE,
+                    PREFILL_Q_B_KV_N_TILE, PREFILL_Q_B_K_TILE, PREFILL_Q_B_KV_M_TILE,
                 )
             elif num_tokens >= PREFILL_QKV_MIN_ROWS:
                 prefill_gemm_int8_tiled(

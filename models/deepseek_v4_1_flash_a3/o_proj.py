@@ -16,7 +16,7 @@ if not __package__:
     __package__ = "models.deepseek_v4_1_flash_a3"
 
 
-from .gemm import gemm_bf16_to_bf16
+from .gemm import gemm_bf16_to_bf16, prefill_gemm_bf16_to_bf16
 from .hc import hc_post_collapse, hc_post_collapse_tile, hc_post_token_tile
 from .rope import make_pipelined_rope
 from .qkv_proj_rope import _rotate_rope
@@ -100,7 +100,7 @@ def make_project_output(*, prefill):
             source_col = pl.cast(group * O_GROUP_IN, pl.INT32)
             output_col = pl.cast(group * O_LORA, pl.INT32)
             if prefill and not sequential and num_tokens >= PREFILL_O_M_TILE:
-                gemm_bf16_to_bf16(
+                prefill_gemm_bf16_to_bf16(
                     rotated, wo_a[group], projected, num_tokens, ready,
                     O_GROUP_IN, O_LORA, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_a",
                     source_col, output_col, False, PREFILL_O_M_TILE, stages=2,
@@ -130,9 +130,10 @@ def make_project_output(*, prefill):
                 0, 0, False, 16, stages=1,
             )
         elif prefill and not sequential and num_tokens >= PREFILL_O_M_TILE:
-            gemm_bf16_to_bf16(
+            prefill_gemm_bf16_to_bf16(
                 projected, wo_b, output, num_tokens, ready,
-                LOCAL_O_WIDTH, D, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_b", 0, 0, False, PREFILL_O_M_TILE, stages=2,
+                LOCAL_O_WIDTH, D, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_b",
+                0, 0, False, PREFILL_O_M_TILE, stages=2,
             )
         elif not sequential and num_tokens >= 64:
             gemm_bf16_to_bf16(

@@ -29,6 +29,7 @@ MM_S_DYN = pl.dynamic("A3_MM_S_DYN")
 DOT_K_TILE = 16
 PREFILL_EXPERT_LARGE_M_TILE = 64
 PREFILL_EXPERT_DOWN_N_TILE = 256
+PREFILL_BF16_K_SUBTILE = 64
 
 
 @pl.jit.inline(auto_scope=False)
@@ -183,6 +184,52 @@ def make_gemm_int8_tiled(*, k_stages, pipe_slots):
 
 gemm_int8_tiled = make_gemm_int8_tiled(k_stages=1, pipe_slots=2)
 prefill_gemm_int8_tiled = make_gemm_int8_tiled(k_stages=2, pipe_slots=1)
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_gemm_int8_reuse_weight(
+    payload: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    name_hint: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+    row_tile: pl.constexpr,
+):
+    """Keep a complete [K, N tile] weight panel in Mat across Prefill row tiles."""
+    # Bound the reuse window to spread the rows across workers.
+    row_tiles_per_group = pl.min(24, pl.max(8, num_tokens // (2 * row_tile)))
+    group_rows = row_tile * row_tiles_per_group
+    col_blocks = output_width // n_tile
+    blocks = (num_tokens + group_rows - 1) // group_rows * col_blocks
+    workers = pl.max(1, pl.min(blocks, pl.system.available_cluster_count()))
+    for worker in pl.spmd(workers, name_hint=name_hint, optimizations=[pl.cross_core_slot(slot_num=1)]):
+        for block in pl.range(worker, blocks, workers):
+            first_row = block // col_blocks * group_rows
+            last_row = pl.min(first_row + group_rows, num_tokens)
+            col = block % col_blocks * n_tile
+            weight_panel = pl.load(weight, [0, col], [width, n_tile], target_memory=pl.MemorySpace.Mat)
+            for row in pl.range(first_row, last_row, row_tile):
+                rows = pl.min(row_tile, num_tokens - row)
+                seed = pl.tile.create([row_tile, n_tile], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc, compact=True)
+                acc = pl.set_validshape(seed, rows, n_tile)
+                for k in pl.pipeline(0, width, k_tile, stage=2):
+                    a = pl.load(payload, [row, k], [row_tile, k_tile], valid_shape=[rows, k_tile])
+                    b = pl.tile.slice(weight_panel, [k_tile, n_tile], [k, 0])
+                    acc = pl.matmul_acc(acc, a, b, init_cond=(k == 0))
+                value = pl.cast(acc, pl.FP32)
+                a_scale = pl.load(activation_scale, [row, 0], [row_tile, 1], valid_shape=[rows, 1])
+                b_scale = pl.load(weight_scale, [0, col], [1, n_tile])
+                scaled = pl.row_expand_mul(value, a_scale)
+                scaled = pl.col_expand_mul(scaled, b_scale)
+                rounded = pl.cast(scaled, pl.BF16, mode="rint")
+                output = pl.store(pl.set_validshape(rounded, rows, n_tile), [row, col], output)
+    return output
 
 
 @pl.jit.inline(auto_scope=False)
@@ -556,7 +603,7 @@ def golden_dynamic_int8(source, weight, scale):
     return (product.float() * activation_scale * scale.float().reshape(1, -1)).bfloat16()
 
 
-def make_gemm_bf16_to_bf16(*, columns_first):
+def make_gemm_bf16_to_bf16(*, columns_first, k_subtile=0):
     @pl.jit.inline(auto_scope=False)
     def gemm_bf16_to_bf16(
         source: pl.Tensor,
@@ -610,9 +657,20 @@ def make_gemm_bf16_to_bf16(*, columns_first):
                     cube_seed = pl.tile.create([row_tile, n_tile], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc, compact=True)
                     cube_acc = pl.set_validshape(cube_seed, rows, n_tile)
                     for k in pl.pipeline(0, width, k_tile, stage=stages):
-                        cube_a = pl.load(source, [row, source_col + k], [row_tile, k_tile], valid_shape=[rows, k_tile])
-                        cube_w = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
-                        cube_acc = pl.matmul_acc(cube_acc, cube_a, cube_w, init_cond=(k == 0))
+                        if k_subtile > 0:
+                            a_panel = pl.load(
+                                source, [row, source_col + k], [row_tile, k_tile],
+                                valid_shape=[rows, k_tile], target_memory=pl.MemorySpace.Mat,
+                            )
+                            w_panel = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
+                            for inner_k in pl.pipeline(0, k_tile, k_subtile, stage=2):
+                                a_fragment = pl.tile.slice(a_panel, [row_tile, k_subtile], [0, inner_k])
+                                w_fragment = pl.tile.slice(w_panel, [k_subtile, n_tile], [inner_k, 0])
+                                cube_acc = pl.matmul_acc(cube_acc, a_fragment, w_fragment, init_cond=(k + inner_k == 0))
+                        else:
+                            cube_a = pl.load(source, [row, source_col + k], [row_tile, k_tile], valid_shape=[rows, k_tile])
+                            cube_w = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
+                            cube_acc = pl.matmul_acc(cube_acc, cube_a, cube_w, init_cond=(k == 0))
                     cube_value = pl.set_validshape(cube_acc, rows, n_tile)
                     output = pl.store(cube_value, [row, output_col + col], output)
         return output, projection_tid
@@ -621,7 +679,10 @@ def make_gemm_bf16_to_bf16(*, columns_first):
 
 
 gemm_bf16_to_bf16 = make_gemm_bf16_to_bf16(columns_first=False)
-gemm_bf16_to_bf16_columns_first = make_gemm_bf16_to_bf16(columns_first=True)
+prefill_gemm_bf16_to_bf16 = make_gemm_bf16_to_bf16(columns_first=False, k_subtile=PREFILL_BF16_K_SUBTILE)
+prefill_gemm_bf16_to_bf16_columns_first = make_gemm_bf16_to_bf16(
+    columns_first=True, k_subtile=PREFILL_BF16_K_SUBTILE,
+)
 
 
 def make_projection_validation(width):
