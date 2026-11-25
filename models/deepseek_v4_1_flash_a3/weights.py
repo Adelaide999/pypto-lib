@@ -245,9 +245,9 @@ def forward_weight_layouts(local_experts=N_LOCAL_EXPERTS):
         "lm_head_weight": ((M.vocab_size // TP_SIZE, d), torch.bfloat16),
     }
     projections = {
-        "wq_a": projection_int8_nz_shape(layers, d, M.q_lora_rank),
+        "wq_a": (layers, d, M.q_lora_rank),
         "wq_b": (layers, M.q_lora_rank, heads * M.head_dim),
-        "wkv": projection_int8_nz_shape(layers, d, M.head_dim),
+        "wkv": (layers, d, M.head_dim),
         "index_wq_b": (index_sources, M.q_lora_rank, M.index_n_heads * M.index_head_dim),
         "shared_w1": (layers, d, inter),
         "shared_w2": (layers, inter, d),
@@ -257,9 +257,15 @@ def forward_weight_layouts(local_experts=N_LOCAL_EXPERTS):
         "routed_w3": (layers * local_experts, d, inter),
     }
     for name, shape in projections.items():
-        bank_shape = (shape[0], shape[2], shape[1]) if name.startswith(("routed_", "shared_")) else shape
+        matrices, input_width, output_width = shape
+        if name in ("wq_a", "wkv"):
+            bank_shape = projection_int8_nz_shape(matrices, input_width, output_width)
+        elif name.startswith(("routed_", "shared_")):
+            bank_shape = (matrices, output_width, input_width)
+        else:
+            bank_shape = shape
         result[name] = (bank_shape, torch.int8)
-        result[name + "_scale"] = ((shape[0], shape[-1]), torch.float32)
+        result[name + "_scale"] = ((matrices, output_width), torch.float32)
     return result
 
 
