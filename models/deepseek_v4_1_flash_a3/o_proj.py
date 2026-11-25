@@ -53,6 +53,7 @@ HC_DIM = M.hc_dim
 O_A_N_TILE = 128
 O_B_N_TILE = 128
 DECODE_B1_O_B_N_TILE = 256
+DECODE_B1_O_A_K_TILE = 256
 K_TILE = 128
 PREFILL_O_M_TILE = 128
 PREFILL_O_N_TILE = 256
@@ -66,6 +67,29 @@ rotate_decode_b1 = make_pipelined_rope(
     T_DYN, LOCAL_H, HEAD_DIM, inverse=True, name_hint="inverse_rope_o_b1", allow_early_resolve=False,
 )
 
+
+@pl.jit.inline(auto_scope=False)
+def _project_decode_o_a_one_row(
+    source: pl.Tensor,
+    weight: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
+    projected: pl.Tensor,
+    n: pl.constexpr,
+    k_tile: pl.constexpr,
+):
+    """Put both O-A groups in one launch and assign one channel panel per Cube worker."""
+    panels = O_LORA // n
+    rhs = pl.reshape(weight, [LOCAL_O_GROUPS * O_GROUP_IN, O_LORA])
+    for worker in pl.spmd(LOCAL_O_GROUPS * panels, name_hint="proj_o_a_nd_grouped"):
+        group = worker // panels
+        column = (worker % panels) * n
+        seed = pl.tile.create([16, n], dtype=pl.FP32, target_memory=pl.Mem.Acc, compact=True)
+        acc = pl.set_validshape(seed, 1, n)
+        for k in pl.pipeline(0, O_GROUP_IN, k_tile, stage=2):
+            lhs = pl.load(source, [0, group * O_GROUP_IN + k], [16, k_tile], valid_shape=[1, k_tile])
+            rhs_tile = pl.load(rhs, [group * O_GROUP_IN + k, column], [k_tile, n], target_memory=pl.Mem.Mat)
+            acc = pl.matmul_acc(acc, lhs, rhs_tile, init_cond=(k == 0))
+        pl.store(acc, [0, group * O_LORA + column], projected)
+    return projected
 
 def make_project_output(*, prefill, b1_rotated=False):
     @pl.jit.inline(auto_scope=False)
@@ -96,56 +120,52 @@ def make_project_output(*, prefill, b1_rotated=False):
                 )
         projected = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
         ready = pl.system.task_dummy(deps=[])
-        for group in pl.parallel(LOCAL_O_GROUPS):
-            source_col = pl.cast(group * O_GROUP_IN, pl.INT32)
-            output_col = pl.cast(group * O_LORA, pl.INT32)
-            if prefill and not sequential and num_tokens >= PREFILL_O_M_TILE:
-                prefill_gemm_bf16_to_bf16(
-                    rotated, wo_a[group], projected, num_tokens, ready,
-                    O_GROUP_IN, O_LORA, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_a",
-                    source_col, output_col, False, PREFILL_O_M_TILE, stages=2,
-                )
-            elif not prefill and not sequential and num_tokens == 1:
-                gemm_bf16_to_bf16(
-                    rotated, wo_a[group], projected, num_tokens, ready,
-                    O_GROUP_IN, O_LORA, O_A_N_TILE, K_TILE, 24, "proj_o_a",
-                    source_col, output_col, False, 16, stages=2,
-                )
-            elif not sequential and num_tokens >= 64:
-                gemm_bf16_to_bf16(
-                    rotated, wo_a[group], projected, num_tokens, ready,
-                    O_GROUP_IN, O_LORA, 256, K_TILE, 24, "proj_o_a",
-                    source_col, output_col, False, 64, stages=1,
-                )
-            else:
-                gemm_bf16_to_bf16(
-                    rotated, wo_a[group], projected, num_tokens, ready,
-                    O_GROUP_IN, O_LORA, O_A_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_a",
-                    source_col, output_col, sequential, 16, stages=1,
-                )
         if not prefill and not sequential and num_tokens == 1:
+            _project_decode_o_a_one_row(rotated, wo_a, projected, O_A_N_TILE, DECODE_B1_O_A_K_TILE)
             gemm_bf16_to_bf16(
                 projected, wo_b, output, num_tokens, ready,
                 LOCAL_O_WIDTH, D, DECODE_B1_O_B_N_TILE, K_TILE, 24, "proj_o_b_b1",
-                0, 0, False, 16, stages=1,
-            )
-        elif prefill and not sequential and num_tokens >= PREFILL_O_M_TILE:
-            prefill_gemm_bf16_to_bf16(
-                projected, wo_b, output, num_tokens, ready,
-                LOCAL_O_WIDTH, D, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_b",
-                0, 0, False, PREFILL_O_M_TILE, stages=2,
-            )
-        elif not sequential and num_tokens >= 64:
-            gemm_bf16_to_bf16(
-                projected, wo_b, output, num_tokens, ready,
-                LOCAL_O_WIDTH, D, 256, K_TILE, 24, "proj_o_b", 0, 0, False, 64, stages=1,
+                0, 0, False, 16, stages=2,
             )
         else:
-            gemm_bf16_to_bf16(
-                projected, wo_b, output, num_tokens, ready,
-                LOCAL_O_WIDTH, D, O_B_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_b",
-                0, 0, sequential, 16, stages=1,
-            )
+            for group in pl.parallel(LOCAL_O_GROUPS):
+                source_col = pl.cast(group * O_GROUP_IN, pl.INT32)
+                output_col = pl.cast(group * O_LORA, pl.INT32)
+                if prefill and not sequential and num_tokens >= PREFILL_O_M_TILE:
+                    prefill_gemm_bf16_to_bf16(
+                        rotated, wo_a[group], projected, num_tokens, ready,
+                        O_GROUP_IN, O_LORA, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_a",
+                        source_col, output_col, False, PREFILL_O_M_TILE, stages=2,
+                    )
+                elif not sequential and num_tokens >= 64:
+                    gemm_bf16_to_bf16(
+                        rotated, wo_a[group], projected, num_tokens, ready,
+                        O_GROUP_IN, O_LORA, 256, K_TILE, 24, "proj_o_a",
+                        source_col, output_col, False, 64, stages=1,
+                    )
+                else:
+                    gemm_bf16_to_bf16(
+                        rotated, wo_a[group], projected, num_tokens, ready,
+                        O_GROUP_IN, O_LORA, O_A_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_a",
+                        source_col, output_col, sequential, 16, stages=1,
+                    )
+            if prefill and not sequential and num_tokens >= PREFILL_O_M_TILE:
+                prefill_gemm_bf16_to_bf16(
+                    projected, wo_b, output, num_tokens, ready,
+                    LOCAL_O_WIDTH, D, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_b",
+                    0, 0, False, PREFILL_O_M_TILE, stages=2,
+                )
+            elif not sequential and num_tokens >= 64:
+                gemm_bf16_to_bf16(
+                    projected, wo_b, output, num_tokens, ready,
+                    LOCAL_O_WIDTH, D, 256, K_TILE, 24, "proj_o_b", 0, 0, False, 64, stages=1,
+                )
+            else:
+                gemm_bf16_to_bf16(
+                    projected, wo_b, output, num_tokens, ready,
+                    LOCAL_O_WIDTH, D, O_B_N_TILE, K_TILE, 48 if sequential else 24, "proj_o_b",
+                    0, 0, sequential, 16, stages=1,
+                )
         return output
 
     return project_output
