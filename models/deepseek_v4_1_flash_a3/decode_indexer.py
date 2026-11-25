@@ -1951,14 +1951,15 @@ def prepare_c2a_index_key(
     tokens = pl.tensor.dim(latent, 0)
     projected = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     projected_tid = c2a_project_index_key(latent, index_wk, projected, num_tokens, latent_ready)
-    normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    normalized_tid = c2a_normalize_index_key(projected, index_norm_weight, normalized, num_tokens, projected_tid)
     rotated = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    rotated_tid = c2a_rotate_index_key(
-        normalized,
-        compressed_rope_cos, compressed_rope_sin,
+    rotated_tid = c1a_norm_rotate_index_key(
+        projected,
+        index_norm_weight,
+        compressed_rope_cos,
+        compressed_rope_sin,
         rotated,
-        num_tokens, normalized_tid,
+        num_tokens,
+        projected_tid,
     )
     return rotated, rotated_tid
 
