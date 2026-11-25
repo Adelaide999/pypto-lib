@@ -738,6 +738,7 @@ def hc_project_prefill(
     function: pl.Tensor,
     incoming_pre_mix: pl.Tensor,
     output: pl.Tensor,
+    scratch_deps: pl.Array[1, pl.TASK_ID],
 ):
     """Batch Prefill RMS, projection and incoming-stream collapse."""
     tokens = pl.tensor.dim(x_hc, 0)
@@ -746,7 +747,8 @@ def hc_project_prefill(
     collapsed_chunks = pl.reshape(output, [tokens * PREFILL_COLLAPSE_ROWS, PREFILL_RMS_D_TILE])
     inverse = pl.create_tensor([tokens, PREFILL_RMS_T_TILE], dtype=pl.FP32)
     workers = pl.min(tokens, PREFILL_WORKER_TILE)
-    for worker in pl.spmd(workers, name_hint="mhc_rms"):
+    with pl.spmd(workers, name_hint="mhc_rms", deps=[scratch_deps]) as _rms_ready:
+        worker = pl.tile.get_block_idx()
         for token in pl.range(worker, tokens, workers):
             values = pl.load(streams, [token * PREFILL_RMS_ROWS, 0], [PREFILL_RMS_ROWS, PREFILL_RMS_D_TILE])
             stream0 = pl.slice(values, [PREFILL_COLLAPSE_ROWS, PREFILL_RMS_D_TILE], [0, 0])
@@ -1194,6 +1196,37 @@ def hc_ffn_decode_mixes(
 
 
 @pl.jit.inline
+def hc_pre_prefill(
+    x_hc: pl.Tensor,
+    incoming_pre_mix: pl.Tensor,
+    function: pl.Tensor,
+    scale: pl.Tensor,
+    base: pl.Tensor,
+    output: pl.Tensor,
+    next_pre_mix: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    scratch_deps: pl.Array[1, pl.TASK_ID],
+):
+    """Collapse the Prefill streams and generate the delayed HC coefficients."""
+    prefill_inv_rms, prefill_projected = hc_project_prefill(x_hc, function, incoming_pre_mix, output, scratch_deps)
+    tokens = pl.tensor.dim(x_hc, 0)
+    if tokens >= PREFILL_SINKHORN_WIDE_T_TILE * PREFILL_WORKER_TILE:
+        mixes_ready = hc_sinkhorn_prefill(
+            prefill_inv_rms, prefill_projected, scale, base, next_pre_mix, post_mix, residual_mix,
+            PREFILL_SINKHORN_WIDE_T_TILE, PREFILL_SINKHORN_WIDE_LANE_BITS,
+            PREFILL_SINKHORN_WIDE_T_TILE * HC_MULT, PREFILL_SINKHORN_WIDE_T_TILE * HC_MULT * HC_MULT,
+        )
+    else:
+        mixes_ready = hc_sinkhorn_prefill(
+            prefill_inv_rms, prefill_projected, scale, base, next_pre_mix, post_mix, residual_mix,
+            PREFILL_SINKHORN_T_TILE, PREFILL_SINKHORN_LANE_BITS,
+            PREFILL_SINKHORN_T_TILE * HC_MULT, PREFILL_SINKHORN_T_TILE * HC_MULT * HC_MULT,
+        )
+    return mixes_ready
+
+
+@pl.jit.inline
 def hc_pre(
     x_hc: pl.Tensor,
     incoming_pre_mix: pl.Tensor,
@@ -1208,22 +1241,11 @@ def hc_pre(
 ):
     """Generate delayed HC coefficients and collapse the incoming streams."""
     if prefill:
-        prefill_inv_rms, prefill_projected = hc_project_prefill(
-            x_hc, function, incoming_pre_mix, output,
+        scratch_deps = pl.array.create(1, pl.TASK_ID)
+        mixes_ready = hc_pre_prefill(
+            x_hc, incoming_pre_mix, function, scale, base,
+            output, next_pre_mix, post_mix, residual_mix, scratch_deps,
         )
-        tokens = pl.tensor.dim(x_hc, 0)
-        if tokens >= PREFILL_SINKHORN_WIDE_T_TILE * PREFILL_WORKER_TILE:
-            mixes_ready = hc_sinkhorn_prefill(
-                prefill_inv_rms, prefill_projected, scale, base, next_pre_mix, post_mix, residual_mix,
-                PREFILL_SINKHORN_WIDE_T_TILE, PREFILL_SINKHORN_WIDE_LANE_BITS,
-                PREFILL_SINKHORN_WIDE_T_TILE * HC_MULT, PREFILL_SINKHORN_WIDE_T_TILE * HC_MULT * HC_MULT,
-            )
-        else:
-            mixes_ready = hc_sinkhorn_prefill(
-                prefill_inv_rms, prefill_projected, scale, base, next_pre_mix, post_mix, residual_mix,
-                PREFILL_SINKHORN_T_TILE, PREFILL_SINKHORN_LANE_BITS,
-                PREFILL_SINKHORN_T_TILE * HC_MULT, PREFILL_SINKHORN_T_TILE * HC_MULT * HC_MULT,
-            )
     else:
         mixes_ready = hc_ffn_decode_mixes(
             x_hc, function, scale, base, next_pre_mix, post_mix, residual_mix, one_token=False,

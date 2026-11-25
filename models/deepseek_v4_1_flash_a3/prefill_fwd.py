@@ -63,7 +63,7 @@ from .config import (
 )
 
 from .hc import hc_post
-from .hc import hc_head, hc_pre, zero_bf16_padding
+from .hc import hc_head, hc_pre, hc_pre_prefill, zero_bf16_padding
 from .input_pack import HIDDEN_TILE, gather_rows, pack_x_hc, prepare_compressed_lens
 from .rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
 from .engram import ENGRAM_K, KV_OUT, prefill_engram_from_rows
@@ -322,6 +322,9 @@ def _prefill_moe(
     slab_hidden: pl.Tensor[[MOE_TOKENS * TP_SIZE, HC_MULT, D], pl.FP32],
     slab_pre: pl.Tensor[[MOE_TOKENS * TP_SIZE, HC_MULT], pl.FP32],
     slab_mixed: pl.Tensor[[MOE_TOKENS * TP_SIZE, D], pl.BF16],
+    ffn_input_rows: pl.Tensor[[T_DYN, D], pl.BF16],
+    ffn_post_rows: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    ffn_residual_rows: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
     statistics: pl.Tensor[[MOE_ROUNDS, 3], pl.INT32],
     gate_inputs: pl.Tensor[[LOCAL_MOE_ROWS, D], pl.BF16],
     owner_payload: pl.Tensor[[LOCAL_MOE_ROWS, D], pl.INT8],
@@ -338,32 +341,21 @@ def _prefill_moe(
     """Execute one interleaved TP slab per EP round."""
     capacity = pl.tensor.dim(x_hc, 0)
     output_flat = pl.reshape(x_next, [capacity, HC_DIM])
-    # Batch the layer's mHC pre rows once and reuse slices in every MoE round.
-    # The previous slab-local calls launched the same projection and Sinkhorn
-    # pipeline separately for each round.
-    prefill_ffn_input = pl.create_tensor([capacity, D], dtype=pl.BF16)
-    prefill_post = pl.create_tensor([capacity, HC_MULT], dtype=pl.FP32)
-    prefill_residual = pl.create_tensor(
-        [capacity, HC_MULT, HC_MULT], dtype=pl.FP32
-    )
-    hc_pre(
+    # The previous layer's final MoE round fences reuse of the shared mHC rows.
+    completion = pl.array.create(1, pl.TASK_ID)
+    completion[0] = reuse_ready
+    hc_pre_prefill(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        prefill_ffn_input, next_pre_mix, prefill_post, prefill_residual,
-        prefill=True,
+        ffn_input_rows, next_pre_mix, ffn_post_rows, ffn_residual_rows, completion,
     )
     round_tokens = MOE_TOKENS * TP_SIZE
     rounds = (CAPACITY + round_tokens - 1) // round_tokens
     with pl.scope():
         prepare_prefill_routes(
-            prefill_ffn_input, norm_weight, gate_weight, correction_bias,
+            ffn_input_rows, norm_weight, gate_weight, correction_bias,
             gate_inputs, owner_payload, owner_scales, gate_indices, gate_weights,
             num_tokens, ep_rank % TP_SIZE, LOCAL_MOE_ROWS,
         )
-    completion = pl.array.create(1, pl.TASK_ID)
-    # Keep the slab pipeline independent from the layer-wide pre transform.
-    # Consumers of the sliced precomputed buffers carry the data dependency,
-    # while packing and transport can overlap the tail of mHC pre.
-    completion[0] = reuse_ready
     for round_id in pl.range(rounds):
         with pl.scope():
             begin = round_id * round_tokens
@@ -385,11 +377,9 @@ def _prefill_moe(
             round_output = pl.slice(x_next, [rows, HC_MULT, D], [begin, 0, 0])
             round_next = pl.slice(next_pre_mix, [rows, HC_MULT], [begin, 0])
             round_mixed = pl.slice(slab_mixed, [rows, D], [0, 0])
-            post = pl.slice(prefill_post, [rows, HC_MULT], [begin, 0])
-            residual = pl.slice(
-                prefill_residual, [rows, HC_MULT, HC_MULT], [begin, 0, 0]
-            )
-            ffn_input = pl.slice(prefill_ffn_input, [rows, D], [begin, 0])
+            post = pl.slice(ffn_post_rows, [rows, HC_MULT], [begin, 0])
+            residual = pl.slice(ffn_residual_rows, [rows, HC_MULT, HC_MULT], [begin, 0, 0])
+            ffn_input = pl.slice(ffn_input_rows, [rows, D], [begin, 0])
             owned = pl.create_tensor([rows, D], dtype=pl.BF16)
             epoch = (moe_epoch - 1) * rounds + round_id + 1
             route_offset = round_id * MOE_TOKENS
@@ -598,7 +588,7 @@ def l2_prefill_fwd(
         replay_initial = pl.reshape(initial_hidden, [CAPACITY, HC_DIM])
         gather_rows(replay_hidden, identity_rows, replay_initial, gather_ready, D)
     gather_rows(initial_pre, identity_rows, initial_mix, gather_ready, HIDDEN_TILE)
-    # Reuse bounded MoE slabs across all layers and rounds.
+    # Reuse mHC rows across layers and bounded MoE slabs across rounds.
     attn_hidden = attn_hc_out
     attn_pre = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
     slab_hidden = pl.create_tensor([MOE_TOKENS * TP_SIZE, HC_MULT, D], dtype=pl.FP32)
@@ -606,6 +596,9 @@ def l2_prefill_fwd(
     slab_mixed = pl.create_tensor([MOE_TOKENS * TP_SIZE, D], dtype=pl.BF16)
     owner_payload = pl.create_tensor([LOCAL_MOE_ROWS, D], dtype=pl.INT8)
     owner_scales = pl.create_tensor([LOCAL_MOE_ROWS, 1], dtype=pl.FP32)
+    ffn_input_rows = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
+    ffn_post_rows = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
+    ffn_residual_rows = pl.create_tensor([CAPACITY, HC_MULT, HC_MULT], dtype=pl.FP32)
     moe_ready = pl.system.task_dummy(deps=[])
     for layer in pl.range(first_layer, last_layer):
         stage = layer // 20
@@ -748,7 +741,8 @@ def l2_prefill_fwd(
              layer_shared_w13, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
             layer_shared_w3_scale, next_pre, next_hidden,
             recv_meta, recv_x, recv_weights, arrived, data_arrived,
-            routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, moe_statistics[layer],
+            routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed,
+            ffn_input_rows, ffn_post_rows, ffn_residual_rows, moe_statistics[layer],
             moe_gate_inputs, owner_payload, owner_scales, moe_route_indices[layer], moe_route_weights[layer],
             moe_ready, active, rank, layer - first_layer + 1, ffn_window, ffn_arrived,
         )
