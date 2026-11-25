@@ -61,8 +61,9 @@ PREFILL_PROJ_T_TILE = 32
 PREFILL_PROJ_N_TILE = 32
 PREFILL_PROJ_K_TILE = 1024
 PREFILL_SINKHORN_T_TILE = 16
-PREFILL_SINKHORN_LANES = PREFILL_SINKHORN_T_TILE * HC_MULT
-PREFILL_SINKHORN_LANE_BITS = (PREFILL_SINKHORN_LANES - 1).bit_length()
+PREFILL_SINKHORN_WIDE_T_TILE = 64
+PREFILL_SINKHORN_LANE_BITS = (PREFILL_SINKHORN_T_TILE * HC_MULT - 1).bit_length()
+PREFILL_SINKHORN_WIDE_LANE_BITS = (PREFILL_SINKHORN_WIDE_T_TILE * HC_MULT - 1).bit_length()
 PREFILL_SINKHORN_STREAM_BITS = (HC_MULT - 1).bit_length()
 PREFILL_WORKER_TILE = 48
 PREFILL_MERGE_T_TILE = 16
@@ -793,6 +794,10 @@ def hc_sinkhorn_prefill(
     pre_mix: pl.Tensor,
     post_mix: pl.Tensor,
     residual_mix: pl.Tensor,
+    token_tile: pl.constexpr,
+    lane_bits: pl.constexpr,
+    lanes_per_stream: pl.constexpr,
+    matrix_elements: pl.constexpr,
 ):
     """Batch Prefill sigmoid and Sinkhorn coefficient generation."""
     tokens = pl.tensor.dim(pre_mix, 0)
@@ -801,20 +806,20 @@ def hc_sinkhorn_prefill(
     scale0 = pl.read(scale, [0])
     scale1 = pl.read(scale, [1])
     scale2 = pl.read(scale, [2])
-    blocks = (tokens + PREFILL_SINKHORN_T_TILE - 1) // PREFILL_SINKHORN_T_TILE
+    blocks = (tokens + token_tile - 1) // token_tile
     workers = pl.min(blocks, PREFILL_WORKER_TILE)
     with pl.spmd(workers, name_hint="mhc_sinkhorn") as ready:
         worker = pl.tile.get_block_idx()
         # Pack [token, row, column] as [column, token * HC_MULT + row].
-        lanes = pl.tile.arange(0, [1, PREFILL_SINKHORN_LANES * HC_MULT], dtype=pl.INT32)
-        axis = pl.shrs(lanes, PREFILL_SINKHORN_LANE_BITS)
-        lane = pl.sub(lanes, pl.shls(axis, PREFILL_SINKHORN_LANE_BITS))
+        lanes = pl.tile.arange(0, [1, matrix_elements], dtype=pl.INT32)
+        axis = pl.shrs(lanes, lane_bits)
+        lane = pl.sub(lanes, pl.shls(axis, lane_bits))
         pack_index = pl.add(pl.shls(lane, PREFILL_SINKHORN_STREAM_BITS), axis)
         # Swap the two matrix axes independently for every token.
         lane_token = pl.shrs(lane, PREFILL_SINKHORN_STREAM_BITS)
         token_base = pl.shls(lane_token, PREFILL_SINKHORN_STREAM_BITS)
         stream = pl.sub(lane, token_base)
-        transpose_index = pl.add(pl.shls(stream, PREFILL_SINKHORN_LANE_BITS), token_base)
+        transpose_index = pl.add(pl.shls(stream, lane_bits), token_base)
         transpose_index = pl.add(transpose_index, axis)
         # The final column normalization leaves [row, token * HC_MULT + column].
         output_row = pl.shrs(lanes, PREFILL_SINKHORN_STREAM_BITS)
@@ -822,33 +827,33 @@ def hc_sinkhorn_prefill(
         output_token = pl.shrs(output_row, PREFILL_SINKHORN_STREAM_BITS)
         output_token_base = pl.shls(output_token, PREFILL_SINKHORN_STREAM_BITS)
         output_stream = pl.sub(output_row, output_token_base)
-        unpack_index = pl.add(pl.shls(output_stream, PREFILL_SINKHORN_LANE_BITS), output_token_base)
+        unpack_index = pl.add(pl.shls(output_stream, lane_bits), output_token_base)
         unpack_index = pl.add(unpack_index, output_column)
-        gather_tmp = pl.create_tile([1, PREFILL_SINKHORN_LANES * HC_MULT], dtype=pl.INT32)
+        gather_tmp = pl.create_tile([1, matrix_elements], dtype=pl.INT32)
         for block in pl.range(worker, blocks, workers):
-            token = block * PREFILL_SINKHORN_T_TILE
-            rows = pl.min(PREFILL_SINKHORN_T_TILE, tokens - token)
+            token = block * token_tile
+            rows = pl.min(token_tile, tokens - token)
             inverse_group = pl.load(
                 inv_rms,
                 [token, 0],
-                [PREFILL_SINKHORN_T_TILE, PREFILL_RMS_T_TILE],
+                [token_tile, PREFILL_RMS_T_TILE],
                 valid_shape=[rows, PREFILL_RMS_T_TILE],
             )
             inverse_tmp = pl.create_tile(
-                [PREFILL_SINKHORN_T_TILE, PREFILL_RMS_T_TILE], dtype=pl.FP32
+                [token_tile, PREFILL_RMS_T_TILE], dtype=pl.FP32
             )
             inverse = pl.row_min(inverse_group, tmp_tile=inverse_tmp)
 
             raw_pre = pl.load(
                 projected,
                 [token, 0],
-                [PREFILL_SINKHORN_T_TILE, MIX_PAD],
+                [token_tile, MIX_PAD],
                 valid_shape=[rows, HC_MULT],
             )
             raw_post = pl.load(
                 projected,
                 [token, HC_MULT],
-                [PREFILL_SINKHORN_T_TILE, MIX_PAD],
+                [token_tile, MIX_PAD],
                 valid_shape=[rows, HC_MULT],
             )
             pre_bias = pl.load(bias, [0, 0], [1, MIX_PAD], valid_shape=[1, HC_MULT])
@@ -865,17 +870,17 @@ def hc_sinkhorn_prefill(
             pl.store(post, [token, 0], post_mix)
 
             logits = pl.load(
-                projected, [token, 2 * HC_MULT], [PREFILL_SINKHORN_T_TILE, HC_MULT * HC_MULT],
+                projected, [token, 2 * HC_MULT], [token_tile, HC_MULT * HC_MULT],
                 valid_shape=[rows, HC_MULT * HC_MULT],
             )
             residual_bias = pl.load(bias, [0, 2 * HC_MULT], [1, HC_MULT * HC_MULT])
             logits = pl.row_expand_mul(logits, inverse)
             logits = pl.col_expand_add(pl.mul(logits, scale2), residual_bias)
             logits = pl.fillpad(logits, pad_value=pl.PadValue.zero)
-            logits = pl.set_validshape(logits, PREFILL_SINKHORN_T_TILE, HC_MULT * HC_MULT)
-            logits_flat = pl.reshape(logits, [1, PREFILL_SINKHORN_LANES * HC_MULT])
+            logits = pl.set_validshape(logits, token_tile, HC_MULT * HC_MULT)
+            logits_flat = pl.reshape(logits, [1, matrix_elements])
             packed = pl.tile.gather(logits_flat, pack_index, gather_tmp)
-            packed = pl.reshape(packed, [HC_MULT, PREFILL_SINKHORN_LANES])
+            packed = pl.reshape(packed, [HC_MULT, lanes_per_stream])
             maximum = pl.col_max(packed)
             exp_values = pl.exp(pl.col_expand_sub(packed, maximum))
             denominator = pl.col_sum(exp_values)
@@ -883,14 +888,14 @@ def hc_sinkhorn_prefill(
 
             # Alternate the axes by transposing each token's four-by-four matrix.
             for _ in pl.unroll(2 * HC_SINKHORN_ITER - 1):
-                flat = pl.reshape(probability, [1, PREFILL_SINKHORN_LANES * HC_MULT])
+                flat = pl.reshape(probability, [1, matrix_elements])
                 rearranged = pl.tile.gather(flat, transpose_index, gather_tmp)
-                transposed = pl.reshape(rearranged, [HC_MULT, PREFILL_SINKHORN_LANES])
+                transposed = pl.reshape(rearranged, [HC_MULT, lanes_per_stream])
                 denominator = pl.add(pl.col_sum(transposed), HC_EPS)
                 probability = pl.col_expand_div(transposed, denominator)
-            flat = pl.reshape(probability, [1, PREFILL_SINKHORN_LANES * HC_MULT])
+            flat = pl.reshape(probability, [1, matrix_elements])
             compact = pl.tile.gather(flat, unpack_index, gather_tmp)
-            compact = pl.reshape(compact, [PREFILL_SINKHORN_T_TILE, HC_MULT * HC_MULT])
+            compact = pl.reshape(compact, [token_tile, HC_MULT * HC_MULT])
             compact = pl.set_validshape(compact, rows, HC_MULT * HC_MULT)
             pl.store(compact, [token, 0], residual_flat)
     return ready
@@ -1086,10 +1091,19 @@ def hc_pre(
         prefill_inv_rms, prefill_projected = hc_project_prefill(
             x_hc, function, incoming_pre_mix, output,
         )
-        mixes_ready = hc_sinkhorn_prefill(
-            prefill_inv_rms, prefill_projected,
-            scale, base, next_pre_mix, post_mix, residual_mix,
-        )
+        tokens = pl.tensor.dim(x_hc, 0)
+        if tokens >= PREFILL_SINKHORN_WIDE_T_TILE * PREFILL_WORKER_TILE:
+            mixes_ready = hc_sinkhorn_prefill(
+                prefill_inv_rms, prefill_projected, scale, base, next_pre_mix, post_mix, residual_mix,
+                PREFILL_SINKHORN_WIDE_T_TILE, PREFILL_SINKHORN_WIDE_LANE_BITS,
+                PREFILL_SINKHORN_WIDE_T_TILE * HC_MULT, PREFILL_SINKHORN_WIDE_T_TILE * HC_MULT * HC_MULT,
+            )
+        else:
+            mixes_ready = hc_sinkhorn_prefill(
+                prefill_inv_rms, prefill_projected, scale, base, next_pre_mix, post_mix, residual_mix,
+                PREFILL_SINKHORN_T_TILE, PREFILL_SINKHORN_LANE_BITS,
+                PREFILL_SINKHORN_T_TILE * HC_MULT, PREFILL_SINKHORN_T_TILE * HC_MULT * HC_MULT,
+            )
     else:
         mixes_ready = hc_ffn_decode_mixes(x_hc, function, scale, base, next_pre_mix, post_mix, residual_mix)
         hc_head(x_hc, incoming_pre_mix, output)
