@@ -216,6 +216,7 @@ def normalize_quantize_prefill_projection(
 
 DECODE_QUANT_ENCODE_TILE = 256
 DECODE_QUANT_REDUCE_TILE = 1024
+DECODE_HIDDEN_WIDTH = pl.dynamic("DECODE_HIDDEN_WIDTH")
 DECODE_CODE_COLUMNS = pl.dynamic("DECODE_CODE_COLUMNS")
 
 
@@ -336,6 +337,54 @@ def _quantize_decode_wide_row(
 
 
 @pl.jit.inline(auto_scope=False)
+def _wide_decode_peak(row: pl.Tile[[1, DECODE_HIDDEN_WIDTH], pl.BF16], width: pl.constexpr):
+    value = pl.cast(pl.reshape(row, [8, width // 8]), pl.FP32)
+    scratch = pl.create_tile([8, width // 8], dtype=pl.FP32)
+    peaks = pl.reshape(pl.row_max(pl.abs(value), tmp_tile=scratch), [1, 8])
+    zero = pl.tile.full([8, 8], dtype=pl.FP32, value=0.0)
+    return pl.row_max(pl.col_expand_add(zero, peaks), tmp_tile=zero)
+
+
+@pl.jit.inline(auto_scope=False)
+def _quantize_decode_wide_pair(
+    source: pl.Tensor, payload: pl.Tensor, scale: pl.Tensor,
+    width: pl.constexpr,
+):
+    """Quantize two live rows and clear the rest of the 16-row slab."""
+    for worker in pl.spmd(4 + width // DECODE_QUANT_ENCODE_TILE, name_hint="quant_fused_small_batch"):
+        if worker < 4:
+            row = worker // 2
+            col = (worker % 2) * (width // 2)
+            full = pl.load(source, [row, 0], [1, width])
+            maximum = _wide_decode_peak(full, width)
+            if worker == 0:
+                inactive = pl.tile.full([1, 8], dtype=pl.FP32, value=1e-30)
+                lanes = pl.cast(pl.tile.arange(0, [1, 8], dtype=pl.INT32), pl.FP32)
+                peak0 = pl.reshape(pl.maximum(pl.mul(maximum, 1.0 / 127.0), 1e-30), [1, 8])
+                row_scales = pl.tile.select(pl.tile.cmps(lanes, 0.0, cmp_type=0), peak0, inactive)
+                second = pl.load(source, [1, 0], [1, width])
+                other = _wide_decode_peak(second, width)
+                peak1 = pl.reshape(pl.maximum(pl.mul(other, 1.0 / 127.0), 1e-30), [1, 8])
+                row_scales = pl.tile.select(pl.tile.cmps(lanes, 1.0, cmp_type=0), peak1, row_scales)
+                pl.store(pl.reshape(row_scales, [8, 1]), [0, 0], scale)
+                pl.store(pl.reshape(inactive, [8, 1]), [8, 0], scale)
+            denominator = pl.mul(pl.maximum(maximum, 127e-30), 1.0 / 128.0)
+            inverse = pl.recip(denominator)
+            panel = pl.load(source, [row, col], [1, width // 2])
+            value = pl.cast(pl.reshape(panel, [8, width // 16]), pl.FP32)
+            encoded = _decode_checkpoint_codes(value, denominator, inverse)
+            pl.store(pl.reshape(encoded, [1, (width // 2)]), [row, col], payload)
+        else:
+            col = (worker - 4) * DECODE_QUANT_ENCODE_TILE
+            zeros = pl.cast(pl.tile.full([8, DECODE_QUANT_ENCODE_TILE], dtype=pl.FP32, value=0.0),
+                            pl.INT8, mode="rint")
+            pl.store(pl.set_validshape(zeros, 6, DECODE_QUANT_ENCODE_TILE), [2, col], payload)
+            pl.store(zeros, [8, col], payload)
+    return payload, scale
+
+
+
+@pl.jit.inline(auto_scope=False)
 def quantize_projection_activation(
     source: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], width: pl.constexpr, dense_query: pl.constexpr,
     prefill: pl.constexpr,
@@ -360,6 +409,8 @@ def _quantize_projection_activation_into(
             _quantize_decode_wide_row(source, payload, scale, width)
         else:
             _quantize_decode_active_row(source, payload, scale, width)
+    elif not prefill and width == 5120 and num_tokens == 2 and padded_rows == 16:
+        _quantize_decode_wide_pair(source, payload, scale, width)
     elif prefill:
         if width == 2304:
             _quantize_prefill_rows(source, payload, scale, num_tokens, padded_rows, width, width)
