@@ -578,8 +578,8 @@ def make_gemm_bf16_to_bf16(*, columns_first):
     ):
         """Project BF16 ND buffers with explicit FP32 accumulation and column offsets."""
         col_blocks = output_width // n_tile
+        row_blocks = (num_tokens + row_tile - 1) // row_tile
         if columns_first:
-            row_blocks = (num_tokens + row_tile - 1) // row_tile
             blocks = row_blocks * col_blocks
         else:
             blocks = (num_tokens + row_tile - 1) // row_tile * col_blocks
