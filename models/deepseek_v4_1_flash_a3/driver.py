@@ -22,7 +22,7 @@ from golden import ScalarSpec, TensorSpec, run
 from pypto.ir import DistributedConfig
 
 from . import config as C
-from .weights import engram_wkv_nz_shape, projection_int8_nz_shape
+from .weights import bf16_nz_shape, engram_wkv_nz_shape, projection_int8_nz_shape
 
 
 TOPOLOGY = {"world": 16, "dp": 4, "tp": 4, "ep": 16, "local_experts": 24}
@@ -72,6 +72,9 @@ def build_specs(function, *, mode, capacity, history_capacity=HISTORY_CAPACITY, 
         elif name in ("wq_a", "wkv"):
             ranks, layers, rows, columns = shape
             shape = list(projection_int8_nz_shape(ranks * layers, rows, columns))
+        elif name in ('wo_a', 'wo_b'):
+            ranks, matrices, rows, columns = shape
+            shape = list(bf16_nz_shape(ranks * matrices, rows, columns))
         specs.append(TensorSpec(name, shape, dtype_map[dtype_name]))
     return specs
 

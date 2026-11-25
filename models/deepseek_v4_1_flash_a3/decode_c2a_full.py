@@ -27,7 +27,7 @@ from .sparse_attention import (
     WORKERS as ATTEND_WORKER_TILE,
 )
 from .decode_indexer import decode_c2a_indexer
-from .o_proj import decode_o_proj_from_attention as o_proj, decode_tp_output_post
+from .o_proj import decode_o_proj_nz_from_attention as o_proj, decode_tp_output_post
 
 # model config
 LOCAL_H = M.num_attention_heads // TP_SIZE
@@ -69,8 +69,8 @@ def decode_c2a_full(
     wkv_scale: pl.Tensor[[1, HEAD_DIM], pl.FP32, pl.ND],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],

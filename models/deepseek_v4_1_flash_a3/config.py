@@ -304,7 +304,7 @@ MX_B_LAYOUT = pl.ND
 PROJECTION_LAYOUT = pl.ND
 EXPERT_N_TILE = 128
 EXPERT_K_TILE = 512
-WEIGHT_LAYOUT_VERSION = "v41-a3-w8a8-dynamic-expert-nk-engram-qakv-nz-v6"
+WEIGHT_LAYOUT_VERSION = "v41-a3-w8a8-dynamic-expert-nk-engram-qakv-wo-nz-v7"
 CACHE_LAYOUT_VERSION = "v41-a3-u8-paged128-v1"
 
 TP_SIZE = _parse_parallel_size("tp", 4)

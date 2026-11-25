@@ -15,7 +15,7 @@ from .config import TP_SIZE
 from .config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
 from .sparse_attention import publish_window_row, swa_attention_partial, swa_attention_partial_b1_rotated
 from .qkv_proj_rope import decode_qkv_proj_rope
-from .o_proj import decode_swa_o_proj_from_attention, decode_tp_output_post
+from .o_proj import decode_o_proj_nz_from_attention, decode_tp_output_post
 from .hc import hc_decode_mixes, hc_head_norm_quantize_decode
 
 
@@ -54,8 +54,8 @@ def decode_swa(
     wkv_scale: pl.Tensor[[1, HEAD_DIM], pl.FP32, pl.ND],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16, pl.NZ],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
@@ -103,7 +103,7 @@ def decode_swa(
         attention_pre_mix, post_mix, residual_mix,
         num_tokens,
     )
-    attention_output = decode_swa_o_proj_from_attention(
+    attention_output = decode_o_proj_nz_from_attention(
         attended, wo_a, wo_b, rope_cos, rope_sin, attention_output, num_tokens,
     )
     decode_tp_output_post(

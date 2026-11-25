@@ -29,6 +29,11 @@ KV_OUT = (M.hc_mult + 1) * M.hidden_size
 _DTYPES = {"F32": torch.float32, "BF16": torch.bfloat16, "I8": torch.int8}
 
 
+def bf16_nz_shape(matrix_count, rows, columns):
+    """Return the physical shape of BF16 Cube weights."""
+    return matrix_count, columns // 16, rows // 16, 16, 16
+
+
 def engram_wkv_nz_shape(matrix_count):
     """Describe the packed BF16 Engram projection buffer for runtime allocation."""
     return matrix_count, KV_OUT // 16, ENGRAM_K // 16, 16, 16
@@ -221,8 +226,8 @@ def forward_weight_layouts(local_experts=N_LOCAL_EXPERTS):
         "q_norm_weight": ((layers * M.q_lora_rank,), torch.bfloat16),
         "kv_norm_weight": ((layers * M.head_dim,), torch.bfloat16),
         "attn_sink": ((layers * heads,), torch.float32),
-        "wo_a": ((layers * groups, M.num_attention_heads * M.head_dim // M.o_groups, M.o_lora_rank), torch.bfloat16),
-        "wo_b": ((layers, groups * M.o_lora_rank, d), torch.bfloat16),
+        "wo_a": (bf16_nz_shape(layers * groups, M.num_attention_heads * M.head_dim // M.o_groups, M.o_lora_rank), torch.bfloat16),
+        "wo_b": (bf16_nz_shape(layers, groups * M.o_lora_rank, d), torch.bfloat16),
         "c2a_compressor_wkv": ((c2a_sources, d, M.head_dim), torch.bfloat16),
         "c2a_compressor_wgate": ((c2a_sources, d, M.head_dim), torch.bfloat16),
         "c1a_compressor_wkv": ((d, M.head_dim), torch.bfloat16),
@@ -368,10 +373,10 @@ class ResidentWeights:
                 copy(target, value, layer, total_layers)
             wo_a = checkpoint.tensor(f"layers.{layer}.attn.wo_a.weight")
             wo_a = wo_a.reshape(M.o_groups, M.o_lora_rank, -1)[lane * groups:(lane + 1) * groups]
-            copy("wo_a", wo_a.transpose(-1, -2), layer, total_layers)
+            copy("wo_a", pack_bf16_nz(wo_a.transpose(-1, -2)), layer, total_layers)
             wo_b = checkpoint.tensor(f"layers.{layer}.attn.wo_b.weight")
             width = groups * M.o_lora_rank
-            copy("wo_b", wo_b[:, lane * width:(lane + 1) * width].t(), layer, total_layers)
+            copy("wo_b", pack_bf16_nz(wo_b[:, lane * width:(lane + 1) * width].t()), layer, total_layers)
             for local in range(self.local_experts):
                 expert = rank * self.local_experts + local
                 for projection in ("w1", "w2", "w3"):
