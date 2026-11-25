@@ -48,6 +48,17 @@ def unpack_bf16_nz(weight):
     return blocks.permute(0, 2, 3, 1, 4).contiguous().reshape(weight.shape)
 
 
+def projection_int8_nz_shape(matrix_count, rows, columns):
+    """Return the physical shape of INT8 Cube weights with C0=32."""
+    return matrix_count, columns // 32, rows // 16, 16, 32
+
+
+def pack_projection_int8_nz(weight):
+    """Reorder the resident bytes without changing any quantized value."""
+    rows, columns = weight.shape
+    return weight.reshape(rows // 16, 16, columns // 32, 32).permute(2, 0, 1, 3).contiguous()
+
+
 class Checkpoint:
     """Read requested original checkpoint tensors and selected embedding rows."""
 
@@ -229,9 +240,9 @@ def forward_weight_layouts(local_experts=N_LOCAL_EXPERTS):
         "lm_head_weight": ((M.vocab_size // TP_SIZE, d), torch.bfloat16),
     }
     projections = {
-        "wq_a": (layers, d, M.q_lora_rank),
+        "wq_a": projection_int8_nz_shape(layers, d, M.q_lora_rank),
         "wq_b": (layers, M.q_lora_rank, heads * M.head_dim),
-        "wkv": (layers, d, M.head_dim),
+        "wkv": projection_int8_nz_shape(layers, d, M.head_dim),
         "index_wq_b": (index_sources, M.q_lora_rank, M.index_n_heads * M.index_head_dim),
         "shared_w1": (layers, d, inter),
         "shared_w2": (layers, inter, d),
@@ -344,6 +355,8 @@ class ResidentWeights:
                 output_slice = slice(lane * heads * M.head_dim, (lane + 1) * heads * M.head_dim) if target == "wq_b" else None
                 weight, scale = self.projection(f"layers.{layer}.{suffix}", output_slice=output_slice,
                                                 output_major=target.startswith("shared_"))
+                if target in ("wq_a", "wkv"):
+                    weight = pack_projection_int8_nz(weight)
                 copy(target, weight, layer, total_layers)
                 copy(target + "_scale", scale, layer, total_layers)
             for target, suffix in self.layer_projections:

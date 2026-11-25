@@ -131,10 +131,10 @@ def decode_encoder(
     hc_attn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
     attn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[N_LAYERS, D, Q_LORA], pl.INT8],
+    wq_a: pl.Tensor[[N_LAYERS, D, Q_LORA], pl.INT8, pl.NZ],
     q_norm_weight: pl.Tensor[[N_LAYERS * Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8],
-    wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.INT8],
+    wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.INT8, pl.NZ],
     kv_norm_weight: pl.Tensor[[N_LAYERS * HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
     wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
@@ -288,12 +288,12 @@ def decode_encoder(
             layer_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [layer * 3])
             layer_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [layer * MIX_HC])
             layer_norm_weight: pl.Tensor[[D], pl.BF16] = pl.slice(attn_norm_weight, [D], [layer * D])
-            layer_wq_a: pl.Tensor[[D, Q_LORA], pl.INT8] = wq_a[layer]
+            layer_wq_a: pl.Tensor[[D, Q_LORA], pl.INT8, pl.NZ] = wq_a[layer]
             layer_wq_a_scale: pl.Tensor[[1, Q_LORA], pl.FP32, pl.ND] = pl.slice(wq_a_scale, [1, Q_LORA], [layer * (1), 0])
             layer_q_norm: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(q_norm_weight, [Q_LORA], [layer * Q_LORA])
             layer_wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8] = wq_b[layer]
             layer_wq_b_scale: pl.Tensor[[1, LOCAL_H * HEAD_DIM], pl.FP32, pl.ND] = pl.slice(wq_b_scale, [1, LOCAL_H * HEAD_DIM], [layer * (1), 0])
-            layer_wkv: pl.Tensor[[D, HEAD_DIM], pl.INT8] = wkv[layer]
+            layer_wkv: pl.Tensor[[D, HEAD_DIM], pl.INT8, pl.NZ] = wkv[layer]
             layer_wkv_scale: pl.Tensor[[1, HEAD_DIM], pl.FP32, pl.ND] = pl.slice(wkv_scale, [1, HEAD_DIM], [layer * (1), 0])
             layer_kv_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(kv_norm_weight, [HEAD_DIM], [layer * HEAD_DIM])
             layer_sink: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(attn_sink, [LOCAL_H], [layer * LOCAL_H])
@@ -383,10 +383,10 @@ def decode_decoder(
     hc_attn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
     attn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[N_LAYERS, D, Q_LORA], pl.INT8],
+    wq_a: pl.Tensor[[N_LAYERS, D, Q_LORA], pl.INT8, pl.NZ],
     q_norm_weight: pl.Tensor[[N_LAYERS * Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8],
-    wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.INT8],
+    wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.INT8, pl.NZ],
     kv_norm_weight: pl.Tensor[[N_LAYERS * HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
     wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
@@ -517,12 +517,12 @@ def decode_decoder(
             layer_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [layer * 3])
             layer_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [layer * MIX_HC])
             layer_norm_weight: pl.Tensor[[D], pl.BF16] = pl.slice(attn_norm_weight, [D], [layer * D])
-            layer_wq_a: pl.Tensor[[D, Q_LORA], pl.INT8] = wq_a[layer]
+            layer_wq_a: pl.Tensor[[D, Q_LORA], pl.INT8, pl.NZ] = wq_a[layer]
             layer_wq_a_scale: pl.Tensor[[1, Q_LORA], pl.FP32, pl.ND] = pl.slice(wq_a_scale, [1, Q_LORA], [layer * (1), 0])
             layer_q_norm: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(q_norm_weight, [Q_LORA], [layer * Q_LORA])
             layer_wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8] = wq_b[layer]
             layer_wq_b_scale: pl.Tensor[[1, LOCAL_H * HEAD_DIM], pl.FP32, pl.ND] = pl.slice(wq_b_scale, [1, LOCAL_H * HEAD_DIM], [layer * (1), 0])
-            layer_wkv: pl.Tensor[[D, HEAD_DIM], pl.INT8] = wkv[layer]
+            layer_wkv: pl.Tensor[[D, HEAD_DIM], pl.INT8, pl.NZ] = wkv[layer]
             layer_wkv_scale: pl.Tensor[[1, HEAD_DIM], pl.FP32, pl.ND] = pl.slice(wkv_scale, [1, HEAD_DIM], [layer * (1), 0])
             layer_kv_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(kv_norm_weight, [HEAD_DIM], [layer * HEAD_DIM])
             layer_sink: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(attn_sink, [LOCAL_H], [layer * LOCAL_H])
@@ -615,10 +615,10 @@ def l2_decode_fwd(
     hc_attn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
     attn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[N_LAYERS, D, Q_LORA], pl.INT8],
+    wq_a: pl.Tensor[[N_LAYERS, D, Q_LORA], pl.INT8, pl.NZ],
     q_norm_weight: pl.Tensor[[N_LAYERS * Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8],
-    wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.INT8],
+    wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.INT8, pl.NZ],
     kv_norm_weight: pl.Tensor[[N_LAYERS * HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
     wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
@@ -738,12 +738,12 @@ def l3_decode_fwd(
     hc_attn_scale: pl.Tensor[[EP_SIZE, N_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[EP_SIZE, N_LAYERS * MIX_HC], pl.FP32],
     attn_norm_weight: pl.Tensor[[EP_SIZE, N_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[EP_SIZE, N_LAYERS, D, Q_LORA], pl.INT8],
+    wq_a: pl.Tensor[[EP_SIZE, N_LAYERS, D, Q_LORA], pl.INT8, pl.NZ],
     wq_a_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (1), Q_LORA], pl.FP32],
     q_norm_weight: pl.Tensor[[EP_SIZE, N_LAYERS * Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[EP_SIZE, N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (1), LOCAL_H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[EP_SIZE, N_LAYERS, D, HEAD_DIM], pl.INT8],
+    wkv: pl.Tensor[[EP_SIZE, N_LAYERS, D, HEAD_DIM], pl.INT8, pl.NZ],
     wkv_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (1), HEAD_DIM], pl.FP32],
     kv_norm_weight: pl.Tensor[[EP_SIZE, N_LAYERS * HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[EP_SIZE, N_LAYERS * LOCAL_H], pl.FP32],

@@ -186,6 +186,55 @@ gemm_int8_tiled = make_gemm_int8_tiled(k_stages=1, pipe_slots=2)
 prefill_gemm_int8_tiled = make_gemm_int8_tiled(k_stages=2, pipe_slots=1)
 
 
+def make_gemm_int8_tiled_nz(*, k_stages, pipe_slots):
+    @pl.jit.inline(auto_scope=False)
+    def gemm_int8_tiled_nz(
+        payload: pl.Tensor,
+        activation_scale: pl.Tensor,
+        weight: pl.Tensor,
+        weight_scale: pl.Tensor,
+        output: pl.Tensor,
+        num_tokens: pl.Scalar[pl.INT32],
+        width: pl.constexpr,
+        output_width: pl.constexpr,
+        name_hint: pl.constexpr,
+        n_tile: pl.constexpr,
+        k_tile: pl.constexpr,
+        row_tile: pl.constexpr,
+    ):
+        """Apply per-token and per-channel scales to an NZ weight projection."""
+        row_blocks = (num_tokens + row_tile - 1) // row_tile
+        col_blocks = output_width // n_tile
+        workers = pl.max(1, pl.min(row_blocks * col_blocks, pl.system.available_cluster_count()))
+        for worker in pl.spmd(workers, name_hint=name_hint, optimizations=[pl.cross_core_slot(slot_num=pipe_slots)]):
+            for panel in pl.range(0, col_blocks):
+                col = panel * n_tile
+                # Stripe the row tiles and start the NZ column offset at a nonnegative panel.
+                first_row = (worker + workers - (panel * row_blocks) % workers) % workers
+                for block in pl.range(first_row, row_blocks, workers):
+                    row = block * row_tile
+                    valid_rows = pl.max(0, pl.min(row_tile, num_tokens - row))
+                    seed = pl.tile.create([row_tile, n_tile], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc, compact=True)
+                    acc = pl.set_validshape(seed, valid_rows, n_tile)
+                    for k0 in pl.pipeline(0, width, k_tile, stage=k_stages):
+                        a = pl.load(payload, [row, k0], [row_tile, k_tile], valid_shape=[valid_rows, k_tile])
+                        b = pl.load(weight, [k0, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                        acc = pl.matmul_acc(acc, a, b, init_cond=(k0 == 0))
+                    value = pl.cast(acc, pl.FP32)
+                    a_scale = pl.load(activation_scale, [row, 0], [row_tile, 1], valid_shape=[valid_rows, 1])
+                    b_scale = pl.load(weight_scale, [0, col], [1, n_tile])
+                    scaled = pl.row_expand_mul(value, a_scale)
+                    scaled = pl.col_expand_mul(scaled, b_scale)
+                    rounded = pl.cast(scaled, pl.BF16, mode="rint")
+                    output = pl.store(pl.set_validshape(rounded, valid_rows, n_tile), [row, col], output)
+        return output
+
+    return gemm_int8_tiled_nz
+
+
+gemm_int8_tiled_nz = make_gemm_int8_tiled_nz(k_stages=2, pipe_slots=1)
+
+
 @pl.jit.inline(auto_scope=False)
 def prefill_gemm_int8_reuse_weight(
     payload: pl.Tensor,
@@ -308,13 +357,13 @@ def gemm_int8_pair_columns(
                         second_acc, source, second_weight_mat, init_cond=(k0 == 0),
                     )
                 else:
-                    first_weight_vec = pl.load(weight, [k0, first_col], [k_tile, n_tile])
-                    second_weight_vec = pl.load(weight, [k0, second_col], [k_tile, n_tile])
+                    first_weight_mat = pl.load(weight, [k0, first_col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                    second_weight_mat = pl.load(weight, [k0, second_col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
                     first_acc = pl.matmul_acc(
-                        first_acc, source, first_weight_vec, init_cond=(k0 == 0),
+                        first_acc, source, first_weight_mat, init_cond=(k0 == 0),
                     )
                     second_acc = pl.matmul_acc(
-                        second_acc, source, second_weight_vec, init_cond=(k0 == 0),
+                        second_acc, source, second_weight_mat, init_cond=(k0 == 0),
                     )
 
             a_scale = pl.load(
