@@ -10,6 +10,7 @@
 
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -323,6 +324,11 @@ def golden_engram(tensors, *, packed_weight=False):
     tensors["output"].copy_((source + gate * value.unsqueeze(1)).bfloat16().float())
 
 
+class _LongHistory(NamedTuple):
+    storage: torch.Tensor
+    length: int
+
+
 class HostEngram:
     """Hash text history and read selected INT8 checkpoint table rows on the CPU.
 
@@ -385,11 +391,17 @@ class HostEngram:
         ids = ids.long()
         if ids.ndim != 1 or bool(((ids < 0) | (ids >= self.token_map.numel())).any()):
             raise ValueError("Engram requires a one-dimensional sequence of valid token IDs")
-        history = self.history.get(request_id, torch.empty(0, dtype=torch.int64))
+        stored = self.history.get(request_id, torch.empty(0, dtype=torch.int64))
+        history = stored.storage[:stored.length] if isinstance(stored, _LongHistory) else stored
         if isinstance(start_pos, bool) or not isinstance(start_pos, int) or not 0 <= start_pos <= history.numel():
             raise ValueError("Engram continuation requires all preceding token history")
-        compressed = torch.cat((history[:start_pos], self.token_map[ids]))
-        positions = torch.arange(start_pos, compressed.numel())
+        incoming = self.token_map[ids]
+        end = start_pos + incoming.numel()
+        # For short requests keep the original contiguous history. On long requests
+        # only the preceding n-gram can affect this chunk's hashes.
+        begin = max(0, start_pos - M.engram_max_ngram_size + 1) if end > 16384 else 0
+        compressed = torch.cat((history[begin:start_pos], incoming))
+        positions = torch.arange(start_pos - begin, compressed.numel())
         lookback = []
         for shift in range(M.engram_max_ngram_size):
             source = (positions - shift).clamp_min(0)
@@ -403,8 +415,20 @@ class HostEngram:
             begin = (shift - 1) * M.engram_n_heads
             primes = self.primes[:, begin:begin + M.engram_n_heads].unsqueeze(1)
             hashes.append(rolling.unsqueeze(-1) % primes)
-        self.history[request_id] = compressed
-        return torch.cat(hashes, dim=-1) + self.offsets.unsqueeze(1)
+        result = torch.cat(hashes, dim=-1) + self.offsets.unsqueeze(1)
+        if end > 16384:
+            if isinstance(stored, _LongHistory) and end <= stored.storage.numel():
+                storage = stored.storage
+            else:
+                # Geometric growth preserves arbitrary rewind without copying the
+                # full prefix on each Decode. Release drops the sole buffer.
+                storage = torch.empty(1 << (end - 1).bit_length(), dtype=torch.int64)
+                storage[:start_pos].copy_(history[:start_pos])
+            storage[start_pos:end].copy_(incoming)
+            self.history[request_id] = _LongHistory(storage, end)
+        else:
+            self.history[request_id] = compressed
+        return result
 
     def lookup(self, token_ids, capacity, start_pos=0, *, request_id=0):
         """Read current rows and group-32 FP32 scales into [2, capacity, 6144] BF16.
