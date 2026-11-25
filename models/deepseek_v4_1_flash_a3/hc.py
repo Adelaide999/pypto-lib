@@ -91,6 +91,7 @@ def hc_sinkhorn(
     pre_mix: pl.Tensor,
     post_mix: pl.Tensor,
     residual_mix: pl.Tensor,
+    one_token: pl.constexpr = False,
 ):
     """Normalize independent HC matrices in two-row tiles."""
     tokens = pl.tensor.dim(pre_mix, 0)
@@ -103,6 +104,8 @@ def hc_sinkhorn(
     scale1 = pl.read(scale, [1])
     scale2 = pl.read(scale, [2])
     blocks = (tokens + SINKHORN_T_TILE - 1) // SINKHORN_T_TILE
+    if one_token:
+        blocks = 1
     workers = pl.min(blocks, SINKHORN_WORKER_TILE)
     with pl.spmd(workers, name_hint="mhc_sinkhorn") as ready:
         worker = pl.tile.get_block_idx()
@@ -149,6 +152,8 @@ def hc_sinkhorn(
         for block in pl.range(worker, blocks, workers):
             t0 = block * SINKHORN_T_TILE
             valid_rows = pl.min(SINKHORN_T_TILE, tokens - t0)
+            if one_token:
+                valid_rows = 1
             load_t0 = t0 // SINKHORN_LOAD_T_TILE * SINKHORN_LOAD_T_TILE
             local_t0 = t0 - load_t0
             total = pl.tile.full([SINKHORN_T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
@@ -236,6 +241,7 @@ def hc_sinkhorn_decode(
     pre_mix: pl.Tensor,
     post_mix: pl.Tensor,
     residual_mix: pl.Tensor,
+    one_token: pl.constexpr = False,
 ):
     """Normalize independent HC matrices in two-row tiles."""
     tokens = pl.tensor.dim(pre_mix, 0)
@@ -248,6 +254,8 @@ def hc_sinkhorn_decode(
     scale1 = pl.read(scale, [1])
     scale2 = pl.read(scale, [2])
     blocks = (tokens + SINKHORN_T_TILE - 1) // SINKHORN_T_TILE
+    if one_token:
+        blocks = 1
     workers = pl.min(blocks, SINKHORN_WORKER_TILE)
     with pl.spmd(workers, name_hint="mhc_sinkhorn") as ready:
         worker = pl.tile.get_block_idx()
@@ -294,6 +302,8 @@ def hc_sinkhorn_decode(
         for block in pl.range(worker, blocks, workers):
             t0 = block * SINKHORN_T_TILE
             valid_rows = pl.min(SINKHORN_T_TILE, tokens - t0)
+            if one_token:
+                valid_rows = 1
             load_t0 = t0 // SINKHORN_LOAD_T_TILE * SINKHORN_LOAD_T_TILE
             local_t0 = t0 - load_t0
             total = pl.tile.full([SINKHORN_T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
@@ -571,28 +581,32 @@ def hc_decode_mixes(
 ):
     """Select the short-slab Decode kernel or the shared multi-token path."""
     if num_tokens == 1:
-        x_active = pl.slice(x_hc, [1, HC_MULT, D], [0, 0, 0])
-        hc_decode_mixes_separate_token(
-            x_active, function, scale, base, pre_mix, post_mix, residual_mix,
-        )
+        # Keep the split-K and reduction order of the physical-slab path.
+        inv_rms, partials = hc_project(x_hc, function, one_token=True)
+        hc_sinkhorn(inv_rms, partials, scale, base, pre_mix, post_mix, residual_mix, one_token=True)
     else:
-        inv_rms_common, partials_common = hc_project(x_hc, function)
+        inv_rms_common, partials_common = hc_project(x_hc, function, one_token=False)
         hc_sinkhorn(
-            inv_rms_common, partials_common, scale, base, pre_mix, post_mix, residual_mix,
+            inv_rms_common, partials_common, scale, base, pre_mix, post_mix, residual_mix, one_token=False,
         )
 
 
 @pl.jit.inline
-def hc_project(x_hc: pl.Tensor, function: pl.Tensor):
+def hc_project(x_hc: pl.Tensor, function: pl.Tensor, one_token: pl.constexpr = False):
     """Compute the inverse RMS and split-K coefficient projection."""
     t_dim = pl.tensor.dim(x_hc, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
 
     inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
-    for block in pl.spmd((t_dim + T_TILE - 1) // T_TILE, name_hint="mhc_rms"):
+    rms_blocks = (t_dim + T_TILE - 1) // T_TILE
+    if one_token:
+        rms_blocks = 1
+    for block in pl.spmd(rms_blocks, name_hint="mhc_rms"):
         t0 = block * T_TILE
         valid_rows = pl.min(T_TILE, t_dim - t0)
+        if one_token:
+            valid_rows = 1
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(HC_DIM // RMS_K_TILE, stage=4):
             k0 = kb * RMS_K_TILE
@@ -609,11 +623,16 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor):
         )
 
     mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
-    for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="mhc_linear"):
+    linear_blocks = t_linear // LINEAR_T_TILE
+    if one_token:
+        linear_blocks = 1
+    for task in pl.spmd(linear_blocks * LINEAR_OK, name_hint="mhc_linear"):
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
         split = task % LINEAR_OK
         k_base = split * LINEAR_K_PER_SPLIT
         valid_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
+        if one_token:
+            valid_rows = 1
         acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(LINEAR_K_PER_SPLIT // LINEAR_K_TILE, stage=2):
             k0 = k_base + kb * LINEAR_K_TILE
@@ -643,6 +662,7 @@ def hc_project_decode(
     inv_rms: pl.Tensor,
     mixes_partials: pl.Tensor,
     short_attention: pl.constexpr,
+    one_token: pl.constexpr = False,
 ):
     """Compute the inverse RMS and split-K coefficient projection."""
     t_dim = pl.tensor.dim(x_hc, 0)
@@ -652,9 +672,14 @@ def hc_project_decode(
     if short_attention:
         hc_decode_token_rms(x_hc, t_dim, inv_rms)
     else:
-        for block in pl.spmd((t_dim + T_TILE - 1) // T_TILE, name_hint="mhc_rms"):
+        rms_blocks = (t_dim + T_TILE - 1) // T_TILE
+        if one_token:
+            rms_blocks = 1
+        for block in pl.spmd(rms_blocks, name_hint="mhc_rms"):
             t0 = block * T_TILE
             valid_rows = pl.min(T_TILE, t_dim - t0)
+            if one_token:
+                valid_rows = 1
             sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
             for kb in pl.pipeline(HC_DIM // DECODE_RMS_K_TILE, stage=1):
                 k0 = kb * DECODE_RMS_K_TILE
@@ -670,14 +695,19 @@ def hc_project_decode(
                 pl.rsqrt(rms_arg, high_precision=True), [T_TILE, 1]
             )
 
+    linear_blocks = t_linear // LINEAR_T_TILE
+    if one_token:
+        linear_blocks = 1
     for task in pl.spmd(
-        (t_linear // LINEAR_T_TILE) * DECODE_LINEAR_OK,
+        linear_blocks * DECODE_LINEAR_OK,
         name_hint="mhc_linear", allow_early_resolve=short_attention,
     ):
         t0 = (task // DECODE_LINEAR_OK) * LINEAR_T_TILE
         split = task % DECODE_LINEAR_OK
         k_base = split * DECODE_LINEAR_K_PER_SPLIT
         valid_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
+        if one_token:
+            valid_rows = 1
         acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(DECODE_LINEAR_K_PER_SPLIT // LINEAR_K_TILE, stage=2):
             k0 = k_base + kb * LINEAR_K_TILE
@@ -940,14 +970,20 @@ def hc_head_norm(
     pre_mix: pl.Tensor,
     norm_weight: pl.Tensor[[D], pl.BF16],
     output: pl.Tensor,
+    one_token: pl.constexpr = False,
 ):
     """Collapse HC rows and normalize their rounded BF16 values."""
     tokens = pl.tensor.dim(x_hc, 0)
     x_flat = pl.reshape(x_hc, [tokens, HC_DIM])
-    with pl.spmd((tokens + PRE_NORM_T_TILE - 1) // PRE_NORM_T_TILE, name_hint="hc_collapse_norm") as ready:
+    blocks = (tokens + PRE_NORM_T_TILE - 1) // PRE_NORM_T_TILE
+    if one_token:
+        blocks = 1
+    with pl.spmd(blocks, name_hint="hc_collapse_norm") as ready:
         block = pl.tile.get_block_idx()
         t0 = block * PRE_NORM_T_TILE
         valid_rows = pl.min(PRE_NORM_T_TILE, tokens - t0)
+        if one_token:
+            valid_rows = 1
         pre_tile = pl.slice(pre_mix, [PRE_NORM_T_TILE, HC_PAD], [t0, 0], valid_shape=[valid_rows, HC_MULT])
         pre_tile = pl.set_validshape(pre_tile, PRE_NORM_T_TILE, HC_PAD)
         pre_rows = pl.transpose(pre_tile, 0, 1)
@@ -1047,10 +1083,9 @@ def hc_head_norm_adaptive(
 ):
     """Use the short Decode norm tile only for a single-token slab."""
     if num_tokens == 1:
-        x_active = pl.slice(x_hc, [1, HC_MULT, D], [0, 0, 0])
-        ready = hc_head_norm_decode(x_active, pre_mix, norm_weight, output)
+        ready = hc_head_norm(x_hc, pre_mix, norm_weight, output, one_token=True)
     else:
-        ready = hc_head_norm(x_hc, pre_mix, norm_weight, output)
+        ready = hc_head_norm(x_hc, pre_mix, norm_weight, output, one_token=False)
     return ready
 
 
@@ -1063,14 +1098,15 @@ def hc_ffn_decode_mixes(
     pre_mix: pl.Tensor,
     post_mix: pl.Tensor,
     residual_mix: pl.Tensor,
+    one_token: pl.constexpr = False,
 ):
     """Compute FFN coefficients after Decode attention has collapsed the streams."""
     t_dim = pl.tensor.dim(x_hc, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     partials = pl.create_tensor([DECODE_LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
-    hc_project_decode(x_hc, function, inv_rms, partials, short_attention=False)
-    return hc_sinkhorn_decode(inv_rms, partials, scale, base, pre_mix, post_mix, residual_mix)
+    hc_project_decode(x_hc, function, inv_rms, partials, short_attention=False, one_token=one_token)
+    return hc_sinkhorn_decode(inv_rms, partials, scale, base, pre_mix, post_mix, residual_mix, one_token=one_token)
 
 
 @pl.jit.inline
@@ -1105,7 +1141,9 @@ def hc_pre(
                 PREFILL_SINKHORN_T_TILE * HC_MULT, PREFILL_SINKHORN_T_TILE * HC_MULT * HC_MULT,
             )
     else:
-        mixes_ready = hc_ffn_decode_mixes(x_hc, function, scale, base, next_pre_mix, post_mix, residual_mix)
+        mixes_ready = hc_ffn_decode_mixes(
+            x_hc, function, scale, base, next_pre_mix, post_mix, residual_mix, one_token=False,
+        )
         hc_head(x_hc, incoming_pre_mix, output)
     return mixes_ready
 
@@ -1747,9 +1785,9 @@ def l2_hc_decode_pre_common(
     pre_mix.bind_dynamic(0, T_DYN)
     post_mix.bind_dynamic(0, T_DYN)
     residual_mix.bind_dynamic(0, T_DYN)
-    inv_rms, partials = hc_project(x_hc, function)
-    hc_sinkhorn(inv_rms, partials, scale, base, pre_mix, post_mix, residual_mix)
-    hc_head_norm(x_hc, incoming_pre_mix, attn_norm_weight, output)
+    inv_rms, partials = hc_project(x_hc, function, one_token=False)
+    hc_sinkhorn(inv_rms, partials, scale, base, pre_mix, post_mix, residual_mix, one_token=False)
+    hc_head_norm(x_hc, incoming_pre_mix, attn_norm_weight, output, one_token=False)
     return output
 
 
