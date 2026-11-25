@@ -188,7 +188,7 @@ def make_pipelined_rope(capacity, heads, head_dim, *, inverse, name_hint, allow_
                 if inplace:
                     pl.store(rotated, [row, nope], target)
                 else:
-                    prefix = pl.load(source, [row, 0], [rows, nope])
+                    prefix = pl.tile.slice(block_value, [rows, nope], [0, 0])
                     pl.store(prefix, [row, 0], target)
                     pl.store(rotated, [row, nope], target)
         return output

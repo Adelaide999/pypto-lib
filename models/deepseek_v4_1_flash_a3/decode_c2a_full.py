@@ -24,11 +24,11 @@ from .compressor import (
 from .hc import hc_decode_mixes, hc_head_norm_adaptive
 from .qkv_proj_rope import decode_qkv_proj_rope
 from .sparse_attention import (
-    gather_packed, attend_selected, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
+    gather_packed, attend_decode_selected, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
     WORKERS as ATTEND_WORKER_TILE,
 )
 from .decode_indexer import decode_c2a_indexer
-from .o_proj import decode_o_proj as o_proj, decode_tp_output_post
+from .o_proj import decode_o_proj_from_attention as o_proj, decode_tp_output_post
 
 # model config
 LOCAL_H = M.num_attention_heads // TP_SIZE
@@ -158,7 +158,9 @@ def decode_c2a_full(
         window_indices, topk_indices, selected, indices, num_tokens, chunk_done, max_workers=GATHER_WORKER_TILE,
         name_hint="c2a_gather", gather_keys=640, decode=True,
     )
-    attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64, ATTEND_WORKER_TILE)
+    attend_decode_selected(
+        query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64, ATTEND_WORKER_TILE, rope_cos, rope_sin,
+    )
 
     hc_decode_mixes(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix,

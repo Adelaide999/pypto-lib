@@ -14,13 +14,13 @@ from .gemm import quantize_activation
 import pypto.language.distributed as pld
 from .config import TP_SIZE
 from .qkv_proj_rope import decode_qkv_proj_rope
-from .o_proj import decode_o_proj as o_proj, decode_tp_output_post
+from .o_proj import decode_o_proj_from_attention as o_proj, decode_tp_output_post
 from .decode_indexer import (
     select_candidate_block_pool, c1a_index, score_select_c1a_groups,
     publish_index_rows, c1a_project_index_key, c1a_norm_rotate_index_key,
 )
 from .sparse_attention import (
-    attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
+    attend_decode_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
     WORKERS as ATTEND_WORKER_TILE,
 )
 from .hc import hc_decode_mixes, hc_head_norm_adaptive
@@ -172,7 +172,9 @@ def decode_c1a_full(
         window_indices, topk_indices, selected, indices, num_tokens, selection_ready,
         max_workers=GATHER_WORKER_TILE, name_hint="c1a_gather", gather_keys=640, decode=True,
     )
-    attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64, ATTEND_WORKER_TILE)
+    attend_decode_selected(
+        query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64, ATTEND_WORKER_TILE, rope_cos, rope_sin,
+    )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     o_proj(
         attended, wo_a, wo_b, rope_cos, rope_sin, attn_out, num_tokens,
