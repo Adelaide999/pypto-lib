@@ -105,6 +105,38 @@ def rms_norm_tiled_compensated(
 
 
 @pl.jit.inline
+def _decode_rms_norm_owner_tile(
+    source: pl.Tensor[[T_DYN, D], pl.BF16],
+    weight: pl.Tensor[[1, D], pl.BF16],
+    owner: pl.Scalar[pl.INT32],
+):
+    values = pl.load(source, [owner, 0], [1, DECODE_NORM_WIDTH_TILE], valid_shape=[1, D])
+    padded = pl.fillpad(values, pad_value=pl.PadValue.zero)
+    padded = pl.set_validshape(padded, 1, DECODE_NORM_WIDTH_TILE)
+    value_fp32 = pl.cast(padded, pl.FP32)
+    chunks = pl.reshape(value_fp32, [DECODE_NORM_REDUCE_ROWS, NORM_D_TILE])
+    squares = pl.mul(chunks, chunks)
+    reduce_tmp = pl.create_tile([DECODE_NORM_REDUCE_ROWS, NORM_D_TILE], dtype=pl.FP32)
+    partials = pl.row_sum(squares, tmp_tile=reduce_tmp)
+    sum_squares = pl.tile.read(partials, [0, 0])
+    for kb in pl.unroll(1, D // NORM_D_TILE):
+        sum_squares = sum_squares + pl.tile.read(partials, [kb, 0])
+    sum_tile = pl.tile.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
+    sum_tile = pl.add(sum_tile, sum_squares)
+    mean_square = pl.mul(sum_tile, 1.0 / D)
+    rms_arg = pl.add(mean_square, EPS)
+    inverse_tmp = pl.create_tile([1, NORM_T_TILE], dtype=pl.FP32)
+    inverse = pl.tile.rsqrt(rms_arg, inverse_tmp, high_precision=True)
+    gamma = pl.load(weight, [0, 0], [1, D])
+    gamma_fp32 = pl.cast(gamma, pl.FP32)
+    real_values = pl.tile.slice(value_fp32, [1, D], [0, 0])
+    scaled = pl.mul(real_values, pl.tile.read(inverse, [0, 0]))
+    weighted = pl.mul(scaled, gamma_fp32)
+    rounded = pl.cast(weighted, pl.BF16, mode="rint")
+    return rounded
+
+
+@pl.jit.inline
 def decode_rms_norm_owner_row(
     source: pl.Tensor[[T_DYN, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.BF16],
@@ -114,31 +146,32 @@ def decode_rms_norm_owner_row(
     """Normalize one Decode owner row with the original 512-column reduction order."""
     weight = pl.reshape(norm_w, [1, D])
     for row in pl.spmd(1, name_hint="decode_moe_owner_norm"):
-        values = pl.load(source, [owner, 0], [1, DECODE_NORM_WIDTH_TILE], valid_shape=[1, D])
-        padded = pl.fillpad(values, pad_value=pl.PadValue.zero)
-        padded = pl.set_validshape(padded, 1, DECODE_NORM_WIDTH_TILE)
-        value_fp32 = pl.cast(padded, pl.FP32)
-        chunks = pl.reshape(value_fp32, [DECODE_NORM_REDUCE_ROWS, NORM_D_TILE])
-        squares = pl.mul(chunks, chunks)
-        reduce_tmp = pl.create_tile([DECODE_NORM_REDUCE_ROWS, NORM_D_TILE], dtype=pl.FP32)
-        partials = pl.row_sum(squares, tmp_tile=reduce_tmp)
-        sum_squares = pl.tile.read(partials, [0, 0])
-        for kb in pl.unroll(1, D // NORM_D_TILE):
-            sum_squares = sum_squares + pl.tile.read(partials, [kb, 0])
-        sum_tile = pl.tile.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
-        sum_tile = pl.add(sum_tile, sum_squares)
-        mean_square = pl.mul(sum_tile, 1.0 / D)
-        rms_arg = pl.add(mean_square, EPS)
-        inverse_tmp = pl.create_tile([1, NORM_T_TILE], dtype=pl.FP32)
-        inverse = pl.tile.rsqrt(rms_arg, inverse_tmp, high_precision=True)
-        gamma = pl.load(weight, [0, 0], [1, D])
-        gamma_fp32 = pl.cast(gamma, pl.FP32)
-        real_values = pl.tile.slice(value_fp32, [1, D], [0, 0])
-        scaled = pl.mul(real_values, pl.tile.read(inverse, [0, 0]))
-        weighted = pl.mul(scaled, gamma_fp32)
-        rounded = pl.cast(weighted, pl.BF16, mode="rint")
+        rounded = _decode_rms_norm_owner_tile(source, weight, owner)
         pl.store(rounded, [row, 0], output)
     return output
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_ffn_norm_gate_input(
+    source: pl.Tensor,
+    norm_w: pl.Tensor[[D], pl.BF16],
+    output: pl.Tensor,
+    gate_input: pl.Tensor,
+    owner: pl.Scalar[pl.INT32],
+):
+    """Prepare both gate and quantization inputs from the same BF16 owner row."""
+    weight = pl.reshape(norm_w, [1, D])
+    for worker in pl.spmd(1 + D // 512, name_hint="decode_moe_norm_gate_input"):
+        if worker == 0:
+            rounded = _decode_rms_norm_owner_tile(source, weight, owner)
+            pl.store(rounded, [0, 0], output)
+            pl.store(pl.cast(rounded, pl.FP32), [0, 0], gate_input)
+        else:
+            column = (worker - 1) * 512
+            zeros = pl.tile.full([8, 512], dtype=pl.FP32, value=0.0)
+            pl.store(pl.set_validshape(zeros, 7, 512), [1, column], gate_input)
+            pl.store(zeros, [8, column], gate_input)
+    return output, gate_input
 
 
 @pl.jit.inline(auto_scope=False)

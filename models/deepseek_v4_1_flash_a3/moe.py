@@ -24,7 +24,8 @@ from .expert_routed import (
     expert_routed_scatter,
 )
 from .hc import hc_ffn_decode_mixes, hc_pre, hc_post
-from .rmsnorm import decode_rms_norm_owner_row, prefill_ffn_norm_quant, rms_norm_tiled
+from .activation_quant import _quantize_projection_activation_into
+from .rmsnorm import decode_ffn_norm_gate_input, decode_rms_norm_owner_row, prefill_ffn_norm_quant, rms_norm_tiled
 from .o_proj import decode_tp_output_post_token, prefill_tp_output_all_reduce
 
 
@@ -712,13 +713,22 @@ def prefill_moe_sublayer(
         shared_output = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
         if local_num_tokens > 0:
             if not prefill:
-                _decode_ffn_owner_norm(
-                    ffn_input, ffn_norm_weight, local_ffn_normed, num_tokens, tp_rank, local_num_tokens,
-                )
-                npu_gate(
-                    local_ffn_normed, gate_weight, correction_bias, local_num_tokens,
-                    x_norm_mx, x_norm_scale, indices, weights,
-                )
+                if TOKENS == 16 and local_num_tokens == 1:
+                    gate_input = pl.create_tensor([TOKENS, D], dtype=pl.FP32)
+                    decode_ffn_norm_gate_input(ffn_input, ffn_norm_weight, local_ffn_normed, gate_input, tp_rank)
+                    row_scales = pl.reshape(x_norm_scale, [TOKENS, 1])
+                    _quantize_projection_activation_into(
+                        local_ffn_normed, x_norm_mx, row_scales, 1, TOKENS, D, True, False,
+                    )
+                    gate_from_fp32(gate_input, gate_weight, correction_bias, 1, indices, weights, TOKENS, decode=True)
+                else:
+                    _decode_ffn_owner_norm(
+                        ffn_input, ffn_norm_weight, local_ffn_normed, num_tokens, tp_rank, local_num_tokens,
+                    )
+                    npu_gate(
+                        local_ffn_normed, gate_weight, correction_bias, local_num_tokens,
+                        x_norm_mx, x_norm_scale, indices, weights,
+                    )
 
             expert_shared_nz(
                 x_norm_mx, x_norm_scale,
