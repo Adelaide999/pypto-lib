@@ -411,10 +411,11 @@ def decode_o_proj_nz_from_attention(
 
 
 @pl.jit.inline(auto_scope=False)
-def _project_ordered_decode_row(
+def _project_ordered_decode_rows(
     source: pl.Tensor,
     weight: pl.Tensor,
     output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
     source_col: pl.Scalar[pl.INT32],
     output_col: pl.Scalar[pl.INT32],
     width: pl.constexpr,
@@ -425,20 +426,22 @@ def _project_ordered_decode_row(
 ):
     """Multiply a panel at once and sum in the original FP32 reduction order."""
     panels = output_width // n_tile
-    workers = pl.min(panels, pl.system.available_cluster_count())
+    work = num_tokens * panels
+    workers = pl.min(work, pl.system.available_cluster_count())
     for worker in pl.spmd(workers, name_hint=name_hint):
-        for panel in pl.range(worker, panels, workers):
-            col = panel * n_tile
+        for block in pl.range(worker, work, workers):
+            row = block // panels
+            col = (block % panels) * n_tile
             total = pl.tile.full([1, n_tile], dtype=pl.FP32, value=0.0)
             for first in pl.pipeline(0, width, k_tile, stage=2):
-                value = pl.cast(pl.load(source, [0, source_col + first], [1, k_tile]), pl.FP32)
+                value = pl.cast(pl.load(source, [row, source_col + first], [1, k_tile]), pl.FP32)
                 matrix = pl.cast(pl.load(weight, [first, col], [k_tile, n_tile]), pl.FP32)
                 column = pl.reshape(value, [k_tile, 1])
                 products = pl.row_expand_mul(matrix, column)
                 for inner in pl.range(k_tile):
                     product = pl.tile.slice(products, [1, n_tile], [inner, 0])
                     total = pl.add(total, product)
-            pl.store(pl.cast(total, pl.BF16, mode="rint"), [0, output_col + col], output)
+            pl.store(pl.cast(total, pl.BF16, mode="rint"), [row, output_col + col], output)
     return output
 
 
@@ -452,19 +455,19 @@ def decode_swa_o_proj_ordered(
     output: pl.Tensor[[T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Apply the ordered SWA projections to the active Decode token."""
+    """Apply the ordered SWA projections independently to each active Decode token."""
     tokens = pl.tensor.dim(attended, 0)
     rotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     rotated = rotate_decode_b1(attended, rope_cos, rope_sin, rotated, num_tokens)
     projected = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
     for group in pl.parallel(LOCAL_O_GROUPS):
-        _project_ordered_decode_row(
-            rotated, wo_a[group], projected,
+        _project_ordered_decode_rows(
+            rotated, wo_a[group], projected, num_tokens,
             pl.cast(group * O_GROUP_IN, pl.INT32), pl.cast(group * O_LORA, pl.INT32),
             O_GROUP_IN, O_LORA, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE, "proj_o_a_ordered_b1",
         )
-    output = _project_ordered_decode_row(
-        projected, wo_b, output, 0, 0,
+    output = _project_ordered_decode_rows(
+        projected, wo_b, output, num_tokens, 0, 0,
         LOCAL_O_WIDTH, D, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE, "proj_o_b_ordered_b1",
     )
     return output

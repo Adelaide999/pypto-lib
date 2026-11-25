@@ -15,7 +15,7 @@ from .config import TP_SIZE
 from .config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
 from .sparse_attention import publish_window_row, swa_attention_partial
 from .qkv_proj_rope import decode_qkv_proj_rope
-from .o_proj import decode_o_proj_nz, decode_swa_o_proj_ordered, decode_tp_output_post
+from .o_proj import decode_swa_o_proj_ordered, decode_tp_output_post
 from .hc import hc_decode_mixes, hc_head_norm_quantize_decode
 
 
@@ -100,13 +100,9 @@ def decode_swa(
         attention_pre_mix, post_mix, residual_mix,
         num_tokens,
     )
-    if num_tokens == 1:
+    if num_tokens > 0:
         decode_swa_o_proj_ordered(
             attended, swa_wo_a, swa_wo_b, rope_cos, rope_sin, attention_output, num_tokens,
-        )
-    else:
-        decode_o_proj_nz(
-            attended, wo_a, wo_b, rope_cos, rope_sin, attention_output, num_tokens,
         )
     decode_tp_output_post(
         attention_output, output_window, output_arrived, group_base, tp_rank, num_tokens, attention_epoch,
