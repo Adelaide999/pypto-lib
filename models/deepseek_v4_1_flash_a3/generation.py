@@ -254,8 +254,11 @@ def open_resident_graphs(args, devices, weights, engram, memory, report, *, sele
                                                request_slots=request_slots)
         decode_template = prepare_decode_inputs(decode_values)
         # TP peers read the same active or idle inputs until the synchronous forward completes.
-        decode_inputs = DecodeInputs({name: value for name, value in decode_template.items()
-                                      if name in names[1] and name not in constants})
+        window_pages = (initial_cache["window_cache"].shape[1] - 1) // request_slots
+        decode_inputs = DecodeInputs(
+            {name: value for name, value in decode_template.items() if name in names[1] and name not in constants},
+            window_pages_per_slot=window_pages,
+        )
         host_io = {"logits": torch.empty((args.max_new_tokens, M.vocab_size), dtype=torch.float32).share_memory_(),
                    "sampled_ids": torch.empty(8, dtype=torch.int32).share_memory_()}
         if request_slots > 1:

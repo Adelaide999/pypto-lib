@@ -29,7 +29,7 @@ from .utils import DECODE_CACHE_NAMES, paged_slots, sliding_page_table, window_m
 class DecodeInputs:
     """Copy one aligned input image per rank and bind its fields as typed device views."""
 
-    def __init__(self, template):
+    def __init__(self, template, *, window_pages_per_slot):
         offsets = {}
         size = 0
         for name, value in template.items():
@@ -47,7 +47,7 @@ class DecodeInputs:
         self.devices = {}
         table = self.fields[0]["c1a_index_block_table"]
         slots = torch.arange(table.shape[0], dtype=table.dtype)
-        self.window_table = sliding_page_table(table, slots)
+        self.window_table = sliding_page_table(table, slots, pages_per_slot=window_pages_per_slot)
 
     def bind(self, runtime, rank):
         image = self.images[0]

@@ -39,8 +39,9 @@ def test_single_token_staging_matches_all_three_tp_images(capacity):
     rope = empty["freqs_cos"], empty["freqs_sin"]
     idle = {key: value for key, value in prepare_decode_inputs(empty).items()
             if key not in ("freqs_cos", "freqs_sin")}
-    full = DecodeInputs(idle)
-    single = DecodeInputs(idle)
+    window_pages = empty["window_cache"].shape[1] - 1
+    full = DecodeInputs(idle, window_pages_per_slot=window_pages)
+    single = DecodeInputs(idle, window_pages_per_slot=window_pages)
     for position, owner in ((0, 0), (127, 12), (128, 12), (129, 4)):
         token = position + 3
         active = prepare_resident_inputs(
@@ -51,6 +52,23 @@ def test_single_token_staging_matches_all_three_tp_images(capacity):
         full.stage({False: idle, True: {name: lowered[name] for name in idle}}, "logit_row_indices")
         single.stage_token(weights, engram, token, position, owner)
         assert torch.equal(single.images, full.images)
+
+
+def test_single_token_staging_wraps_only_the_sliding_cache():
+    empty = prepare_prefill_inputs(torch.empty(0, FLASH.hidden_size), 16, max_seq_len=128)
+    idle = prepare_decode_inputs(empty)
+    idle["c1a_index_block_table"] = torch.arange(257, dtype=torch.int32).view(1, -1)
+    idle["c2a_index_block_table"] = torch.arange(129, dtype=torch.int32).view(1, -1)
+    staging = DecodeInputs(idle, window_pages_per_slot=5)
+    weights = SimpleNamespace(lookup_rows=lambda ids: torch.zeros(1, FLASH.hidden_size))
+    engram = SimpleNamespace(lookup=lambda *args, **kwargs: torch.zeros(2, 1, ENGRAM_K))
+    for position in (639, 640, 32769):
+        staging.stage_token(weights, engram, 42, position, 0)
+        for fields in staging.fields[1:]:
+            assert fields["window_slots"][0].item() == position % 640
+            expected = torch.arange(position - FLASH.sliding_window + 1, position + 1) % 640
+            assert torch.equal(fields["window_indices"][0], expected)
+            assert fields["c1a_compressed_slots"][0].item() == position
 
 
 def test_typed_view_retains_its_allocation_and_rejects_overruns():
@@ -85,7 +103,7 @@ def test_fixed_trace_drives_decode_after_a_different_prefill_argmax(tmp_path, mo
     # Both phases return token 1 for every call, independently of the forced history.
     host_io = dict(logits=torch.tensor([[0., 1., 0., 0., 0.]] * 3), sampled_ids=torch.tensor([1]))
     monkeypatch.setattr(replay, "prepare_resident_inputs", lambda *args, **kwargs: {})
-    monkeypatch.setattr(replay, "route_distribution", lambda *args: {})
+    monkeypatch.setattr(replay, "route_distribution", lambda *args, **kwargs: {})
     runtime, engram, decode_inputs = Mock(), Mock(), Mock()
     report = replay.run_request(
         runtime, ("prefill", "decode"), ({}, counts), ([], []), (ranks, ranks),
