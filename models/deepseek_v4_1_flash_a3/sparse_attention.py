@@ -115,7 +115,7 @@ SWA_SHARED_HEAD_TILE = 16
 SWA_GATHER_TILE = 16
 SWA_SELECTED_GATHER_TILE = 64 if TP_SIZE == 1 else SWA_GATHER_TILE
 SWA_WORKER_TILE = 32
-SWA_CROSS_CORE_SLOT_TILE = 1
+SWA_CROSS_CORE_SLOT_TILE = 3
 SWA_RUN_TILE = 32
 SWA_RUN_PARTS = SWA_WINDOW // SWA_RUN_TILE
 SWA_RUN_DESCRIPTOR_WIDTH = 8
@@ -635,7 +635,8 @@ def attend_window_tiled(
     head_blocks = LOCAL_H // SWA_HEAD_TILE
     tasks = num_tokens * head_blocks
     workers = pl.max(1, pl.min(tasks, SWA_WORKER_TILE))
-    with pl.spmd(workers, name_hint="swa_attn", deps=[ready], optimizations=[pl.cross_core_slot(slot_num=1)]) as attention_done:
+    with pl.spmd(workers, name_hint="swa_attn", deps=[ready],
+                 optimizations=[pl.cross_core_slot(slot_num=SWA_CROSS_CORE_SLOT_TILE)]) as attention_done:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, tasks, workers):
             token = block // head_blocks
