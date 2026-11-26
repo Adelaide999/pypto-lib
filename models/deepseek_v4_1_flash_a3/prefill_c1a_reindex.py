@@ -132,12 +132,6 @@ def prefill_c1a_reindex_attention(
             num_tokens,
         )
         cache_ready = pl.system.task_dummy(deps=[])
-        indexer_completion = prefill_indexer(
-            x, qb_payload, qb_scales, request_ids, compressed_lens,
-            index_cache, index_cache_scale, index_block_table,
-            rope_cos, rope_sin, index_wq_b, index_wq_b_scale, index_weights_proj,
-            pool_block_ids, pool_block_counts, topk_indices, num_tokens, cache_ready, pool=use_candidates, c2a=False,
-        )
         window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         kv_proj_rope(
@@ -148,8 +142,16 @@ def prefill_c1a_reindex_attention(
             num_tokens,
         )
         window_ready = prefill_publish_window(
-            window_kv, window_slots, window_cache, window_cache_scale, num_tokens, indexer_completion,
+            window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready,
         )
+
+        indexer_completion = prefill_indexer(
+            x, qb_payload, qb_scales, request_ids, compressed_lens,
+            index_cache, index_cache_scale, index_block_table,
+            rope_cos, rope_sin, index_wq_b, index_wq_b_scale, index_weights_proj,
+            pool_block_ids, pool_block_counts, topk_indices, num_tokens, cache_ready, pool=use_candidates, c2a=False,
+        )
+        attention_ready = pl.system.task_dummy(deps=[window_ready, indexer_completion])
 
         attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         attend_packed(
@@ -157,7 +159,7 @@ def prefill_c1a_reindex_attention(
             window_indices, window_cache, window_cache_scale,
             topk_indices, compressed_cache, compressed_cache_scale,
             attn_sink, attended,
-            num_tokens, window_ready, KEY_TILE, TOKEN_TILE, shared_prefix=shared_prefix,
+            num_tokens, attention_ready, KEY_TILE, TOKEN_TILE, shared_prefix=shared_prefix,
         )
         o_proj(
             attended, wo_a, wo_b, rope_cos, rope_sin, partial, num_tokens,
