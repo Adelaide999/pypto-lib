@@ -50,7 +50,7 @@ prefill_sp_input_allgather = make_prefill_sp_input_allgather(PREFILL_MAX_TOKENS)
 
 
 # tiling
-QUERY_TILE = 512
+QUERY_TILE = 1024
 WORKER_TILE = 64
 
 
