@@ -14,7 +14,7 @@ from .activation_quant import quantize_projection_activation
 import pypto.language.distributed as pld
 from .sparse_attention import (
     SWA_RUN_DESCRIPTOR_WIDTH as RUN_DESCRIPTOR_WIDTH, SWA_RUN_PARTS as RUN_PARTS,
-    analyze_index_runs, attend_shared_cache, decode_shared_cache_after_publish,
+    analyze_index_runs, attend_shared_cache_direct, decode_shared_cache_after_publish,
     prefill_publish_window,
 )
 from .config import (
@@ -103,11 +103,11 @@ def prefill_swa_attention(
     chunk_done = prefill_publish_window(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
     cache_blocks = pl.tensor.dim(window_cache, 0)
     cache_rows = cache_blocks * 128
-    decoded_cache = pl.create_tensor([cache_blocks, 128, 1, HEAD_DIM], dtype=pl.BF16)
+    keys = pl.create_tensor([cache_rows + QUERY_TILE * 128, HEAD_DIM], dtype=pl.BF16)
     zero_row = pl.create_tensor([32, HEAD_DIM], dtype=pl.BF16)
     # Decode once for the entire packed prompt. The explicit publication
     # dependency protects the hoisted reader independently of query staging.
-    decoded_ready = decode_shared_cache_after_publish(window_cache, window_cache_scale, decoded_cache, zero_row, chunk_done)
+    decoded_ready = decode_shared_cache_after_publish(window_cache, window_cache_scale, keys, zero_row, chunk_done)
 
     chunk_codes = pl.create_tensor([QUERY_TILE, D], dtype=pl.INT8)
     chunk_scales = pl.create_tensor([QUERY_TILE, 1], dtype=pl.FP32)
@@ -146,8 +146,8 @@ def prefill_swa_attention(
             active,
         )
         index_ready = analyze_index_runs(chunk_indices, descriptors, active, cache_rows)
-        attend_shared_cache(
-            q, decoded_cache, zero_row,
+        attend_shared_cache_direct(
+            q, keys, cache_rows, zero_row,
             descriptors, chunk_indices, attn_sink,
             attended, active, decoded_ready, index_ready,
         )
