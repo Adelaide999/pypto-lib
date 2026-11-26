@@ -5,7 +5,7 @@ devices (DP4, TP4, EP16). Each program owns its layer schedule and calls the
 phase-specific operators beside the forward entries. One request runs in one TP group.
 All sixteen ranks participate in expert communication.
 
-The candidate A3 topologies also include DP8/TP2 and DP16/TP1 with EP16.
+The model also supports DP8/TP2 and DP16/TP1 with EP16.
 Select a topology when compiling both phases and when starting generation, for
 example `--tp 2 --dp 8 --ep 16`. Each topology uses its own graph pair.
 For contexts above 16,384 positions, each request slot retains enough sliding
@@ -85,6 +85,17 @@ The accuracy collector uses the same Prefill and Decode entry points as generati
 It feeds the prepared trace token into each Decode step and records full-vocabulary
 FP32 logits. See the [fixed-trace comparison](../../docs/models/deepseek_v4_1_flash_a3/accuracy.md)
 and the [module map](MODULE_ALIGNMENT.md).
+
+The long-context regression uses DP4/TP4/EP16, 512-token chunks, and the
+repeating input IDs `[42, 43, 97, 681, 1024, 320, 419, 135]`. One request
+processes all input tokens with Prefill. A second request processes the last
+input token with Decode. At that position, compare each phase's 129,280 logits
+with its saved output from the same checkpoint and input.
+
+| Input tokens | Changed Prefill logits | Changed Decode logits | Prefill vs Decode relative L2, before and after | Top token in both phases |
+| ---: | ---: | ---: | ---: | ---: |
+| 32,770 | 0 | 0 | 8.15% | 97 |
+| 1,048,576 | 0 | 0 | 47.20% | 104 |
 
 ## Packed request execution
 
