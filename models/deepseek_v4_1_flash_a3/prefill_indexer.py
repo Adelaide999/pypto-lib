@@ -57,6 +57,8 @@ rotate_index_query = make_pipelined_rope(
 
 INDEX_SCORE_SCALE = INDEX_DIM ** -0.5 * INDEX_H ** -0.5
 INDEX_MAX_LOGITS_BYTES = 64 * 1024 * 1024
+# A larger single-request C2A slab amortizes the ordered score/Top-K handoff.
+C2A_LINEAR_MAX_LOGITS_BYTES = 144 * 1024 * 1024
 TOPK_LEAF = 8192
 TOPK_PAIR_WIDTH = 2 * INDEX_TOPK
 TOPK_GROUP_LEAVES = 2
@@ -1402,7 +1404,10 @@ def prefill_indexer(
         decoded_keys, decoded_tid = _decode_index_pages(cache, cache_scale, table, completion[0], linear_available)
         completion[0] = decoded_tid
         active = pl.cast(num_tokens, pl.INDEX)
-        chunk = pl.min(active, pl.max(1, INDEX_MAX_LOGITS_BYTES // (width * 4)))
+        logits_bytes = pl.cast(INDEX_MAX_LOGITS_BYTES, pl.INDEX)
+        if c2a and not pool and linear_available != 0:
+            logits_bytes = pl.cast(C2A_LINEAR_MAX_LOGITS_BYTES, pl.INDEX)
+        chunk = pl.min(active, pl.max(1, logits_bytes // (width * 4)))
         if pool:
             chunk = pl.min(chunk, INDEX_POOL_QUERY_TILE)
         elif linear_available != 0 and chunk < active and chunk >= INDEX_SCORE_QUERY_TILE:
