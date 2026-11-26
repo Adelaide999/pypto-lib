@@ -13,8 +13,7 @@ import pypto.language as pl
 from .activation_quant import quantize_projection_activation
 import pypto.language.distributed as pld
 from .sparse_attention import (
-    SWA_RUN_DESCRIPTOR_WIDTH as RUN_DESCRIPTOR_WIDTH, SWA_RUN_PARTS as RUN_PARTS,
-    analyze_index_runs, attend_shared_cache_direct, decode_shared_cache_after_publish,
+    attend_shared_cache_direct, decode_shared_cache_after_publish,
     prefill_publish_window,
 )
 from .config import (
@@ -117,13 +116,11 @@ def prefill_swa_attention(
         rope_cos, rope_sin,
         qr, q, num_tokens,
     )
-    descriptors = pl.create_tensor([tokens, RUN_PARTS, RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
-    index_ready = analyze_index_runs(window_indices, descriptors, num_tokens, cache_rows)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     attend_shared_cache_direct(
         q, keys, cache_rows, zero_row,
-        descriptors, window_indices, attn_sink,
-        attended, num_tokens, decoded_ready, index_ready,
+        window_indices, attn_sink,
+        attended, num_tokens, decoded_ready,
     )
     o_proj(attended, wo_a, wo_b, rope_cos, rope_sin, partial, num_tokens)
     return partial

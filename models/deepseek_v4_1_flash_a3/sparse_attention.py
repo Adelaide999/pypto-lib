@@ -48,6 +48,7 @@ from .config import (
 # Dynamic shape variables.
 SELECTED_ROWS = pl.dynamic("SPARSE_SELECTED_ROWS")
 SWA_KEY_ROWS = pl.dynamic("SWA_KEY_ROWS")
+SWA_RUN_WIDTH = pl.dynamic("SWA_RUN_WIDTH")
 BF16_HEADS = pl.dynamic("SPARSE_BF16_HEADS")
 BF16_PAGES_W = pl.dynamic("SPARSE_BF16_PAGES_W")
 BF16_PAGES_C = pl.dynamic("SPARSE_BF16_PAGES_C")
@@ -868,40 +869,63 @@ def attend_shared_cache(
 
 
 @pl.jit.inline(auto_scope=False)
+def _classify_swa_run(
+    ids: pl.Tile[[1, SWA_RUN_WIDTH], pl.INT32],
+    cache_rows: pl.Scalar[pl.INDEX],
+    width: pl.constexpr,
+    classify_empty: pl.constexpr,
+):
+    """Return a contiguous physical start, -1 for a scattered run, or -2 for an empty run."""
+    ids_fixed = pl.reshape(ids, [1, width])
+    first = pl.tile.read(ids_fixed, [0, 0])
+    start = pl.cast(first, pl.INDEX)
+    run = pl.cast(-1, pl.INT32)
+    reduction = pl.tile.create([8, width], dtype=pl.FP32)
+    if first >= 0 and start + width <= cache_rows:
+        expected_ids = pl.tile.ci(first, [1, width], dtype=pl.INT32)
+        delta = pl.abs(pl.cast(pl.sub(ids_fixed, expected_ids), pl.FP32))
+        delta_rows = pl.tile.full([8, width], dtype=pl.FP32, value=0.0)
+        delta_rows = pl.tile.assemble(delta_rows, delta, [0, 0])
+        error = pl.tile.read(pl.row_max(delta_rows, tmp_tile=reduction), [0, 0])
+        if error == 0.0:
+            run = first
+    if classify_empty:
+        if first < 0:
+            index_rows = pl.tile.full([8, width], dtype=pl.FP32, value=0.0)
+            index_rows = pl.tile.assemble(index_rows, pl.cast(ids_fixed, pl.FP32), [0, 0])
+            largest = pl.tile.read(pl.row_max(index_rows, tmp_tile=reduction), [0, 0])
+            if largest < 0.0:
+                run = pl.cast(-2, pl.INT32)
+    return run
+
+
+@pl.jit.inline(auto_scope=False)
 def attend_shared_cache_direct(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     keys: pl.Tensor[[SWA_KEY_ROWS, HEAD_DIM], pl.BF16],
     cache_rows: pl.Scalar[pl.INDEX],
     zero_row: pl.Tensor[[SWA_RUN_TILE, HEAD_DIM], pl.BF16],
-    descriptors: pl.Tensor[[T_DYN, SWA_RUN_PARTS, SWA_RUN_DESCRIPTOR_WIDTH], pl.INT32],
     indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
-    index_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Select a cache offset or gather a fragmented window into the scratch suffix."""
     tokens = pl.tensor.dim(query, 0)
-    descriptor_flat = pl.reshape(descriptors, [tokens * SWA_RUN_PARTS, SWA_RUN_DESCRIPTOR_WIDTH])
     key_offsets = pl.create_tensor([tokens, SWA_RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
     workers = pl.max(1, pl.min(num_tokens, SWA_WORKER_TILE * 2))
-    with pl.spmd(workers, name_hint="swa_select_window_offsets", deps=[ready, index_ready]) as selected:
+    with pl.spmd(workers, name_hint="swa_select_window_offsets", deps=[ready]) as selected:
         worker = pl.tile.get_block_idx()
         for token in pl.range(worker, num_tokens, workers):
-            first_part = token * SWA_RUN_PARTS
-            first = pl.read(descriptor_flat, [first_part, 0])
-            contiguous = first >= 0
-            for part in pl.unroll(1, SWA_RUN_PARTS):
-                run = pl.read(descriptor_flat, [first_part + part, 0])
-                contiguous = contiguous and (run == first + part * SWA_RUN_TILE)
-
-            offset = first
-            if not contiguous:
+            window_ids = pl.load(indices, [token, 0], [1, SWA_WINDOW])
+            offset = _classify_swa_run(window_ids, cache_rows, SWA_WINDOW, False)
+            if offset < 0:
                 fallback_row = cache_rows + token * SWA_WINDOW
                 for part in pl.range(SWA_RUN_PARTS):
-                    run = pl.read(descriptor_flat, [first_part + part, 0])
                     column = part * SWA_RUN_TILE
+                    run_ids = pl.tile.slice(window_ids, [1, SWA_RUN_TILE], [0, column])
+                    run = _classify_swa_run(run_ids, cache_rows, SWA_RUN_TILE, True)
                     values = _load_swa_run(keys, zero_row, indices, token, column, run)
                     pl.store(values, [fallback_row + column, 0], keys)
                 offset = pl.cast(fallback_row, pl.INT32)
