@@ -638,6 +638,8 @@ def attend_window_tiled(
     head_blocks = LOCAL_H // SWA_HEAD_TILE
     tasks = num_tokens * head_blocks
     workers = pl.max(1, pl.min(tasks, SWA_WORKER_TILE))
+    if use_offsets:
+        workers = pl.max(1, pl.min(workers, pl.system.available_cluster_count()))
     with pl.spmd(workers, name_hint="swa_attn", deps=[ready],
                  optimizations=[pl.cross_core_slot(slot_num=SWA_CROSS_CORE_SLOT_TILE)]) as attention_done:
         worker = pl.tile.get_block_idx()
