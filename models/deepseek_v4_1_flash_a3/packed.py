@@ -49,8 +49,7 @@ class PackedSession:
         self._idle_values = {}
         self._active_dps = [set(), set()]
         self.failed = False
-        n = slots * ((context + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE)
-        self.free_pages = [list(reversed(range(n))) for _ in range(C.DP_SIZE)]
+        self.pages_per_slot = (context + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE
 
     def _ready(self):
         if self.failed:
@@ -102,7 +101,6 @@ class PackedSession:
         except BaseException:
             self.failed = True
             raise
-        self.free_pages[handle.dp].extend(reversed(record.pages))
         g.engram.history.pop(handle, None)
         del self.history[handle.request_id]
 
@@ -160,7 +158,10 @@ class PackedSession:
             start = record.committed
             end = start + len(tokens)
             needed = (end + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE
-            record.pages.extend(self.free_pages[dp].pop() for _ in range(needed - len(record.pages)))
+            # Physical order participates in sparse attention reductions. Keep it
+            # chronological across chunk boundaries, Decode reordering and slot reuse.
+            base = handle.slot * self.pages_per_slot
+            record.pages.extend(range(base + len(record.pages), base + needed))
             physical = torch.tensor(record.pages, dtype=torch.int32)
             table[row, :needed] = physical
             n_half = (end // 2 + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE

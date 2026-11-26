@@ -59,8 +59,12 @@ def test_packed_page_boundary_and_recycled_handle():
     assert {(kw["worker_id"], dst, kw["dst_offset"], n) for dst, _, n, kw in writes} == expected
     for dst, src, size, kw in writes:
         assert ctypes.string_at(src, size) == ctypes.string_at(dst + kw["dst_offset"], size)
-    assert not set(session.free_pages[0]).intersection(live_pages)
+    assert old.pages == [0, 1]
+    assert live_pages == [session.pages_per_slot]
     new = session.admit("a", 0, 1)
     with pytest.raises(ValueError, match="Expired"):
         session.advance_batch("decode", [(a, [1])])
     assert new is not a and live.pages == live_pages
+    fresh = session.history["a"]
+    session._inputs(0, [(fresh, [44])], 0, cap)
+    assert fresh.pages == [old.pages[0]]
