@@ -16,6 +16,7 @@ from .sparse_attention import (
     attend_shared_cache_direct, decode_shared_cache_after_publish,
     prefill_publish_window,
 )
+from .o_proj import ATTN_PARTIAL_WIDTH
 from .config import (
     WINDOW_CACHE_GROUP, FLASH as M, ORI_BLOCKS_DYN, T_DYN, TP_SIZE, PREFILL_MAX_TOKENS,
     SP_T_DYN,
@@ -73,7 +74,7 @@ def prefill_swa_attention(
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.UINT8],
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    partial: pl.Tensor[[T_DYN, D], pl.BF16],
+    partial: pl.Tensor[[T_DYN, ATTN_PARTIAL_WIDTH], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
@@ -153,7 +154,7 @@ def prefill_swa(
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
     input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     hidden: pl.Tensor[[T_DYN, D], pl.BF16],
     attn_out: pl.Tensor[[SP_T_DYN, D], pl.BF16],
@@ -184,7 +185,7 @@ def prefill_swa(
         group_base, tp_rank, num_tokens, attention_epoch,
     )
     group_tokens = pl.tensor.dim(hidden, 0)
-    partial = pl.create_tensor([group_tokens, D], dtype=pl.BF16)
+    partial = pl.create_tensor([group_tokens, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
     if num_tokens > 0:
         prefill_swa_attention(
             hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, output_arrived, partial, num_tokens, attention_epoch,
@@ -255,7 +256,7 @@ def l2_prefill_swa(
     attn_out: pl.Out[pl.Tensor[[SP_T_DYN, D], pl.BF16]],
     input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     num_tokens: pl.Tensor[[1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -313,12 +314,12 @@ def l3_prefill_swa(
     window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
     input_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     input_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    data_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
+    data_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
     signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         input_data = pld.window(input_buf, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         input_signal = pld.window(input_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        data = pld.window(data_buf, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
+        data = pld.window(data_buf, [PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
         signal = pld.window(signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
         wq_a_scale_r: pl.Tensor[[1, Q_LORA], pl.FP32, pl.ND] = wq_a_scale[rank]

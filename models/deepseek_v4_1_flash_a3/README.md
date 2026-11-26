@@ -34,6 +34,12 @@ From the repository root, compile into fresh directories. Prefill capacity
 must be a multiple of 16 in 16..8192. Both phases need the same history
 capacity, including reserved output positions.
 
+For contexts above 16,384 tokens, set `--swa-chunk-capacity` on both compile
+commands to size the sliding-window cache for a particular Prefill capacity.
+For example, a 512-token graph uses five data pages per request slot at this
+setting. The default is 8,192 tokens. The compressed KV and Indexer caches
+retain the full requested history. Use a matched pair of artifacts for replay.
+
 ```bash
 model=models.deepseek_v4_1_flash_a3
 python -m "$model.prefill_fwd" --compile-only --capacity 128 \

@@ -31,7 +31,8 @@ TOPOLOGY = {"world": C.EP_SIZE, "dp": C.DP_SIZE, "tp": C.TP_SIZE, "ep": C.EP_SIZ
 HISTORY_CAPACITY = 8200
 
 
-def build_specs(function, *, mode, capacity, history_capacity=HISTORY_CAPACITY, prepare_windows=False, request_slots=1):
+def build_specs(function, *, mode, capacity, history_capacity=HISTORY_CAPACITY, prepare_windows=False,
+                request_slots=1, window_chunk_capacity=C.PREFILL_MAX_TOKENS):
     """Construct compile shapes without allocating the model's weight tensors."""
     dtype_map = {"FP32": torch.float32, "BF16": torch.bfloat16, "INT8": torch.int8,
                  "UINT8": torch.uint8, "INT32": torch.int32, "INT64": torch.int64}
@@ -39,7 +40,7 @@ def build_specs(function, *, mode, capacity, history_capacity=HISTORY_CAPACITY, 
         raise ValueError("Invalid per-DP request capacity")
     table_pages = (history_capacity + 127) // 128
     pages = table_pages * request_slots + 1
-    window_pages = window_pages_per_slot(table_pages) * request_slots + 1
+    window_pages = window_pages_per_slot(table_pages, window_chunk_capacity) * request_slots + 1
     c2a_pages = max(1, (history_capacity // 2 + 127) // 128)
     dimensions = {
         "FWD_ORI_BLOCKS_DYN": 40 * window_pages, "FWD_CMP_BLOCKS_DYN": 4 * pages,
@@ -86,8 +87,13 @@ def build_specs(function, *, mode, capacity, history_capacity=HISTORY_CAPACITY, 
     return specs
 
 
-def manifest(mode, capacity, history_capacity=HISTORY_CAPACITY, *, slab_rows=64, request_slots=1):
+def manifest(mode, capacity, history_capacity=HISTORY_CAPACITY, *, slab_rows=64, request_slots=1,
+             window_chunk_capacity=C.PREFILL_MAX_TOKENS):
     """Version the shared weight, cache and quantization ABI."""
+    if type(window_chunk_capacity) is not int or not 1 <= window_chunk_capacity <= C.PREFILL_MAX_TOKENS:
+        raise ValueError("Invalid sliding-window chunk capacity")
+    if mode == "prefill" and capacity > window_chunk_capacity:
+        raise ValueError("Sliding-window chunk capacity must cover the Prefill graph capacity")
     root = Path(__file__).parent
     pending = ["prefill_fwd", "decode_fwd", "driver"]
     sources = {}
@@ -106,7 +112,8 @@ def manifest(mode, capacity, history_capacity=HISTORY_CAPACITY, *, slab_rows=64,
                     pending.extend(alias.name for alias in node.names)
     return {"format": "deepseek-v41-a3-artifact-v1", "platform": "a2a3", "mode": mode,
             "topology": TOPOLOGY, "moe_slab_rows": slab_rows, "capacity": capacity, "history_capacity": history_capacity,
-            "request_slots_per_dp": request_slots, "weight_layout": C.WEIGHT_LAYOUT_VERSION, "cache_layout": C.CACHE_LAYOUT_VERSION,
+            "request_slots_per_dp": request_slots, "window_chunk_capacity": window_chunk_capacity,
+            "weight_layout": C.WEIGHT_LAYOUT_VERSION, "cache_layout": C.CACHE_LAYOUT_VERSION,
             "quantization": "W8A8_DYNAMIC", "sources": sources}
 
 
@@ -123,7 +130,8 @@ def load_manifest(directory, *, mode, capacity=None, request_slots=1):
     if slab_rows not in supported_slabs:
         raise ValueError(f"artifact {path} has incompatible MoE slab geometry")
     expected = manifest(mode, actual["capacity"] if capacity is None else capacity, actual["history_capacity"],
-                        slab_rows=slab_rows, request_slots=request_slots)
+                        slab_rows=slab_rows, request_slots=request_slots,
+                        window_chunk_capacity=actual.get("window_chunk_capacity"))
     for key, value in expected.items():
         if actual.get(key) != value:
             raise ValueError(f"artifact {path} has incompatible {key}")
@@ -131,13 +139,14 @@ def load_manifest(directory, *, mode, capacity=None, request_slots=1):
 
 
 def compile_generation_graphs(prefill_dir, decode_dir, *, devices, context, prefill_capacity,
-                              prefill_slab_rows, decode_capacity=16, request_slots=1):
+                              prefill_slab_rows, decode_capacity=16, request_slots=1,
+                              window_chunk_capacity=C.PREFILL_MAX_TOKENS):
     """Compile each phase in its own process with the matching runtime ABI."""
     for phase, directory in (("prefill", prefill_dir), ("decode", decode_dir)):
         cmd = [sys.executable, str(Path(__file__).with_name(f"{phase}_fwd.py")), "--compile-only", "--prepare-windows",
                "--output", str(directory), "--context-capacity", str(context), "--devices", devices,
                "--request-slots-per-dp", str(request_slots), "--tp", str(C.TP_SIZE),
-               "--dp", str(C.DP_SIZE), "--ep", str(C.EP_SIZE)]
+               "--dp", str(C.DP_SIZE), "--ep", str(C.EP_SIZE), "--swa-chunk-capacity", str(window_chunk_capacity)]
         if phase == "prefill":
             cmd.extend(("--capacity", str(prefill_capacity), "--prefill-moe-slab-rows", str(prefill_slab_rows)))
         else:
@@ -171,6 +180,8 @@ def main(function, *, mode, capacity, argv=None):
     inputs.add_argument("--tokens", help="Comma-separated token IDs")
     inputs.add_argument("--prompt")
     parser.add_argument("--context-capacity", type=int)
+    parser.add_argument("--swa-chunk-capacity", dest="window_chunk_capacity", type=int,
+                        help="Maximum Prefill chunk retained by a long-context sliding window in both graphs")
     parser.add_argument("--output", type=Path, help="Fresh compile or generation directory")
     parser.add_argument("--result", type=Path, help="Generation output directory")
     parser.add_argument("--graph-dir", type=Path, help="Directory containing native prefill/ and decode/ artifacts")
@@ -235,13 +246,17 @@ def main(function, *, mode, capacity, argv=None):
         slab_rows = C.MOE_TOKENS
         if args.prefill_moe_slab_rows is not None and (mode != "prefill" or args.prefill_moe_slab_rows != slab_rows):
             parser.error("MoE slab size must match the imported Prefill entry")
-        snapshot = manifest(mode, capacity, context, slab_rows=slab_rows, request_slots=args.request_slots_per_dp)
+        window_chunk = C.PREFILL_MAX_TOKENS if args.window_chunk_capacity is None else args.window_chunk_capacity
+        snapshot = manifest(mode, capacity, context, slab_rows=slab_rows, request_slots=args.request_slots_per_dp,
+                            window_chunk_capacity=window_chunk)
         specs = build_specs(function, mode=mode, capacity=capacity, history_capacity=context,
-                            prepare_windows=args.prepare_windows, request_slots=args.request_slots_per_dp)
+                            prepare_windows=args.prepare_windows, request_slots=args.request_slots_per_dp,
+                            window_chunk_capacity=window_chunk)
         result = run(fn=function, specs=specs, config=config, compile_only=True)
         if not result.passed:
             raise SystemExit(result.error or 1)
-        if manifest(mode, capacity, context, slab_rows=slab_rows, request_slots=args.request_slots_per_dp) != snapshot:
+        if manifest(mode, capacity, context, slab_rows=slab_rows, request_slots=args.request_slots_per_dp,
+                    window_chunk_capacity=window_chunk) != snapshot:
             raise RuntimeError("Model sources changed during compilation")
         path = Path(result.work_dir) / "a3_manifest.json"
         path.write_text(json.dumps(snapshot, indent=2) + "\n")
@@ -267,6 +282,7 @@ def main(function, *, mode, capacity, argv=None):
             args.runtime_dir, args.decode_runtime_dir, devices=args.devices, context=context,
             prefill_capacity=prefill_capacity, decode_capacity=args.decode_capacity or 16,
             prefill_slab_rows=args.prefill_moe_slab_rows or C.default_prefill_slab_rows(prefill_capacity),
+            window_chunk_capacity=C.PREFILL_MAX_TOKENS if args.window_chunk_capacity is None else args.window_chunk_capacity,
         )
     manifests = (load_manifest(args.runtime_dir, mode="prefill"),
                  load_manifest(args.decode_runtime_dir, mode="decode", capacity=args.decode_capacity))
@@ -284,6 +300,10 @@ def main(function, *, mode, capacity, argv=None):
     if context != manifests[1]["history_capacity"] or (args.context_capacity and context != args.context_capacity):
         parser.error("Both programs must share the requested history capacity")
     args.context_capacity = context
+    window_chunk = manifests[0]["window_chunk_capacity"]
+    if window_chunk != manifests[1]["window_chunk_capacity"] or args.window_chunk_capacity not in (None, window_chunk):
+        parser.error("Both graphs must share the requested sliding-window chunk capacity")
+    args.window_chunk_capacity = window_chunk
     if args.chunk_size > args.capacity:
         parser.error("Chunk size exceeds compiled Prefill capacity")
     from .generation import generate

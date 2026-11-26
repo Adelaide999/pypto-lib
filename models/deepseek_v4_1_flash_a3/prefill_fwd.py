@@ -43,6 +43,7 @@ if _shape_options.experts_per_rank != C.N_LOCAL_EXPERTS:
     _shape_parser.error("EP16 requires 24 experts per rank")
 C.set_moe_tokens(_shape_options.prefill_moe_slab_rows or C.default_prefill_slab_rows(CAPACITY))
 
+from .o_proj import ATTN_PARTIAL_WIDTH
 from .config import (
     FLASH as M,
     COMPRESSED_CACHE_GROUP,
@@ -188,7 +189,7 @@ def prefill_attention(
     pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
     pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output: pl.Tensor[[T_DYN, D], pl.BF16],
     group_base: pl.Scalar[pl.INT32],
@@ -200,7 +201,7 @@ def prefill_attention(
 ):
     if mode == 0:
         tokens = pl.tensor.dim(x, 0)
-        partial = pl.create_tensor([tokens, D], dtype=pl.BF16)
+        partial = pl.create_tensor([tokens, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
         prefill_swa_attention(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, output_arrived, partial, num_tokens, attention_epoch,
         )
@@ -209,7 +210,7 @@ def prefill_attention(
         )
     elif mode == 1:
         attention_tokens = pl.tensor.dim(x, 0)
-        attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.BF16)
+        attention_partial = pl.create_tensor([attention_tokens, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
         prefill_c2a_full_attention(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, token_to_req_indices, c2a_compressed_lens, index_cache, index_cache_scale, c2a_index_block_table, position_ids, compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_wgate, query_start_loc, state_block_table, state_cache, compressor_norm_weight, c2a_compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices, output_arrived, attention_partial, num_tokens, attention_epoch, shared_prefix=shared_prefix,
         )
@@ -218,7 +219,7 @@ def prefill_attention(
         )
     elif mode == 2:
         attention_tokens = pl.tensor.dim(x, 0)
-        attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.BF16)
+        attention_partial = pl.create_tensor([attention_tokens, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
         prefill_c2a_reuse_attention(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, topk_indices, output_arrived, attention_partial, num_tokens, attention_epoch, shared_prefix=shared_prefix,
         )
@@ -550,7 +551,7 @@ def l2_prefill_fwd(
     data_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
     routed_output: pld.DistributedTensor[[MOE_TOKENS * TOPK, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
-    attention_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.BF16],
+    attention_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], pl.BF16],
     attention_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
     head_hidden: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     head_hidden_done: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
@@ -951,7 +952,7 @@ def l3_prefill_fwd(
     data_arrived_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
     routed_output_buffer = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
     combine_arrived_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
-    attention_window_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
+    attention_window_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
     attention_arrived_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     ffn_window_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     ffn_arrived_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
@@ -967,7 +968,7 @@ def l3_prefill_fwd(
         data_arrived = pld.window(data_arrived_buffer, [RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
         routed_output = pld.window(routed_output_buffer, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buffer, [RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
-        attention_window = pld.window(attention_window_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
+        attention_window = pld.window(attention_window_buffer, [PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
         attention_arrived = pld.window(attention_arrived_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         ffn_window = pld.window(ffn_window_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         ffn_arrived = pld.window(ffn_arrived_buffer, [TP_SIZE, 1], dtype=pl.INT32)

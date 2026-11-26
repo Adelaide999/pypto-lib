@@ -114,17 +114,19 @@ def paged_slots(
     return mapped
 
 
-def window_pages_per_slot(history_pages: int) -> int:
-    """Keep a whole maximum Prefill chunk and its oldest visible sliding window."""
+def window_pages_per_slot(history_pages: int, chunk_capacity: int = PREFILL_MAX_TOKENS) -> int:
+    """Retain all writes of one Prefill chunk and the preceding visible keys."""
+    if type(chunk_capacity) is not int or not 1 <= chunk_capacity <= PREFILL_MAX_TOKENS:
+        raise ValueError(f"Sliding-window chunk capacity must be in 1..{PREFILL_MAX_TOKENS}")
     if history_pages <= 16384 // BLOCK_SIZE:
         return history_pages
-    return (PREFILL_MAX_TOKENS + M.sliding_window - 1 + BLOCK_SIZE - 1) // BLOCK_SIZE
+    return (chunk_capacity + M.sliding_window - 1 + BLOCK_SIZE - 1) // BLOCK_SIZE
 
 
-def sliding_page_table(history_table, slots):
+def sliding_page_table(history_table, slots, *, pages_per_slot=None):
     """Map logical pages onto disjoint cyclic storage owned by stable request slots."""
     width = history_table.shape[1]
-    pages = window_pages_per_slot(width)
+    pages = window_pages_per_slot(width) if pages_per_slot is None else pages_per_slot
     if pages == width:
         return history_table
     logical = torch.arange(width, dtype=torch.int32, device=history_table.device)

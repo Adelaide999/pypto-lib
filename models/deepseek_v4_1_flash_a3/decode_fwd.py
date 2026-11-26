@@ -19,6 +19,7 @@ if not __package__:
 
 import argparse
 import pypto.language as pl
+from .o_proj import ATTN_PARTIAL_WIDTH
 from .config import SWA_LAYER_COUNT, TP_SIZE
 import pypto.language.distributed as pld
 from . import config as C
@@ -210,7 +211,7 @@ def decode_encoder(
     shared_w1_scale: pl.Tensor[[N_LAYERS * (1), MOE_INTER], pl.FP32],
     shared_w2_scale: pl.Tensor[[N_LAYERS * (1), D], pl.FP32],
     shared_w3_scale: pl.Tensor[[N_LAYERS * (1), MOE_INTER], pl.FP32],
-    output_window: pld.DistributedTensor[[DECODE_CAPACITY, D], pl.BF16],
+    output_window: pld.DistributedTensor[[DECODE_CAPACITY, ATTN_PARTIAL_WIDTH], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     ffn_window: pld.DistributedTensor[[DECODE_CAPACITY, D], pl.BF16],
     ffn_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -303,7 +304,7 @@ def decode_encoder(
             if layer < SWA_LAYER_COUNT:
                 layer_swa_wo_a = pl.slice(swa_wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [layer * LOCAL_O_GROUPS, 0, 0])
                 layer_swa_wo_b = swa_wo_b[layer]
-                swa_attention_output = pl.create_tensor([tokens, D], dtype=pl.BF16)
+                swa_attention_output = pl.create_tensor([tokens, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
                 decode_swa(
                     x_hc, pre_mix, layer_hc_fn, layer_hc_scale, layer_hc_base, layer_norm_weight, layer_wq_a, layer_wq_a_scale, layer_q_norm, layer_wq_b, layer_wq_b_scale, layer_wkv, layer_wkv_scale, layer_kv_norm, layer_sink, layer_wo_a, layer_wo_b, layer_swa_wo_a, layer_swa_wo_b, base_rope_cos, base_rope_sin, window_slots, window_indices, layer_window_cache, layer_window_cache_scale, swa_attention_output, attention_hidden, attention_pre_mix, ffn_input, attention_count, output_window, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, layer + 1,
                 )
@@ -460,7 +461,7 @@ def decode_decoder(
     shared_w1_scale: pl.Tensor[[N_LAYERS * (1), MOE_INTER], pl.FP32],
     shared_w2_scale: pl.Tensor[[N_LAYERS * (1), D], pl.FP32],
     shared_w3_scale: pl.Tensor[[N_LAYERS * (1), MOE_INTER], pl.FP32],
-    output_window: pld.DistributedTensor[[DECODE_CAPACITY, D], pl.BF16],
+    output_window: pld.DistributedTensor[[DECODE_CAPACITY, ATTN_PARTIAL_WIDTH], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     ffn_window: pld.DistributedTensor[[DECODE_CAPACITY, D], pl.BF16],
     ffn_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -703,7 +704,7 @@ def l2_decode_fwd(
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
     logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output_window: pld.DistributedTensor[[DECODE_CAPACITY, D], pl.BF16],
+    output_window: pld.DistributedTensor[[DECODE_CAPACITY, ATTN_PARTIAL_WIDTH], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     ffn_window: pld.DistributedTensor[[DECODE_CAPACITY, D], pl.BF16],
     ffn_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -916,7 +917,7 @@ def l3_decode_fwd(
     combine_arrived_buffer = pld.alloc_window_buffer(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
     )
-    output_window_buffer = pld.alloc_window_buffer([DECODE_CAPACITY, D], dtype=pl.BF16)
+    output_window_buffer = pld.alloc_window_buffer([DECODE_CAPACITY, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
     output_arrived_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     ffn_window_buffer = pld.alloc_window_buffer([DECODE_CAPACITY, D], dtype=pl.BF16)
     ffn_arrived_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
@@ -940,7 +941,7 @@ def l3_decode_fwd(
             [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
             dtype=pl.INT32,
         )
-        output_window = pld.window(output_window_buffer, [DECODE_CAPACITY, D], dtype=pl.BF16)
+        output_window = pld.window(output_window_buffer, [DECODE_CAPACITY, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
         output_arrived = pld.window(output_arrived_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         ffn_window = pld.window(ffn_window_buffer, [DECODE_CAPACITY, D], dtype=pl.BF16)
         ffn_arrived = pld.window(ffn_arrived_buffer, [TP_SIZE, 1], dtype=pl.INT32)

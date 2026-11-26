@@ -41,6 +41,8 @@ LOCAL_H = M.num_attention_heads // TP_SIZE
 LOCAL_O_GROUPS = M.o_groups // TP_SIZE
 LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
 D = M.hidden_size
+ATTN_SHARDS_PER_RANK = 2 if TP_SIZE == 2 else 1
+ATTN_PARTIAL_WIDTH = D * ATTN_SHARDS_PER_RANK
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
 O_LORA = M.o_lora_rank
@@ -254,6 +256,7 @@ def make_gemm_bf16_native(*, k_subtile):
         output_col: pl.Scalar[pl.INT32],
         row_tile: pl.constexpr,
         stages: pl.constexpr,
+        weight_offset: pl.constexpr,
     ):
         """Project BF16 activations against packed Cube weights."""
         col_blocks = output_width // n_tile
@@ -286,14 +289,14 @@ def make_gemm_bf16_native(*, k_subtile):
                         if k_subtile > 0:
                             a = pl.load(source, [row, source_col + k], [row_tile, k_tile],
                                         valid_shape=[rows, k_tile], target_memory=pl.Mem.Mat)
-                            b = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
+                            b = pl.load(weight, [k + weight_offset, col], [k_tile, n_tile], target_memory=pl.Mem.Mat)
                             for inner in pl.pipeline(0, k_tile, k_subtile, stage=2):
                                 af = pl.tile.slice(a, [row_tile, k_subtile], [0, inner])
                                 bf = pl.tile.slice(b, [k_subtile, n_tile], [inner, 0])
                                 cube_acc = pl.matmul_acc(cube_acc, af, bf, init_cond=(k + inner == 0))
                         else:
                             cube_a = pl.load(source, [row, source_col + k], [row_tile, k_tile], valid_shape=[rows, k_tile])
-                            cube_w = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
+                            cube_w = pl.load(weight, [k + weight_offset, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
                             cube_acc = pl.matmul_acc(cube_acc, cube_a, cube_w, init_cond=(k == 0))
                     cube_value = pl.set_validshape(cube_acc, rows, n_tile)
                     output = pl.store(cube_value, [row, output_col + col], output)
@@ -306,7 +309,51 @@ gemm_bf16_native = make_gemm_bf16_native(k_subtile=0)
 prefill_bf16_native = make_gemm_bf16_native(k_subtile=PREFILL_BF16_K_SUBTILE)
 
 
+REFERENCE_TP = 4
+REFERENCE_O_WIDTH = M.o_groups * O_LORA // REFERENCE_TP
+
+
+@pl.jit.inline(auto_scope=False)
+def combine_reference_partials(partials: pl.Tensor, output: pl.Tensor, num_tokens: pl.Scalar[pl.INT32]):
+    """Reproduce the four BF16 attention partials and their TP4 FP32 addition order."""
+    tokens = pl.tensor.dim(output, 0)
+    rows = pl.reshape(partials, [REFERENCE_TP * tokens, D])
+    with pl.spmd(24, name_hint="combine_reference_partials"):
+        worker = pl.tile.get_block_idx()
+        for panel in pl.range(worker, num_tokens * (D // 256), 24):
+            row = panel // (D // 256)
+            col = panel % (D // 256) * 256
+            total = pl.tile.full([1, 256], dtype=pl.FP32, value=0.0)
+            for shard in pl.unroll(REFERENCE_TP):
+                value = pl.load(rows, [shard * tokens + row, col], [1, 256])
+                total = pl.add(total, pl.cast(value, pl.FP32))
+            pl.store(pl.cast(total, pl.BF16, mode="rint"), [row, col], output)
+    return output
+
+
 def make_native_project_output(*, prefill, b1_rotated):
+    @pl.jit.inline(auto_scope=False)
+    def reference_part(projected: pl.Tensor, wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
+                       out: pl.Tensor, num_tokens: pl.Scalar[pl.INT32], ready: pl.Scalar[pl.TASK_ID],
+                       offset: pl.constexpr, dest: pl.constexpr):
+        if not prefill and num_tokens == 1:
+            gemm_bf16_native(projected, wo_b, out, num_tokens, ready,
+                             REFERENCE_O_WIDTH, D, DECODE_B1_O_B_N_TILE, K_TILE, 24, "ref_o_b_b1",
+                             offset, dest, 16, stages=2, weight_offset=offset)
+        elif prefill and num_tokens >= PREFILL_O_M_TILE:
+            prefill_bf16_native(projected, wo_b, out, num_tokens, ready,
+                                REFERENCE_O_WIDTH, D, PREFILL_O_N_TILE, K_TILE, 24, "ref_o_b",
+                                offset, dest, PREFILL_O_M_TILE, stages=2, weight_offset=offset)
+        elif num_tokens >= 64:
+            gemm_bf16_native(projected, wo_b, out, num_tokens, ready,
+                             REFERENCE_O_WIDTH, D, 256, K_TILE, 24, "ref_o_b",
+                             offset, dest, 64, stages=1, weight_offset=offset)
+        else:
+            gemm_bf16_native(projected, wo_b, out, num_tokens, ready,
+                             REFERENCE_O_WIDTH, D, O_B_N_TILE, K_TILE, 24, "ref_o_b",
+                             offset, dest, 16, stages=1, weight_offset=offset)
+        return out
+
     @pl.jit.inline(auto_scope=False)
     def project_output(
         attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -314,7 +361,7 @@ def make_native_project_output(*, prefill, b1_rotated):
         wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
         rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
         rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        output: pl.Tensor[[T_DYN, D], pl.BF16],
+        output: pl.Tensor[[T_DYN, ATTN_PARTIAL_WIDTH], pl.BF16],
         num_tokens: pl.Scalar[pl.INT32],
     ):
         """Apply inverse RoPE and grouped BF16 O-A/O-B projections. Prefill consumes attention scratch."""
@@ -341,47 +388,57 @@ def make_native_project_output(*, prefill, b1_rotated):
                 prefill_bf16_native(
                     rotated, wo_a[group], projected, num_tokens, ready,
                     O_GROUP_IN, O_LORA, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_a",
-                    source_col, output_col, PREFILL_O_M_TILE, stages=2,
+                    source_col, output_col, PREFILL_O_M_TILE, stages=2, weight_offset=0,
                 )
             elif not prefill and num_tokens == 1:
                 gemm_bf16_native(
                     rotated, wo_a[group], projected, num_tokens, ready,
                     O_GROUP_IN, O_LORA, O_A_N_TILE, DECODE_B1_O_A_K_TILE, 24, "proj_o_a",
-                    source_col, output_col, 16, stages=2,
+                    source_col, output_col, 16, stages=2, weight_offset=0,
                 )
             elif num_tokens >= 64:
                 gemm_bf16_native(
                     rotated, wo_a[group], projected, num_tokens, ready,
                     O_GROUP_IN, O_LORA, 256, K_TILE, 24, "proj_o_a",
-                    source_col, output_col, 64, stages=1,
+                    source_col, output_col, 64, stages=1, weight_offset=0,
                 )
             else:
                 gemm_bf16_native(
                     rotated, wo_a[group], projected, num_tokens, ready,
                     O_GROUP_IN, O_LORA, O_A_N_TILE, K_TILE, 24, "proj_o_a",
-                    source_col, output_col, 16, stages=1,
+                    source_col, output_col, 16, stages=1, weight_offset=0,
                 )
-        if not prefill and num_tokens == 1:
+        if TP_SIZE == 1:
+            partials = pl.create_tensor([REFERENCE_TP, tokens, D], dtype=pl.BF16)
+            reference_part(projected, wo_b, partials[0], num_tokens, ready, 0, 0)
+            reference_part(projected, wo_b, partials[1], num_tokens, ready, 2048, 0)
+            reference_part(projected, wo_b, partials[2], num_tokens, ready, 4096, 0)
+            reference_part(projected, wo_b, partials[3], num_tokens, ready, 6144, 0)
+            combine_reference_partials(partials, output, num_tokens)
+        elif TP_SIZE == 2:
+            reference_part(projected, wo_b, output, num_tokens, ready, 0, 0)
+            reference_part(projected, wo_b, output, num_tokens, ready, 2048, D)
+        elif not prefill and num_tokens == 1:
             gemm_bf16_native(
                 projected, wo_b, output, num_tokens, ready,
                 LOCAL_O_WIDTH, D, DECODE_B1_O_B_N_TILE, K_TILE, 24, "proj_o_b_b1",
-                0, 0, 16, stages=2,
+                0, 0, 16, stages=2, weight_offset=0,
             )
         elif prefill and num_tokens >= PREFILL_O_M_TILE:
             prefill_bf16_native(
                 projected, wo_b, output, num_tokens, ready,
-                LOCAL_O_WIDTH, D, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_b", 0, 0, PREFILL_O_M_TILE, stages=2,
+                LOCAL_O_WIDTH, D, PREFILL_O_N_TILE, K_TILE, 24, "proj_o_b", 0, 0, PREFILL_O_M_TILE, stages=2, weight_offset=0,
             )
         elif num_tokens >= 64:
             gemm_bf16_native(
                 projected, wo_b, output, num_tokens, ready,
-                LOCAL_O_WIDTH, D, 256, K_TILE, 24, "proj_o_b", 0, 0, 64, stages=1,
+                LOCAL_O_WIDTH, D, 256, K_TILE, 24, "proj_o_b", 0, 0, 64, stages=1, weight_offset=0,
             )
         else:
             gemm_bf16_native(
                 projected, wo_b, output, num_tokens, ready,
                 LOCAL_O_WIDTH, D, O_B_N_TILE, K_TILE, 24, "proj_o_b",
-                0, 0, 16, stages=1,
+                0, 0, 16, stages=1, weight_offset=0,
             )
         return output
 
@@ -400,7 +457,7 @@ def decode_o_proj_nz_from_attention(
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16, pl.NZ],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    output: pl.Tensor[[T_DYN, ATTN_PARTIAL_WIDTH], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     if num_tokens == 1:
@@ -452,7 +509,7 @@ def decode_swa_o_proj_ordered(
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    output: pl.Tensor[[T_DYN, ATTN_PARTIAL_WIDTH], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Apply the ordered SWA projections independently to each active Decode token."""
@@ -466,10 +523,27 @@ def decode_swa_o_proj_ordered(
             pl.cast(group * O_GROUP_IN, pl.INT32), pl.cast(group * O_LORA, pl.INT32),
             O_GROUP_IN, O_LORA, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE, "proj_o_a_ordered_b1",
         )
-    output = _project_ordered_decode_rows(
-        projected, wo_b, output, num_tokens, 0, 0,
-        LOCAL_O_WIDTH, D, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE, "proj_o_b_ordered_b1",
-    )
+    if TP_SIZE == 1:
+        partials = pl.create_tensor([REFERENCE_TP, tokens, D], dtype=pl.BF16)
+        for shard in pl.parallel(REFERENCE_TP):
+            first = shard * REFERENCE_O_WIDTH
+            block = pl.slice(wo_b, [REFERENCE_O_WIDTH, D], [first, 0])
+            _project_ordered_decode_rows(projected, block, partials[shard], num_tokens, first, 0,
+                                         REFERENCE_O_WIDTH, D, DECODE_B1_ORDERED_K_TILE,
+                                         DECODE_B1_ORDERED_N_TILE, "ref_o_b_ordered")
+        combine_reference_partials(partials, output, num_tokens)
+    elif TP_SIZE == 2:
+        for shard in pl.parallel(2):
+            first = shard * REFERENCE_O_WIDTH
+            block = pl.slice(wo_b, [REFERENCE_O_WIDTH, D], [first, 0])
+            _project_ordered_decode_rows(projected, block, output, num_tokens, first, shard * D,
+                                        REFERENCE_O_WIDTH, D, DECODE_B1_ORDERED_K_TILE,
+                                        DECODE_B1_ORDERED_N_TILE, "ref_o_b_ordered_pair")
+    else:
+        output = _project_ordered_decode_rows(
+            projected, wo_b, output, num_tokens, 0, 0,
+            LOCAL_O_WIDTH, D, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE, "proj_o_b_ordered_b1",
+        )
     return output
 
 
@@ -512,8 +586,8 @@ def retire_prefill_signals(
 
 @pl.jit.inline(auto_scope=False)
 def prefill_sp_output_reduce_scatter(
-    partial: pl.Tensor[[T_DYN, D], pl.BF16],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
+    partial: pl.Tensor[[T_DYN, ATTN_PARTIAL_WIDTH], pl.BF16],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output: pl.Tensor[[SP_T_DYN, D], pl.BF16],
     group_base: pl.Scalar[pl.INT32],
@@ -532,7 +606,7 @@ def prefill_sp_output_reduce_scatter(
 
 @pl.jit.inline(auto_scope=False)
 def prefill_tp_output_all_reduce(
-    output_partial: pl.Tensor[[T_DYN, D], pl.BF16],
+    output_partial: pl.Tensor,
     output_window: pld.DistributedTensor,
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -567,7 +641,9 @@ def _tp_output_publish(
     publish_rows = num_tokens
     if owner_rows:
         publish_rows = (num_tokens + TP_SIZE - 1 - tp_rank) // TP_SIZE
-    column_tiles = D // TP_COLUMNS
+    column_tiles = ATTN_PARTIAL_WIDTH // TP_COLUMNS
+    if owner_rows:
+        column_tiles = D // TP_COLUMNS
     publish_tiles = (publish_rows + tile_rows - 1) // tile_rows * column_tiles
     publish_workers = pl.max(1, pl.min(64, publish_tiles))
     with pl.spmd(publish_workers, name_hint="prefill_tp_publish", deps=[reuse_tid]) as publish_tid:
@@ -600,7 +676,7 @@ def _tp_output_publish(
 
 @pl.jit.inline(auto_scope=False)
 def _tp_output_all_reduce(
-    output_partial: pl.Tensor[[T_DYN, D], pl.BF16],
+    output_partial: pl.Tensor,
     output_window: pld.DistributedTensor,
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output: pl.Tensor,
@@ -634,16 +710,20 @@ def _tp_output_all_reduce(
                 else:
                     live = pl.min(tile_rows, pl.min(num_tokens - row, output_rows - local_row))
                     if live == tile_rows:
-                        for peer in pl.range(TP_SIZE):
+                        for shard in pl.range(TP_SIZE * ATTN_SHARDS_PER_RANK):
+                            peer = shard // ATTN_SHARDS_PER_RANK
+                            shard_col = col + (shard % ATTN_SHARDS_PER_RANK) * D
                             value = pld.tile.remote_load(
-                                output_window, peer=group_base + peer, offsets=[row, col],
+                                output_window, peer=group_base + peer, offsets=[row, shard_col],
                                 shape=[tile_rows, TP_COLUMNS],
                             )
                             acc = pl.add(acc, pl.cast(value, pl.FP32))
                     else:
-                        for peer in pl.range(TP_SIZE):
+                        for shard in pl.range(TP_SIZE * ATTN_SHARDS_PER_RANK):
+                            peer = shard // ATTN_SHARDS_PER_RANK
+                            shard_col = col + (shard % ATTN_SHARDS_PER_RANK) * D
                             tail = pld.tile.remote_load(
-                                output_window, peer=group_base + peer, offsets=[row, col],
+                                output_window, peer=group_base + peer, offsets=[row, shard_col],
                                 shape=[tile_rows, TP_COLUMNS], valid_shape=[live, TP_COLUMNS],
                             )
                             filled = pl.fillpad(tail, pad_value=pl.PadValue.zero)
@@ -669,7 +749,7 @@ def _tp_output_all_reduce(
 
 @pl.jit.inline(auto_scope=False)
 def decode_tp_output_post_token(
-    output_partial: pl.Tensor[[T_DYN, D], pl.BF16],
+    output_partial: pl.Tensor,
     output_window: pld.DistributedTensor,
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
@@ -701,9 +781,11 @@ def decode_tp_output_post_token(
                 value = pld.tile.remote_load(output_window, peer=group_base, offsets=[0, col], shape=[1, TP_COLUMNS])
                 acc = pl.add(acc, pl.cast(value, pl.FP32))
             else:
-                for peer in pl.range(TP_SIZE):
+                for shard in pl.range(TP_SIZE * ATTN_SHARDS_PER_RANK):
+                    peer = shard // ATTN_SHARDS_PER_RANK
+                    shard_col = col + (shard % ATTN_SHARDS_PER_RANK) * D
                     value = pld.tile.remote_load(
-                        output_window, peer=group_base + peer, offsets=[0, col], shape=[1, TP_COLUMNS],
+                        output_window, peer=group_base + peer, offsets=[0, shard_col], shape=[1, TP_COLUMNS],
                     )
                     acc = pl.add(acc, pl.cast(value, pl.FP32))
         reduced_tile = pl.cast(acc, pl.BF16, mode="rint")
@@ -737,7 +819,7 @@ def decode_tp_output_post_token(
 
 @pl.jit.inline(auto_scope=False)
 def decode_tp_output_post(
-    output_partial: pl.Tensor[[T_DYN, D], pl.BF16],
+    output_partial: pl.Tensor[[T_DYN, ATTN_PARTIAL_WIDTH], pl.BF16],
     output_window: pld.DistributedTensor,
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],

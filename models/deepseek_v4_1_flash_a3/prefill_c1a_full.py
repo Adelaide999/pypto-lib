@@ -12,6 +12,7 @@ from . import config as C
 import pypto.language as pl
 from .activation_quant import quantize_projection_activation
 import pypto.language.distributed as pld
+from .o_proj import ATTN_PARTIAL_WIDTH
 from .config import (
     FLASH as M, TP_SIZE, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN,
     INDEX_POOL_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, PREFILL_MAX_TOKENS, SP_T_DYN,
@@ -125,7 +126,7 @@ def prefill_c1a_full_attention(
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
     pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output: pl.Tensor,
     group_base: pl.Scalar[pl.INT32],
@@ -136,7 +137,7 @@ def prefill_c1a_full_attention(
 ):
     """Publish ratio-1 caches, select sparse rows, and compute packed C1A."""
     tokens = pl.tensor.dim(x, 0)
-    partial = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    partial = pl.create_tensor([tokens, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
     if num_tokens > 0:
         proj_payload, proj_scales = quantize_projection_activation(x, num_tokens, D, True, True)
         published = prefill_publish_decoder(
@@ -300,7 +301,7 @@ def l2_prefill_c1a_full_sharded(
     x_hc_out: pl.Out[pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32]],
     input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     num_tokens: pl.Tensor[[1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -449,12 +450,12 @@ def l3_prefill_c1a_full_sharded(
     x_hc_out.bind_dynamic(1, SP_T_DYN)
     input_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    output_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
+    output_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
     output_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         input_window = pld.window(input_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         input_arrived = pld.window(input_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
-        output_window = pld.window(output_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
+        output_window = pld.window(output_buffer, [PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
         output_arrived = pld.window(output_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         wq_a_scale_r: pl.Tensor[[1, Q_LORA], pl.FP32, pl.ND] = wq_a_scale[rank]
         wq_b_scale_r: pl.Tensor[[1, LOCAL_H * HEAD_DIM], pl.FP32, pl.ND] = wq_b_scale[rank]
@@ -523,7 +524,7 @@ def prefill_c1a_full(
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
     pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     hidden: pl.Tensor[[T_DYN, D], pl.BF16],
     attn_input: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -619,7 +620,7 @@ def l2_prefill_c1a_full(
     topk_indices: pl.Out[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
     pool_block_ids: pl.Out[pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
     pool_block_counts: pl.Out[pl.Tensor[[T_DYN], pl.INT32]],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     hidden: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
@@ -713,10 +714,10 @@ def l3_prefill_c1a_full(
     output: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    output_window_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
+    output_window_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
     output_arrived_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
-        output_window = pld.window(output_window_buf, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
+        output_window = pld.window(output_window_buf, [PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
         output_arrived = pld.window(output_arrived_buf, [TP_SIZE, 1], dtype=pl.INT32)
         wq_a_scale_r: pl.Tensor[[1, Q_LORA], pl.FP32, pl.ND] = wq_a_scale[rank]
         wq_b_scale_r: pl.Tensor[

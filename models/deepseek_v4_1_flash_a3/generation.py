@@ -245,7 +245,8 @@ def open_resident_graphs(args, devices, weights, engram, memory, report, *, sele
     try:
         torch.set_num_threads(4)
         prefill_template = prepare_resident_inputs(weights, [], args.capacity, max_seq_len=args.context_capacity,
-                                                  engram=engram, request_slots=request_slots)
+                                                  engram=engram, request_slots=request_slots,
+                                                  window_chunk_capacity=getattr(args, "window_chunk_capacity", C.PREFILL_MAX_TOKENS))
         rope_tables = prefill_template["freqs_cos"], prefill_template["freqs_sin"]
         initial_cache = {name: prefill_template[name] for name in cache_names}
         decode_values = prepare_resident_inputs(weights, [], args.decode_capacity, max_seq_len=args.context_capacity,

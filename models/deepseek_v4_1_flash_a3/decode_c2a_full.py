@@ -11,6 +11,7 @@
 
 import pypto.language as pl
 import pypto.language.distributed as pld
+from .o_proj import ATTN_PARTIAL_WIDTH
 from .config import TP_SIZE
 from .config import (
     FLASH as M, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN,
@@ -166,7 +167,7 @@ def decode_c2a_full(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix,
         num_tokens,
     )
-    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    attn_out = pl.create_tensor([tokens, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
     o_proj(
         attended, wo_a, wo_b, rope_cos, rope_sin, attn_out, num_tokens,
     )

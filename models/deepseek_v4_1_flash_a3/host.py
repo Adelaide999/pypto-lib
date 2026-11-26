@@ -29,6 +29,7 @@ def prepare_prefill_inputs(
     max_seq_len: int | None = None,
     cache_state: Mapping[str, torch.Tensor] | None = None,
     request_slots: int = 1,
+    window_chunk_capacity: int = C.PREFILL_MAX_TOKENS,
     rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Prepare one TP group member's next embedding chunk and native cache metadata.
@@ -59,6 +60,14 @@ def prepare_prefill_inputs(
         raise ValueError("continuation requires the preceding call's retained cache state")
 
     data_pages = (max_seq_len + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE
+    if cache_state is None:
+        window_stride = window_pages_per_slot(data_pages, window_chunk_capacity)
+    else:
+        window_stride, extra = divmod(cache_state["window_cache"].shape[1] - 1, request_slots)
+        if extra or not 1 <= window_stride <= data_pages:
+            raise ValueError("Invalid retained sliding-window layout")
+    if window_stride < data_pages and count + min(start_pos, M.sliding_window - 1) > window_stride * C.BLOCK_SIZE:
+        raise ValueError("Current chunk exceeds the retained sliding-window storage")
     pages = data_pages * request_slots + 1
     table = torch.arange(data_pages, dtype=torch.int32).reshape(1, -1)
     c2a_pages = max(1, (max_seq_len // 2 + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE)
@@ -83,7 +92,7 @@ def prepare_prefill_inputs(
     query_starts = torch.tensor([0] + [count] * request_slots, dtype=torch.int32)
     request_ids = torch.zeros(count, dtype=torch.int32)
     positions = torch.arange(start_pos, start_pos + count, dtype=torch.int32)
-    window_table = sliding_page_table(table, state_table[:, 0])
+    window_table = sliding_page_table(table, state_table[:, 0], pages_per_slot=window_stride)
     window_slots, window_indices, _ = window_metadata(positions, request_ids, window_table)
     c2a_slots = paged_slots(positions, request_ids, c2a_table, C.BLOCK_SIZE, 2, True)
     c1a_slots = window_slots if window_table is table else paged_slots(positions, request_ids, table)
@@ -98,7 +107,7 @@ def prepare_prefill_inputs(
     initial_pre[:, 0] = 1.0
     logit_rows = torch.full((16,), -1, dtype=torch.int32)
     logit_rows[0] = count - 1
-    window_pages = request_slots * window_pages_per_slot(data_pages) + 1
+    window_pages = request_slots * window_stride + 1
     window_shape = (M.num_hidden_layers, window_pages, C.BLOCK_SIZE, 1)
     source_shape = (len(M.kv_source_layer_ids), pages, C.BLOCK_SIZE, 1)
 
@@ -174,6 +183,7 @@ def prepare_resident_inputs(
     max_seq_len: int | None = None,
     cache_state: Mapping[str, torch.Tensor] | None = None,
     request_slots: int = 1,
+    window_chunk_capacity: int = C.PREFILL_MAX_TOKENS,
     rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
     engram: HostEngram,
     request_id: int = 0,
@@ -195,6 +205,7 @@ def prepare_resident_inputs(
     values = prepare_prefill_inputs(
         embedding, capacity, start_pos=start_pos, max_seq_len=max_seq_len,
         cache_state=cache_state, rope_tables=rope_tables, request_slots=request_slots,
+        window_chunk_capacity=window_chunk_capacity,
     )
     values["engram_lookup"] = engram.lookup(ids, capacity, start_pos, request_id=request_id)
     return values

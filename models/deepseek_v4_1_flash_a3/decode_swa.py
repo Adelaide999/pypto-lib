@@ -11,6 +11,7 @@
 
 import pypto.language as pl
 import pypto.language.distributed as pld
+from .o_proj import ATTN_PARTIAL_WIDTH
 from .config import TP_SIZE
 from .config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
 from .sparse_attention import publish_window_row, swa_attention_partial
@@ -64,7 +65,7 @@ def decode_swa(
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.UINT8],
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
-    attention_output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
+    attention_output: pl.Tensor[[LOCAL_T_DYN, ATTN_PARTIAL_WIDTH], pl.BF16],
     attention_hidden: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
     attention_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     ffn_input: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],

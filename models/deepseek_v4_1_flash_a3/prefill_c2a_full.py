@@ -26,6 +26,7 @@ import pypto.language.distributed as pld
 import torch
 
 from .hc import hc_pre
+from .o_proj import ATTN_PARTIAL_WIDTH
 from .config import (
     FLASH as M, B_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN, TABLE_DYN, Q_START_DYN,
     STATE_BLOCKS_DYN, TP_SIZE, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, PREFILL_MAX_TOKENS, STATE_CAPACITY, WINDOW_CACHE_GROUP, SP_T_DYN,
@@ -111,7 +112,7 @@ def prefill_c2a_full_attention(
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.ND],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    partial: pl.Tensor[[T_DYN, D], pl.BF16],
+    partial: pl.Tensor[[T_DYN, ATTN_PARTIAL_WIDTH], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
     shared_prefix: pl.Scalar[pl.INT32] = -1,
@@ -243,7 +244,7 @@ def prefill_c2a_full_sp(
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     attn_input: pl.Tensor[[T_DYN, D], pl.BF16],
     attn_output: pl.Tensor[[SP_T_DYN, D], pl.BF16],
@@ -279,7 +280,7 @@ def prefill_c2a_full_sp(
         group_base, tp_rank, num_tokens, attention_epoch,
     )
     group_tokens = pl.tensor.dim(attn_input, 0)
-    partial = pl.create_tensor([group_tokens, D], dtype=pl.BF16)
+    partial = pl.create_tensor([group_tokens, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
     for row in pl.spmd(group_tokens, name_hint="sp_topk_padding"):
         if row >= num_tokens:
             topk_indices[row:row + 1, :] = pl.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
@@ -446,7 +447,7 @@ def l2_prefill_c2a_full(
     x_hc_out: pl.Out[pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32]],
     input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Tensor[[1], pl.INT32],
@@ -563,12 +564,12 @@ def l3_prefill_c2a_full(
     state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
     input_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    data_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
+    data_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
     signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         input_data = pld.window(input_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         input_signal = pld.window(input_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
-        data = pld.window(data_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
+        data = pld.window(data_buffer, [PREFILL_MAX_TOKENS, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
         signal = pld.window(signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         # Each rank consumes packed MX_B_NN scale rows.
         wq_a_scale_r: pl.Tensor[[1, Q_LORA], pl.FP32, pl.ND] = wq_a_scale[rank]

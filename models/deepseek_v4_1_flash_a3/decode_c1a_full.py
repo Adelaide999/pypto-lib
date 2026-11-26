@@ -11,6 +11,7 @@
 
 import pypto.language as pl
 import pypto.language.distributed as pld
+from .o_proj import ATTN_PARTIAL_WIDTH
 from .config import TP_SIZE
 from .qkv_proj_rope import decode_qkv_proj_rope
 from .o_proj import decode_o_proj_nz_from_attention as o_proj, decode_tp_output_post
@@ -175,7 +176,7 @@ def decode_c1a_full(
     attend_decode_selected(
         query, selected, indices, attn_sink, attended, num_tokens, gather_tid, 64, ATTEND_WORKER_TILE, rope_cos, rope_sin,
     )
-    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    attn_out = pl.create_tensor([tokens, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
     o_proj(
         attended, wo_a, wo_b, rope_cos, rope_sin, attn_out, num_tokens,
     )

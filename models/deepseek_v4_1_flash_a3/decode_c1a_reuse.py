@@ -10,6 +10,7 @@
 
 import pypto.language as pl
 import pypto.language.distributed as pld
+from .o_proj import ATTN_PARTIAL_WIDTH
 from .config import TP_SIZE
 from .config import (
     COMPRESSED_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN,
@@ -111,7 +112,7 @@ def decode_c1a_reuse(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix,
         num_tokens,
     )
-    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    attn_out = pl.create_tensor([tokens, ATTN_PARTIAL_WIDTH], dtype=pl.BF16)
     o_proj(
         attended, wo_a, wo_b, rope_cos, rope_sin, attn_out, num_tokens,
     )

@@ -45,6 +45,7 @@ class PackedSession:
         self.slots = slots
         self.context = context
         self.capacities = capacities
+        self._window_stride = (graphs.host_cache[0]["window_cache"].shape[1] - 1) // slots
         self.history = {}
         self._idle_values = {}
         self._active_dps = [set(), set()]
@@ -182,7 +183,7 @@ class PackedSession:
         values = dict(g.host_io["idle_inputs"][0 if not index else 1])
         pos = torch.tensor(positions, dtype=torch.int32)
         req = torch.tensor(owners, dtype=torch.int32)
-        window_table = sliding_page_table(table, state[:, 0])
+        window_table = sliding_page_table(table, state[:, 0], pages_per_slot=self._window_stride)
         slots, window, _ = window_metadata(pos, req, window_table)
         c1a_slots = slots if window_table is table else paged_slots(pos, req, table)
         compressed = paged_slots(pos, req, half, C.BLOCK_SIZE, 2, True)
@@ -289,6 +290,9 @@ def open_packed_session(args, devices, weights, engram, memory, report, *, reque
                                                (args.decode_runtime_dir, "decode", args.decode_capacity))]
     if any(m["history_capacity"] != args.context_capacity for m in manifests):
         raise ValueError("History capacity differs from the compiled graph pair")
+    if manifests[0]["window_chunk_capacity"] != manifests[1]["window_chunk_capacity"]:
+        raise ValueError("Sliding-window chunk capacity differs between compiled graphs")
+    args.window_chunk_capacity = manifests[0]["window_chunk_capacity"]
     C.set_moe_tokens(manifests[0]["moe_slab_rows"])
     with open_resident_graphs(args, devices, weights, engram, memory, report, request_slots=request_slots) as graphs:
         session = PackedSession(graphs, request_slots, args.context_capacity, (args.capacity, args.decode_capacity))
