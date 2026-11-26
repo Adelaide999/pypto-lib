@@ -17,7 +17,7 @@ from . import config as C
 from .config import FLASH as M
 from .engram import ENGRAM_K, HostEngram
 from .rope_tables import prepare_forward_rope_tables
-from .utils import paged_slots, window_metadata
+from .utils import paged_slots, sliding_page_table, window_metadata, window_pages_per_slot
 from .weights import ResidentWeights
 
 
@@ -83,9 +83,10 @@ def prepare_prefill_inputs(
     query_starts = torch.tensor([0] + [count] * request_slots, dtype=torch.int32)
     request_ids = torch.zeros(count, dtype=torch.int32)
     positions = torch.arange(start_pos, start_pos + count, dtype=torch.int32)
-    window_slots, window_indices, _ = window_metadata(positions, request_ids, table)
+    window_table = sliding_page_table(table, state_table[:, 0])
+    window_slots, window_indices, _ = window_metadata(positions, request_ids, window_table)
     c2a_slots = paged_slots(positions, request_ids, c2a_table, C.BLOCK_SIZE, 2, True)
-    c1a_slots = window_slots
+    c1a_slots = window_slots if window_table is table else paged_slots(positions, request_ids, table)
     freqs_cos, freqs_sin = prepare_forward_rope_tables(max_seq_len, rope_tables)
 
     def pad(value, fill=0):
@@ -97,7 +98,8 @@ def prepare_prefill_inputs(
     initial_pre[:, 0] = 1.0
     logit_rows = torch.full((16,), -1, dtype=torch.int32)
     logit_rows[0] = count - 1
-    window_shape = (M.num_hidden_layers, pages, C.BLOCK_SIZE, 1)
+    window_pages = request_slots * window_pages_per_slot(data_pages) + 1
+    window_shape = (M.num_hidden_layers, window_pages, C.BLOCK_SIZE, 1)
     source_shape = (len(M.kv_source_layer_ids), pages, C.BLOCK_SIZE, 1)
 
     def native_cache(name, shape, dtype, fill=0):
@@ -160,7 +162,7 @@ def prepare_prefill_inputs(
         ),
         "logit_rows": logit_rows,
     }
-    validate_prefill_caches(values, table, compressed_tables, state_tables)
+    validate_prefill_caches(values, window_table, compressed_tables, state_tables)
     return values
 
 def prepare_resident_inputs(
@@ -230,8 +232,9 @@ def validate_prefill_caches(
         if value.shape[-1] != expected_width:
             raise ValueError(f"{name} has an incompatible native row width")
         reference = cache_state["window_cache"]
-        if value.shape[:-5] != reference.shape[:-5] or value.shape[-4] != reference.shape[-4]:
-            raise ValueError("all prefill cache pools must preserve the same rank and page extents")
+        family = reference if name.startswith("window") else cache_state["compressed_cache"]
+        if value.shape[:-5] != reference.shape[:-5] or value.shape[-4] != family.shape[-4]:
+            raise ValueError("cache pools must preserve rank and source-family page extents")
         if value.device != reference.device:
             raise ValueError("all cache payloads and scales must reside on the same device")
     state = cache_state["state_cache"]
@@ -273,7 +276,7 @@ def validate_prefill_caches(
         if source not in compressed_block_tables:
             raise ValueError(f"missing compressed block table for source layer {source}")
         table = compressed_block_tables[source]
-        validate_table(f"source {source} compressed block table", table, pages)
+        validate_table(f"source {source} compressed block table", table, cache_state["compressed_cache"].shape[1])
         ratio = M.compress_ratios[source]
         family_table = family_tables.setdefault(ratio, table)
         if not torch.equal(table, family_table):

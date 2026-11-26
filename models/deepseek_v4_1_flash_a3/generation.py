@@ -123,9 +123,9 @@ def audit_caches(runtime, ranks, host_cache, owner, step, directory=None):
             runtime.copy_from(value.data_ptr(), handle.data_ptr, value.numel() * value.element_size(), worker_id=rank)
             actual.append(value)
         active_equal = all(torch.equal(actual[owner].view(torch.uint8), actual[rank].view(torch.uint8))
-                           for rank in range(owner, owner + 4))
+                           for rank in range(owner, owner + C.TP_SIZE))
         inactive_equal = all(torch.equal(actual[rank].view(torch.uint8), host_cache[rank][name].view(torch.uint8))
-                             for rank in range(16) if rank // 4 != owner // 4)
+                             for rank in range(C.EP_SIZE) if rank // C.TP_SIZE != owner // C.TP_SIZE)
         checks[name] = dict(tp_replicas_equal=active_equal, inactive_preserved=inactive_equal)
         if directory is not None:
             torch.save(actual[owner], directory / f"cache_step{step + 1}_{name}.pt")
@@ -164,8 +164,8 @@ def read_request(args, tokenizer):
             path.write_bytes(payload)
     if not isinstance(record, dict) or not {"request_id", "dp_rank", "input_ids"} <= record.keys():
         raise ValueError("A request requires request_id, dp_rank and input_ids")
-    if type(record["dp_rank"]) is not int or record["dp_rank"] not in range(4):
-        raise ValueError("dp_rank must be in 0..3")
+    if type(record["dp_rank"]) is not int or record["dp_rank"] not in range(C.DP_SIZE):
+        raise ValueError(f"dp_rank must be in 0..{C.DP_SIZE - 1}")
     ids = record["input_ids"]
     if not isinstance(ids, list) or not ids or any(type(v) is not int or not 0 <= v < M.vocab_size for v in ids):
         raise ValueError("Expected a nonempty array of valid integer token IDs")
@@ -369,7 +369,7 @@ def generate(args, devices, *, manifests):
         raise ValueError("Frozen layer/logit comparisons and eight-step timing reports use the 8192+8 replay")
     if args.validate_layers and args.context_capacity != 8200:
         raise ValueError("Frozen layer fixtures require history capacity 8200")
-    owner = request["dp_rank"] * 4
+    owner = request["dp_rank"] * C.TP_SIZE
     weights = ResidentWeights(checkpoint)
     selected_layers = [int(value) for value in args.validate_layers.split(",")] if args.validation_only else None
     engram = HostEngram(checkpoint, tokenizer)

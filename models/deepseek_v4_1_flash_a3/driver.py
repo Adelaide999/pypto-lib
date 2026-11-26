@@ -22,10 +22,12 @@ from golden import ScalarSpec, TensorSpec, run
 from pypto.ir import DistributedConfig
 
 from . import config as C
+from .utils import window_pages_per_slot
 from .weights import bf16_nz_shape, engram_wkv_nz_shape, projection_int8_nz_shape
 
 
-TOPOLOGY = {"world": 16, "dp": 4, "tp": 4, "ep": 16, "local_experts": 24}
+TOPOLOGY = {"world": C.EP_SIZE, "dp": C.DP_SIZE, "tp": C.TP_SIZE, "ep": C.EP_SIZE,
+            "local_experts": C.N_LOCAL_EXPERTS}
 HISTORY_CAPACITY = 8200
 
 
@@ -37,9 +39,11 @@ def build_specs(function, *, mode, capacity, history_capacity=HISTORY_CAPACITY, 
         raise ValueError("Invalid per-DP request capacity")
     table_pages = (history_capacity + 127) // 128
     pages = table_pages * request_slots + 1
+    window_pages = window_pages_per_slot(table_pages) * request_slots + 1
     c2a_pages = max(1, (history_capacity // 2 + 127) // 128)
     dimensions = {
-        "FWD_ORI_BLOCKS_DYN": 40 * pages, "FWD_CMP_BLOCKS_DYN": 4 * pages,
+        "FWD_ORI_BLOCKS_DYN": 40 * window_pages, "FWD_CMP_BLOCKS_DYN": 4 * pages,
+        "PREFILL_WINDOW_PAGES": window_pages,
         "FWD_INDEX_BLOCKS_DYN": 4 * pages, "FWD_STATE_BLOCKS_DYN": 3 * request_slots,
         "FWD_C2A_TABLE_DYN": c2a_pages, "FWD_C1A_TABLE_DYN": table_pages,
         "PREFILL_HISTORY_PAGES": pages, "PREFILL_C2A_TABLE": c2a_pages, "PREFILL_C1A_TABLE": table_pages,
@@ -132,7 +136,8 @@ def compile_generation_graphs(prefill_dir, decode_dir, *, devices, context, pref
     for phase, directory in (("prefill", prefill_dir), ("decode", decode_dir)):
         cmd = [sys.executable, str(Path(__file__).with_name(f"{phase}_fwd.py")), "--compile-only", "--prepare-windows",
                "--output", str(directory), "--context-capacity", str(context), "--devices", devices,
-               "--request-slots-per-dp", str(request_slots)]
+               "--request-slots-per-dp", str(request_slots), "--tp", str(C.TP_SIZE),
+               "--dp", str(C.DP_SIZE), "--ep", str(C.EP_SIZE)]
         if phase == "prefill":
             cmd.extend(("--capacity", str(prefill_capacity), "--prefill-moe-slab-rows", str(prefill_slab_rows)))
         else:
@@ -144,8 +149,8 @@ def main(function, *, mode, capacity, argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", choices=["a2a3"], default="a2a3")
     parser.add_argument("-d", "--device", "--devices", dest="devices", default=",".join(map(str, range(16))))
-    parser.add_argument("--tp", type=int, choices=[4], default=4)
-    parser.add_argument("--dp", type=int, choices=[4], default=4)
+    parser.add_argument("--tp", type=int, choices=C.SUPPORTED_TP_SIZES, default=C.TP_SIZE)
+    parser.add_argument("--dp", type=int, choices=[C.EP_SIZE // tp for tp in C.SUPPORTED_TP_SIZES], default=C.DP_SIZE)
     parser.add_argument("--ep", type=int, choices=[16], default=16)
     parser.add_argument("--experts-per-rank", type=int, choices=[24], default=24)
     parser.add_argument("--decode-capacity", type=int, choices=[16, C.DECODE_INPUT_MAX_TOKENS],
@@ -191,6 +196,8 @@ def main(function, *, mode, capacity, argv=None):
     parser.add_argument("--report", type=Path)
     parser.add_argument("--request-slots-per-dp", type=int, choices=range(1, C.MAX_BATCH_PER_DP + 1), default=1)
     args = parser.parse_args(argv)
+    if (args.tp, args.dp) != (C.TP_SIZE, C.DP_SIZE):
+        parser.error("Requested topology differs from the imported forward program")
     if args.request_slots_per_dp != 1 and not args.compile_only:
         parser.error("Use the packed session API to execute multi-slot artifacts")
     app_request = args.prompt is not None or args.tokens is not None or args.tokens_file is not None
@@ -213,8 +220,8 @@ def main(function, *, mode, capacity, argv=None):
         parser.error("exactly 16 distinct allocated devices are required")
     if not 1 <= args.chunk_size <= C.PREFILL_MAX_TOKENS or not 1 <= args.max_new_tokens <= 256:
         parser.error("Require a chunk size in 1..8192 and a generation limit in 1..256")
-    if args.context_capacity is not None and not 1 <= args.context_capacity <= 16384:
-        parser.error("Context capacity must be in 1..16384")
+    if args.context_capacity is not None and not 1 <= args.context_capacity <= C.FLASH.max_position_embeddings:
+        parser.error(f"Context capacity must be in 1..{C.FLASH.max_position_embeddings}")
     if args.compile_only:
         if function is None or args.capacity != capacity:
             parser.error("Compile with the phase's forward entry and its matching capacity")
@@ -291,7 +298,7 @@ def main(function, *, mode, capacity, argv=None):
     if args.execution_log:
         from .telemetry import rank_timings
 
-        report["device_timings"] = rank_timings(args.execution_log, devices, dp_rank=report["dp_rank"])
+        report["device_timings"] = rank_timings(args.execution_log, devices, dp_rank=report["dp_rank"], tp_size=C.TP_SIZE)
     if args.report:
         args.report.write_text(json.dumps(report, indent=2) + "\n")
     if result_dir and report["output_sequences"]:

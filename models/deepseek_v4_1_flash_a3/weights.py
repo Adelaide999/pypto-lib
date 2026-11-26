@@ -22,7 +22,7 @@ import struct
 
 import torch
 
-from .config import FLASH as M, EP_SIZE, N_LOCAL_EXPERTS, TP_SIZE, WEIGHT_LAYOUT_VERSION
+from .config import FLASH as M, DP_SIZE, EP_SIZE, N_LOCAL_EXPERTS, SUPPORTED_TP_SIZES, TP_SIZE, WEIGHT_LAYOUT_VERSION
 from .config import SHARED_NZ_PANEL, SWA_LAYER_COUNT
 
 ENGRAM_K = (M.engram_max_ngram_size - 1) * M.engram_n_heads * M.engram_head_dim
@@ -292,8 +292,8 @@ class ResidentWeights:
     )
 
     def __init__(self, checkpoint, *, ep_size=EP_SIZE):
-        if (ep_size, TP_SIZE, N_LOCAL_EXPERTS) != (16, 4, 24):
-            raise ValueError("resident weights require DP4/TP4/EP16 and 24 local experts")
+        if ep_size != EP_SIZE or N_LOCAL_EXPERTS != 24:
+            raise ValueError("resident weights require EP16 and 24 local experts")
         self.checkpoint = checkpoint
         self.ranks = ep_size
         self.local_experts = N_LOCAL_EXPERTS
@@ -494,7 +494,7 @@ def audit_checkpoint(weights):
     vocab = M.vocab_size // TP_SIZE
     head_rows = torch.tensor([value for lane in range(TP_SIZE) for value in (lane * vocab, (lane + 1) * vocab - 1)])
     head = checkpoint.tensor_rows("head.weight", head_rows)
-    if head.shape != (8, M.hidden_size) or head.dtype != torch.bfloat16 or not bool(torch.isfinite(head).all()):
+    if head.shape != (2 * TP_SIZE, M.hidden_size) or head.dtype != torch.bfloat16 or not bool(torch.isfinite(head).all()):
         raise ValueError("invalid LM head boundary rows")
     for layer in M.engram_layer_ids:
         prefix = f"layers.{layer}.engram.embed."
@@ -522,6 +522,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--audit", action="store_true")
+    parser.add_argument("--tp", type=int, choices=SUPPORTED_TP_SIZES, default=TP_SIZE)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
     checkpoint = Checkpoint(args.checkpoint)
@@ -529,7 +530,7 @@ if __name__ == "__main__":
     report = {"layout_version": WEIGHT_LAYOUT_VERSION, "checkpoint_identity": checkpoint.identity,
               "resident_bytes_per_rank": weights.bytes_per_rank, "resident_byte_breakdown": weights.byte_breakdown,
               "resident_gib_per_rank": weights.bytes_per_rank / 1024**3,
-              "topology": {"dp": 4, "tp": 4, "ep": 16, "local_experts": 24}}
+              "topology": {"dp": DP_SIZE, "tp": TP_SIZE, "ep": EP_SIZE, "local_experts": N_LOCAL_EXPERTS}}
     if args.audit:
         report.update(audit_checkpoint(weights))
     if args.report:

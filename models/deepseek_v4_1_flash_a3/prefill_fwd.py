@@ -88,6 +88,7 @@ HC_MULT = M.hc_mult
 VOCAB = M.vocab_size
 VOCAB_PER_TP = VOCAB // C.TP_SIZE
 PAGES = pl.dynamic("V41_PREFILL_HISTORY_PAGES")
+WINDOW_PAGES = pl.dynamic("V41_PREFILL_WINDOW_PAGES")
 C2A_TABLE_DYN = pl.dynamic("V41_PREFILL_C2A_TABLE")
 C1A_TABLE_DYN = pl.dynamic("V41_PREFILL_C1A_TABLE")
 LOCAL_EXPERTS = C.N_LOCAL_EXPERTS
@@ -527,8 +528,8 @@ def l2_prefill_fwd(
     c2a_index_block_table: pl.Tensor[[B_DYN, C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[B_DYN, C1A_TABLE_DYN], pl.INT32],
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[40, PAGES, 128, 1, 512], pl.UINT8]],
-    window_scales: pl.InOut[pl.Tensor[[40, PAGES, 128, 1, 16], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[40, WINDOW_PAGES, 128, 1, 512], pl.UINT8]],
+    window_scales: pl.InOut[pl.Tensor[[40, WINDOW_PAGES, 128, 1, 16], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 256], pl.UINT8]],
     compressed_scales: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 32], pl.BF16]],
     index_cache: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 64], pl.UINT8]],
@@ -560,6 +561,7 @@ def l2_prefill_fwd(
     rank: pl.Scalar[pl.INT32],
 ):
     """Run both CED stages and retire communication signals after the decoder."""
+    window_cache.bind_dynamic(1, WINDOW_PAGES)
     compressed_cache.bind_dynamic(1, PAGES)
     pool_block_ids.bind_dynamic(1, INDEX_POOL_BLOCKS_DYN)
     state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
@@ -866,8 +868,8 @@ def l3_prefill_fwd(
     c2a_index_block_table: pl.Tensor[[RANKS, B_DYN, C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[RANKS, B_DYN, C1A_TABLE_DYN], pl.INT32],
     state_block_table: pl.Tensor[[RANKS, B_DYN, 1], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[RANKS, 40, PAGES, 128, 1, 512], pl.UINT8]],
-    window_scales: pl.InOut[pl.Tensor[[RANKS, 40, PAGES, 128, 1, 16], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[RANKS, 40, WINDOW_PAGES, 128, 1, 512], pl.UINT8]],
+    window_scales: pl.InOut[pl.Tensor[[RANKS, 40, WINDOW_PAGES, 128, 1, 16], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[RANKS, 4, PAGES, 128, 1, 256], pl.UINT8]],
     compressed_scales: pl.InOut[pl.Tensor[[RANKS, 4, PAGES, 128, 1, 32], pl.BF16]],
     index_cache: pl.InOut[pl.Tensor[[RANKS, 4, PAGES, 128, 1, 64], pl.UINT8]],
@@ -932,6 +934,7 @@ def l3_prefill_fwd(
     """
     freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
+    window_cache.bind_dynamic(2, WINDOW_PAGES)
     compressed_cache.bind_dynamic(2, PAGES)
     pool_block_ids.bind_dynamic(2, INDEX_POOL_BLOCKS_DYN)
     state_cache.bind_dynamic(2, STATE_BLOCKS_DYN)

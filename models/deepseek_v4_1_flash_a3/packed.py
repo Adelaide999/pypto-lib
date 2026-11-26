@@ -17,7 +17,7 @@ import torch
 from . import config as C
 from .driver import load_manifest
 from .generation import open_resident_graphs
-from .utils import paged_slots, prepare_decode_inputs, window_metadata
+from .utils import paged_slots, prepare_decode_inputs, sliding_page_table, window_metadata
 
 
 @dataclass(frozen=True, eq=False)
@@ -86,6 +86,10 @@ class PackedSession:
             for name, initial in g.host_cache[rank].items():
                 target = g.ranks[0][rank][name]
                 blocks = [handle.slot] if name == "state_cache" else record.pages
+                if name.startswith("window") and initial.shape[1] != g.host_cache[rank]["compressed_cache"].shape[1]:
+                    stride = (initial.shape[1] - 1) // self.slots
+                    begin = handle.slot * stride
+                    blocks = range(begin, begin + min(stride, len(record.pages)))
                 page_image = g.host_io.get("reset_" + name)
                 for source in range(initial.shape[0]):
                     for block in blocks:
@@ -178,7 +182,9 @@ class PackedSession:
         values = dict(g.host_io["idle_inputs"][0 if not index else 1])
         pos = torch.tensor(positions, dtype=torch.int32)
         req = torch.tensor(owners, dtype=torch.int32)
-        slots, window, _ = window_metadata(pos, req, table)
+        window_table = sliding_page_table(table, state[:, 0])
+        slots, window, _ = window_metadata(pos, req, window_table)
+        c1a_slots = slots if window_table is table else paged_slots(pos, req, table)
         compressed = paged_slots(pos, req, half, C.BLOCK_SIZE, 2, True)
         def pad(value, fill=-1):
             out = torch.full((capacity, *value.shape[1:]), fill, dtype=value.dtype)
@@ -196,7 +202,7 @@ class PackedSession:
             engram[:, :count] = torch.cat(lookups, dim=1)
         values.update(embedding=pad(emb, 0), initial_pre=initial, engram_lookup=engram,
                       logit_rows=rows, c2a_index_block_table=half, c1a_index_block_table=table,
-                      state_block_table=state, c1a_compressed_slots=pad(slots),
+                      state_block_table=state, c1a_compressed_slots=pad(c1a_slots),
                       c2a_compressed_slots=pad(compressed))
         for name, value in (("window_slots", pad(slots)), ("window_indices", pad(window)),
                             ("position_ids", pad(pos)), ("token_to_req_indices", pad(req)),

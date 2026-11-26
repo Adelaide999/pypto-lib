@@ -5,6 +5,13 @@ devices (DP4, TP4, EP16). Each program owns its layer schedule and calls the
 phase-specific operators beside the forward entries. One request runs in one TP group.
 All sixteen ranks participate in expert communication.
 
+The candidate A3 topologies also include DP8/TP2 and DP16/TP1 with EP16.
+Select a topology when compiling both phases and when starting generation, for
+example `--tp 2 --dp 8 --ep 16`. Each topology uses its own graph pair.
+For contexts above 16,384 positions, each request slot retains enough sliding
+window pages for a full Prefill chunk and its preceding visible keys. Compressed
+and Indexer caches keep their original page maps for the complete history.
+
 | | Prefill | Decode |
 | --- | --- | --- |
 | Distributed entry | `prefill_fwd.l3_prefill_fwd` binds rank-local slices and communication windows | `decode_fwd.l3_decode_fwd` binds Decode views, valid counts and windows |

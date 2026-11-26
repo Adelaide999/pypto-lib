@@ -15,17 +15,17 @@ import statistics
 from pathlib import Path
 
 
-def route_distribution(runtime, ranks, owner, rows=8192):
+def route_distribution(runtime, ranks, owner, rows=8192, *, tp_size=4):
     """Read the production prefill routes after token delivery has completed."""
     import torch
 
     counts = torch.zeros((40, 384), dtype=torch.int64)
-    for rank in range(owner, owner + 4):
+    for rank in range(owner, owner + tp_size):
         source = ranks[0][rank]["moe_route_indices"]
         indices = torch.empty(source.shape, dtype=torch.int32)
         runtime.copy_from(indices.data_ptr(), source.data_ptr,
                           indices.numel() * indices.element_size(), worker_id=rank)
-        indices = indices[:, :(rows + 3 - (rank - owner)) // 4]
+        indices = indices[:, :(rows + tp_size - 1 - (rank - owner)) // tp_size]
         if bool(((indices < 0) | (indices >= 384)).any()):
             raise ValueError("production prefill contains an invalid expert ID")
         for layer in range(40):
@@ -37,7 +37,7 @@ def route_distribution(runtime, ranks, owner, rows=8192):
                 receiver_rank_counts_per_layer=counts.reshape(40, 16, 24).sum(2).tolist())
 
 
-def rank_timings(path, devices=tuple(range(16)), *, dp_rank=0):
+def rank_timings(path, devices=tuple(range(16)), *, dp_rank=0, tp_size=4):
     """Read orch/sched unions in device nanoseconds and retain every dispatch."""
     physical_to_rank = {device: rank for rank, device in enumerate(devices)}
     identities, windows = {}, {}
@@ -90,11 +90,11 @@ def rank_timings(path, devices=tuple(range(16)), *, dp_rank=0):
         stage = stages.setdefault(key, {})
         stage.setdefault(dispatch["rank"], []).append(dispatch["effective_us"])
     summaries = []
-    active_ranks = list(range(dp_rank * 4, dp_rank * 4 + 4))
+    active_ranks = list(range(dp_rank * tp_size, (dp_rank + 1) * tp_size))
     for (mode, step, profiled), samples in sorted(stages.items(), key=lambda item: item[0][1]):
         medians = {rank: statistics.median(values) for rank, values in samples.items()}
         comparable = {rank: medians[rank] for rank in active_ranks if rank in medians}
-        fastest = min(comparable, key=comparable.get) if len(comparable) == 4 else None
+        fastest = min(comparable, key=comparable.get) if len(comparable) == tp_size else None
         slowest = max(medians, key=medians.get)
         summaries.append(dict(mode=mode, step=step, profiled=profiled, median_us_per_rank=medians,
                               samples_us_per_rank=samples, fastest_rank=fastest,
@@ -122,7 +122,8 @@ def main():
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
     report = json.loads(args.report.read_text())
-    report["device_timings"] = rank_timings(args.execution_log, dp_rank=report.get("dp_rank", 0))
+    report["device_timings"] = rank_timings(args.execution_log, dp_rank=report.get("dp_rank", 0),
+                                          tp_size=report.get("topology", {}).get("tp", 4))
     args.report.write_text(json.dumps(report, indent=2) + "\n")
 
 

@@ -14,7 +14,7 @@ import torch
 
 
 from . import config as C
-from .config import BLOCK_SIZE, FLASH as M, TP_SIZE
+from .config import BLOCK_SIZE, FLASH as M, PREFILL_MAX_TOKENS, TP_SIZE
 from golden import ScalarSpec
 
 
@@ -112,6 +112,24 @@ def paged_slots(
         slots[publish] = mapped
         return slots
     return mapped
+
+
+def window_pages_per_slot(history_pages: int) -> int:
+    """Keep a whole maximum Prefill chunk and its oldest visible sliding window."""
+    if history_pages <= 16384 // BLOCK_SIZE:
+        return history_pages
+    return (PREFILL_MAX_TOKENS + M.sliding_window - 1 + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+
+def sliding_page_table(history_table, slots):
+    """Map logical pages onto disjoint cyclic storage owned by stable request slots."""
+    width = history_table.shape[1]
+    pages = window_pages_per_slot(width)
+    if pages == width:
+        return history_table
+    logical = torch.arange(width, dtype=torch.int32, device=history_table.device)
+    mapped = slots.reshape(-1, 1) * pages + logical.remainder(pages)
+    return mapped.masked_fill(history_table < 0, -1)
 
 
 def window_metadata(

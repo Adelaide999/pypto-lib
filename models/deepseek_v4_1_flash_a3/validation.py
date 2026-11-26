@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from golden import ratio_allclose
 
-from .config import FLASH as M
+from .config import FLASH as M, TP_SIZE
 from .host import prepare_prefill_inputs, prepare_resident_inputs
 from .hc import golden_hc_collapse, golden_mhc_mixes
 from .engram import golden_engram
@@ -78,7 +78,7 @@ def validate_routes(runtime, ranks, checkpoint, layer, owner, received, *, bias=
         for name, value in (("moe_route_indices", indices), ("moe_route_weights", weights)):
             runtime.copy_from(value.data_ptr(), ranks[0][rank][name].data_ptr,
                               value.numel() * value.element_size(), worker_id=rank)
-        if rank // 4 == owner // 4:
+        if rank // TP_SIZE == owner // TP_SIZE:
             source = torch.empty((2048, M.hidden_size), dtype=torch.bfloat16)
             runtime.copy_from(source.data_ptr(), ranks[0][rank]["moe_gate_inputs"].data_ptr,
                               source.numel() * source.element_size(), worker_id=rank)
@@ -98,7 +98,7 @@ def validate_routes(runtime, ranks, checkpoint, layer, owner, received, *, bias=
                                 weights_detail=detail, six_distinct_experts=unique,
                                 passed=indices_ok and bool(weights_ok) and unique))
             if not records[-1]["passed"] and diagnostics_dir is not None:
-                path = diagnostics_dir / f"failed_gate_layer_{layer:02d}_dp{owner // 4}_rank{rank:02d}.pt"
+                path = diagnostics_dir / f"failed_gate_layer_{layer:02d}_dp{owner // TP_SIZE}_rank{rank:02d}.pt"
                 torch.save(dict(source=source, gate_weight=matrix, gate_bias=bias,
                                 actual_indices=indices[layer], actual_weights=weights[layer],
                                 expected_indices=expected_indices, expected_weights=expected_weights), path)
@@ -289,10 +289,10 @@ def validate_layers(runtime, programs, arguments, names, ranks, weights, engram,
             fixture = base_fixture
             if target is not None:
                 fixture = concentrated_fixture(base_fixture, target, args.reference_dir, weights, tokenizer, request, rope)
-            owner = dp * 4
+            owner = dp * TP_SIZE
             memory.phase = f"layer_{layer}_dp{dp}"
             for rank in range(16):
-                active = rank // 4 == dp
+                active = rank // TP_SIZE == dp
                 if target is not None:
                     bias = fixture["correction_bias"]
                     runtime.copy_to(ranks[0][rank]["correction_bias"].data_ptr, bias.data_ptr(),

@@ -49,7 +49,7 @@ from pypto.ir import DistributedConfig
 
 # Standalone LM-head validation defaults to TP2/DP1.
 
-from .config import FLASH as M, TP_SIZE as CONFIG_TP_SIZE, DP_SIZE as CONFIG_DP_SIZE
+from .config import FLASH as M, TP_SIZE as CONFIG_TP_SIZE, DP_SIZE as CONFIG_DP_SIZE, EP_SIZE, SUPPORTED_TP_SIZES
 from .hc import hc_head, golden_hc_collapse
 from .rmsnorm import rms_norm_tiled_compensated, golden_rms_norm_tiled
 
@@ -64,8 +64,8 @@ HC_MULT = M.hc_mult
 
 # Parallelism. Static in the frontend, so both worlds are parsed off argv here.
 # Imported kernels inherit TP from the composing program.
-_TP_CHOICES = (4,)
-_DP_CHOICES = (4,)
+_TP_CHOICES = SUPPORTED_TP_SIZES
+_DP_CHOICES = tuple(EP_SIZE // tp for tp in SUPPORTED_TP_SIZES)
 _TP_DEFAULT = CONFIG_TP_SIZE
 
 

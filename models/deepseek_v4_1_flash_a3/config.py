@@ -271,7 +271,7 @@ INDEX_POOL_POSITIONS_DYN = pl.dynamic("V41_INDEX_POOL_POSITIONS_DYN")
 
 
 # Parallel configuration
-SUPPORTED_TP_SIZES = (4,)
+SUPPORTED_TP_SIZES = (1, 2, 4)
 SUPPORTED_EP_SIZES = (16,)
 
 
@@ -348,8 +348,6 @@ EP_SIZE = get_ep_size()
 DP_SIZE = _parse_parallel_size("dp", EP_SIZE // TP_SIZE)
 if DP_SIZE <= 0 or DP_SIZE * TP_SIZE != EP_SIZE:
     raise ValueError("DP * TP must equal the EP world size")
-if IS_A3 and (DP_SIZE, TP_SIZE, EP_SIZE) != (4, 4, 16):
-    raise ValueError("the A3 text forward requires --dp 4 --tp 4 --ep 16")
 N_LOCAL_EXPERTS = FLASH.n_routed_experts // EP_SIZE
 MOE_TOKENS = 64
 MOE_RECV_MAX = EP_SIZE * MOE_TOKENS

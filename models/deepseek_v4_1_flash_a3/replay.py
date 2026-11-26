@@ -23,7 +23,7 @@ from .reference import compare_logits
 from .swimlane import step_name
 from .telemetry import route_distribution
 from .device_views import _device_view
-from .utils import DECODE_CACHE_NAMES, paged_slots, window_metadata
+from .utils import DECODE_CACHE_NAMES, paged_slots, sliding_page_table, window_metadata
 
 
 class DecodeInputs:
@@ -45,6 +45,9 @@ class DecodeInputs:
                 fields[name].copy_(value)
             self.fields.append(fields)
         self.devices = {}
+        table = self.fields[0]["c1a_index_block_table"]
+        slots = torch.arange(table.shape[0], dtype=table.dtype)
+        self.window_table = sliding_page_table(table, slots)
 
     def bind(self, runtime, rank):
         image = self.images[0]
@@ -66,7 +69,8 @@ class DecodeInputs:
         req = torch.zeros(1, dtype=torch.int32)
         table = self.fields[0]["c1a_index_block_table"]
         c2a_table = self.fields[0]["c2a_index_block_table"]
-        slot, window, _ = window_metadata(pos, req, table)
+        slot, window, _ = window_metadata(pos, req, self.window_table)
+        c1a_slot = slot if self.window_table is table else paged_slots(pos, req, table)
         compressed_slot = paged_slots(pos, req, c2a_table, C.BLOCK_SIZE, 2, True)
         embedding = weights.lookup_rows(ids)
         lookup = engram.lookup(ids, 1, position, request_id=owner)
@@ -76,7 +80,7 @@ class DecodeInputs:
             fields["position_ids"][:1].copy_(pos)
             fields["window_slots"][:1].copy_(slot)
             fields["window_indices"][:1].copy_(window)
-            fields["c1a_compressed_slots"][:1].copy_(slot)
+            fields["c1a_compressed_slots"][:1].copy_(c1a_slot)
             fields["c2a_compressed_slots"][:1].copy_(compressed_slot)
             fields["token_to_req_indices"][0] = 0
             fields["query_start_loc"][1] = 1
@@ -110,7 +114,7 @@ def run_request(
     if teacher_forced and reference is None:
         raise ValueError("teacher forcing requires the frozen reference")
     trace = reference["token_ids"] if teacher_forced else request.get("trace_token_ids")
-    owner = request["dp_rank"] * 4
+    owner = request["dp_rank"] * C.TP_SIZE
     constants = set(weights.tensor_layouts) | set(DECODE_CACHE_NAMES.values()) | {"freqs_cos", "freqs_sin"}
     counts = {name: arguments[1][name] for name in ("moe_num_tokens", "attention_num_tokens")}
     logit_buffer = host_io["logits"]
@@ -250,7 +254,8 @@ def run_request(
                   end_to_end_seconds=token_times[-1] - start,
                   token_intervals_seconds=[b - a for a, b in zip(token_times, token_times[1:])],
                   engine_seconds=engine_times, text=tokenizer.decode(generated, skip_special_tokens=False))
-    report["prefill_routing"] = route_distribution(runtime, ranks, owner, len(prompt) - (chunks - 1) * options.chunk_size)
+    report["prefill_routing"] = route_distribution(runtime, ranks, owner, len(prompt) - (chunks - 1) * options.chunk_size,
+                                                  tp_size=C.TP_SIZE)
     if reference is not None:
         report["numerical_acceptance"] = reference["policy"]
         for step, value in enumerate(observed_logits):

@@ -42,7 +42,7 @@ import pypto.language as pl
 from .quant import decode_fp4, decode_fp8, decode_fp8_cache_values, encode_fp8, fp4_bf16_bits, make_fp8_cache_table
 
 from .config import (
-    FLASH as M, CMP_BLOCKS_DYN, MAX_BATCH_PER_DP, ORI_BLOCKS_DYN, T_DYN, TP_SIZE,
+    FLASH as M, CMP_BLOCKS_DYN, MAX_BATCH_PER_DP, ORI_BLOCKS_DYN, SUPPORTED_TP_SIZES, T_DYN, TP_SIZE,
 )
 
 # Dynamic shape variables.
@@ -115,7 +115,7 @@ SWA_HEAD_TILE = 16
 # Leave Vector space for the value-preserving query startup before QK.
 SWA_SHARED_HEAD_TILE = 16
 SWA_GATHER_TILE = 16
-SWA_SELECTED_GATHER_TILE = 64 if TP_SIZE == 1 else SWA_GATHER_TILE
+SWA_SELECTED_GATHER_TILE = SWA_GATHER_TILE
 SWA_WORKER_TILE = 32
 SWA_CROSS_CORE_SLOT_TILE = 3
 SWA_RUN_TILE = 32
@@ -2834,7 +2834,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[4])
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=SUPPORTED_TP_SIZES)
     rows_help = "single row count (default: 1, 7, 12, 13)"
     parser.add_argument("--rows", type=int, help=rows_help)
     mode_choices = ["packed", "bf16", "both", "c2a", "swa", "swa-packed", "swa-both", "all"]
