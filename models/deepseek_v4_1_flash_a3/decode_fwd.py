@@ -19,7 +19,6 @@ if not __package__:
 
 import argparse
 import pypto.language as pl
-from .o_proj import ATTN_PARTIAL_WIDTH
 from .config import SWA_LAYER_COUNT, TP_SIZE
 import pypto.language.distributed as pld
 from . import config as C
@@ -46,7 +45,7 @@ from .config import (
 )
 from .compressor import STATE_WIDTH
 from .moe import ROUTED_RECV_ROWS, prefill_moe_sublayer, prefill_ffn_restore
-from .o_proj import retire_prefill_signals
+from .o_proj import ATTN_PARTIAL_WIDTH, retire_prefill_signals
 from .decode_c1a_full import decode_c1a_full
 from .decode_c1a_reindex import decode_c1a_reindex
 from .decode_c1a_reuse import decode_c1a_reuse
