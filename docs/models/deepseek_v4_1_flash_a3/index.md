@@ -9,6 +9,26 @@ the graph operators, weight loading, replay and validation. The
 [accuracy collector](accuracy.md) captures raw logits from the same two graphs
 and aligns them with a fixed vLLM-Ascend token history.
 
+## Packed Prefill Indexer
+
+Each consecutive run of queries for one request uses that request's page-table
+row and visible compressed-key range. Short histories use a bounded score row.
+Histories over 32K compressed keys stream score bands into Top-512 and the C1A
+candidate pool. C2A can map up to 512 visible keys directly. C1A reindex scores
+only the candidate blocks for sparse long histories and can reuse request-local
+scores for denser short histories. Invalid pages and noncausal keys are excluded
+from selection.
+
+Run the single-device regression from the repository root. It checks the
+physical Top-512 indices, candidate IDs and counts against independent Torch
+references for each request. The attention option also consumes the selected
+indices in the production sparse-attention operator.
+
+```bash
+python models/deepseek_v4_1_flash_a3/validate_prefill_indexer.py --case pool-holes --attention --device 0
+python models/deepseek_v4_1_flash_a3/validate_prefill_indexer.py --case packed-mixed --device 0
+```
+
 ## Development priorities
 
 - Performance target: run one distributed dispatch per prompt chunk and one
