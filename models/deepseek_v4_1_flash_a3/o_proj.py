@@ -234,15 +234,11 @@ decode_swa_o_proj = make_decode_swa_o_proj(b1_rotated=False)
 decode_swa_o_proj_from_attention = make_decode_swa_o_proj(b1_rotated=True)
 
 
-NZ_WEIGHT_K = pl.dynamic("NZ_WEIGHT_K")
-NZ_WEIGHT_N = pl.dynamic("NZ_WEIGHT_N")
-
-
 def make_gemm_bf16_native(*, k_subtile):
     @pl.jit.inline(auto_scope=False)
     def gemm_bf16_native(
         source: pl.Tensor,
-        weight: pl.Tensor[[NZ_WEIGHT_K, NZ_WEIGHT_N], pl.BF16, pl.NZ],
+        weight: pl.Tensor,
         output: pl.Tensor,
         num_tokens: pl.Scalar[pl.INT32],
         ready: pl.Scalar[pl.TASK_ID],
