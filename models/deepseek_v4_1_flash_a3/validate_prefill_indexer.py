@@ -38,12 +38,23 @@ CASES = {
     "packed-mixed": (1048576, [(2, n) for n in (32767, 32768, 32769, 33005)] +
                      [(0, n) for n in (511, 512, 513, 2047, 2048, 2049)]),
     "interleaved": (4096, [(1, 2047), (0, 2048), (1, 2049), (2, 4095), (0, 1025), (1, 1)]),
+    "same-bucket": (65536, [(slot, n + slot) for n in (1023, 1024, 2048, 4095) for slot in (2, 0)]),
+    "mixed-buckets": (65536, [(1, 0), (0, 65535), (2, 16383), (1, 512), (0, 65536),
+                              (2, 16384), (1, 513), (2, 16385), (0, 32769)]),
+    "c2a-mixed-buckets": (65536, [(2, 511), (1, 16385), (0, 32769), (2, 512),
+                                  (0, 32768), (1, 16384), (2, 513), (0, 65025)]),
+    "pool-interleaved": (65536, [(2, 65535), (0, 513), (2, 65536), (0, 1025), (2, 32769)]),
     "c2a-packed": (524288, [(2, n) for n in (0, 1, 511, 512, 513)] + [(1, 32768), (1, 32769)]),
     "pool-sparse": (1048576, [(1, 33005), (1, 33117), (0, 1048573), (0, 1048576)]),
     "pool-holes": (1048576, [(2, 0), (2, 513), (2, 32769), (1, 1048573)]),
     "pool-dense": (8192, [(1, 511), (1, 513), (1, 8001), (0, 8192)]),
     "published-pool": (65536, [(2, 32767), (2, 32768), (2, 32769), (1, 1025), (1, 513)]),
+    "published-interleaved": (65536, [(2, 32769), (1, 512), (2, 33005), (1, 1025), (2, 65535)]),
+    "many-slots": (65536, [(32, 32769), (1, 1025), (31, 16385), (32, 33005), (34, 0), (1, 513)]),
     "stream-ties": (65536, [(1, 32767), (1, 32768), (1, 32769), (1, 33280)]),
+    "band-ties": (131072, [(2, 65535), (0, 16383), (2, 65536), (0, 16384), (2, 65537)]),
+    "stream-empty-prefix": (65536, [(1, 0)] * 64 + [(1, 32769)]),
+    "c2a-stream-short-prefix": (65536, [(1, 512)] * 64 + [(1, 32769)]),
     "c1a-million": (1048576, [(1, 1048575), (1, 1048576)]),
     "c2a-million": (524288, [(2, 512), (1, 524287), (1, 524288)]),
     "empty": (4096, []),
@@ -121,7 +132,8 @@ def make_specs(case):
     pages = 263
     permutation = torch.randperm(pages, generator=generator)
     logical = torch.arange(width // 128)
-    table = torch.stack([permutation[(logical + slot * 29) % pages] for slot in range(3)]).int()
+    slots = max(3, max((slot + 1 for slot, _ in runs), default=0))
+    table = torch.stack([permutation[(logical + slot * 29) % pages] for slot in range(slots)]).int()
     if case != "pool-sparse":
         table[:, 1] = -1
         table[:, 4] = pages
@@ -131,7 +143,7 @@ def make_specs(case):
             table[1, page] = permutation[page]
     cache, scales = quantize_mxfp4_cache(random(pages, 128, 1, INDEX_DIM), 32, "e8m0", round_to_even=True)
     latent = random(rows, Q_LORA)
-    if case == "stream-ties":
+    if case in {"stream-ties", "band-ties"}:
         latent.zero_()
     req = torch.tensor([slot for slot, _ in runs] + [-1, -1], dtype=torch.int32)
     lengths = torch.tensor([length for _, length in runs] + [width, width], dtype=torch.int32)
@@ -209,13 +221,14 @@ def main():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--attention", action="store_true")
     parser.add_argument("--output")
+    parser.add_argument("--runtime-dir", help="replay a compatible precompiled validation graph")
     parser.add_argument("--golden-data")
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     args = parser.parse_args()
     torch.set_num_threads(4)
-    _PUBLISHED = args.case == "published-pool"
+    _PUBLISHED = args.case.startswith("published-")
     _POOL = args.case.startswith("pool-") or _PUBLISHED
     _C2A, _ATTEND = args.case.startswith("c2a-"), args.attention
     exact = ratio_allclose(atol=0, rtol=0, max_error_ratio=0)
@@ -233,6 +246,7 @@ def main():
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
     )
     if not result.passed:
         raise SystemExit(result.error or 1)

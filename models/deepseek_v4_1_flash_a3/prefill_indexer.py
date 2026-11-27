@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 import pypto.language as pl
 INDEX_POOL_SCORE_DYN = pl.dynamic("A3_INDEX_POOL_SCORE_DYN")
-from .quant import decode_fp4, decode_scale
+from .quant import decode_scale, fp4_bf16_bits
 
 from .config import INDEX_CACHE_GROUP, FLASH as M, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, T_DYN
 from .rmsnorm import EPS, rms_norm, golden_rms_norm
@@ -78,7 +78,9 @@ INDEX_SCORE_WORKERS = 24
 INDEX_SCORE_QUERY_TILE = 2
 INDEX_SCORE_SHARED_QUERIES = 4
 INDEX_STREAM_KEYS = 32768
+INDEX_BAND_TILE = 16384
 INDEX_STREAM_QUERIES = 64
+INDEX_REQUEST_TILE = 32
 
 
 CANDIDATE_SCORE_TILE = 1024
@@ -570,7 +572,16 @@ def _select_candidate_blocks(
             sorted_ids = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
         # Publish the sorted prefix and -1 padding as one aligned pool row.
         pl.store(pl.tile.set_validshape(sorted_ids, 1, capacity), [token, 0], pool_block_ids)
-    # Publish cache-line-sharing counts from one worker after the ID rows.
+    return _publish_pool_counts(compressed_lens, pool_block_counts, tokens, num_tokens, positions, capacity, pool_tid)
+
+
+@pl.jit.inline(auto_scope=False)
+def _publish_pool_counts(
+    compressed_lens: pl.Tensor, pool_block_counts: pl.Tensor, tokens: pl.Scalar[pl.INDEX],
+    active_tokens: pl.Scalar[pl.INT32], positions: pl.Scalar[pl.INDEX], capacity: pl.Scalar[pl.INDEX],
+    pool_tid: pl.Scalar[pl.TASK_ID],
+):
+    """Publish cache-line-sharing counts from one worker after the ID rows."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_pool_count_publish", deps=[pool_tid]) as counts_tid:
         for publish_token in pl.range(tokens):
             published_count = pl.cast(0, pl.INT32)
@@ -701,10 +712,29 @@ def prepare_prefill_index_query(
 
 
 @pl.jit.inline
-def _decode_index_tile(packed: pl.Tensor, scales: pl.Tensor, source_row: pl.Scalar[pl.INDEX], tile_rows: pl.constexpr):
+def _index_fp4_pairs():
+    """Build one lookup of the two BF16 values in each signed cache byte."""
+    code = pl.cast(pl.tile.arange(-128, [1, 256], dtype=pl.INT32), pl.INT16, mode="rint")
+    low = pl.cast(pl.cast(fp4_bf16_bits(code), pl.FP32), pl.INT32, mode="rint")
+    high = pl.cast(pl.cast(fp4_bf16_bits(pl.shrs(code, 4)), pl.FP32), pl.INT32, mode="rint")
+    low_bits = pl.sub(low, pl.mul(pl.shrs(low, 31), 65536))
+    return pl.add(low_bits, pl.shls(high, 16))
+
+
+@pl.jit.inline
+def _decode_index_tile(
+    packed: pl.Tensor, scales: pl.Tensor, source_row: pl.Scalar[pl.INDEX],
+    pairs: pl.Tile[[1, 256], pl.INT32], tile_rows: pl.constexpr,
+):
     codes = pl.load(packed, [source_row, 0], [tile_rows, INDEX_DIM // 2])
     raw_scales = pl.load(scales, [0, source_row * IDX_SCALES], [1, tile_rows * IDX_SCALES])
-    magnitudes = decode_fp4(codes, tile_rows, INDEX_DIM)
+    signed = pl.reinterpret_view(codes, pl.INT8)
+    offsets = pl.add(pl.cast(signed, pl.FP16), 128.0)
+    wide = pl.cast(pl.cast(offsets, pl.FP32), pl.INT32, mode="rint")
+    indices = pl.reshape(wide, [1, tile_rows * IDX_PACKED])
+    tmp = pl.create_tile([1, tile_rows * IDX_PACKED], dtype=pl.INT32)
+    decoded = pl.tile.gather(pairs, indices, tmp)
+    magnitudes = pl.reinterpret_view(decoded, pl.BF16, shape=[tile_rows, INDEX_DIM])
     groups = pl.reshape(pl.cast(magnitudes, pl.FP32), [tile_rows * IDX_SCALES, 32])
     factors = pl.reshape(decode_scale(raw_scales, 1, tile_rows * IDX_SCALES), [tile_rows * IDX_SCALES, 1])
     scaled = pl.row_expand_mul(groups, factors)
@@ -735,6 +765,7 @@ def _decode_index_pages(
     entry_deps[0] = ready
     with pl.spmd(workers, name_hint="prefill_index_decode_pages", deps=[entry_deps[0]]) as decoded_tid:
         worker = pl.tile.get_block_idx()
+        pairs = _index_fp4_pairs()
         for panel in pl.range(worker, rows // 32, workers):
             row = panel * 32
             source_row = first + row
@@ -745,7 +776,7 @@ def _decode_index_pages(
                     physical = pl.read(table, [request, logical])
                 physical = pl.min(pages - 1, pl.max(physical, 0))
                 source_row = physical * 128 + row % 128
-            values = _decode_index_tile(packed, scales, source_row, tile_rows=32)
+            values = _decode_index_tile(packed, scales, source_row, pairs, tile_rows=32)
             pl.store(values, [row, 0], decoded)
     return decoded_tid
 
@@ -784,6 +815,7 @@ def _compact_pool_cache(
     scales = pl.reshape(cache_scale, [1, cache_pages * 128 * IDX_SCALES])
     with pl.spmd(32, name_hint="prefill_pool_gather", deps=[planned]) as gathered:
         worker = pl.tile.get_block_idx()
+        pairs = _index_fp4_pairs()
         lanes = pl.cast(pl.tile.arange(0, [1, CANDIDATE_BLOCK_SIZE], dtype=pl.INT32), pl.FP32)
         for work in pl.range(worker, num_tokens * capacity, 32):
             token = work // capacity
@@ -799,7 +831,7 @@ def _compact_pool_cache(
                     physical_page = pl.read(table, [request, logical // 128])
                     if physical_page >= 0 and physical_page < cache_pages:
                         physical_row = physical_page * 128 + logical % 128
-                        values = _decode_index_tile(packed, scales, physical_row, tile_rows=CANDIDATE_BLOCK_SIZE)
+                        values = _decode_index_tile(packed, scales, physical_row, pairs, tile_rows=CANDIDATE_BLOCK_SIZE)
                         live = pl.cast(pl.min(CANDIDATE_BLOCK_SIZE, visible - logical), pl.INT32)
             mask = pl.tile.cmps(lanes, pl.cast(live, pl.FP32), cmp_type=2)
             ones = pl.tile.full([1, CANDIDATE_BLOCK_SIZE], dtype=pl.FP32, value=1.0)
@@ -965,7 +997,7 @@ def _prefill_index_scores(
                     begin = key_begin + offset
                     first_page = begin // 128
                     if ordered_keys:
-                        key_panel = pl.load(decoded_keys, [begin, 0], [tile_n, INDEX_DIM],
+                        key_panel = pl.load(decoded_keys, [offset, 0], [tile_n, INDEX_DIM],
                                             target_memory=pl.MemorySpace.Mat)
                     elif tile_n == 128:
                         page = pl.read(block_table, [safe_request, pl.min(table_width - 1, first_page)])
@@ -1043,7 +1075,7 @@ def _prefill_index_scores(
                                             if visible_keys <= lane_begin + tile_n // 2:
                                                 pl.tile.write(peaks, [0, blocks - 1], 1e30)
                                             pl.store(pl.set_validshape(peaks, 1, blocks),
-                                                     [row_token, lane_begin // CANDIDATE_BLOCK_SIZE], auxiliary)
+                                                     [row_token, lane_offset // CANDIDATE_BLOCK_SIZE], auxiliary)
                                     cols = pl.min(lane_cols, width - lane_offset)
                                     pl.store(pl.set_validshape(masked, 1, cols), [row_token, lane_offset], output)
     return score_tid
@@ -1068,14 +1100,14 @@ def _score_ordered_index_queries(
 ):
     """Share ordered key panels across four, two, or one query."""
     done = pl.array.create(1, pl.TASK_ID)
-    if count % INDEX_SCORE_SHARED_QUERIES == 0 and pl.tensor.dim(scores, 1) > TOPK_SHORT_LEAF:
+    if count >= INDEX_SCORE_SHARED_QUERIES:
         done[0] = _prefill_index_scores(
             query, weights, decoded_keys, table, requests, lengths, scores, block_scores, count, ready,
             tile_n=256, query_tile=INDEX_SCORE_SHARED_QUERIES, skip_short=c2a,
             head_rows=INDEX_SCORE_QUERY_TILE * INDEX_H, materialize_padding=False,
             ordered_keys=True, physical_pages=cache_pages, key_begin=key_begin, compact=False, collect_blocks=collect_blocks,
         )
-    elif count % INDEX_SCORE_QUERY_TILE == 0:
+    elif count >= INDEX_SCORE_QUERY_TILE:
         done[0] = _prefill_index_scores(
             query, weights, decoded_keys, table, requests, lengths, scores, block_scores, count, ready,
             tile_n=256, query_tile=INDEX_SCORE_QUERY_TILE, skip_short=c2a,
@@ -1481,12 +1513,62 @@ def _retie_topk_pairs(
 
 
 @pl.jit.inline(auto_scope=False)
+def _stream_pool_row(
+    maxima: pl.Tensor, pool_state: pl.Tensor, ids: pl.Tensor, row: pl.Scalar[pl.INDEX],
+    begin: pl.Scalar[pl.INDEX], visible: pl.Scalar[pl.INDEX], final: pl.Scalar[pl.BOOL],
+):
+    """Merge a band of block maxima with the earlier candidate winners."""
+    capacity = pl.tensor.dim(ids, 1)
+    lanes = pl.tile.arange(0, [1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32)
+    total = (visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+    block_begin = begin // CANDIDATE_BLOCK_SIZE
+    count = pl.min(CANDIDATE_TOPK_BLOCKS, pl.max(0, total - block_begin))
+    best = pl.tile.full([1, CANDIDATE_PAIR_WIDTH], dtype=pl.FP32, value=0.0)
+    if begin > 0:
+        best = pl.load(pool_state, [row, 0], [1, CANDIDATE_PAIR_WIDTH])
+    if count > 0:
+        raw = pl.load(maxima, [row, 0], [1, CANDIDATE_TOPK_BLOCKS], valid_shape=[1, count])
+        padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
+        floor = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.FP32, value=-1e30)
+        values = pl.maximum(floor, padded)
+        logical = pl.add(lanes, pl.cast(block_begin, pl.INT32))
+        pairs = pl.tile.sort32(values, pl.reinterpret_view(logical, pl.UINT32))
+        pairs = pl.tile.mrgsort(pairs, block_len=64)
+        pairs = pl.tile.mrgsort(pairs, block_len=256)
+        pairs = pl.tile.mrgsort(pairs, block_len=1024)
+        if begin == 0:
+            best = pairs
+        else:
+            tmp = pl.create_tile([1, 2 * CANDIDATE_PAIR_WIDTH], dtype=pl.FP32)
+            merged = pl.tile.mrgsort(best, pairs, tmp=tmp)
+            best = pl.tile.slice(merged, [1, CANDIDATE_PAIR_WIDTH], [0, 0])
+    if final:
+        chosen = pl.tile.gather_mask(best, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+        limit = pl.cast(pl.cast(pl.min(capacity, total), pl.INT32), pl.FP32)
+        live = pl.tile.cmps(pl.cast(lanes, pl.FP32), limit, cmp_type=2)
+        order = pl.tile.select(live, pl.mul(pl.cast(chosen, pl.FP32), -1.0), SORT_FLOOR)
+        logical_ids = pl.tile.select(live, chosen, -1)
+        ordered = pl.tile.sort32(order, pl.reinterpret_view(logical_ids, pl.UINT32))
+        ordered = pl.tile.mrgsort(ordered, block_len=64)
+        ordered = pl.tile.mrgsort(ordered, block_len=256)
+        ordered = pl.tile.mrgsort(ordered, block_len=1024)
+        indices = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+        pl.store(pl.set_validshape(indices, 1, capacity), [row, 0], ids)
+    else:
+        pl.store(best, [row, 0], pool_state)
+    return ids
+
+
+@pl.jit.inline(auto_scope=False)
 def _update_stream_topk(
     scores: pl.Tensor,
     lengths: pl.Tensor,
     state: pl.Tensor,
+    maxima: pl.Tensor, pool_state: pl.Tensor, pool_ids: pl.Tensor,
+    requests: pl.Tensor, table: pl.Tensor, output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     key_begin: pl.Scalar[pl.INDEX],
+    positions: pl.Scalar[pl.INDEX], cache_pages: pl.Scalar[pl.INDEX], final: pl.Scalar[pl.BOOL],
     scored: pl.Scalar[pl.TASK_ID],
     previous: pl.Scalar[pl.TASK_ID],
     c2a: pl.constexpr,
@@ -1506,7 +1588,7 @@ def _update_stream_topk(
         earlier = pl.add(pl.mul(lanes, -1), TOPK_PAIR_WIDTH - 1)
         later = pl.sub(earlier, INDEX_TOPK)
         for token in pl.range(worker, num_tokens, workers):
-            visible = pl.max(0, pl.read(lengths, [token]))
+            visible = pl.min(positions, pl.max(0, pl.read(lengths, [token])))
             length = pl.min(width, pl.max(0, visible - key_begin))
             if c2a:
                 if visible <= INDEX_TOPK:
@@ -1524,51 +1606,42 @@ def _update_stream_topk(
                 temporary = pl.create_tile([1, 2 * TOPK_PAIR_WIDTH], dtype=pl.FP32)
                 merged = pl.tile.mrgsort(left, right, tmp=temporary)
                 running = pl.yield_(pl.tile.slice(merged, [1, TOPK_PAIR_WIDTH], [0, 0]))
-            pl.store(running, [token, 0], state)
+            if final:
+                _publish_stream_row(running, table, requests, output, token, visible, cache_pages, c2a=c2a)
+            else:
+                pl.store(running, [token, 0], state)
+            if not c2a:
+                _stream_pool_row(maxima, pool_state, pool_ids, token, key_begin, visible, final)
     return updated
 
 
-@pl.jit.inline(auto_scope=False)
-def _finish_stream_topk(
-    state: pl.Tensor,
-    lengths: pl.Tensor,
-    requests: pl.Tensor,
-    table: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    width: pl.Scalar[pl.INDEX],
-    cache_pages: pl.Scalar[pl.INDEX],
-    ready: pl.Scalar[pl.TASK_ID],
-    c2a: pl.constexpr,
+@pl.jit.inline
+def _publish_stream_row(
+    pairs: pl.Tile[[1, TOPK_PAIR_WIDTH], pl.FP32], table: pl.Tensor, requests: pl.Tensor, output: pl.Tensor,
+    token: pl.Scalar[pl.INDEX], length: pl.Scalar[pl.INDEX], cache_pages: pl.Scalar[pl.INDEX], c2a: pl.constexpr,
 ):
-    """Materialize the retained indices once after the last score band."""
-    workers = pl.min(48, num_tokens)
-    with pl.spmd(workers, name_hint="prefill_index_stream_rows", deps=[ready]) as finished:
-        worker = pl.tile.get_block_idx()
+    """Map the final band winners directly from the ranking tile to physical rows."""
+    request = pl.read(requests, [token])
+    if length == 0 or request < 0 or request >= pl.tensor.dim(table, 0):
+        empty = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
+        pl.store(empty, [token, 0], output)
+    else:
         lanes = pl.tile.arange(0, [1, INDEX_TOPK], dtype=pl.INT32)
-        for token in pl.range(worker, num_tokens, workers):
-            length = pl.min(width, pl.max(pl.read(lengths, [token]), 0))
-            request = pl.read(requests, [token])
-            if length == 0 or request < 0 or request >= pl.tensor.dim(table, 0):
-                empty = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
-                pl.store(empty, [token, 0], output)
-            else:
-                chosen = lanes
-                limit = pl.cast(pl.cast(length, pl.INT32), pl.FP32)
-                valid = pl.tile.cmps(pl.cast(lanes, pl.FP32), limit, cmp_type=2)
-                use_scores = True
-                if c2a:
-                    use_scores = length > INDEX_TOPK
-                if use_scores:
-                    pairs = pl.load(state, [token, 0], [1, TOPK_PAIR_WIDTH])
-                    keys = pl.tile.gather_mask(pairs, mask_pattern=pl.tile.MaskPattern.P0101)
-                    chosen = pl.tile.gather_mask(pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-                    valid = pl.tile.cmps(keys, 0.0, cmp_type=4)
-                _store_index_rows(
-                    table, state, output, token, request, cache_pages, chosen, valid, use_scores,
-                    max_pages=TOPK_CACHED_PAGES, pool=False, c2a=c2a,
-                )
-    return finished
+        chosen = lanes
+        limit = pl.cast(pl.cast(length, pl.INT32), pl.FP32)
+        valid = pl.tile.cmps(pl.cast(lanes, pl.FP32), limit, cmp_type=2)
+        use_scores = True
+        if c2a:
+            use_scores = length > INDEX_TOPK
+        if use_scores:
+            keys = pl.tile.gather_mask(pairs, mask_pattern=pl.tile.MaskPattern.P0101)
+            chosen = pl.tile.gather_mask(pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+            valid = pl.tile.cmps(keys, 0.0, cmp_type=4)
+        _store_index_rows(
+            table, output, output, token, request, cache_pages, chosen, valid, use_scores,
+            max_pages=TOPK_CACHED_PAGES, pool=False, c2a=c2a,
+        )
+    return output
 
 
 @pl.jit.inline
@@ -1713,52 +1786,60 @@ def _stream_ordered_index(
     cache_pages: pl.Scalar[pl.INDEX],
     request: pl.Scalar[pl.INDEX],
     decoded_until: pl.Scalar[pl.INDEX],
+    prefix_ready: pl.Scalar[pl.TASK_ID],
     cache_ready: pl.Scalar[pl.TASK_ID],
     ready: pl.Scalar[pl.TASK_ID],
     c2a: pl.constexpr,
 ):
     """Pipeline score bands and retain Top-K state and block maxima."""
-    rows = pl.tensor.dim(query, 0)
-    scores = pl.create_tensor([2 * rows, INDEX_STREAM_KEYS], dtype=pl.FP32)
+    rows = pl.tensor.dim(weights, 0)
+    scores = pl.create_tensor([2 * rows, INDEX_BAND_TILE], dtype=pl.FP32)
     state = pl.create_tensor([rows, TOPK_PAIR_WIDTH], dtype=pl.FP32)
     block_cols = 1
+    pair_cols = 1
     if not c2a:
-        blocks = (maximum_visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
-        leaves = (blocks + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE
-        block_cols = pl.max(1, leaves) * CANDIDATE_LEAF_TILE
-    block_scores = pl.create_tensor([rows, block_cols], dtype=pl.FP32)
+        block_cols = INDEX_BAND_TILE // CANDIDATE_BLOCK_SIZE
+        pair_cols = CANDIDATE_PAIR_WIDTH
+    block_scores = pl.create_tensor([2 * rows, block_cols], dtype=pl.FP32)
+    pool_state = pl.create_tensor([rows, pair_cols], dtype=pl.FP32)
     bank_ready = pl.array.create(2, pl.TASK_ID)
     bank_ready[0] = ready
     bank_ready[1] = ready
     rank_ready = pl.array.create(1, pl.TASK_ID)
     rank_ready[0] = ready
-    for key_begin in pl.range(0, maximum_visible, INDEX_STREAM_KEYS):
+    decode_ready = pl.array.create(1, pl.TASK_ID)
+    decode_ready[0] = prefix_ready
+    for key_begin in pl.range(0, pl.max(1, maximum_visible), INDEX_BAND_TILE):
         with pl.scope():
-            slot = key_begin // INDEX_STREAM_KEYS % 2
-            cols = pl.min(width - key_begin, INDEX_STREAM_KEYS)
+            slot = key_begin // INDEX_BAND_TILE % 2
+            cols = pl.min(width - key_begin, INDEX_BAND_TILE)
             band = pl.slice(scores, [rows, cols], [slot * rows, 0])
+            maxima = pl.slice(block_scores, [rows, block_cols], [slot * rows, 0])
+            key_rows = pl.min(INDEX_BAND_TILE, pl.tensor.dim(decoded_keys, 0) - key_begin)
+            keys = pl.slice(decoded_keys, [key_rows, INDEX_DIM], [key_begin, 0])
             bank_entry = bank_ready[slot]
             prior_rank = rank_ready[0]
-            decode_ready = pl.array.create(1, pl.TASK_ID)
-            decode_ready[0] = bank_entry
-            if key_begin >= decoded_until:
-                decode_rows = pl.min(INDEX_STREAM_KEYS, pl.tensor.dim(decoded_keys, 0) - key_begin)
-                destination = pl.slice(decoded_keys, [decode_rows, INDEX_DIM], [key_begin, 0])
-                decoded = _decode_index_pages(cache, cache_scale, table, destination, key_begin, cache_ready, 1, request)
-                decode_ready[0] = pl.system.task_dummy(deps=[bank_entry, decoded])
-            band_ready = decode_ready[0]
+            decoded = decode_ready[0]
+            band_ready = pl.system.task_dummy(deps=[bank_entry, decoded])
             scored = _score_ordered_index_queries(
-                query, weights, decoded_keys, table, requests, lengths, band, block_scores,
+                query, weights, keys, table, requests, lengths, band, maxima,
                 count, band_ready, cache_pages, key_begin, c2a=c2a, collect_blocks=not c2a,
             )
-            ranked = _update_stream_topk(band, lengths, state, count, key_begin, scored, prior_rank, c2a=c2a)
+            next_begin = key_begin + INDEX_BAND_TILE
+            if next_begin < maximum_visible and next_begin >= decoded_until:
+                next_rows = pl.min(INDEX_BAND_TILE, pl.tensor.dim(decoded_keys, 0) - next_begin)
+                destination = pl.slice(decoded_keys, [next_rows, INDEX_DIM], [next_begin, 0])
+                decode_ready[0] = _decode_index_pages(cache, cache_scale, table, destination, next_begin, cache_ready, 1, request)
+            ranked = _update_stream_topk(
+                band, lengths, state, maxima, pool_state, pool_ids, requests, table, output,
+                count, key_begin, width, cache_pages, next_begin >= maximum_visible, scored, prior_rank, c2a=c2a,
+            )
             rank_ready[0] = ranked
             bank_ready[slot] = ranked
     final_rank = rank_ready[0]
-    selected = _finish_stream_topk(state, lengths, requests, table, output, count, width, cache_pages, final_rank, c2a=c2a)
+    selected = final_rank
     if not c2a:
-        pooled = _select_candidate_blocks(block_scores, lengths, pool_ids, pool_counts, count, width, final_rank)
-        selected = pl.system.task_dummy(deps=[selected, pooled])
+        selected = _publish_pool_counts(lengths, pool_counts, rows, count, width, pl.tensor.dim(pool_ids, 1), final_rank)
     return selected
 
 
@@ -1827,6 +1908,13 @@ def _index_request_run(
             decode_entry = completion[0]
             completion[0] = _decode_index_pages(cache, cache_scale, table, decoded_keys, 0, decode_entry, 1, request)
         decoded_until = pl.cast(0, pl.INDEX)
+        prefix = pl.array.create(1, pl.TASK_ID)
+        prefix[0] = ready
+        if not pool and streaming:
+            prefix_rows = pl.min(INDEX_BAND_TILE, decoded_rows)
+            prefix_keys = pl.slice(decoded_keys, [prefix_rows, INDEX_DIM], [0, 0])
+            prefix[0] = _decode_index_pages(cache, cache_scale, table, prefix_keys, 0, ready, 1, request)
+            decoded_until = pl.cast(INDEX_BAND_TILE, pl.INDEX)
         active = pl.cast(num_tokens, pl.INDEX)
         score_width = width
         chunk = pl.min(active, pl.max(1, INDEX_MAX_LOGITS_BYTES // (score_width * 4)))
@@ -1854,7 +1942,8 @@ def _index_request_run(
                 chunk_counts = pl.slice(pool_counts, [rows], [begin])
                 chunk_output = pl.slice(output, [rows, INDEX_TOPK], [begin, 0])
                 chunk_scores = pl.slice(scores, [rows, score_width], [0, 0])
-                query = pl.create_tensor([rows, INDEX_QUERY_WIDTH], dtype=pl.BF16)
+                query_rows = (rows + INDEX_SCORE_SHARED_QUERIES - 1) // INDEX_SCORE_SHARED_QUERIES
+                query = pl.create_tensor([query_rows * INDEX_SCORE_SHARED_QUERIES, INDEX_QUERY_WIDTH], dtype=pl.BF16)
                 weights = pl.create_tensor([rows, INDEX_H], dtype=pl.BF16)
                 maximum_visible = pl.cast(0, pl.INDEX)
                 if streaming or c2a:
@@ -1867,16 +1956,17 @@ def _index_request_run(
                 if not c2a or maximum_visible > INDEX_TOPK:
                     chunk_payload = pl.slice(latent_payload, [rows, Q_LORA], [begin, 0])
                     chunk_scales = pl.slice(latent_scales, [rows, 1], [begin, 0])
+                    live_query = pl.slice(query, [rows, INDEX_QUERY_WIDTH], [0, 0])
                     query_tid, weights_tid = prepare_prefill_index_query(
                         chunk_x, chunk_payload, chunk_scales, query_weight, query_weight_scale, weight_projection,
-                        chunk_cos, chunk_sin, query, weights, count, ready,
+                        chunk_cos, chunk_sin, live_query, weights, count, ready,
                     )
                     prepared = pl.system.task_dummy(deps=[query_tid, weights_tid, chunk_ready])
                     if not pool and streaming:
                         scoring[0] = _stream_ordered_index(
                             query, weights, cache, cache_scale, decoded_keys, table, chunk_requests, chunk_lengths,
                             chunk_pool, chunk_counts, chunk_output, count, width, maximum_visible, cache_pages,
-                            request, decoded_until, ready, prepared, c2a=c2a,
+                            request, decoded_until, prefix[0], ready, prepared, c2a=c2a,
                         )
                     elif pool:
                         if reuse_scores:
@@ -1918,9 +2008,9 @@ def _index_request_run(
                 selection[0] = score_ready
                 if not pool and streaming:
                     if c2a and maximum_visible <= INDEX_TOPK:
-                        selection[0] = _finish_stream_topk(
-                            chunk_scores, chunk_lengths, chunk_requests, table, chunk_output,
-                            count, width, cache_pages, score_ready, c2a=True,
+                        selection[0] = _select_paged_topk(
+                            chunk_scores, chunk_lengths, chunk_requests, table, chunk_pool, chunk_counts,
+                            cache_pages, chunk_output, count, score_ready, pool=False, c2a=True,
                         )
                 elif width <= TOPK_ORDER_WIDTH and pages <= TOPK_ORDER_WIDTH // 128:
                     selected = _select_paged_topk(
@@ -1939,9 +2029,9 @@ def _index_request_run(
                     )
                     selection[0] = selected
                 if not pool and streaming:
-                    decoded_bands = (maximum_visible + INDEX_STREAM_KEYS - 1) // INDEX_STREAM_KEYS
+                    decoded_bands = (maximum_visible + INDEX_BAND_TILE - 1) // INDEX_BAND_TILE
                     if not c2a or maximum_visible > INDEX_TOPK:
-                        decoded_until = pl.max(decoded_until, decoded_bands * INDEX_STREAM_KEYS)
+                        decoded_until = pl.max(decoded_until, decoded_bands * INDEX_BAND_TILE)
                 topk_ready = selection[0]
                 completion[0] = topk_ready
                 if not pool and not c2a:
@@ -1953,6 +2043,88 @@ def _index_request_run(
             if all_blocks_fit:
                 completion[0] = pl.system.task_dummy(deps=[completion[0], direct_pool[0]])
     return completion[0]
+
+
+@pl.jit.inline(auto_scope=False)
+def _index_fragmented_request(
+    x: pl.Tensor, payload: pl.Tensor, scales: pl.Tensor, requests: pl.Tensor, lengths: pl.Tensor,
+    cache: pl.Tensor, cache_scale: pl.Tensor, table: pl.Tensor,
+    cos: pl.Tensor, sin: pl.Tensor, wq: pl.Tensor, wscale: pl.Tensor, wp: pl.Tensor,
+    ids: pl.Tensor, counts: pl.Tensor, output: pl.Tensor,
+    rows: pl.Scalar[pl.INDEX], first: pl.Scalar[pl.INDEX], end: pl.Scalar[pl.INDEX],
+    request: pl.Scalar[pl.INDEX], slots: pl.Scalar[pl.INDEX], ready: pl.Scalar[pl.TASK_ID],
+    pool: pl.constexpr, c2a: pl.constexpr,
+):
+    """Score the noncontiguous rows of one request in stable packed order."""
+    capacity = pl.tensor.dim(ids, 1)
+    row_map = pl.create_tensor([rows], dtype=pl.INT32)
+    packed_requests = pl.create_tensor([rows], dtype=pl.INT32)
+    packed_lengths = pl.create_tensor([rows], dtype=pl.INT32)
+    packed_scales = pl.create_tensor([rows, 1], dtype=pl.FP32)
+    packed_counts = pl.create_tensor([rows], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_index_request_map", deps=[ready]) as mapped:
+        dest = pl.cast(0, pl.INDEX)
+        for source in pl.range(first, end):
+            slot = pl.read(requests, [source])
+            if slot == request or (request == slots and (slot < 0 or slot >= slots)):
+                pl.write(row_map, [dest], pl.cast(source, pl.INT32))
+                pl.write(packed_requests, [dest], slot)
+                pl.write(packed_lengths, [dest], pl.read(lengths, [source]))
+                pl.write(packed_scales, [dest, 0], pl.read(scales, [source, 0]))
+                if pool:
+                    pl.write(packed_counts, [dest], pl.read(counts, [source]))
+                dest = dest + 1
+    packed_x = pl.create_tensor([rows, D], dtype=pl.BF16)
+    packed_payload = pl.create_tensor([rows, Q_LORA], dtype=pl.INT8)
+    packed_cos = pl.create_tensor([rows, ROPE_DIM // 2], dtype=pl.FP32)
+    packed_sin = pl.create_tensor([rows, ROPE_DIM // 2], dtype=pl.FP32)
+    packed_ids = pl.create_tensor([rows, capacity], dtype=pl.INT32)
+    workers = pl.min(48, rows)
+    with pl.spmd(workers, name_hint="prefill_index_request_gather", deps=[mapped]) as gathered:
+        for row in pl.range(pl.tile.get_block_idx(), rows, workers):
+            source = pl.cast(pl.read(row_map, [row]), pl.INDEX)
+            pl.store(pl.load(x, [source, 0], [1, D]), [row, 0], packed_x)
+            pl.store(pl.load(payload, [source, 0], [1, Q_LORA]), [row, 0], packed_payload)
+            pl.store(pl.load(cos, [source, 0], [1, ROPE_DIM // 2]), [row, 0], packed_cos)
+            pl.store(pl.load(sin, [source, 0], [1, ROPE_DIM // 2]), [row, 0], packed_sin)
+            if pool:
+                block_ids = pl.load(ids, [source, 0], [1, CANDIDATE_TOPK_BLOCKS], valid_shape=[1, capacity])
+                pl.store(block_ids, [row, 0], packed_ids)
+    selected = pl.create_tensor([rows, INDEX_TOPK], dtype=pl.INT32)
+    finished = _index_request_run(
+        packed_x, packed_payload, packed_scales, packed_requests, packed_lengths, cache, cache_scale, table,
+        packed_cos, packed_sin, wq, wscale, wp, packed_ids, packed_counts, selected,
+        pl.cast(rows, pl.INT32), gathered, 0, pl.min(request, slots - 1), pool=pool, c2a=c2a,
+    )
+    return _restore_index_rows(
+        row_map, selected, packed_ids, packed_counts, output, ids, counts, rows, finished,
+        publish_pool=not pool and not c2a,
+    )
+
+
+@pl.jit.inline(auto_scope=False)
+def _restore_index_rows(
+    row_map: pl.Tensor, selected: pl.Tensor, selected_ids: pl.Tensor, selected_counts: pl.Tensor,
+    output: pl.Tensor, ids: pl.Tensor, counts: pl.Tensor,
+    rows: pl.Scalar[pl.INDEX], ready: pl.Scalar[pl.TASK_ID], publish_pool: pl.constexpr,
+):
+    """Scatter physical indices and published candidate rows to their packed-batch positions."""
+    capacity = pl.tensor.dim(ids, 1)
+    workers = pl.min(48, rows)
+    with pl.spmd(workers, name_hint="prefill_index_request_scatter", deps=[ready]) as scattered:
+        for row in pl.range(pl.tile.get_block_idx(), rows, workers):
+            dest = pl.read(row_map, [row])
+            pl.store(pl.load(selected, [row, 0], [1, INDEX_TOPK]), [dest, 0], output)
+            if publish_pool:
+                block_ids = pl.load(selected_ids, [row, 0], [1, CANDIDATE_TOPK_BLOCKS], valid_shape=[1, capacity])
+                pl.store(block_ids, [dest, 0], ids)
+    if publish_pool:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_index_request_counts", deps=[scattered]) as published:
+            for row in pl.range(rows):
+                dest = pl.read(row_map, [row])
+                pl.write(counts, [dest], pl.read(selected_counts, [row]))
+        scattered = published
+    return scattered
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1978,32 +2150,69 @@ def prefill_indexer(
     pool: pl.constexpr,
     c2a: pl.constexpr,
 ):
-    """Dispatch contiguous request runs using their visible compressed histories."""
+    """Group packed queries by request and its maximum visible compressed history."""
     done = pl.array.create(1, pl.TASK_ID)
     done[0] = ready
     if not pool and not c2a:
         if num_tokens < pl.tensor.dim(x, 0):
             done[0] = clear_inactive_index_pool(pool_ids, pool_counts, num_tokens, ready)
     slots = pl.tensor.dim(table, 0)
-    step = pl.max(1, pl.cast(num_tokens, pl.INDEX))
+    slot_count = slots
     if slots > 1:
-        step = pl.cast(1, pl.INDEX)
-    first = pl.cast(0, pl.INDEX)
-    for token in pl.range(0, num_tokens, step):
-        end = pl.min(token + step, num_tokens)
-        last = end == num_tokens
-        if not last:
-            last = pl.read(request_ids, [end]) != pl.read(request_ids, [token])
-        if last:
-            with pl.scope():
-                request = pl.min(slots - 1, pl.max(0, pl.read(request_ids, [token])))
-                count = pl.cast(end - first, pl.INT32)
-                done[0] = _index_request_run(
-                    x, latent_payload, latent_scales, request_ids, lengths, cache, cache_scale, table,
-                    cos, sin, query_weight, query_weight_scale, weight_projection,
-                    pool_ids, pool_counts, output, count, done[0], first, request, pool=pool, c2a=c2a,
-                )
-            first = end
+        slot_count = slots + 1
+    for base in pl.range(0, slot_count, INDEX_REQUEST_TILE):
+        group_slots = pl.min(INDEX_REQUEST_TILE, slot_count - base)
+        sizes = pl.array.create(INDEX_REQUEST_TILE, pl.INT32)
+        starts = pl.array.create(INDEX_REQUEST_TILE, pl.INT32)
+        ends = pl.array.create(INDEX_REQUEST_TILE, pl.INT32)
+        maxima = pl.array.create(INDEX_REQUEST_TILE, pl.INT32)
+        for lane in pl.range(group_slots):
+            sizes[lane] = 0
+            starts[lane] = num_tokens
+            ends[lane] = 0
+            maxima[lane] = 0
+        buckets = pl.cast(1, pl.INDEX)
+        if slots == 1:
+            sizes[0] = num_tokens
+            starts[0] = 0
+            ends[0] = num_tokens
+        else:
+            buckets = pl.cast(3, pl.INDEX)
+            for token in pl.range(num_tokens):
+                request_id = pl.read(request_ids, [token])
+                if request_id < 0 or request_id >= slots:
+                    request_id = pl.cast(slots, pl.INT32)
+                lane = request_id - base
+                if lane >= 0 and lane < group_slots:
+                    sizes[lane] = sizes[lane] + 1
+                    starts[lane] = pl.cast(pl.min(starts[lane], token), pl.INT32)
+                    ends[lane] = pl.cast(token + 1, pl.INT32)
+                    maxima[lane] = pl.cast(pl.max(maxima[lane], pl.read(lengths, [token])), pl.INT32)
+        for bucket in pl.range(buckets):
+            for lane in pl.range(group_slots):
+                visible = maxima[lane]
+                kind = pl.cast(visible > TOPK_ORDER_WIDTH, pl.INT32) + pl.cast(visible > INDEX_STREAM_KEYS, pl.INT32)
+                if sizes[lane] > 0 and kind == bucket:
+                    with pl.scope():
+                        rows = pl.cast(sizes[lane], pl.INDEX)
+                        first = pl.cast(starts[lane], pl.INDEX)
+                        end = pl.cast(ends[lane], pl.INDEX)
+                        request = base + lane
+                        entry = done[0]
+                        safe_request = pl.min(request, slots - 1)
+                        count = pl.cast(rows, pl.INT32)
+                        if end - first == rows:
+                            done[0] = _index_request_run(
+                                x, latent_payload, latent_scales, request_ids, lengths, cache, cache_scale, table,
+                                cos, sin, query_weight, query_weight_scale, weight_projection,
+                                pool_ids, pool_counts, output, count, entry, first, safe_request, pool=pool, c2a=c2a,
+                            )
+                        else:
+                            done[0] = _index_fragmented_request(
+                                x, latent_payload, latent_scales, request_ids, lengths, cache, cache_scale, table,
+                                cos, sin, query_weight, query_weight_scale, weight_projection, pool_ids, pool_counts,
+                                output, rows, first, end, request, slots, entry, pool=pool, c2a=c2a,
+                            )
     return done[0]
 
 

@@ -11,10 +11,17 @@ and aligns them with a fixed vLLM-Ascend token history.
 
 ## Packed Prefill Indexer
 
-Each consecutive run of queries for one request uses that request's page-table
-row and visible compressed-key range. Short histories use a bounded score row.
-Histories over 32K compressed keys stream score bands into Top-512 and the C1A
-candidate pool. C2A can map up to 512 visible keys directly. C1A reindex scores
+Packed queries use each request's maximum visible compressed-key count. Requests
+with up to 16K keys, up to 32K keys, and longer histories are scheduled in
+separate groups. Consecutive rows use the original tensors. Interleaved rows
+are gathered once per request and their results are scattered back to the input
+row order. Up to four queries share a decoded key panel.
+
+Histories over 32K keys stream 16K-key bands. The first decode can overlap
+query preparation and subsequent decodes can overlap scoring. Each band merges
+both the Top-512 keys and C1A's best 2048 eight-key blocks. The last band maps
+keys to physical rows and publishes the sorted logical block IDs. C2A can map
+up to 512 visible keys directly. C1A reindex scores
 only the candidate blocks for sparse long histories and can reuse request-local
 scores for denser short histories. Invalid pages and noncausal keys are excluded
 from selection.
@@ -27,6 +34,7 @@ indices in the production sparse-attention operator.
 ```bash
 python models/deepseek_v4_1_flash_a3/validate_prefill_indexer.py --case pool-holes --attention --device 0
 python models/deepseek_v4_1_flash_a3/validate_prefill_indexer.py --case packed-mixed --device 0
+python models/deepseek_v4_1_flash_a3/validate_prefill_indexer.py --case published-interleaved --attention --device 0
 ```
 
 ## Development priorities
