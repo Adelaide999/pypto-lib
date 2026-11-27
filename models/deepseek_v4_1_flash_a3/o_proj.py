@@ -57,6 +57,9 @@ O_B_N_TILE = 128
 DECODE_B1_O_B_N_TILE = 256
 DECODE_B1_ORDERED_K_TILE = 64
 DECODE_B1_ORDERED_N_TILE = 128
+DECODE_SWA_PAIR_K_TILE = 32
+DECODE_SWA_PAIR_N_TILE = 256
+DECODE_SWA_PAIR_MIN_ROWS = 8
 DECODE_B1_O_A_K_TILE = 256
 K_TILE = 128
 PREFILL_O_M_TILE = 128
@@ -499,6 +502,77 @@ def _project_ordered_decode_rows(
 
 
 @pl.jit.inline(auto_scope=False)
+def _project_ordered_decode_pairs(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    source_col: pl.Scalar[pl.INT32],
+    output_col: pl.Scalar[pl.INT32],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    k_tile: pl.constexpr,
+    n_tile: pl.constexpr,
+    name_hint: pl.constexpr,
+):
+    """Share a weight panel across two rows with separate ordered FP32 accumulators."""
+    panels = output_width // n_tile
+    work = ((num_tokens + 1) // 2) * panels
+    workers = pl.min(work, pl.system.available_cluster_count())
+    for worker in pl.spmd(workers, name_hint=name_hint):
+        for block in pl.range(worker, work, workers):
+            row = (block // panels) * 2
+            col = (block % panels) * n_tile
+            has_next = row + 1 < num_tokens
+            next_row = pl.min(row + 1, num_tokens - 1)
+            total = pl.tile.full([1, n_tile], dtype=pl.FP32, value=0.0)
+            next_total = pl.tile.full([1, n_tile], dtype=pl.FP32, value=0.0)
+            for first in pl.pipeline(0, width, k_tile, stage=2):
+                left = pl.load(source, [row, source_col + first], [1, k_tile])
+                right = pl.load(source, [next_row, source_col + first], [1, k_tile])
+                left_column = pl.reshape(pl.cast(left, pl.FP32), [k_tile, 1])
+                right_column = pl.reshape(pl.cast(right, pl.FP32), [k_tile, 1])
+                weight_panel = pl.load(weight, [first, col], [k_tile, n_tile])
+                matrix = pl.cast(weight_panel, pl.FP32)
+                products = pl.row_expand_mul(matrix, left_column)
+                next_products = pl.row_expand_mul(matrix, right_column)
+                for inner in pl.range(k_tile):
+                    product = pl.tile.slice(products, [1, n_tile], [inner, 0])
+                    next_product = pl.tile.slice(next_products, [1, n_tile], [inner, 0])
+                    total = pl.add(total, product)
+                    next_total = pl.add(next_total, next_product)
+            pl.store(pl.cast(total, pl.BF16, mode="rint"), [row, output_col + col], output)
+            if has_next:
+                pl.store(pl.cast(next_total, pl.BF16, mode="rint"), [next_row, output_col + col], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def _project_swa_decode_rows(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    source_col: pl.Scalar[pl.INT32],
+    output_col: pl.Scalar[pl.INT32],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    name_hint: pl.constexpr,
+):
+    if num_tokens >= DECODE_SWA_PAIR_MIN_ROWS:
+        _project_ordered_decode_pairs(
+            source, weight, output, num_tokens, source_col, output_col, width, output_width,
+            DECODE_SWA_PAIR_K_TILE, DECODE_SWA_PAIR_N_TILE, name_hint,
+        )
+    else:
+        _project_ordered_decode_rows(
+            source, weight, output, num_tokens, source_col, output_col, width, output_width,
+            DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE, name_hint,
+        )
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
 def decode_swa_o_proj_ordered(
     attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.BF16],
@@ -514,31 +588,45 @@ def decode_swa_o_proj_ordered(
     rotated = rotate_decode_b1(attended, rope_cos, rope_sin, rotated, num_tokens)
     projected = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
     for group in pl.parallel(LOCAL_O_GROUPS):
-        _project_ordered_decode_rows(
-            rotated, wo_a[group], projected, num_tokens,
-            pl.cast(group * O_GROUP_IN, pl.INT32), pl.cast(group * O_LORA, pl.INT32),
-            O_GROUP_IN, O_LORA, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE, "proj_o_a_ordered_b1",
-        )
+        if TP_SIZE == 4:
+            _project_swa_decode_rows(
+                rotated, wo_a[group], projected, num_tokens,
+                pl.cast(group * O_GROUP_IN, pl.INT32), pl.cast(group * O_LORA, pl.INT32),
+                O_GROUP_IN, O_LORA, "proj_o_a_ordered_b1",
+            )
+        else:
+            _project_ordered_decode_rows(
+                rotated, wo_a[group], projected, num_tokens,
+                pl.cast(group * O_GROUP_IN, pl.INT32), pl.cast(group * O_LORA, pl.INT32),
+                O_GROUP_IN, O_LORA, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE,
+                "proj_o_a_ordered_b1",
+            )
     if TP_SIZE == 1:
         partials = pl.create_tensor([REFERENCE_TP, tokens, D], dtype=pl.BF16)
         for shard in pl.parallel(REFERENCE_TP):
             first = shard * REFERENCE_O_WIDTH
             block = pl.slice(wo_b, [REFERENCE_O_WIDTH, D], [first, 0])
             _project_ordered_decode_rows(projected, block, partials[shard], num_tokens, first, 0,
-                                         REFERENCE_O_WIDTH, D, DECODE_B1_ORDERED_K_TILE,
-                                         DECODE_B1_ORDERED_N_TILE, "ref_o_b_ordered")
+                                         REFERENCE_O_WIDTH, D, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE,
+                                         "ref_o_b_ordered")
         combine_reference_partials(partials, output, num_tokens)
     elif TP_SIZE == 2:
         for shard in pl.parallel(2):
             first = shard * REFERENCE_O_WIDTH
             block = pl.slice(wo_b, [REFERENCE_O_WIDTH, D], [first, 0])
             _project_ordered_decode_rows(projected, block, output, num_tokens, first, shard * D,
-                                        REFERENCE_O_WIDTH, D, DECODE_B1_ORDERED_K_TILE,
-                                        DECODE_B1_ORDERED_N_TILE, "ref_o_b_ordered_pair")
+                                         REFERENCE_O_WIDTH, D, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE,
+                                         "ref_o_b_ordered_pair")
+    elif TP_SIZE == 4:
+        output = _project_swa_decode_rows(
+            projected, wo_b, output, num_tokens, 0, 0,
+            LOCAL_O_WIDTH, D, "proj_o_b_ordered_b1",
+        )
     else:
         output = _project_ordered_decode_rows(
             projected, wo_b, output, num_tokens, 0, 0,
-            LOCAL_O_WIDTH, D, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE, "proj_o_b_ordered_b1",
+            LOCAL_O_WIDTH, D, DECODE_B1_ORDERED_K_TILE, DECODE_B1_ORDERED_N_TILE,
+            "proj_o_b_ordered_b1",
         )
     return output
 
